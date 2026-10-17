@@ -1,5 +1,7 @@
 #include "n64.h"
 
+#include <stdio.h>
+#include <stdlib.h>
 #include <string.h>
 
 static inline uint32_t* reg(uint32_t* regs, uint32_t addr, int count) {
@@ -37,6 +39,15 @@ static void spWriteStatus(struct N64* n, uint32_t v) {
 	if ((v & 1) && (*s & 1)) {
 		*s &= ~1u;
 		++n->stats.rspTasks;
+		// N64TASKDUMP=number,file: the RSP's memories, registers and RDRAM as that task starts.
+		if (getenv("N64TASKDUMP") && n->stats.rspTasks == strtoull(getenv("N64TASKDUMP"), NULL, 10)) {
+			FILE* f = fopen(strchr(getenv("N64TASKDUMP"), ',') + 1, "wb");
+			fwrite(n->sp.mem, 1, sizeof(n->sp.mem), f);
+			fwrite(&n->sp, 1, sizeof(n->sp), f);
+			fwrite(&n->rsp, 1, sizeof(n->rsp), f);
+			fwrite(n->rdram, 1, RDRAM_SIZE, f);
+			fclose(f);
+		}
 	}
 	if (v & 2) {
 		*s |= 1;

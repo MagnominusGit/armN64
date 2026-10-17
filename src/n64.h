@@ -69,6 +69,11 @@ struct RSP {
 	uint64_t clock;
 	uint64_t scalarReady[32];
 	uint64_t vectorReady[32];
+	// Dual issue: the previous instruction, when it started, and whether it could still take a partner.
+	uint32_t lastOp, lastPc;
+	uint64_t lastStart;
+	bool lastAlone;
+	bool inDelay;
 };
 
 struct DP {

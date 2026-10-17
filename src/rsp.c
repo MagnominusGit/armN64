@@ -15,7 +15,8 @@ void rspInitTables(void) {
 	for (uint32_t i = 0; i < 512; ++i) {
 		uint64_t a = i + 512;
 		uint64_t b = (1ull << 34) / a;
-		reciprocals[i] = (uint16_t) ((b + 1) >> 8);
+		// The first entry would be 0x20000; the table holds 0xFFFF there.
+		reciprocals[i] = i == 0 ? 0xFFFF : (uint16_t) ((b + 1) >> 8);
 		a = (i + 512) >> (i & 1);
 		b = 1 << 17;
 		while (a * (b + 1) * (b + 1) < (1ull << 44)) {
@@ -486,7 +487,7 @@ static void vectorLoad(struct N64* n, uint32_t op) {
 	if (kind > 11) {
 		return;
 	}
-	uint32_t addr = r->r[RS] + (uint32_t) (offset * scale[kind]);
+	uint32_t addr = (r->r[RS] + (uint32_t) (offset * scale[kind])) & 0xFFF;
 	switch (kind) {
 	case 0:
 	case 1:
@@ -575,7 +576,7 @@ static void vectorStore(struct N64* n, uint32_t op) {
 	if (kind > 11) {
 		return;
 	}
-	uint32_t addr = r->r[RS] + (uint32_t) (offset * scale[kind]);
+	uint32_t addr = (r->r[RS] + (uint32_t) (offset * scale[kind])) & 0xFFF;
 	switch (kind) {
 	case 0:
 	case 1:
@@ -798,13 +799,69 @@ static bool isBranch(uint32_t op) {
 	return (code >= 0x01 && code <= 0x07) || (code == 0x00 && ((op & 0x3F) == 0x08 || (op & 0x3F) == 0x09));
 }
 
+static bool isVectorOp(uint32_t op) {
+	return (op >> 26) == 0x12 && (op & (1 << 25));
+}
+
+// The vector register an instruction writes, or -1.
+static int vectorWritten(uint32_t op) {
+	if (isVectorOp(op)) {
+		return SA;
+	}
+	if ((op >> 26) == 0x32) {
+		return RT;
+	}
+	if ((op >> 26) == 0x12 && RS == 0x04) {
+		return RD;
+	}
+	return -1;
+}
+
+// A scalar-unit and a vector-unit instruction issue together when neither is a branch or in a delay
+// slot, the pair is 8-byte aligned and the second doesn't use a vector register the first writes.
+static bool pairs(struct RSP* r, uint32_t op) {
+	uint32_t first = r->lastOp;
+	if (!r->lastAlone || r->inDelay || isBranch(first) || (r->lastPc & 4) || isVectorOp(first) == isVectorOp(op)) {
+		return false;
+	}
+	int code = op >> 26, firstCode = first >> 26;
+	if ((code == 0x12 && (RS == 0x02 || RS == 0x06)) || (firstCode == 0x12 && (((first >> 21) & 31) == 0x02 || ((first >> 21) & 31) == 0x06))) {
+		return false;
+	}
+	int w = vectorWritten(first);
+	if (w < 0) {
+		return true;
+	}
+	if (isVectorOp(op)) {
+		return w != (int) RT && w != (int) RD && w != (int) SA;
+	}
+	return !((code == 0x3A || code == 0x32) && w == (int) RT) && !(code == 0x12 && (int) RD == w);
+}
+
 void rspStep(struct N64* n) {
 	struct RSP* r = &n->rsp;
 	uint32_t pc = n->sp.pc & 0xFFC;
 	uint32_t op = be32(&n->sp.mem[0x1000 | pc]);
 	uint64_t start = issueTime(r, op);
+	if (pairs(r, op)) {
+		uint64_t clock = r->clock;
+		r->clock = r->lastStart;
+		uint64_t ready = issueTime(r, op);
+		r->clock = clock;
+		if (ready <= r->lastStart) {
+			start = r->lastStart;
+		}
+	}
+	bool paired = start == r->lastStart && r->lastAlone && start < r->clock;
 	// A branch also costs one bubble cycle after its delay slot.
-	r->clock = start + 1 + isBranch(op);
+	if (!paired) {
+		r->clock = start + 1 + isBranch(op);
+	}
+	r->inDelay = isBranch(op);
+	r->lastAlone = !paired;
+	r->lastOp = op;
+	r->lastPc = pc;
+	r->lastStart = start;
 	markResults(r, op, start);
 	r->scalarReady[0] = 0;
 	n->sp.pc = r->nextPc;

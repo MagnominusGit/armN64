@@ -70,8 +70,8 @@ int main(int argc, char** argv) {
 			writePicture(n, path);
 		}
 		if (getenv("N64PCLOG") && f % 60 == 59) {
-			printf("field %4d pc %08x  pi %llu (%llu KiB)  rsp tasks %llu  rdp syncs %llu  ai %llu  si %llu\n", f + 1,
-			       (uint32_t) n->cpu.pc, (unsigned long long) n->stats.piDmas, (unsigned long long) (n->stats.piBytes >> 10),
+			printf("field %4d pc %08x rsp %03x%s  pi %llu (%llu KiB)  rsp tasks %llu  rdp syncs %llu  ai %llu  si %llu\n", f + 1,
+			       (uint32_t) n->cpu.pc, n->sp.pc, n->sp.status & 1 ? " halted" : "", (unsigned long long) n->stats.piDmas, (unsigned long long) (n->stats.piBytes >> 10),
 			       (unsigned long long) n->stats.rspTasks, (unsigned long long) n->stats.dpSyncs,
 			       (unsigned long long) n->stats.aiBuffers, (unsigned long long) n->stats.siDmas);
 		}
@@ -88,6 +88,16 @@ int main(int argc, char** argv) {
 		struct CPU* c = &n->cpu;
 		printf("sp status %04x pc %03x, dp status %x, mi intr %02x mask %02x, pi status %x, vi intr %d\n",
 		       n->sp.status, n->sp.pc, n->dp.status, n->miIntr, n->miMask, n->pi.status, n->vi.reg[3]);
+		printf("rsp code:");
+		for (int k = -6; k < 4; ++k) {
+			uint32_t a = (n->sp.pc + k * 4) & 0xFFC;
+			printf("%s%03x:%08x", k == 0 ? " >" : " ", a, be32(&n->sp.mem[0x1000 + a]));
+		}
+		printf("\nrsp regs:");
+		for (int i = 0; i < 32; ++i) {
+			printf(" %d=%x", i, n->rsp.r[i]);
+		}
+		printf("\ndp start %06x current %06x end %06x\n", n->dp.start, n->dp.current, n->dp.end);
 		printf("vi:");
 		for (int i = 0; i < 14; ++i) {
 			printf(" %08x", n->vi.reg[i]);
