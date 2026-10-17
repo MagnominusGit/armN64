@@ -926,6 +926,36 @@ static void execute(struct N64* n, uint32_t op) {
 	loadStore(n, op);
 }
 
+#ifdef N64_TRACE
+#include <stdio.h>
+#include <stdlib.h>
+
+// N64TRACE=file N64TRACEN=count: the PC and a hash of the general registers before each instruction,
+// for comparing against another emulator's trace.
+static void traceInstruction(struct N64* n) {
+	static FILE* file;
+	static long count, limit;
+	struct CPU* c = &n->cpu;
+	if (!file && getenv("N64TRACE")) {
+		file = fopen(getenv("N64TRACE"), "wb");
+		limit = getenv("N64TRACEN") ? atol(getenv("N64TRACEN")) : 1000000;
+	}
+	if (!file || count >= limit) {
+		return;
+	}
+	uint32_t rec[2] = { (uint32_t) c->curPc, 2166136261u };
+	for (int i = 1; i < 32; ++i) {
+		for (int b = 0; b < 8; ++b) {
+			rec[1] = (rec[1] ^ (uint8_t) (c->gpr[i] >> (b * 8))) * 16777619u;
+		}
+	}
+	fwrite(rec, 4, 2, file);
+	if (++count == limit) {
+		fclose(file);
+	}
+}
+#endif
+
 void cpuStep(struct N64* n) {
 	struct CPU* c = &n->cpu;
 	if (cpuCount(n) == (uint32_t) c->cop0[CP0_COMPARE]) {
@@ -943,6 +973,9 @@ void cpuStep(struct N64* n) {
 		return;
 	}
 	uint32_t op = busRead32(n, p);
+#ifdef N64_TRACE
+	traceInstruction(n);
+#endif
 	c->pc = c->nextPc;
 	c->nextPc += 4;
 	execute(n, op);

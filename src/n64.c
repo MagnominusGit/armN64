@@ -84,6 +84,11 @@ void n64RunField(struct N64* n) {
 			n64Interrupt(n, MI_VI, true);
 			raised = true;
 		}
+		if (n->pi.busyUntil && n->cycles >= n->pi.busyUntil) {
+			n->pi.busyUntil = 0;
+			n->pi.status &= ~1u;
+			n64Interrupt(n, MI_PI, true);
+		}
 		cpuStep(n);
 		++n->cycles;
 		// The RSP runs at two thirds of the CPU clock.

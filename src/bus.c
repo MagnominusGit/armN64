@@ -96,7 +96,12 @@ static void piDma(struct N64* n, uint32_t len, bool toRdram) {
 	}
 	n->pi.dramAddr = dram + len;
 	n->pi.cartAddr = cart + len;
-	n64Interrupt(n, MI_PI, true);
+	// Domain 1 bus timing, in RCP cycles: latency per page, pulse width and release per halfword.
+	uint32_t* t = n->pi.timing;
+	uint32_t page = 1u << ((t[2] & 15) + 2);
+	uint64_t rcp = (uint64_t) ((len + page - 1) / page) * (t[0] + 1) + (uint64_t) ((len + 1) / 2) * ((t[1] + 1) + (t[3] + 1));
+	n->pi.busyUntil = n->cycles + rcp * 3 / 2;
+	n->pi.status |= 1;
 }
 
 static void siDma(struct N64* n, bool toPif) {
@@ -202,7 +207,7 @@ uint32_t busRead32(struct N64* n, uint32_t addr) {
 		case 0x04:
 			return n->pi.cartAddr;
 		case 0x10:
-			return n->pi.status;
+			return n->pi.status | (n->miIntr & MI_PI ? 8 : 0);
 		default:
 			if ((addr & 0x3F) >= 0x14 && (addr & 0x3F) < 0x34) {
 				return n->pi.timing[((addr & 0x3F) - 0x14) >> 2];
@@ -366,6 +371,10 @@ void busWrite32(struct N64* n, uint32_t addr, uint32_t v) {
 		case 0x10:
 			if (v & 2) {
 				n64Interrupt(n, MI_PI, false);
+			}
+			if (v & 1) {
+				n->pi.status = 0;
+				n->pi.busyUntil = 0;
 			}
 			break;
 		default:

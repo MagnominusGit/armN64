@@ -553,7 +553,7 @@ static void triangle(struct N64* n, struct RDP* r, const uint64_t* w, int op) {
 			}
 			if (zbuf) {
 				int64_t v = zv + zde * ey + (zdx * dx >> 16);
-				p.z = (int) (v >> 16) >> 3;
+				p.z = (int) (v >> 13);
 			}
 			if (tex) {
 				int64_t sS = tv[0] + tde[0] * ey + (tdx[0] * dx >> 16);

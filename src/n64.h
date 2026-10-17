@@ -83,6 +83,7 @@ struct AI {
 
 struct PI {
 	uint32_t dramAddr, cartAddr, status;
+	uint64_t busyUntil;
 	uint32_t timing[8];
 };
 
