@@ -26,6 +26,9 @@ struct RDP {
 	uint32_t fillColor;
 	struct Color fog, blend, prim, env;
 	int primLod, primZ, primDz;
+	int minLevel, maxLevel;
+	// The combiner's last output: what "combined" reads in one-cycle mode and in the first cycle.
+	struct Color lastCombined;
 	int k4, k5;
 	// RDP clocks spent on the commands so far.
 	uint64_t clocks;
@@ -279,7 +282,7 @@ static int rgbInput(struct RDP* r, struct Pixel* p, int sel, int channel, int wh
 		break;
 	default:
 		if (which == 0 && sel == 6) {
-			return 255;
+			return 0x100;
 		}
 		if (which == 0 && sel == 7) {
 			return rand() & 255;
@@ -310,7 +313,7 @@ static int rgbInput(struct RDP* r, struct Pixel* p, int sel, int channel, int wh
 			}
 		}
 		if (which == 3 && sel == 6) {
-			return 255;
+			return 0x100;
 		}
 		return 0;
 	}
@@ -332,9 +335,27 @@ static int alphaInput(struct RDP* r, struct Pixel* p, int sel, bool multiplier) 
 	case 5:
 		return r->env.a;
 	case 6:
-		return multiplier ? r->primLod : 255;
+		return multiplier ? r->primLod : 0x100;
 	}
 	return 0;
+}
+
+// The combiner works on 9-bit values: inputs from 0x180 up are negative, the multiplier is signed,
+// and the result keeps 9 bits (Angrylion as the behaviour reference). clamp9 turns a result into the
+// pixel's 8 bits: 0x100-0x17F saturate, 0x180-0x1FF are negative and give 0.
+static int ext9(int v) {
+	v &= 0x1FF;
+	return (v & 0x180) == 0x180 ? v - 0x200 : v;
+}
+
+static int sign9(int v) {
+	v &= 0x1FF;
+	return v & 0x100 ? v - 0x200 : v;
+}
+
+static int clamp9(int v) {
+	v &= 0x1FF;
+	return v < 0x100 ? v : v < 0x180 ? 255 : 0;
 }
 
 static struct Color combine(struct RDP* r, struct Pixel* p, int cycle) {
@@ -350,13 +371,13 @@ static struct Color combine(struct RDP* r, struct Pixel* p, int cycle) {
 	struct Color out;
 	int* o = &out.r;
 	for (int ch = 0; ch < 3; ++ch) {
-		int a = rgbInput(r, p, subA, ch, 0), b = rgbInput(r, p, subB, ch, 1);
-		int m = rgbInput(r, p, mul, ch, 2), d = rgbInput(r, p, add, ch, 3);
-		o[ch] = clamp8(((a - b) * m + (d << 8) + 0x80) >> 8);
+		int a = ext9(rgbInput(r, p, subA, ch, 0)), b = ext9(rgbInput(r, p, subB, ch, 1));
+		int m = sign9(rgbInput(r, p, mul, ch, 2)), d = ext9(rgbInput(r, p, add, ch, 3));
+		o[ch] = (((a - b) * m + (d << 8) + 0x80) & 0x1FFFF) >> 8;
 	}
-	int a = alphaInput(r, p, aA, false), b = alphaInput(r, p, aB, false);
-	int m = alphaInput(r, p, aMul, true), d = alphaInput(r, p, aAdd, false);
-	out.a = clamp8(((a - b) * m + (d << 8) + 0x80) >> 8);
+	int a = ext9(alphaInput(r, p, aA, false)), b = ext9(alphaInput(r, p, aB, false));
+	int m = sign9(alphaInput(r, p, aMul, true)), d = ext9(alphaInput(r, p, aAdd, false));
+	out.a = (((a - b) * m + (d << 8) + 0x80) >> 8) & 0x1FF;
 	return out;
 }
 
@@ -368,11 +389,11 @@ static struct Color blendColor(struct RDP* r, struct Color pixel, struct Color m
 	struct Color P = *choices[sp], M = *choices[sm];
 	int a = sa == 0 ? pixel.a : sa == 1 ? r->fog.a : sa == 2 ? p->shade.a : 0;
 	int b = sb == 0 ? 255 - a : sb == 1 ? memory.a : sb == 2 ? 255 : 0;
-	int sum = a + b;
-	if (sum == 0) {
-		return P;
-	}
-	struct Color out = { (P.r * a + M.r * b) / sum, (P.g * a + M.g * b) / sum, (P.b * a + M.b * b) / sum, pixel.a };
+	// The blender works with 5-bit factors and doesn't normalise: (P * a + M * (b + 1)) / 32, wrapping
+	// at 8 bits, so "one" for b adds.
+	int fa = a >> 3, fb = (b >> 3) + 1;
+	struct Color out = { ((P.r * fa + M.r * fb) >> 5) & 255, ((P.g * fa + M.g * fb) >> 5) & 255,
+	                     ((P.b * fa + M.b * fb) >> 5) & 255, pixel.a };
 	return out;
 }
 
@@ -403,11 +424,15 @@ static void shadePixel(struct N64* n, struct RDP* r, int x, int y, struct Pixel*
 			return;
 		}
 	}
-	struct Color c = combine(r, p, 0);
+	// One-cycle mode runs the combiner's second-cycle equation.
+	p->combined = r->lastCombined;
+	struct Color c = combine(r, p, cycleType == 1 ? 0 : 1);
 	if (cycleType == 1) {
 		p->combined = c;
 		c = combine(r, p, 1);
 	}
+	r->lastCombined = c;
+	c = (struct Color) { clamp9(c.r), clamp9(c.g), clamp9(c.b), clamp9(c.a) };
 	if ((m & 1) && c.a < r->blend.a) {
 		return;
 	}
@@ -476,6 +501,81 @@ static int t0Coord(int t0, int d, int dtdy) {
 	return ((t0 << 5) + d * dtdy) >> 5;
 }
 
+// Texture coordinates for the texture unit: S and T over W when perspective is on.
+static void texCoords(int64_t sS, int64_t sT, int64_t sW, bool persp, int* s, int* t) {
+	if (persp) {
+		int wv = (int) ((sW >> 16) & 0x7FFF);
+		if (wv == 0) {
+			wv = 1;
+		}
+		*s = (int) (((sS >> 16) * 0x8000) / wv);
+		*t = (int) (((sT >> 16) * 0x8000) / wv);
+	} else {
+		*s = (int) (sS >> 16);
+		*t = (int) (sT >> 16);
+	}
+}
+
+// Whether the combiner reads the LOD fraction in the cycles in use (then the RDP works out the LOD
+// even with mipmapping off).
+static bool lodFracUsed(struct RDP* r) {
+	uint64_t c = r->combine;
+	bool cycle1 = ((c >> 32) & 31) == 13 || ((c >> 18) & 7) == 0;
+	bool cycle0 = ((c >> 47) & 31) == 13 || ((c >> 41) & 7) == 0;
+	return cycle1 || (((r->otherModes >> 52) & 3) == 1 && cycle0);
+}
+
+// Level of detail from the texel step to the next pixel and the next line: picks the mipmap tiles
+// and the fraction between them (the RDP's rules; Angrylion as the behaviour reference).
+static int levelOfDetail(struct RDP* r, int primTile, int s, int t, int sx, int tx, int sy, int ty, int* t1, int* t2) {
+	uint64_t m = r->otherModes;
+	bool lodEn = (m >> 48) & 1, sharpen = (m >> 49) & 1, detail = (m >> 50) & 1;
+	bool clamp = s < -0x10000 || s > 0xFFFF || t < -0x10000 || t > 0xFFFF || sx < -0x10000 || sx > 0xFFFF ||
+	             tx < -0x10000 || tx > 0xFFFF || sy < -0x10000 || sy > 0xFFFF || ty < -0x10000 || ty > 0xFFFF;
+	int lod = 0;
+	if (!clamp) {
+		int d[4] = { abs(sx - s), abs(tx - t), abs(sy - s), abs(ty - t) };
+		for (int i = 0; i < 4; ++i) {
+			lod = d[i] > lod ? d[i] : lod;
+		}
+		lod = lod >= 0x4000 ? (lod & 0x3FFF) | 0x4000 : lod;
+	}
+	int tile = 0, frac;
+	bool magnify = false, distant;
+	if ((lod & 0x4000) || clamp) {
+		distant = true;
+		frac = 0xFF;
+	} else if (lod < 32) {
+		magnify = true;
+		distant = r->maxLevel == 0;
+		int base = lod < r->minLevel ? r->minLevel : lod;
+		frac = !sharpen && !detail ? (distant ? 0xFF : 0) : (base << 3) | (sharpen ? 0x100 : 0);
+	} else {
+		int v = (lod >> 5) & 0xFF;
+		while (v > 1) {
+			v >>= 1;
+			++tile;
+		}
+		distant = !r->maxLevel || (lod & 0x6000) || tile >= r->maxLevel;
+		frac = !sharpen && !detail && distant ? 0xFF : ((lod << 3) >> tile) & 0xFF;
+	}
+	*t1 = primTile;
+	*t2 = primTile + 1;
+	if (lodEn) {
+		if (distant) {
+			tile = r->maxLevel;
+		}
+		if (!detail) {
+			*t1 = (primTile + tile) & 7;
+			*t2 = distant || (!sharpen && magnify) ? *t1 : (*t1 + 1) & 7;
+		} else {
+			*t1 = (primTile + tile + (magnify ? 0 : 1)) & 7;
+			*t2 = (primTile + tile + (!distant && !magnify ? 2 : 1)) & 7;
+		}
+	}
+	return frac;
+}
+
 static void textureRect(struct N64* n, struct RDP* r, uint64_t w0, uint64_t w1, bool flip) {
 	int xl = (w0 >> 44) & 0xFFF, yl = (w0 >> 32) & 0xFFF, tile = (w0 >> 24) & 7;
 	int xh = (w0 >> 12) & 0xFFF, yh = w0 & 0xFFF;
@@ -491,14 +591,22 @@ static void textureRect(struct N64* n, struct RDP* r, uint64_t w0, uint64_t w1, 
 	int cx0 = x0, cy0 = y0;
 	clipRect(r, &x0, &y0, &x1, &y1);
 	uint64_t copied = 0;
+	r->maxLevel = 0;
+	bool doLod = cycleType < 2 && (((r->otherModes >> 48) & 1) || lodFracUsed(r));
 	for (int y = y0; y <= y1; ++y) {
 		for (int x = x0; x <= x1; ++x) {
 			int dx = x - cx0, dy = y - cy0;
 			int s = ((s0 << 5) + (flip ? dy * dsdx : dx * dsdx)) >> 5;
 			int t = ((t0 << 5) + (flip ? dx * dtdy : dy * dtdy)) >> 5;
 			struct Pixel p = { 0 };
-			p.tex0 = sample(r, tile, s, t);
-			p.tex1 = cycleType == 1 ? sample(r, tile + 1, s, t) : p.tex0;
+			int t1 = tile, t2 = tile + 1;
+			if (doLod) {
+				int sx = s + (flip ? 0 : dsdx >> 5), tx = t + (flip ? dtdy >> 5 : 0);
+				int sy = s + (flip ? dsdx >> 5 : 0), ty = t + (flip ? 0 : dtdy >> 5);
+				p.lodFrac = levelOfDetail(r, tile, s, t, sx, tx, sy, ty, &t1, &t2);
+			}
+			p.tex0 = sample(r, t1, s, t);
+			p.tex1 = cycleType == 1 ? sample(r, t2, s, t) : p.tex0;
 			if (cycleType == 2) {
 				++copied;
 				if ((r->otherModes & 1) && p.tex0.a == 0) {
@@ -539,7 +647,7 @@ static void triangle(struct N64* n, struct RDP* r, const uint64_t* w, int op) {
 	int64_t xm = fix(w[3], 32), dxm = fix(w[3], 0);
 	int idx = 4;
 	int64_t sv[4] = { 0 }, sdx[4] = { 0 }, sde[4] = { 0 };
-	int64_t tv[3] = { 0 }, tdx[3] = { 0 }, tde[3] = { 0 };
+	int64_t tv[3] = { 0 }, tdx[3] = { 0 }, tde[3] = { 0 }, tdy[3] = { 0 };
 	int64_t zv = 0, zdx = 0, zde = 0;
 	if (shade) {
 		for (int i = 0; i < 4; ++i) {
@@ -556,9 +664,12 @@ static void triangle(struct N64* n, struct RDP* r, const uint64_t* w, int op) {
 			tv[i] = (int32_t) ((uint32_t) ((w[idx] >> sh) & 0xFFFF) << 16 | (uint32_t) ((w[idx + 2] >> sh) & 0xFFFF));
 			tdx[i] = (int32_t) ((uint32_t) ((w[idx + 1] >> sh) & 0xFFFF) << 16 | (uint32_t) ((w[idx + 3] >> sh) & 0xFFFF));
 			tde[i] = (int32_t) ((uint32_t) ((w[idx + 4] >> sh) & 0xFFFF) << 16 | (uint32_t) ((w[idx + 6] >> sh) & 0xFFFF));
+			tdy[i] = (int32_t) ((uint32_t) ((w[idx + 5] >> sh) & 0xFFFF) << 16 | (uint32_t) ((w[idx + 7] >> sh) & 0xFFFF));
 		}
 		idx += 8;
 	}
+	r->maxLevel = (w[0] >> 51) & 7;
+	bool doLod = tex && (((r->otherModes >> 48) & 1) || lodFracUsed(r));
 	if (zbuf) {
 		zv = fix(w[idx], 32);
 		zdx = fix(w[idx], 0);
@@ -605,20 +716,16 @@ static void triangle(struct N64* n, struct RDP* r, const uint64_t* w, int op) {
 				int64_t sS = tv[0] + tde[0] * ey + (tdx[0] * dx >> 16);
 				int64_t sT = tv[1] + tde[1] * ey + (tdx[1] * dx >> 16);
 				int64_t sW = tv[2] + tde[2] * ey + (tdx[2] * dx >> 16);
-				int s, t;
-				if (persp) {
-					int wv = (int) ((sW >> 16) & 0x7FFF);
-					if (wv == 0) {
-						wv = 1;
-					}
-					s = (int) (((sS >> 16) * 0x8000) / wv);
-					t = (int) (((sT >> 16) * 0x8000) / wv);
-				} else {
-					s = (int) (sS >> 16);
-					t = (int) (sT >> 16);
+				int s, t, t1 = tile, t2 = tile + 1;
+				texCoords(sS, sT, sW, persp, &s, &t);
+				if (doLod) {
+					int sx, tx, sy, ty;
+					texCoords(sS + tdx[0], sT + tdx[1], sW + tdx[2], persp, &sx, &tx);
+					texCoords(sS + tdy[0], sT + tdy[1], sW + tdy[2], persp, &sy, &ty);
+					p.lodFrac = levelOfDetail(r, tile, s, t, sx, tx, sy, ty, &t1, &t2);
 				}
-				p.tex0 = sample(r, tile, s, t);
-				p.tex1 = cycleType == 1 ? sample(r, tile + 1, s, t) : p.tex0;
+				p.tex0 = sample(r, t1, s, t);
+				p.tex1 = cycleType == 1 ? sample(r, t2, s, t) : p.tex0;
 			}
 			shadePixel(n, r, x, y, &p);
 		}
@@ -840,6 +947,7 @@ void rdpRun(struct N64* n) {
 		case 0x3A:
 			r->prim = unpack((uint32_t) c);
 			r->primLod = (c >> 32) & 0xFF;
+			r->minLevel = (c >> 40) & 0x1F;
 			break;
 		case 0x3B:
 			r->env = unpack((uint32_t) c);
