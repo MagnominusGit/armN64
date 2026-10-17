@@ -146,6 +146,16 @@ int n64Picture(struct N64* n, uint32_t* out, int* width, int* height) {
 	if (h > 480) {
 		h = 480;
 	}
+	// With gamma on, the VI outputs the square root of each channel (scaled to 8 bits).
+	uint8_t gamma[256];
+	for (int i = 0; i < 256; ++i) {
+		int s = 0;
+		while ((s + 1) * (s + 1) <= i * 256) {
+			++s;
+		}
+		gamma[i] = (uint8_t) (s > 255 ? 255 : s);
+	}
+	bool gammaOn = v[0] & 8;
 	for (int y = 0; y < h; ++y) {
 		uint32_t row = origin + (uint32_t) y * stride * (type == 3 ? 4 : 2);
 		for (int x = 0; x < w; ++x) {
@@ -158,6 +168,9 @@ int n64Picture(struct N64* n, uint32_t* out, int* width, int* height) {
 				uint16_t px = (uint16_t) (p[0] << 8 | p[1]);
 				uint32_t r = (px >> 11) & 31, g = (px >> 6) & 31, b = (px >> 1) & 31;
 				c = (r << 3 | r >> 2) << 16 | (g << 3 | g >> 2) << 8 | (b << 3 | b >> 2);
+			}
+			if (gammaOn) {
+				c = (uint32_t) gamma[c >> 16] << 16 | (uint32_t) gamma[(c >> 8) & 255] << 8 | gamma[c & 255];
 			}
 			out[y * w + x] = c;
 		}
