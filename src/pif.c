@@ -129,10 +129,40 @@ static void eeprom(struct N64* n, const uint8_t* cmd, uint8_t* resp, int send, i
 	}
 }
 
+// Answers the CIC-NUS-6105 challenge: 30 nibbles at 0x30 in, 30 nibbles out (X-Scale's decoding of
+// the algorithm, as used by mupen64plus).
+static void cicChallenge(uint8_t* ram) {
+	static const uint8_t lut0[16] = { 4, 7, 10, 7, 14, 5, 14, 1, 12, 15, 8, 15, 6, 3, 6, 9 };
+	static const uint8_t lut1[16] = { 4, 1, 10, 7, 14, 5, 14, 1, 12, 9, 8, 5, 6, 3, 12, 9 };
+	const uint8_t* lut = lut0;
+	uint8_t key = 0xB;
+	for (int i = 0; i < 30; ++i) {
+		uint8_t* b = &ram[0x30 + i / 2];
+		int shift = i & 1 ? 0 : 4;
+		uint8_t out = (key + 5 * ((*b >> shift) & 15)) & 15;
+		*b = (uint8_t) ((*b & ~(15 << shift)) | out << shift);
+		key = lut[out];
+		int sign = out >> 3;
+		int magnitude = (sign ? ~out : out) & 7;
+		int mod = magnitude % 3 == 1 ? sign : 1 - sign;
+		if (lut == lut1 && (out == 1 || out == 9)) {
+			mod = 1;
+		} else if (lut == lut1 && (out == 11 || out == 14)) {
+			mod = 0;
+		}
+		lut = mod ? lut1 : lut0;
+	}
+	ram[63] = 0;
+}
+
 // Runs the Joybus commands in PIF RAM: per channel, a send length, a receive length, the command
 // and room for the reply. Controller 1 is plugged in and the cartridge's EEPROM answers on channel 4.
 void pifRun(struct N64* n) {
 	uint8_t* ram = n->pifRam;
+	if (ram[63] == 2) {
+		cicChallenge(ram);
+		return;
+	}
 	if (!(ram[63] & 1)) {
 		return;
 	}
