@@ -56,6 +56,18 @@ struct SP {
 	uint32_t memAddr, dramAddr, status, semaphore, pc;
 };
 
+struct RSP {
+	uint32_t r[32];
+	uint32_t nextPc;
+	int16_t vr[32][8];
+	int64_t acc[8];
+	uint16_t vco, vcc;
+	uint8_t vce;
+	int16_t divIn;
+	uint32_t divOut;
+	bool divDp;
+};
+
 struct DP {
 	uint32_t start, end, current, status;
 };
@@ -78,6 +90,8 @@ struct SI {
 	uint32_t dramAddr, status;
 };
 
+struct RDP;
+
 struct N64 {
 	uint8_t* rdram;
 	uint8_t* rom;
@@ -88,7 +102,9 @@ struct N64 {
 
 	struct CPU cpu;
 	struct SP sp;
+	struct RSP rsp;
 	struct DP dp;
+	struct RDP* rdp;
 	struct VI vi;
 	struct AI ai;
 	struct PI pi;
@@ -118,6 +134,10 @@ void cpuException(struct N64*, int code, int coprocessor);
 void cpuCheckInterrupts(struct N64*);
 uint32_t cpuCount(struct N64*);
 
+// rsp.c
+void rspInitTables(void);
+void rspStep(struct N64*);
+
 // fpu.c
 void fpuExecute(struct N64*, uint32_t op);
 
@@ -130,6 +150,10 @@ void busWrite8(struct N64*, uint32_t addr, uint8_t value);
 void busWrite16(struct N64*, uint32_t addr, uint16_t value);
 void busWrite32(struct N64*, uint32_t addr, uint32_t value);
 void busWrite64(struct N64*, uint32_t addr, uint64_t value);
+
+// rdp.c
+void rdpRun(struct N64*);
+void rdpDestroy(struct N64*);
 
 // pif.c
 void pifBoot(struct N64*);

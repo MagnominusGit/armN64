@@ -4,6 +4,11 @@
 #include <string.h>
 
 struct N64* n64Create(void) {
+	static bool tables;
+	if (!tables) {
+		rspInitTables();
+		tables = true;
+	}
 	struct N64* n = calloc(1, sizeof(*n));
 	if (!n) {
 		return NULL;
@@ -18,6 +23,7 @@ struct N64* n64Create(void) {
 
 void n64Destroy(struct N64* n) {
 	if (n) {
+		rdpDestroy(n);
 		free(n->rdram);
 		free(n->rom);
 		free(n);
@@ -80,6 +86,10 @@ void n64RunField(struct N64* n) {
 		}
 		cpuStep(n);
 		++n->cycles;
+		// The RSP runs at two thirds of the CPU clock.
+		if (n->cycles % 3 != 0 && !(n->sp.status & 1)) {
+			rspStep(n);
+		}
 	}
 	if (!raised) {
 		n64Interrupt(n, MI_VI, true);

@@ -69,39 +69,6 @@ static void spWriteStatus(struct N64* n, uint32_t v) {
 			*s |= 0x80u << sig;
 		}
 	}
-	if (!(*s & 1)) {
-		n->unimplemented = "RSP started";
-	}
-}
-
-static uint64_t dpWord(struct N64* n, uint32_t addr) {
-	if (n->dp.status & 1) {
-		const uint8_t* p = &n->sp.mem[addr & 0xFF8];
-		return (uint64_t) be32(p) << 32 | be32(p + 4);
-	}
-	const uint8_t* p = &n->rdram[addr & (RDRAM_SIZE - 8)];
-	return (uint64_t) be32(p) << 32 | be32(p + 4);
-}
-
-// Walks the command list; until the RDP is emulated this only raises the full-sync interrupt.
-static void dpRun(struct N64* n) {
-	while (n->dp.current < n->dp.end) {
-		uint64_t cmd = dpWord(n, n->dp.current);
-		int op = (cmd >> 56) & 0x3F;
-		int words = 1;
-		if (op >= 0x08 && op <= 0x0F) {
-			words = 4 + (op & 4 ? 8 : 0) + (op & 2 ? 8 : 0) + (op & 1 ? 2 : 0);
-		} else if (op == 0x24 || op == 0x25) {
-			words = 2;
-		}
-		if (n->dp.current + words * 8 > n->dp.end) {
-			break;
-		}
-		n->dp.current += words * 8;
-		if (op == 0x29) {
-			n64Interrupt(n, MI_DP, true);
-		}
-	}
 }
 
 static void aiStart(struct N64* n) {
@@ -276,6 +243,7 @@ void busWrite32(struct N64* n, uint32_t addr, uint32_t v) {
 	case 0x040:
 		if (addr == 0x04080000) {
 			n->sp.pc = v & 0xFFC;
+			n->rsp.nextPc = (n->sp.pc + 4) & 0xFFC;
 			return;
 		}
 		switch (addr & 0x1F) {
@@ -306,7 +274,7 @@ void busWrite32(struct N64* n, uint32_t addr, uint32_t v) {
 			break;
 		case 0x04:
 			n->dp.end = v & 0xFFFFF8;
-			dpRun(n);
+			rdpRun(n);
 			break;
 		case 0x0C:
 			if (v & 1) {
