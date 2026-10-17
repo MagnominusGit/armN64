@@ -59,8 +59,11 @@ bool n64LoadRom(struct N64* n, const uint8_t* data, size_t size) {
 	n->romSize = size & ~3u;
 	cpuReset(n);
 	pifBoot(n);
-	n->vi.reg[6] = 0x20D;
-	n->nextVi = CYCLES_PER_FIELD;
+	n->eeprom16k = cartEeprom16k(rom);
+	memset(n->eeprom, 0xFF, sizeof(n->eeprom));
+	n->fieldCycles = CPU_HZ / (n->cpu.gpr[20] == 0 ? 50 : 60);
+	n->vi.reg[6] = n->cpu.gpr[20] == 0 ? 0x271 : 0x20D;
+	n->nextVi = n->fieldCycles;
 	return true;
 }
 
@@ -75,9 +78,9 @@ void n64Interrupt(struct N64* n, uint32_t line, bool set) {
 
 // One video field: the CPU runs until the field ends, with the VI interrupt at the V_INTR line.
 void n64RunField(struct N64* n) {
-	uint64_t start = n->nextVi - CYCLES_PER_FIELD;
+	uint64_t start = n->nextVi - n->fieldCycles;
 	uint32_t lines = (n->vi.reg[6] & 0x3FF) + 1;
-	uint64_t intrAt = start + (uint64_t) (n->vi.reg[3] & 0x3FF) * CYCLES_PER_FIELD / lines;
+	uint64_t intrAt = start + (uint64_t) (n->vi.reg[3] & 0x3FF) * n->fieldCycles / lines;
 	bool raised = false;
 	while (n->cycles < n->nextVi) {
 		if (!raised && n->cycles >= intrAt) {
@@ -107,7 +110,7 @@ void n64RunField(struct N64* n) {
 	if (!raised) {
 		n64Interrupt(n, MI_VI, true);
 	}
-	n->nextVi += CYCLES_PER_FIELD;
+	n->nextVi += n->fieldCycles;
 	++n->fields;
 }
 

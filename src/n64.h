@@ -7,7 +7,6 @@
 
 #define CPU_HZ 93750000
 #define RDRAM_SIZE (8 << 20)
-#define CYCLES_PER_FIELD (CPU_HZ / 60)
 
 // MI interrupt lines.
 enum { MI_SP = 1, MI_SI = 2, MI_AI = 4, MI_VI = 8, MI_PI = 16, MI_DP = 32 };
@@ -107,6 +106,8 @@ struct N64 {
 	size_t romSize;
 	uint8_t pifRam[64];
 	uint8_t save[0x20000];
+	uint8_t eeprom[2048];
+	bool eeprom16k;
 	int cic;
 
 	struct CPU cpu;
@@ -123,6 +124,8 @@ struct N64 {
 
 	uint64_t cycles;
 	uint64_t nextVi;
+	// CPU cycles per video field: 60 fields a second for NTSC and MPAL, 50 for PAL.
+	uint64_t fieldCycles;
 	uint64_t fields;
 	uint32_t buttons;
 	const char* unimplemented;
@@ -169,6 +172,9 @@ void busWrite64(struct N64*, uint32_t addr, uint64_t value);
 // rdp.c
 void rdpRun(struct N64*);
 void rdpDestroy(struct N64*);
+
+// carts.c
+bool cartEeprom16k(const uint8_t* rom);
 
 // pif.c
 void pifBoot(struct N64*);

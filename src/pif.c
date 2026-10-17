@@ -101,8 +101,36 @@ static void controller(struct N64* n, const uint8_t* cmd, uint8_t* resp, int rx)
 	}
 }
 
+// The cartridge's EEPROM on channel 4: info, then 8-byte block reads and writes.
+static void eeprom(struct N64* n, const uint8_t* cmd, uint8_t* resp, int send, int rx) {
+	uint32_t size = n->eeprom16k ? 2048 : 512;
+	switch (cmd[0]) {
+	case 0x00:
+	case 0xFF:
+		if (rx >= 3) {
+			resp[0] = 0x00;
+			resp[1] = n->eeprom16k ? 0xC0 : 0x80;
+			resp[2] = 0x00;
+		}
+		return;
+	case 0x04:
+		if (send >= 2 && rx >= 8) {
+			memcpy(resp, &n->eeprom[(cmd[1] * 8u) % size], 8);
+		}
+		return;
+	case 0x05:
+		if (send >= 10) {
+			memcpy(&n->eeprom[(cmd[1] * 8u) % size], cmd + 2, 8);
+			if (rx >= 1) {
+				resp[0] = 0x00;
+			}
+		}
+		return;
+	}
+}
+
 // Runs the Joybus commands in PIF RAM: per channel, a send length, a receive length, the command
-// and room for the reply. Controller 1 is plugged in; nothing else answers yet.
+// and room for the reply. Controller 1 is plugged in and the cartridge's EEPROM answers on channel 4.
 void pifRun(struct N64* n) {
 	uint8_t* ram = n->pifRam;
 	if (!(ram[63] & 1)) {
@@ -133,6 +161,8 @@ void pifRun(struct N64* n) {
 		uint8_t* resp = cmd + send;
 		if (channel == 0) {
 			controller(n, cmd, resp, receive);
+		} else if (channel == 4) {
+			eeprom(n, cmd, resp, send, receive);
 		} else {
 			ram[i + 1] |= 0x80;
 		}

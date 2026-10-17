@@ -7,7 +7,7 @@ if(NOT CMAKE_BUILD_TYPE)
 endif()
 add_compile_options(-Wall -Wextra -Wno-unused-parameter)
 
-add_library(n64 STATIC src/n64.c src/cpu.c src/fpu.c src/bus.c src/pif.c src/rsp.c src/rdp.c)
+add_library(n64 STATIC src/n64.c src/cpu.c src/fpu.c src/bus.c src/pif.c src/rsp.c src/rdp.c src/carts.c)
 target_include_directories(n64 PUBLIC src)
 target_link_libraries(n64 m)
 

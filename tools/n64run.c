@@ -22,6 +22,27 @@ static uint8_t* readFile(const char* path, size_t* size) {
 	return data;
 }
 
+static void writePicture(struct N64* n, const char* path) {
+	static uint32_t picture[640 * 480];
+	int w, h;
+	n64Picture(n, picture, &w, &h);
+	FILE* out = fopen(path, "wb");
+	if (!out) {
+		return;
+	}
+	if (!w || !h) {
+		w = 1;
+		h = 1;
+		picture[0] = 0;
+	}
+	fprintf(out, "P6\n%d %d\n255\n", w, h);
+	for (int i = 0; i < w * h; ++i) {
+		uint8_t px[3] = { picture[i] >> 16, picture[i] >> 8, picture[i] };
+		fwrite(px, 1, 3, out);
+	}
+	fclose(out);
+}
+
 int main(int argc, char** argv) {
 	if (argc < 3) {
 		fprintf(stderr, "usage: %s rom fields [picture.ppm]\n", argv[0]);
@@ -42,6 +63,12 @@ int main(int argc, char** argv) {
 	clock_gettime(CLOCK_MONOTONIC, &t0);
 	for (int f = 0; f < fields; ++f) {
 		n64RunField(n);
+		// N64SHOTS=prefix N64SHOTEVERY=fields: a picture every so many fields, as prefix-<field>.ppm.
+		if (getenv("N64SHOTS") && (f + 1) % atoi(getenv("N64SHOTEVERY") ? getenv("N64SHOTEVERY") : "300") == 0) {
+			char path[1024];
+			snprintf(path, sizeof(path), "%s-%05d.ppm", getenv("N64SHOTS"), f + 1);
+			writePicture(n, path);
+		}
 		if (getenv("N64PCLOG") && f % 60 == 59) {
 			printf("field %4d pc %08x  pi %llu (%llu KiB)  rsp tasks %llu  rdp syncs %llu  ai %llu  si %llu\n", f + 1,
 			       (uint32_t) n->cpu.pc, (unsigned long long) n->stats.piDmas, (unsigned long long) (n->stats.piBytes >> 10),
@@ -79,21 +106,7 @@ int main(int argc, char** argv) {
 		}
 	}
 	if (argc > 3) {
-		static uint32_t picture[640 * 480];
-		int w, h;
-		n64Picture(n, picture, &w, &h);
-		FILE* out = fopen(argv[3], "wb");
-		if (out && w && h) {
-			fprintf(out, "P6\n%d %d\n255\n", w, h);
-			for (int i = 0; i < w * h; ++i) {
-				uint8_t px[3] = { picture[i] >> 16, picture[i] >> 8, picture[i] };
-				fwrite(px, 1, 3, out);
-			}
-		}
-		if (out) {
-			fclose(out);
-		}
-		printf("picture %dx%d\n", w, h);
+		writePicture(n, argv[3]);
 	}
 	n64Destroy(n);
 	return 0;

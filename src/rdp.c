@@ -72,6 +72,10 @@ static int zDecompress(uint16_t v) {
 
 static struct Color readPixel(struct N64* n, struct RDP* r, int x, int y) {
 	uint32_t i = y * r->colorWidth + x;
+	if (r->colorSize == 1) {
+		int v = n->rdram[(r->colorAddr + i) & (RDRAM_SIZE - 1)];
+		return (struct Color) { v, v, v, 0xE0 };
+	}
 	if (r->colorSize == 3) {
 		uint32_t a = (r->colorAddr + i * 4) & (RDRAM_SIZE - 4);
 		return unpack(be32(&n->rdram[a]));
@@ -84,6 +88,11 @@ static struct Color readPixel(struct N64* n, struct RDP* r, int x, int y) {
 
 static void writePixel(struct N64* n, struct RDP* r, int x, int y, struct Color c) {
 	uint32_t i = y * r->colorWidth + x;
+	// An 8-bit color image keeps one byte per pixel: the red channel.
+	if (r->colorSize == 1) {
+		n->rdram[(r->colorAddr + i) & (RDRAM_SIZE - 1)] = (uint8_t) c.r;
+		return;
+	}
 	if (r->colorSize == 3) {
 		uint32_t a = (r->colorAddr + i * 4) & (RDRAM_SIZE - 4);
 		put32(&n->rdram[a], (uint32_t) c.r << 24 | (uint32_t) c.g << 16 | (uint32_t) c.b << 8 | (uint32_t) c.a);
@@ -399,6 +408,10 @@ static void shadePixel(struct N64* n, struct RDP* r, int x, int y, struct Pixel*
 	if ((m & 1) && c.a < r->blend.a) {
 		return;
 	}
+	// With alpha as coverage, alpha becomes the 3-bit coverage; a pixel with none isn't written.
+	if (((m >> 13) & 1) && c.a < 32) {
+		return;
+	}
 	struct Color memory = readPixel(n, r, x, y);
 	// The blend formula applies only with force blend (or at partly covered edges, which aren't
 	// modelled yet); otherwise a cycle passes its first input through. In 2-cycle mode the first
@@ -423,7 +436,10 @@ static void fillRect(struct N64* n, struct RDP* r, int x0, int y0, int x1, int y
 	for (int y = y0; y <= y1; ++y) {
 		for (int x = x0; x <= x1; ++x) {
 			uint32_t i = y * r->colorWidth + x;
-			if (r->colorSize == 3) {
+			if (r->colorSize == 1) {
+				uint32_t a = (r->colorAddr + i) & (RDRAM_SIZE - 1);
+				n->rdram[a] = (uint8_t) (r->fillColor >> ((3 - (a & 3)) * 8));
+			} else if (r->colorSize == 3) {
 				put32(&n->rdram[(r->colorAddr + i * 4) & (RDRAM_SIZE - 4)], r->fillColor);
 			} else {
 				uint32_t a = (r->colorAddr + i * 2) & (RDRAM_SIZE - 2);
@@ -450,6 +466,10 @@ static void clipRect(struct RDP* r, int* x0, int* y0, int* x1, int* y1) {
 	}
 }
 
+static int t0Coord(int t0, int d, int dtdy) {
+	return ((t0 << 5) + d * dtdy) >> 5;
+}
+
 static void textureRect(struct N64* n, struct RDP* r, uint64_t w0, uint64_t w1, bool flip) {
 	int xl = (w0 >> 44) & 0xFFF, yl = (w0 >> 32) & 0xFFF, tile = (w0 >> 24) & 7;
 	int xh = (w0 >> 12) & 0xFFF, yh = w0 & 0xFFF;
@@ -474,6 +494,16 @@ static void textureRect(struct N64* n, struct RDP* r, uint64_t w0, uint64_t w1, 
 			p.tex1 = cycleType == 1 ? sample(r, tile + 1, s, t) : p.tex0;
 			if (cycleType == 2) {
 				if ((r->otherModes & 1) && p.tex0.a == 0) {
+					continue;
+				}
+				// Copying into an 8-bit image moves the texel bytes themselves (palette indices).
+				if (r->colorSize == 1 && r->tile[tile & 7].size == 1) {
+					struct Tile* t = &r->tile[tile & 7];
+					int f;
+					int ss = wrapCoord(s, t->shiftS, t->sl, t->sh, t->cmS, t->maskS, &f);
+					int tt = wrapCoord(t0Coord(t0, flip ? dx : dy, dtdy), t->shiftT, t->tl, t->th, t->cmT, t->maskT, &f);
+					uint32_t a = (t->tmem * 8 + tt * t->line * 8 + ss) ^ (tt & 1 ? 4 : 0);
+					n->rdram[(r->colorAddr + y * r->colorWidth + x) & (RDRAM_SIZE - 1)] = tmemByte(r, a);
 					continue;
 				}
 				writePixel(n, r, x, y, p.tex0);

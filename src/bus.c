@@ -147,8 +147,8 @@ static void siDma(struct N64* n, bool toPif) {
 
 static uint32_t viCurrent(struct N64* n) {
 	uint32_t lines = (n->vi.reg[6] & 0x3FF) + 1;
-	uint64_t into = n->cycles - (n->nextVi - CYCLES_PER_FIELD);
-	uint32_t line = (uint32_t) (into * lines / CYCLES_PER_FIELD);
+	uint64_t into = n->cycles - (n->nextVi - n->fieldCycles);
+	uint32_t line = (uint32_t) (into * lines / n->fieldCycles);
 	uint32_t field = (n->fields & 1) && (n->vi.reg[0] & 0x40) ? 1 : 0;
 	return ((line + n->vi.reg[3]) % lines & ~1u) | field;
 }
