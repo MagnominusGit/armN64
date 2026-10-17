@@ -50,6 +50,12 @@ struct CPU {
 	uint64_t fpr[32];
 	uint32_t fcr31;
 	bool exception;
+	// Timing: cache tags (only to cost misses; the data lives in memory) and cycles owed by this step.
+	uint32_t icacheTag[512], dcacheTag[512];
+	bool dcacheDirty[512];
+	uint32_t stall;
+	// Count when the timer was last checked, so a Compare value passed during a stall still fires.
+	uint32_t lastCount;
 };
 
 struct SP {

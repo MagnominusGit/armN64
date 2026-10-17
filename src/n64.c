@@ -104,10 +104,10 @@ void n64RunField(struct N64* n) {
 			n->pi.status &= ~1u;
 			n64Interrupt(n, MI_PI, true);
 		}
-		// Each instruction counts two cycles: the VR4300's caches, bus waits and interlocks aren't
-		// modelled yet, and two cycles an instruction is the long-standing average that games expect.
+		// One cycle an instruction, plus cache fills, RCP register reads and long operations.
 		cpuStep(n);
-		n->cycles += 2;
+		n->cycles += 1 + n->cpu.stall;
+		n->cpu.stall = 0;
 		// The RSP runs at two thirds of the CPU clock, on its own cycle count.
 		uint64_t rspNow = n->cycles * 2 / 3;
 		if (n->sp.status & 1) {

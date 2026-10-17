@@ -11,6 +11,66 @@
 
 enum { ST_IE = 1, ST_EXL = 2, ST_ERL = 4, ST_FR = 1 << 26, ST_CU1 = 1 << 29, ST_BEV = 1 << 22 };
 
+// Timing, in CPU cycles on top of one a instruction: cache line fills and write-backs, and reads of
+// RCP registers (cache figures as in the VR4300 manual and ares; the RCP read cost is fitted to
+// pdrome's instruction timing ROM, which counts loop iterations per field on hardware).
+enum { ICACHE_FILL = 48, DCACHE_FILL = 40, DCACHE_WRITEBACK = 40, RCP_READ = 22 };
+
+static bool cached(uint64_t vaddr) {
+	return ((uint32_t) vaddr & 0xE0000000) != 0xA0000000;
+}
+
+static void fetchTiming(struct CPU* c, uint64_t vaddr, uint32_t paddr) {
+	if (!cached(vaddr)) {
+		c->stall += paddr >= RDRAM_SIZE ? RCP_READ : 0;
+		return;
+	}
+	uint32_t i = ((uint32_t) vaddr >> 5) & 511, tag = paddr >> 5 | 0x80000000u;
+	if (c->icacheTag[i] != tag) {
+		c->icacheTag[i] = tag;
+		c->stall += ICACHE_FILL;
+	}
+}
+
+static void dataTiming(struct CPU* c, uint64_t vaddr, uint32_t paddr, bool store) {
+	if (paddr >= RDRAM_SIZE) {
+		c->stall += store ? 0 : RCP_READ;
+		return;
+	}
+	if (!cached(vaddr)) {
+		return;
+	}
+	uint32_t i = ((uint32_t) vaddr >> 4) & 511, tag = paddr >> 4 | 0x80000000u;
+	if (c->dcacheTag[i] != tag) {
+		c->stall += DCACHE_FILL + (c->dcacheDirty[i] ? DCACHE_WRITEBACK : 0);
+		c->dcacheTag[i] = tag;
+		c->dcacheDirty[i] = false;
+	}
+	if (store) {
+		c->dcacheDirty[i] = true;
+	}
+}
+
+// CACHE: invalidates or writes back the line an address selects (only the timing state changes).
+static void cacheOp(struct CPU* c, uint32_t op, uint64_t vaddr) {
+	int which = (op >> 16) & 3, action = (op >> 18) & 7;
+	if (which == 0) {
+		c->icacheTag[((uint32_t) vaddr >> 5) & 511] = 0;
+		return;
+	}
+	if (which != 1) {
+		return;
+	}
+	uint32_t i = ((uint32_t) vaddr >> 4) & 511;
+	if (action != 3 && c->dcacheDirty[i]) {
+		c->stall += DCACHE_WRITEBACK;
+		c->dcacheDirty[i] = false;
+	}
+	if (action == 0 || action == 4 || action == 5) {
+		c->dcacheTag[i] = 0;
+	}
+}
+
 void cpuReset(struct N64* n) {
 	struct CPU* c = &n->cpu;
 	memset(c, 0, sizeof(*c));
@@ -188,6 +248,7 @@ static void cop0Write(struct N64* n, int r, uint64_t v) {
 	switch (r) {
 	case CP0_COUNT:
 		n->cpu.countBase = (n->cycles >> 1) - (uint32_t) v;
+		n->cpu.lastCount = (uint32_t) v;
 		return;
 	case CP0_COMPARE:
 		cop0[r] = (uint32_t) v;
@@ -291,6 +352,7 @@ static bool load(struct N64* n, uint64_t vaddr, int size, uint64_t* out) {
 	if (!address(n, vaddr, size, false, &p)) {
 		return false;
 	}
+	dataTiming(&n->cpu, vaddr, p, false);
 	switch (size) {
 	case 1:
 		*out = busRead8(n, p);
@@ -312,6 +374,7 @@ static bool store(struct N64* n, uint64_t vaddr, int size, uint64_t v) {
 	if (!address(n, vaddr, size, true, &p)) {
 		return false;
 	}
+	dataTiming(&n->cpu, vaddr, p, true);
 	switch (size) {
 	case 1:
 		busWrite8(n, p, v);
@@ -387,19 +450,23 @@ static void special(struct N64* n, uint32_t op) {
 	case 0x17:
 		r[RD] = (uint64_t) ((int64_t) t >> (s & 63));
 		return;
+	// The multiply/divide unit holds the pipeline; cycles fitted to the same timing ROM.
 	case 0x18: {
+		c->stall += 3;
 		int64_t p = (int64_t) (int32_t) s * (int32_t) t;
 		c->lo = sext32((uint32_t) p);
 		c->hi = sext32((uint32_t) (p >> 32));
 		return;
 	}
 	case 0x19: {
+		c->stall += 3;
 		uint64_t p = (uint64_t) (uint32_t) s * (uint32_t) t;
 		c->lo = sext32((uint32_t) p);
 		c->hi = sext32((uint32_t) (p >> 32));
 		return;
 	}
 	case 0x1A: {
+		c->stall += 36;
 		int32_t a = (int32_t) s, b = (int32_t) t;
 		if (b == 0) {
 			c->lo = a < 0 ? 1 : ~0ull;
@@ -414,6 +481,7 @@ static void special(struct N64* n, uint32_t op) {
 		return;
 	}
 	case 0x1B: {
+		c->stall += 36;
 		uint32_t a = (uint32_t) s, b = (uint32_t) t;
 		if (b == 0) {
 			c->lo = ~0ull;
@@ -425,18 +493,21 @@ static void special(struct N64* n, uint32_t op) {
 		return;
 	}
 	case 0x1C: {
+		c->stall += 6;
 		__int128 p = (__int128) (int64_t) s * (int64_t) t;
 		c->lo = (uint64_t) p;
 		c->hi = (uint64_t) (p >> 64);
 		return;
 	}
 	case 0x1D: {
+		c->stall += 6;
 		unsigned __int128 p = (unsigned __int128) s * t;
 		c->lo = (uint64_t) p;
 		c->hi = (uint64_t) (p >> 64);
 		return;
 	}
 	case 0x1E: {
+		c->stall += 67;
 		int64_t a = (int64_t) s, b = (int64_t) t;
 		if (b == 0) {
 			c->lo = a < 0 ? 1 : ~0ull;
@@ -451,6 +522,7 @@ static void special(struct N64* n, uint32_t op) {
 		return;
 	}
 	case 0x1F:
+		c->stall += 67;
 		if (t == 0) {
 			c->lo = ~0ull;
 			c->hi = s;
@@ -934,6 +1006,7 @@ static void execute(struct N64* n, uint32_t op) {
 		r[RT] = s + IMM;
 		return;
 	case 0x2F:
+		cacheOp(c, op, s + IMM);
 		return;
 	case 0x31:
 	case 0x35:
@@ -981,9 +1054,11 @@ static void traceInstruction(struct N64* n) {
 
 void cpuStep(struct N64* n) {
 	struct CPU* c = &n->cpu;
-	if (cpuCount(n) == (uint32_t) c->cop0[CP0_COMPARE]) {
+	uint32_t now = cpuCount(n);
+	if ((uint32_t) ((uint32_t) c->cop0[CP0_COMPARE] - c->lastCount - 1) < now - c->lastCount) {
 		c->cop0[CP0_CAUSE] |= 0x8000;
 	}
+	c->lastCount = now;
 	c->inDelay = c->nextInDelay;
 	c->nextInDelay = false;
 	c->curPc = c->pc;
@@ -995,6 +1070,7 @@ void cpuStep(struct N64* n) {
 	if (!address(n, c->curPc, 4, false, &p)) {
 		return;
 	}
+	fetchTiming(c, c->curPc, p);
 	uint32_t op = busRead32(n, p);
 #ifdef N64_TRACE
 	traceInstruction(n);

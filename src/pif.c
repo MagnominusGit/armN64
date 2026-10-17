@@ -70,8 +70,16 @@ void pifBoot(struct N64* n) {
 	c->gpr[31] = 0xFFFFFFFFA4001550ull;
 	c->pc = 0xFFFFFFFFA4000040ull;
 	c->nextPc = c->pc + 4;
-	c->cop0[CP0_STATUS] = 0x34000000;
-	c->cop0[CP0_CONFIG] = 0x0006E463;
+	// CP0 as the boot ROMs leave it on hardware (Peter Lemon's COP0Register test, cold boot).
+	c->cop0[CP0_STATUS] = 0x241000E0;
+	c->cop0[CP0_CONFIG] = 0x7006E463;
+	c->cop0[CP0_PRID] = 0x00000B22;
+	c->cop0[CP0_CONTEXT] = 0x007FFFF0;
+	c->cop0[CP0_XCONTEXT] = 0xFFFFFFF0;
+	c->cop0[CP0_BADVADDR] = 0xFFFFFFFFFFFFFFFFull;
+	c->cop0[CP0_EPC] = 0xFFFFFFFFFFFFFFFFull;
+	c->cop0[CP0_ERROREPC] = 0xFFFFFFFFFFFFFFFFull;
+	c->cop0[CP0_LLADDR] = 0xFFFFFFFF;
 	n->riReg[0] = 0x0E;
 	n->riReg[1] = 0x40;
 	n->riReg[3] = 0x14;

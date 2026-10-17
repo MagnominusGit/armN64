@@ -51,13 +51,24 @@ static double getD(struct N64* n, int r) {
 	return d;
 }
 
+// With FCR31.FS set (libultra sets it) the FPU flushes denormal results to zero.
+static bool flush(struct N64* n) {
+	return n->cpu.fcr31 & (1u << 24);
+}
+
 static void setS(struct N64* n, int r, float f) {
+	if (flush(n) && fpclassify(f) == FP_SUBNORMAL) {
+		f = copysignf(0.0f, f);
+	}
 	uint32_t v;
 	memcpy(&v, &f, 4);
 	set32(n, r, v);
 }
 
 static void setD(struct N64* n, int r, double d) {
+	if (flush(n) && fpclassify(d) == FP_SUBNORMAL) {
+		d = copysign(0.0, d);
+	}
 	uint64_t v;
 	memcpy(&v, &d, 8);
 	set64(n, r, v);
@@ -101,6 +112,27 @@ static void result(struct N64* n, int fmt, int r, double v) {
 	}
 }
 
+// Cycles an operation holds the pipeline beyond the first (VR4300 manual, as ares has them).
+static uint32_t fpuCycles(int fmt, int func) {
+	bool dbl = fmt == 17;
+	switch (func) {
+	case 0:
+	case 1:
+		return 2;
+	case 2:
+		return dbl ? 7 : 4;
+	case 3:
+	case 4:
+		return dbl ? 57 : 28;
+	case 32:
+		return fmt == 17 ? 1 : 4;
+	case 33:
+		return fmt == 16 ? 0 : 4;
+	default:
+		return (func >= 8 && func <= 15) || func == 36 || func == 37 ? 4 : 0;
+	}
+}
+
 void fpuExecute(struct N64* n, uint32_t op) {
 	struct CPU* c = &n->cpu;
 	int fmt = (op >> 21) & 31;
@@ -132,6 +164,7 @@ void fpuExecute(struct N64* n, uint32_t op) {
 		return;
 	}
 	int func = op & 0x3F;
+	c->stall += fpuCycles(fmt, func);
 	if (func >= 0x30) {
 		double a = source(n, fmt, FS), b = source(n, fmt, FT);
 		bool unordered = isnan(a) || isnan(b);
