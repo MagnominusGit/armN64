@@ -66,6 +66,10 @@ struct RSP {
 	int16_t divIn;
 	uint32_t divOut;
 	bool divDp;
+	// Pipeline timing: the RSP's own clock and when each register's pending result is ready.
+	uint64_t clock;
+	uint64_t scalarReady[32];
+	uint64_t vectorReady[32];
 };
 
 struct DP {
@@ -78,7 +82,11 @@ struct VI {
 };
 
 struct AI {
-	uint32_t dramAddr, len, control, status, dacrate, bitrate;
+	uint32_t dramAddr, len, control, dacrate, bitrate;
+	// Up to two buffers: the one playing and one queued behind it.
+	int queued;
+	uint32_t queueLen[2];
+	uint64_t startedAt, endsAt;
 };
 
 struct PI {
@@ -126,6 +134,7 @@ void n64Destroy(struct N64*);
 bool n64LoadRom(struct N64*, const uint8_t* data, size_t size);
 void n64RunField(struct N64*);
 void n64Interrupt(struct N64*, uint32_t line, bool set);
+void aiUpdate(struct N64*);
 int n64Picture(struct N64*, uint32_t* out, int* width, int* height);
 
 // cpu.c

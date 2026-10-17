@@ -71,9 +71,34 @@ static void spWriteStatus(struct N64* n, uint32_t v) {
 	}
 }
 
-static void aiStart(struct N64* n) {
-	n->ai.status |= 0x40000000;
+// Playing time of a buffer: four bytes per stereo sample at the VI clock over (dacrate + 1).
+static uint64_t aiDuration(struct N64* n, uint32_t len) {
+	uint64_t rate = 48681812ull / (n->ai.dacrate + 1);
+	return rate ? (uint64_t) (len / 4) * CPU_HZ / rate : 0;
+}
+
+static void aiStartNext(struct N64* n) {
+	n->ai.startedAt = n->cycles;
+	n->ai.endsAt = n->cycles + aiDuration(n, n->ai.queueLen[0]);
 	n64Interrupt(n, MI_AI, true);
+}
+
+void aiUpdate(struct N64* n) {
+	while (n->ai.queued && n->cycles >= n->ai.endsAt) {
+		n->ai.queueLen[0] = n->ai.queueLen[1];
+		if (--n->ai.queued) {
+			aiStartNext(n);
+		}
+	}
+}
+
+static uint32_t aiRemaining(struct N64* n) {
+	if (!n->ai.queued) {
+		return 0;
+	}
+	uint64_t total = n->ai.endsAt - n->ai.startedAt;
+	uint64_t left = n->ai.endsAt > n->cycles ? n->ai.endsAt - n->cycles : 0;
+	return total ? (uint32_t) ((uint64_t) n->ai.queueLen[0] * left / total) & ~7u : 0;
 }
 
 static void piDma(struct N64* n, uint32_t len, bool toRdram) {
@@ -193,13 +218,13 @@ uint32_t busRead32(struct N64* n, uint32_t addr) {
 		return r ? *r : 0;
 	}
 	case 0x045:
-		switch (addr & 0x1F) {
-		case 0x04:
-			return n->ai.len;
-		case 0x0C:
-			return n->ai.status;
+		aiUpdate(n);
+		if ((addr & 0x1F) == 0x0C) {
+			uint32_t full = n->ai.queued >= 2 ? 0x80000001u : 0;
+			uint32_t busy = n->ai.queued ? 0x40000000u : 0;
+			return full | busy | 0x01100000;
 		}
-		return n->ai.len;
+		return aiRemaining(n);
 	case 0x046:
 		switch (addr & 0x3F) {
 		case 0x00:
@@ -335,9 +360,13 @@ void busWrite32(struct N64* n, uint32_t addr, uint32_t v) {
 			n->ai.dramAddr = v & 0xFFFFF8;
 			break;
 		case 0x04:
+			aiUpdate(n);
 			n->ai.len = v & 0x3FFF8;
-			if (n->ai.len) {
-				aiStart(n);
+			if (n->ai.len && n->ai.queued < 2) {
+				n->ai.queueLen[n->ai.queued++] = n->ai.len;
+				if (n->ai.queued == 1) {
+					aiStartNext(n);
+				}
 			}
 			break;
 		case 0x08:

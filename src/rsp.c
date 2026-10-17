@@ -714,10 +714,99 @@ static void halt(struct N64* n) {
 	}
 }
 
+static uint64_t latest(uint64_t a, uint64_t b) {
+	return a > b ? a : b;
+}
+
+// When an instruction can start: after the results it reads are ready. Loads, MFC0, MFC2 and CFC2
+// have a 3-cycle latency; any write to a vector register has a 4-cycle latency.
+static uint64_t issueTime(struct RSP* r, uint32_t op) {
+	uint64_t t = r->clock;
+	uint64_t* s = r->scalarReady;
+	uint64_t* v = r->vectorReady;
+	switch (op >> 26) {
+	case 0x00:
+	case 0x04:
+	case 0x05:
+	case 0x28:
+	case 0x29:
+	case 0x2B:
+		return latest(t, latest(s[RS], s[RT]));
+	case 0x10:
+		return RS == 0x04 ? latest(t, s[RT]) : t;
+	case 0x12:
+		if (op & (1 << 25)) {
+			return latest(t, latest(v[RD], v[RT]));
+		}
+		if (RS == 0x00) {
+			return latest(t, v[RD]);
+		}
+		return RS == 0x04 || RS == 0x06 ? latest(t, s[RT]) : t;
+	case 0x3A: {
+		uint64_t ready = latest(t, s[RS]);
+		if (RD == 11) {
+			for (int i = 0; i < 8; ++i) {
+				ready = latest(ready, v[(RT & ~7) + i]);
+			}
+			return ready;
+		}
+		return latest(ready, v[RT]);
+	}
+	default:
+		return latest(t, s[RS]);
+	}
+}
+
+static void markResults(struct RSP* r, uint32_t op, uint64_t start) {
+	switch (op >> 26) {
+	case 0x20:
+	case 0x21:
+	case 0x23:
+	case 0x24:
+	case 0x25:
+	case 0x27:
+		r->scalarReady[RT] = start + 3;
+		return;
+	case 0x10:
+		if (RS == 0x00) {
+			r->scalarReady[RT] = start + 3;
+		}
+		return;
+	case 0x12:
+		if (op & (1 << 25)) {
+			r->vectorReady[SA] = start + 4;
+		} else if (RS == 0x00 || RS == 0x02) {
+			r->scalarReady[RT] = start + 3;
+		} else if (RS == 0x04) {
+			r->vectorReady[RD] = start + 4;
+		}
+		return;
+	case 0x32:
+		if (RD == 11) {
+			for (int i = 0; i < 8; ++i) {
+				r->vectorReady[(RT & ~7) + i] = start + 4;
+			}
+		} else {
+			r->vectorReady[RT] = start + 4;
+		}
+		return;
+	}
+}
+
+static bool isBranch(uint32_t op) {
+	int code = op >> 26;
+	return (code >= 0x01 && code <= 0x07) || (code == 0x00 && ((op & 0x3F) == 0x08 || (op & 0x3F) == 0x09));
+}
+
 void rspStep(struct N64* n) {
 	struct RSP* r = &n->rsp;
 	uint32_t pc = n->sp.pc & 0xFFC;
 	uint32_t op = be32(&n->sp.mem[0x1000 | pc]);
+	uint64_t start = issueTime(r, op);
+	// A branch also costs one bubble cycle after its delay slot.
+	r->clock = start + 1 + isBranch(op);
+	markResults(r, op, start);
+	r->scalarReady[0] = 0;
 	n->sp.pc = r->nextPc;
 	r->nextPc = (r->nextPc + 4) & 0xFFC;
 	uint32_t* g = r->r;

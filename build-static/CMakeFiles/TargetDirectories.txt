@@ -1,4 +1,0 @@
-/home/jake/arch-N64/build-static/CMakeFiles/n64.dir
-/home/jake/arch-N64/build-static/CMakeFiles/n64run.dir
-/home/jake/arch-N64/build-static/CMakeFiles/edit_cache.dir
-/home/jake/arch-N64/build-static/CMakeFiles/rebuild_cache.dir

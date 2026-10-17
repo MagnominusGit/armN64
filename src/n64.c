@@ -84,6 +84,9 @@ void n64RunField(struct N64* n) {
 			n64Interrupt(n, MI_VI, true);
 			raised = true;
 		}
+		if (n->ai.queued && n->cycles >= n->ai.endsAt) {
+			aiUpdate(n);
+		}
 		if (n->pi.busyUntil && n->cycles >= n->pi.busyUntil) {
 			n->pi.busyUntil = 0;
 			n->pi.status &= ~1u;
@@ -91,9 +94,14 @@ void n64RunField(struct N64* n) {
 		}
 		cpuStep(n);
 		++n->cycles;
-		// The RSP runs at two thirds of the CPU clock.
-		if (n->cycles % 3 != 0 && !(n->sp.status & 1)) {
-			rspStep(n);
+		// The RSP runs at two thirds of the CPU clock, on its own cycle count.
+		uint64_t rspNow = n->cycles * 2 / 3;
+		if (n->sp.status & 1) {
+			n->rsp.clock = rspNow;
+		} else {
+			while (n->rsp.clock < rspNow && !(n->sp.status & 1)) {
+				rspStep(n);
+			}
 		}
 	}
 	if (!raised) {

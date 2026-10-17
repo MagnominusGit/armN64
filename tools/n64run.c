@@ -51,6 +51,20 @@ int main(int argc, char** argv) {
 	double secs = (t1.tv_sec - t0.tv_sec) + (t1.tv_nsec - t0.tv_nsec) / 1e9;
 	printf("%d fields in %.2f s (%.1fx real time), pc %08x\n", fields, secs, fields / 60.0 / secs,
 	       (uint32_t) n->cpu.pc);
+	if (getenv("N64STATE")) {
+		struct CPU* c = &n->cpu;
+		printf("sp status %04x pc %03x, dp status %x, mi intr %02x mask %02x, pi status %x, vi intr %d\n",
+		       n->sp.status, n->sp.pc, n->dp.status, n->miIntr, n->miMask, n->pi.status, n->vi.reg[3]);
+		printf("cop0 status %08x cause %08x epc %08x\n", (uint32_t) c->cop0[CP0_STATUS],
+		       (uint32_t) c->cop0[CP0_CAUSE], (uint32_t) c->cop0[CP0_EPC]);
+		for (int k = -8; k < 4; ++k) {
+			uint32_t a = (uint32_t) c->pc + k * 4;
+			printf("%08x %08x%s\n", a, busRead32(n, a & 0x1FFFFFFF), k == 0 ? " <" : "");
+		}
+		for (int i = 0; i < 32; ++i) {
+			printf("r%-2d %016llx%s", i, (unsigned long long) c->gpr[i], i % 4 == 3 ? "\n" : "  ");
+		}
+	}
 	if (argc > 3) {
 		static uint32_t picture[640 * 480];
 		int w, h;
