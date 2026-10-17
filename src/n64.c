@@ -90,6 +90,10 @@ void n64RunField(struct N64* n) {
 		if (n->ai.queued && n->cycles >= n->ai.endsAt) {
 			aiUpdate(n);
 		}
+		if (n->dp.syncAt && n->cycles >= n->dp.syncAt) {
+			n->dp.syncAt = 0;
+			n64Interrupt(n, MI_DP, true);
+		}
 		if (n->pi.busyUntil && n->cycles >= n->pi.busyUntil) {
 			n->pi.busyUntil = 0;
 			n->pi.status &= ~1u;

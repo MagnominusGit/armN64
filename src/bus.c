@@ -328,6 +328,14 @@ void busWrite32(struct N64* n, uint32_t addr, uint32_t v) {
 			if (v & 2) {
 				n->dp.status |= 1;
 			}
+			// While frozen the RDP takes no commands; it carries on with them when thawed.
+			if (v & 8) {
+				n->dp.status |= 2;
+			}
+			if (v & 4) {
+				n->dp.status &= ~2u;
+				rdpRun(n);
+			}
 			break;
 		}
 		return;

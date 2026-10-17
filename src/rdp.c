@@ -27,6 +27,8 @@ struct RDP {
 	struct Color fog, blend, prim, env;
 	int primLod, primZ, primDz;
 	int k4, k5;
+	// RDP clocks spent on the commands so far.
+	uint64_t clocks;
 };
 
 static struct RDP* state(struct N64* n) {
@@ -385,6 +387,7 @@ static struct Color blendInput(struct RDP* r, struct Color pixel, struct Color m
 static void shadePixel(struct N64* n, struct RDP* r, int x, int y, struct Pixel* p) {
 	uint64_t m = r->otherModes;
 	int cycleType = (m >> 52) & 3;
+	r->clocks += cycleType == 1 ? 2 : 1;
 	bool zCompare = (m >> 4) & 1, zUpdate = (m >> 5) & 1;
 	int z = (m >> 2) & 1 ? r->primZ : p->z;
 	if (z < 0) {
@@ -433,6 +436,9 @@ static void shadePixel(struct N64* n, struct RDP* r, int x, int y, struct Pixel*
 // ---- Primitives
 
 static void fillRect(struct N64* n, struct RDP* r, int x0, int y0, int x1, int y1) {
+	if (x1 >= x0 && y1 >= y0) {
+		r->clocks += (uint64_t) (x1 - x0 + 1) * (y1 - y0 + 1) / (r->colorSize == 3 ? 2 : 4);
+	}
 	for (int y = y0; y <= y1; ++y) {
 		for (int x = x0; x <= x1; ++x) {
 			uint32_t i = y * r->colorWidth + x;
@@ -484,6 +490,7 @@ static void textureRect(struct N64* n, struct RDP* r, uint64_t w0, uint64_t w1, 
 	}
 	int cx0 = x0, cy0 = y0;
 	clipRect(r, &x0, &y0, &x1, &y1);
+	uint64_t copied = 0;
 	for (int y = y0; y <= y1; ++y) {
 		for (int x = x0; x <= x1; ++x) {
 			int dx = x - cx0, dy = y - cy0;
@@ -493,6 +500,7 @@ static void textureRect(struct N64* n, struct RDP* r, uint64_t w0, uint64_t w1, 
 			p.tex0 = sample(r, tile, s, t);
 			p.tex1 = cycleType == 1 ? sample(r, tile + 1, s, t) : p.tex0;
 			if (cycleType == 2) {
+				++copied;
 				if ((r->otherModes & 1) && p.tex0.a == 0) {
 					continue;
 				}
@@ -513,6 +521,7 @@ static void textureRect(struct N64* n, struct RDP* r, uint64_t w0, uint64_t w1, 
 			shadePixel(n, r, x, y, &p);
 		}
 	}
+	r->clocks += copied / 4;
 }
 
 static int32_t fix(uint64_t w, int shift) {
@@ -706,8 +715,15 @@ static int commandWords(int op) {
 	return op == 0x24 || op == 0x25 ? 2 : 1;
 }
 
+// Rough cost model: one or two clocks a pixel by cycle type, four pixels a clock to fill or copy,
+// and a fixed setup per primitive. A full sync interrupts the CPU once that time has passed.
 void rdpRun(struct N64* n) {
+	if (n->dp.status & 2) {
+		return;
+	}
 	struct RDP* r = state(n);
+	uint64_t begin = n->dp.busyUntil > n->cycles ? n->dp.busyUntil : n->cycles;
+	r->clocks = 0;
 	while (n->dp.current < n->dp.end) {
 		uint64_t w[22];
 		w[0] = word(n, n->dp.current);
@@ -731,14 +747,19 @@ void rdpRun(struct N64* n) {
 		case 0x0E:
 		case 0x0F:
 			triangle(n, r, w, op);
+			r->clocks += 20;
 			break;
 		case 0x24:
 		case 0x25:
 			textureRect(n, r, w[0], w[1], op == 0x25);
+			r->clocks += 10;
 			break;
 		case 0x29:
 			++n->stats.dpSyncs;
-			n64Interrupt(n, MI_DP, true);
+			if (n->dp.syncAt) {
+				n64Interrupt(n, MI_DP, true);
+			}
+			n->dp.syncAt = begin + r->clocks * 3 / 2;
 			break;
 		case 0x2C:
 			r->k4 = (c >> 9) & 0x1FF;
@@ -843,6 +864,7 @@ void rdpRun(struct N64* n) {
 			break;
 		}
 	}
+	n->dp.busyUntil = begin + r->clocks * 3 / 2;
 }
 
 void rdpDestroy(struct N64* n) {

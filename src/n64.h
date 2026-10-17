@@ -78,6 +78,8 @@ struct RSP {
 
 struct DP {
 	uint32_t start, end, current, status;
+	// When the RDP finishes the commands it has, and when its pending full-sync interrupt is due.
+	uint64_t busyUntil, syncAt;
 };
 
 struct VI {

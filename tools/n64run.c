@@ -115,6 +115,13 @@ int main(int argc, char** argv) {
 			printf("r%-2d %016llx%s", i, (unsigned long long) c->gpr[i], i % 4 == 3 ? "\n" : "  ");
 		}
 	}
+	if (getenv("N64RAMDUMP")) {
+		FILE* f = fopen(getenv("N64RAMDUMP"), "wb");
+		if (f) {
+			fwrite(n->rdram, 1, RDRAM_SIZE, f);
+			fclose(f);
+		}
+	}
 	if (argc > 3) {
 		writePicture(n, argv[3]);
 	}
