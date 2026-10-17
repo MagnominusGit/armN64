@@ -94,6 +94,11 @@ void n64RunField(struct N64* n) {
 			n->dp.syncAt = 0;
 			n64Interrupt(n, MI_DP, true);
 		}
+		if (n->si.busyUntil && n->cycles >= n->si.busyUntil) {
+			n->si.busyUntil = 0;
+			n->si.status = (n->si.status & ~1u) | 0x1000;
+			n64Interrupt(n, MI_SI, true);
+		}
 		if (n->pi.busyUntil && n->cycles >= n->pi.busyUntil) {
 			n->pi.busyUntil = 0;
 			n->pi.status &= ~1u;

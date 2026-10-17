@@ -6,6 +6,8 @@
 #include <stdint.h>
 
 #define CPU_HZ 93750000
+// About 50 microseconds for the PIF to take or return a 64-byte block.
+#define SI_DMA_CYCLES 4608
 #define RDRAM_SIZE (8 << 20)
 
 // MI interrupt lines.
@@ -99,10 +101,13 @@ struct PI {
 	uint32_t dramAddr, cartAddr, status;
 	uint64_t busyUntil;
 	uint32_t timing[8];
+	uint32_t romLatch;
+	bool romLatched;
 };
 
 struct SI {
 	uint32_t dramAddr, status;
+	uint64_t busyUntil;
 };
 
 struct RDP;

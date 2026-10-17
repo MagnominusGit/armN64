@@ -152,8 +152,9 @@ static void siDma(struct N64* n, bool toPif) {
 	} else {
 		memcpy(&n->rdram[dram], n->pifRam, 64);
 	}
-	n->si.status |= 0x1000;
-	n64Interrupt(n, MI_SI, true);
+	// The PIF takes a while to run the commands; the interrupt comes when the transfer is done.
+	n->si.status |= 1;
+	n->si.busyUntil = n->cycles + SI_DMA_CYCLES;
 }
 
 static uint32_t viCurrent(struct N64* n) {
@@ -173,6 +174,11 @@ uint32_t busRead32(struct N64* n, uint32_t addr) {
 		return be32(&n->sp.mem[addr & 0x1FFC]);
 	}
 	if (addr >= 0x10000000 && addr < 0x1FC00000) {
+		// A write to cartridge space stays on the bus, and the next read returns it.
+		if (n->pi.romLatched) {
+			n->pi.romLatched = false;
+			return n->pi.romLatch;
+		}
 		uint32_t off = (addr - 0x10000000) & ~3u;
 		return off + 4 <= n->romSize ? be32(&n->rom[off]) : 0;
 	}
@@ -463,6 +469,9 @@ void busWrite32(struct N64* n, uint32_t addr, uint32_t v) {
 	}
 	if (addr >= 0x08000000 && addr < 0x08020000) {
 		put32(&n->save[addr & 0x1FFFC], v);
+	} else if (addr >= 0x10000000 && addr < 0x1FC00000) {
+		n->pi.romLatch = v;
+		n->pi.romLatched = true;
 	}
 }
 
