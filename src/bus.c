@@ -113,26 +113,68 @@ static uint32_t aiRemaining(struct N64* n) {
 	return total ? (uint32_t) ((uint64_t) n->ai.queueLen[0] * left / total) & ~7u : 0;
 }
 
-static void piDma(struct N64* n, uint32_t len, bool toRdram) {
-	uint32_t dram = n->pi.dramAddr & 0xFFFFFE;
-	uint32_t cart = n->pi.cartAddr;
-	for (uint32_t i = 0; i < len; ++i) {
-		uint32_t c = cart + i;
-		uint32_t d = (dram + i) & (RDRAM_SIZE - 1);
-		if (toRdram) {
-			uint8_t v = 0;
-			if (c >= 0x10000000 && c - 0x10000000 < n->romSize) {
-				v = n->rom[c - 0x10000000];
-			} else if (c >= 0x08000000 && c < 0x08020000) {
-				v = n->save[c - 0x08000000];
-			}
-			n->rdram[d] = v;
-		} else if (c >= 0x08000000 && c < 0x08020000) {
-			n->save[c - 0x08000000] = n->rdram[d];
-		}
+static uint8_t cartByte(struct N64* n, uint32_t c) {
+	if (c >= 0x10000000 && c - 0x10000000 < n->romSize) {
+		return n->rom[c - 0x10000000];
 	}
-	n->pi.dramAddr = dram + len;
-	n->pi.cartAddr = cart + len;
+	if (c >= 0x08000000 && c < 0x08020000) {
+		return n->save[c - 0x08000000];
+	}
+	return 0;
+}
+
+// Cartridge to RDRAM goes through the RCP's 128-byte buffer, a block at a time, never crossing a
+// 2 KiB RDRAM page. Odd blocks fetch a byte more. An unaligned RDRAM address starts the first block
+// part way into the buffer, which then writes back only up to the block length counted from the
+// buffer's start; the address continues 8-byte aligned (n64brew, Peter Lemon's PI tests).
+static void piDmaToRdram(struct N64* n, uint32_t len) {
+	uint32_t dram = n->pi.dramAddr & 0xFFFFFE, cart = n->pi.cartAddr & ~1u;
+	uint8_t buf[128];
+	bool first = true;
+	while (len > 0) {
+		uint32_t mis = first ? dram & 7 : 0;
+		uint32_t pageLeft = 0x800 - (dram & 0x7FF);
+		uint32_t block = len < 128 - mis ? len : 128 - mis;
+		block = block < pageLeft ? block : pageLeft;
+		uint32_t fetched = (block + 1) & ~1u;
+		for (uint32_t i = 0; i < fetched && mis + i < 128; ++i) {
+			buf[mis + i] = cartByte(n, cart + i);
+		}
+		uint32_t base = dram & ~7u;
+		if (first) {
+			uint32_t end = mis == 0 && fetched == 128 ? 128 : block;
+			for (uint32_t i = mis; i < end; ++i) {
+				n->rdram[(base + i) & (RDRAM_SIZE - 1)] = buf[i];
+			}
+			dram = (dram + block + 7) & ~7u;
+		} else {
+			for (uint32_t i = 0; i < fetched; ++i) {
+				n->rdram[(dram + i) & (RDRAM_SIZE - 1)] = buf[i];
+			}
+			dram += fetched;
+		}
+		cart += fetched;
+		len -= block;
+		first = false;
+	}
+	n->pi.dramAddr = dram & 0xFFFFFF;
+	n->pi.cartAddr = cart;
+}
+
+static void piDma(struct N64* n, uint32_t len, bool toRdram) {
+	if (toRdram) {
+		piDmaToRdram(n, len);
+	} else {
+		uint32_t dram = n->pi.dramAddr & 0xFFFFFE, cart = n->pi.cartAddr & ~1u;
+		for (uint32_t i = 0; i < len; ++i) {
+			uint32_t c = cart + i;
+			if (c >= 0x08000000 && c < 0x08020000) {
+				n->save[c - 0x08000000] = n->rdram[(dram + i) & (RDRAM_SIZE - 1)];
+			}
+		}
+		n->pi.dramAddr = dram + len;
+		n->pi.cartAddr = cart + len;
+	}
 	++n->stats.piDmas;
 	n->stats.piBytes += len;
 	// Domain 1 bus timing, in RCP cycles: latency per page, pulse width and release per halfword.
@@ -162,7 +204,7 @@ static uint32_t viCurrent(struct N64* n) {
 	uint64_t into = n->cycles - (n->nextVi - n->fieldCycles);
 	uint32_t line = (uint32_t) (into * lines / n->fieldCycles);
 	uint32_t field = (n->fields & 1) && (n->vi.reg[0] & 0x40) ? 1 : 0;
-	return ((line + n->vi.reg[3]) % lines & ~1u) | field;
+	return (line % lines & ~1u) | field;
 }
 
 uint32_t busRead32(struct N64* n, uint32_t addr) {
@@ -174,6 +216,8 @@ uint32_t busRead32(struct N64* n, uint32_t addr) {
 		return be32(&n->sp.mem[addr & 0x1FFC]);
 	}
 	if (addr >= 0x10000000 && addr < 0x1FC00000) {
+		// The PI's address counter moves past the word the CPU reads.
+		n->pi.cartAddr = (addr & ~3u) + 4;
 		// A write to cartridge space stays on the bus, and the next read returns it.
 		if (n->pi.romLatched) {
 			n->pi.romLatched = false;
@@ -252,6 +296,10 @@ uint32_t busRead32(struct N64* n, uint32_t addr) {
 			return n->pi.dramAddr;
 		case 0x04:
 			return n->pi.cartAddr;
+		// The length registers read back 0x7F once a transfer is done (n64brew).
+		case 0x08:
+		case 0x0C:
+			return 0x7F;
 		case 0x10:
 			return n->pi.status | (n->miIntr & MI_PI ? 8 : 0);
 		default:
@@ -416,10 +464,10 @@ void busWrite32(struct N64* n, uint32_t addr, uint32_t v) {
 	case 0x046:
 		switch (addr & 0x3F) {
 		case 0x00:
-			n->pi.dramAddr = v & 0xFFFFFF;
+			n->pi.dramAddr = v & 0xFFFFFE;
 			break;
 		case 0x04:
-			n->pi.cartAddr = v;
+			n->pi.cartAddr = v & ~1u;
 			break;
 		case 0x08:
 			piDma(n, (v & 0xFFFFFF) + 1, false);
@@ -475,12 +523,26 @@ void busWrite32(struct N64* n, uint32_t addr, uint32_t v) {
 	}
 }
 
-// Sub-word reads come from the word that holds them; RDRAM and SP memory take sub-word writes.
+// Sub-word reads come from the word that holds them; RDRAM and SP memory take sub-word writes. On
+// the cartridge bus the PI answers with the upper half of the word at (address + 2) & ~3, and a byte
+// read takes a byte of that half (Peter Lemon's PI test, hardware).
+static bool cartSpace(uint32_t addr) {
+	addr &= 0x1FFFFFFF;
+	return addr >= 0x10000000 && addr < 0x1FC00000;
+}
+
 uint8_t busRead8(struct N64* n, uint32_t addr) {
+	if (cartSpace(addr)) {
+		uint16_t h = busRead32(n, (addr + 2) & ~3u) >> 16;
+		return addr & 1 ? h & 0xFF : h >> 8;
+	}
 	return busRead32(n, addr & ~3u) >> (24 - (addr & 3) * 8);
 }
 
 uint16_t busRead16(struct N64* n, uint32_t addr) {
+	if (cartSpace(addr)) {
+		return busRead32(n, (addr + 2) & ~3u) >> 16;
+	}
 	return busRead32(n, addr & ~3u) >> (16 - (addr & 2) * 8);
 }
 
