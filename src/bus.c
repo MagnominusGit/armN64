@@ -1,0 +1,488 @@
+#include "n64.h"
+
+#include <string.h>
+
+static inline uint32_t* reg(uint32_t* regs, uint32_t addr, int count) {
+	unsigned i = (addr & 0xFFFFF) >> 2;
+	return i < (unsigned) count ? &regs[i] : NULL;
+}
+
+// SP DMA: rows of len+1 bytes (rounded to 8), count+1 rows, skipping between rows in RDRAM.
+static void spDma(struct N64* n, uint32_t lenReg, bool toRdram) {
+	uint32_t len = ((lenReg & 0xFFF) | 7) + 1;
+	uint32_t count = ((lenReg >> 12) & 0xFF) + 1;
+	uint32_t skip = lenReg >> 20;
+	uint32_t mem = n->sp.memAddr & 0x1FF8;
+	uint32_t base = mem & 0x1000;
+	uint32_t dram = n->sp.dramAddr & 0xFFFFF8;
+	for (uint32_t row = 0; row < count; ++row) {
+		for (uint32_t i = 0; i < len; ++i) {
+			uint8_t* sp = &n->sp.mem[base | ((mem + i) & 0xFFF)];
+			uint32_t d = (dram + i) & (RDRAM_SIZE - 1);
+			if (toRdram) {
+				n->rdram[d] = *sp;
+			} else {
+				*sp = n->rdram[d];
+			}
+		}
+		mem = base | ((mem + len) & 0xFFF);
+		dram += len + skip;
+	}
+	n->sp.memAddr = mem;
+	n->sp.dramAddr = dram;
+}
+
+static void spWriteStatus(struct N64* n, uint32_t v) {
+	uint32_t* s = &n->sp.status;
+	if (v & 1) {
+		*s &= ~1u;
+	}
+	if (v & 2) {
+		*s |= 1;
+	}
+	if (v & 4) {
+		*s &= ~2u;
+	}
+	if (v & 8) {
+		n64Interrupt(n, MI_SP, false);
+	}
+	if (v & 16) {
+		n64Interrupt(n, MI_SP, true);
+	}
+	if (v & 32) {
+		*s &= ~0x20u;
+	}
+	if (v & 64) {
+		*s |= 0x20;
+	}
+	if (v & 128) {
+		*s &= ~0x40u;
+	}
+	if (v & 256) {
+		*s |= 0x40;
+	}
+	for (int sig = 0; sig < 8; ++sig) {
+		if (v & (1u << (9 + sig * 2))) {
+			*s &= ~(0x80u << sig);
+		}
+		if (v & (1u << (10 + sig * 2))) {
+			*s |= 0x80u << sig;
+		}
+	}
+	if (!(*s & 1)) {
+		n->unimplemented = "RSP started";
+	}
+}
+
+static uint64_t dpWord(struct N64* n, uint32_t addr) {
+	if (n->dp.status & 1) {
+		const uint8_t* p = &n->sp.mem[addr & 0xFF8];
+		return (uint64_t) be32(p) << 32 | be32(p + 4);
+	}
+	const uint8_t* p = &n->rdram[addr & (RDRAM_SIZE - 8)];
+	return (uint64_t) be32(p) << 32 | be32(p + 4);
+}
+
+// Walks the command list; until the RDP is emulated this only raises the full-sync interrupt.
+static void dpRun(struct N64* n) {
+	while (n->dp.current < n->dp.end) {
+		uint64_t cmd = dpWord(n, n->dp.current);
+		int op = (cmd >> 56) & 0x3F;
+		int words = 1;
+		if (op >= 0x08 && op <= 0x0F) {
+			words = 4 + (op & 4 ? 8 : 0) + (op & 2 ? 8 : 0) + (op & 1 ? 2 : 0);
+		} else if (op == 0x24 || op == 0x25) {
+			words = 2;
+		}
+		if (n->dp.current + words * 8 > n->dp.end) {
+			break;
+		}
+		n->dp.current += words * 8;
+		if (op == 0x29) {
+			n64Interrupt(n, MI_DP, true);
+		}
+	}
+}
+
+static void aiStart(struct N64* n) {
+	n->ai.status |= 0x40000000;
+	n64Interrupt(n, MI_AI, true);
+}
+
+static void piDma(struct N64* n, uint32_t len, bool toRdram) {
+	uint32_t dram = n->pi.dramAddr & 0xFFFFFE;
+	uint32_t cart = n->pi.cartAddr;
+	for (uint32_t i = 0; i < len; ++i) {
+		uint32_t c = cart + i;
+		uint32_t d = (dram + i) & (RDRAM_SIZE - 1);
+		if (toRdram) {
+			uint8_t v = 0;
+			if (c >= 0x10000000 && c - 0x10000000 < n->romSize) {
+				v = n->rom[c - 0x10000000];
+			} else if (c >= 0x08000000 && c < 0x08020000) {
+				v = n->save[c - 0x08000000];
+			}
+			n->rdram[d] = v;
+		} else if (c >= 0x08000000 && c < 0x08020000) {
+			n->save[c - 0x08000000] = n->rdram[d];
+		}
+	}
+	n->pi.dramAddr = dram + len;
+	n->pi.cartAddr = cart + len;
+	n64Interrupt(n, MI_PI, true);
+}
+
+static void siDma(struct N64* n, bool toPif) {
+	uint32_t dram = n->si.dramAddr & (RDRAM_SIZE - 1) & ~3u;
+	if (toPif) {
+		memcpy(n->pifRam, &n->rdram[dram], 64);
+		pifRun(n);
+	} else {
+		memcpy(&n->rdram[dram], n->pifRam, 64);
+	}
+	n->si.status |= 0x1000;
+	n64Interrupt(n, MI_SI, true);
+}
+
+static uint32_t viCurrent(struct N64* n) {
+	uint32_t lines = (n->vi.reg[6] & 0x3FF) + 1;
+	uint64_t into = n->cycles - (n->nextVi - CYCLES_PER_FIELD);
+	uint32_t line = (uint32_t) (into * lines / CYCLES_PER_FIELD);
+	uint32_t field = (n->fields & 1) && (n->vi.reg[0] & 0x40) ? 1 : 0;
+	return ((line + n->vi.reg[3]) % lines & ~1u) | field;
+}
+
+uint32_t busRead32(struct N64* n, uint32_t addr) {
+	addr &= 0x1FFFFFFF;
+	if (addr < RDRAM_SIZE) {
+		return be32(&n->rdram[addr & ~3u]);
+	}
+	if (addr >= 0x04000000 && addr < 0x04040000) {
+		return be32(&n->sp.mem[addr & 0x1FFC]);
+	}
+	if (addr >= 0x10000000 && addr < 0x1FC00000) {
+		uint32_t off = (addr - 0x10000000) & ~3u;
+		return off + 4 <= n->romSize ? be32(&n->rom[off]) : 0;
+	}
+	if (addr >= 0x1FC007C0 && addr < 0x1FC00800) {
+		return be32(&n->pifRam[addr & 0x3C]);
+	}
+	switch (addr >> 20) {
+	case 0x040:
+		if (addr == 0x04080000) {
+			return n->sp.pc;
+		}
+		switch (addr & 0x1F) {
+		case 0x00:
+			return n->sp.memAddr;
+		case 0x04:
+			return n->sp.dramAddr;
+		case 0x10:
+			return n->sp.status;
+		case 0x14:
+		case 0x18:
+			return 0;
+		case 0x1C: {
+			uint32_t v = n->sp.semaphore;
+			n->sp.semaphore = 1;
+			return v;
+		}
+		}
+		return 0;
+	case 0x041:
+		switch (addr & 0x1F) {
+		case 0x00:
+			return n->dp.start;
+		case 0x04:
+			return n->dp.end;
+		case 0x08:
+			return n->dp.current;
+		case 0x0C:
+			return n->dp.status | 0x80;
+		}
+		return 0;
+	case 0x043:
+		switch (addr & 0xF) {
+		case 0x0:
+			return n->miMode;
+		case 0x4:
+			return 0x02020102;
+		case 0x8:
+			return n->miIntr;
+		case 0xC:
+			return n->miMask;
+		}
+		return 0;
+	case 0x044: {
+		if ((addr & 0xFF) == 0x10) {
+			return viCurrent(n);
+		}
+		uint32_t* r = reg(n->vi.reg, addr, 14);
+		return r ? *r : 0;
+	}
+	case 0x045:
+		switch (addr & 0x1F) {
+		case 0x04:
+			return n->ai.len;
+		case 0x0C:
+			return n->ai.status;
+		}
+		return n->ai.len;
+	case 0x046:
+		switch (addr & 0x3F) {
+		case 0x00:
+			return n->pi.dramAddr;
+		case 0x04:
+			return n->pi.cartAddr;
+		case 0x10:
+			return n->pi.status;
+		default:
+			if ((addr & 0x3F) >= 0x14 && (addr & 0x3F) < 0x34) {
+				return n->pi.timing[((addr & 0x3F) - 0x14) >> 2];
+			}
+			return 0;
+		}
+	case 0x047: {
+		uint32_t* r = reg(n->riReg, addr, 8);
+		return r ? *r : 0;
+	}
+	case 0x048:
+		switch (addr & 0x1F) {
+		case 0x00:
+			return n->si.dramAddr;
+		case 0x18:
+			return n->si.status;
+		}
+		return 0;
+	}
+	return 0;
+}
+
+void busWrite32(struct N64* n, uint32_t addr, uint32_t v) {
+	addr &= 0x1FFFFFFF;
+	if (addr < RDRAM_SIZE) {
+		put32(&n->rdram[addr & ~3u], v);
+		return;
+	}
+	if (addr >= 0x04000000 && addr < 0x04040000) {
+		put32(&n->sp.mem[addr & 0x1FFC], v);
+		return;
+	}
+	if (addr >= 0x1FC007C0 && addr < 0x1FC00800) {
+		put32(&n->pifRam[addr & 0x3C], v);
+		return;
+	}
+	switch (addr >> 20) {
+	case 0x040:
+		if (addr == 0x04080000) {
+			n->sp.pc = v & 0xFFC;
+			return;
+		}
+		switch (addr & 0x1F) {
+		case 0x00:
+			n->sp.memAddr = v & 0x1FF8;
+			break;
+		case 0x04:
+			n->sp.dramAddr = v & 0xFFFFF8;
+			break;
+		case 0x08:
+			spDma(n, v, false);
+			break;
+		case 0x0C:
+			spDma(n, v, true);
+			break;
+		case 0x10:
+			spWriteStatus(n, v);
+			break;
+		case 0x1C:
+			n->sp.semaphore = 0;
+			break;
+		}
+		return;
+	case 0x041:
+		switch (addr & 0x1F) {
+		case 0x00:
+			n->dp.start = n->dp.current = v & 0xFFFFF8;
+			break;
+		case 0x04:
+			n->dp.end = v & 0xFFFFF8;
+			dpRun(n);
+			break;
+		case 0x0C:
+			if (v & 1) {
+				n->dp.status &= ~1u;
+			}
+			if (v & 2) {
+				n->dp.status |= 1;
+			}
+			break;
+		}
+		return;
+	case 0x043:
+		switch (addr & 0xF) {
+		case 0x0:
+			n->miMode = (n->miMode & ~0x7Fu) | (v & 0x7F);
+			if (v & 0x80) {
+				n->miMode &= ~0x80u;
+			}
+			if (v & 0x100) {
+				n->miMode |= 0x80;
+			}
+			if (v & 0x800) {
+				n64Interrupt(n, MI_DP, false);
+			}
+			break;
+		case 0xC:
+			for (int line = 0; line < 6; ++line) {
+				if (v & (1u << (line * 2))) {
+					n->miMask &= ~(1u << line);
+				}
+				if (v & (2u << (line * 2))) {
+					n->miMask |= 1u << line;
+				}
+			}
+			cpuCheckInterrupts(n);
+			break;
+		}
+		return;
+	case 0x044: {
+		if ((addr & 0xFF) == 0x10) {
+			n64Interrupt(n, MI_VI, false);
+			return;
+		}
+		uint32_t* r = reg(n->vi.reg, addr, 14);
+		if (r) {
+			*r = v;
+		}
+		return;
+	}
+	case 0x045:
+		switch (addr & 0x1F) {
+		case 0x00:
+			n->ai.dramAddr = v & 0xFFFFF8;
+			break;
+		case 0x04:
+			n->ai.len = v & 0x3FFF8;
+			if (n->ai.len) {
+				aiStart(n);
+			}
+			break;
+		case 0x08:
+			n->ai.control = v & 1;
+			break;
+		case 0x0C:
+			n64Interrupt(n, MI_AI, false);
+			break;
+		case 0x10:
+			n->ai.dacrate = v & 0x3FFF;
+			break;
+		case 0x14:
+			n->ai.bitrate = v & 0xF;
+			break;
+		}
+		return;
+	case 0x046:
+		switch (addr & 0x3F) {
+		case 0x00:
+			n->pi.dramAddr = v & 0xFFFFFF;
+			break;
+		case 0x04:
+			n->pi.cartAddr = v;
+			break;
+		case 0x08:
+			piDma(n, (v & 0xFFFFFF) + 1, false);
+			break;
+		case 0x0C:
+			piDma(n, (v & 0xFFFFFF) + 1, true);
+			break;
+		case 0x10:
+			if (v & 2) {
+				n64Interrupt(n, MI_PI, false);
+			}
+			break;
+		default:
+			if ((addr & 0x3F) >= 0x14 && (addr & 0x3F) < 0x34) {
+				n->pi.timing[((addr & 0x3F) - 0x14) >> 2] = v & 0xFF;
+			}
+		}
+		return;
+	case 0x047: {
+		uint32_t* r = reg(n->riReg, addr, 8);
+		if (r) {
+			*r = v;
+		}
+		return;
+	}
+	case 0x048:
+		switch (addr & 0x1F) {
+		case 0x00:
+			n->si.dramAddr = v & 0xFFFFFF;
+			break;
+		case 0x04:
+			siDma(n, false);
+			break;
+		case 0x10:
+			siDma(n, true);
+			break;
+		case 0x18:
+			n->si.status &= ~0x1000u;
+			n64Interrupt(n, MI_SI, false);
+			break;
+		}
+		return;
+	}
+	if (addr >= 0x08000000 && addr < 0x08020000) {
+		put32(&n->save[addr & 0x1FFFC], v);
+	}
+}
+
+// Sub-word reads come from the word that holds them; RDRAM and SP memory take sub-word writes.
+uint8_t busRead8(struct N64* n, uint32_t addr) {
+	return busRead32(n, addr & ~3u) >> (24 - (addr & 3) * 8);
+}
+
+uint16_t busRead16(struct N64* n, uint32_t addr) {
+	return busRead32(n, addr & ~3u) >> (16 - (addr & 2) * 8);
+}
+
+uint64_t busRead64(struct N64* n, uint32_t addr) {
+	return (uint64_t) busRead32(n, addr) << 32 | busRead32(n, addr + 4);
+}
+
+static uint8_t* writable(struct N64* n, uint32_t addr) {
+	addr &= 0x1FFFFFFF;
+	if (addr < RDRAM_SIZE) {
+		return &n->rdram[addr];
+	}
+	if (addr >= 0x04000000 && addr < 0x04040000) {
+		return &n->sp.mem[addr & 0x1FFF];
+	}
+	if (addr >= 0x1FC007C0 && addr < 0x1FC00800) {
+		return &n->pifRam[addr & 0x3F];
+	}
+	return NULL;
+}
+
+void busWrite8(struct N64* n, uint32_t addr, uint8_t v) {
+	uint8_t* p = writable(n, addr);
+	if (p) {
+		*p = v;
+	} else {
+		busWrite32(n, addr & ~3u, (uint32_t) v << (24 - (addr & 3) * 8));
+	}
+}
+
+void busWrite16(struct N64* n, uint32_t addr, uint16_t v) {
+	uint8_t* p = writable(n, addr & ~1u);
+	if (p) {
+		p[0] = v >> 8;
+		p[1] = v;
+	} else {
+		busWrite32(n, addr & ~3u, (uint32_t) v << (16 - (addr & 2) * 8));
+	}
+}
+
+void busWrite64(struct N64* n, uint32_t addr, uint64_t v) {
+	busWrite32(n, addr, v >> 32);
+	busWrite32(n, addr + 4, (uint32_t) v);
+}

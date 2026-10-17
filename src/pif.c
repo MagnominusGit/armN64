@@ -1,0 +1,120 @@
+#include "n64.h"
+
+#include <string.h>
+
+static uint32_t crc32(const uint8_t* data, size_t size) {
+	uint32_t crc = ~0u;
+	for (size_t i = 0; i < size; ++i) {
+		crc ^= data[i];
+		for (int b = 0; b < 8; ++b) {
+			crc = crc >> 1 ^ (0xEDB88320u & -(crc & 1));
+		}
+	}
+	return ~crc;
+}
+
+// The lockout chip is identified by the boot code it pairs with; its seed goes to the boot code.
+static const struct {
+	uint32_t crc;
+	int cic;
+	uint8_t seed;
+} cics[] = {
+	{ 0x6170A4A1, 6101, 0x3F }, { 0x90BB6CB5, 6102, 0x3F }, { 0x0B050EE0, 6103, 0x78 },
+	{ 0x98BC2C86, 6105, 0x91 }, { 0xACC8580A, 6106, 0x85 }, { 0x009E9EA3, 7102, 0x3F },
+};
+
+// Leaves the machine as the PIF boot ROM does when it hands over to the cartridge's boot code.
+void pifBoot(struct N64* n) {
+	struct CPU* c = &n->cpu;
+	uint32_t crc = n->romSize >= 0x1000 ? crc32(n->rom + 0x40, 0x1000 - 0x40) : 0;
+	uint8_t seed = 0x3F;
+	n->cic = 6102;
+	for (size_t i = 0; i < sizeof(cics) / sizeof(*cics); ++i) {
+		if (cics[i].crc == crc) {
+			n->cic = cics[i].cic;
+			seed = cics[i].seed;
+		}
+	}
+	memcpy(n->sp.mem, n->rom, n->romSize < 0x1000 ? n->romSize : 0x1000);
+	n->sp.status = 1;
+	c->gpr[11] = 0xFFFFFFFFA4000040ull;
+	c->gpr[19] = 0;
+	c->gpr[20] = 1;
+	c->gpr[21] = 0;
+	c->gpr[22] = seed;
+	c->gpr[23] = 0;
+	c->gpr[29] = 0xFFFFFFFFA4001FF0ull;
+	c->gpr[31] = 0xFFFFFFFFA4001550ull;
+	c->pc = 0xFFFFFFFFA4000040ull;
+	c->nextPc = c->pc + 4;
+	c->cop0[CP0_STATUS] = 0x34000000;
+	c->cop0[CP0_CONFIG] = 0x0006E463;
+	n->riReg[0] = 0x0E;
+	n->riReg[1] = 0x40;
+	n->riReg[3] = 0x14;
+	n->riReg[4] = 0x00063634;
+	put32(&n->rdram[0x318], RDRAM_SIZE);
+	put32(&n->rdram[0x3F0], RDRAM_SIZE);
+}
+
+static void controller(struct N64* n, const uint8_t* cmd, uint8_t* resp, int rx) {
+	switch (cmd[0]) {
+	case 0x00:
+	case 0xFF:
+		if (rx >= 3) {
+			resp[0] = 0x05;
+			resp[1] = 0x00;
+			resp[2] = 0x02;
+		}
+		return;
+	case 0x01:
+		if (rx >= 4) {
+			resp[0] = n->buttons >> 24;
+			resp[1] = n->buttons >> 16;
+			resp[2] = n->buttons >> 8;
+			resp[3] = n->buttons;
+		}
+		return;
+	}
+}
+
+// Runs the Joybus commands in PIF RAM: per channel, a send length, a receive length, the command
+// and room for the reply. Controller 1 is plugged in; nothing else answers yet.
+void pifRun(struct N64* n) {
+	uint8_t* ram = n->pifRam;
+	if (!(ram[63] & 1)) {
+		return;
+	}
+	int channel = 0;
+	int i = 0;
+	while (i < 62 && channel < 5) {
+		uint8_t tx = ram[i];
+		if (tx == 0xFE) {
+			break;
+		}
+		if (tx == 0xFF || tx == 0xFD) {
+			++i;
+			continue;
+		}
+		if (tx == 0) {
+			++channel;
+			++i;
+			continue;
+		}
+		int send = tx & 0x3F;
+		int receive = ram[i + 1] & 0x3F;
+		if (i + 2 + send + receive > 63) {
+			break;
+		}
+		uint8_t* cmd = &ram[i + 2];
+		uint8_t* resp = cmd + send;
+		if (channel == 0) {
+			controller(n, cmd, resp, receive);
+		} else {
+			ram[i + 1] |= 0x80;
+		}
+		i += 2 + send + receive;
+		++channel;
+	}
+	ram[63] &= ~1;
+}
