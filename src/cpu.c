@@ -105,6 +105,29 @@ miss:
 	return false;
 }
 
+// For tools: the physical address of a virtual one, without raising exceptions or changing state.
+bool cpuPeekAddress(struct N64* n, uint64_t vaddr, uint32_t* paddr) {
+	struct CPU* c = &n->cpu;
+	uint32_t v = (uint32_t) vaddr;
+	if ((v & 0xC0000000) == 0x80000000) {
+		*paddr = v & 0x1FFFFFFF;
+		return true;
+	}
+	for (int i = 0; i < 32; ++i) {
+		struct TLBEntry* e = &c->tlb[i];
+		uint32_t mask = e->pageMask | 0x1FFF;
+		bool global = e->entryLo[0] & e->entryLo[1] & 1;
+		if (((v ^ (uint32_t) e->entryHi) & ~mask) || (!global && ((e->entryHi ^ c->cop0[CP0_ENTRYHI]) & 0xFF))) {
+			continue;
+		}
+		uint32_t offsetMask = mask >> 1;
+		uint64_t lo = e->entryLo[(v & (offsetMask + 1)) ? 1 : 0];
+		*paddr = ((uint32_t) (lo >> 6) << 12 & ~offsetMask) | (v & offsetMask);
+		return lo & 2;
+	}
+	return false;
+}
+
 static bool address(struct N64* n, uint64_t vaddr, int align, bool store, uint32_t* paddr) {
 	if (vaddr & (align - 1)) {
 		n->cpu.cop0[CP0_BADVADDR] = vaddr;

@@ -34,8 +34,9 @@ static void spDma(struct N64* n, uint32_t lenReg, bool toRdram) {
 
 static void spWriteStatus(struct N64* n, uint32_t v) {
 	uint32_t* s = &n->sp.status;
-	if (v & 1) {
+	if ((v & 1) && (*s & 1)) {
 		*s &= ~1u;
+		++n->stats.rspTasks;
 	}
 	if (v & 2) {
 		*s |= 1;
@@ -121,6 +122,8 @@ static void piDma(struct N64* n, uint32_t len, bool toRdram) {
 	}
 	n->pi.dramAddr = dram + len;
 	n->pi.cartAddr = cart + len;
+	++n->stats.piDmas;
+	n->stats.piBytes += len;
 	// Domain 1 bus timing, in RCP cycles: latency per page, pulse width and release per halfword.
 	uint32_t* t = n->pi.timing;
 	uint32_t page = 1u << ((t[2] & 15) + 2);
@@ -130,6 +133,7 @@ static void piDma(struct N64* n, uint32_t len, bool toRdram) {
 }
 
 static void siDma(struct N64* n, bool toPif) {
+	++n->stats.siDmas;
 	uint32_t dram = n->si.dramAddr & (RDRAM_SIZE - 1) & ~3u;
 	if (toPif) {
 		memcpy(n->pifRam, &n->rdram[dram], 64);
@@ -364,6 +368,7 @@ void busWrite32(struct N64* n, uint32_t addr, uint32_t v) {
 			n->ai.len = v & 0x3FFF8;
 			if (n->ai.len && n->ai.queued < 2) {
 				n->ai.queueLen[n->ai.queued++] = n->ai.len;
+				++n->stats.aiBuffers;
 				if (n->ai.queued == 1) {
 					aiStartNext(n);
 				}

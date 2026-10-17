@@ -365,6 +365,14 @@ static struct Color blendColor(struct RDP* r, struct Color pixel, struct Color m
 	return out;
 }
 
+// The blender's first input (P) for a cycle, without blending.
+static struct Color blendInput(struct RDP* r, struct Color pixel, struct Color memory, int cycle) {
+	int sp = (r->otherModes >> (30 - cycle * 2)) & 3;
+	struct Color out = sp == 0 ? pixel : sp == 1 ? memory : sp == 2 ? r->blend : r->fog;
+	out.a = pixel.a;
+	return out;
+}
+
 static void shadePixel(struct N64* n, struct RDP* r, int x, int y, struct Pixel* p) {
 	uint64_t m = r->otherModes;
 	int cycleType = (m >> 52) & 3;
@@ -392,17 +400,16 @@ static void shadePixel(struct N64* n, struct RDP* r, int x, int y, struct Pixel*
 		return;
 	}
 	struct Color memory = readPixel(n, r, x, y);
-	bool blending = (m >> 14) & 1 || (m >> 6) & 1;
+	// The blend formula applies only with force blend (or at partly covered edges, which aren't
+	// modelled yet); otherwise a cycle passes its first input through. In 2-cycle mode the first
+	// cycle always blends (fog), and its result is the second cycle's pixel.
+	bool force = (m >> 14) & 1;
 	struct Color out = c;
-	if (blending) {
-		if (cycleType == 1) {
-			struct Color first = blendColor(r, c, memory, p, 0);
-			out = blendColor(r, first, memory, p, 1);
-		} else {
-			out = blendColor(r, c, memory, p, 0);
-		}
-	} else if (cycleType == 1) {
-		out = blendColor(r, c, memory, p, 1);
+	if (cycleType == 1) {
+		struct Color first = blendColor(r, c, memory, p, 0);
+		out = force ? blendColor(r, first, memory, p, 1) : blendInput(r, first, memory, 1);
+	} else {
+		out = force ? blendColor(r, c, memory, p, 0) : blendInput(r, c, memory, 0);
 	}
 	writePixel(n, r, x, y, out);
 	if (r->zAddr && zUpdate) {
@@ -700,6 +707,7 @@ void rdpRun(struct N64* n) {
 			textureRect(n, r, w[0], w[1], op == 0x25);
 			break;
 		case 0x29:
+			++n->stats.dpSyncs;
 			n64Interrupt(n, MI_DP, true);
 			break;
 		case 0x2C:

@@ -126,6 +126,10 @@ struct N64 {
 	uint64_t fields;
 	uint32_t buttons;
 	const char* unimplemented;
+	// Activity counts for diagnostics.
+	struct {
+		uint64_t piDmas, piBytes, rspTasks, dpSyncs, aiBuffers, siDmas;
+	} stats;
 };
 
 // n64.c
@@ -143,6 +147,7 @@ void cpuStep(struct N64*);
 void cpuException(struct N64*, int code, int coprocessor);
 void cpuCheckInterrupts(struct N64*);
 uint32_t cpuCount(struct N64*);
+bool cpuPeekAddress(struct N64*, uint64_t vaddr, uint32_t* paddr);
 
 // rsp.c
 void rspInitTables(void);

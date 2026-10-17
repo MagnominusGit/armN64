@@ -42,6 +42,12 @@ int main(int argc, char** argv) {
 	clock_gettime(CLOCK_MONOTONIC, &t0);
 	for (int f = 0; f < fields; ++f) {
 		n64RunField(n);
+		if (getenv("N64PCLOG") && f % 60 == 59) {
+			printf("field %4d pc %08x  pi %llu (%llu KiB)  rsp tasks %llu  rdp syncs %llu  ai %llu  si %llu\n", f + 1,
+			       (uint32_t) n->cpu.pc, (unsigned long long) n->stats.piDmas, (unsigned long long) (n->stats.piBytes >> 10),
+			       (unsigned long long) n->stats.rspTasks, (unsigned long long) n->stats.dpSyncs,
+			       (unsigned long long) n->stats.aiBuffers, (unsigned long long) n->stats.siDmas);
+		}
 		if (n->unimplemented && n->unimplemented != reported) {
 			printf("field %d: %s (pc %08x)\n", f, n->unimplemented, (uint32_t) n->cpu.curPc);
 			reported = n->unimplemented;
@@ -55,11 +61,18 @@ int main(int argc, char** argv) {
 		struct CPU* c = &n->cpu;
 		printf("sp status %04x pc %03x, dp status %x, mi intr %02x mask %02x, pi status %x, vi intr %d\n",
 		       n->sp.status, n->sp.pc, n->dp.status, n->miIntr, n->miMask, n->pi.status, n->vi.reg[3]);
+		printf("vi:");
+		for (int i = 0; i < 14; ++i) {
+			printf(" %08x", n->vi.reg[i]);
+		}
+		printf("\n");
 		printf("cop0 status %08x cause %08x epc %08x\n", (uint32_t) c->cop0[CP0_STATUS],
 		       (uint32_t) c->cop0[CP0_CAUSE], (uint32_t) c->cop0[CP0_EPC]);
 		for (int k = -8; k < 4; ++k) {
-			uint32_t a = (uint32_t) c->pc + k * 4;
-			printf("%08x %08x%s\n", a, busRead32(n, a & 0x1FFFFFFF), k == 0 ? " <" : "");
+			uint32_t a = (uint32_t) c->pc + k * 4, p;
+			if (cpuPeekAddress(n, a, &p)) {
+				printf("%08x %08x%s\n", a, busRead32(n, p), k == 0 ? " <" : "");
+			}
 		}
 		for (int i = 0; i < 32; ++i) {
 			printf("r%-2d %016llx%s", i, (unsigned long long) c->gpr[i], i % 4 == 3 ? "\n" : "  ");
