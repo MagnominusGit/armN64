@@ -35,6 +35,9 @@ static void spDma(struct N64* n, uint32_t lenReg, bool toRdram) {
 	}
 	n->sp.memAddr = mem;
 	n->sp.dramAddr = dram;
+	if (!toRdram && base) {
+		++n->rspCodeGen;
+	}
 }
 
 static void spWriteStatus(struct N64* n, uint32_t v) {
@@ -359,6 +362,7 @@ void busWrite32(struct N64* n, uint32_t addr, uint32_t v) {
 	}
 	if (addr >= 0x04000000 && addr < 0x04040000) {
 		put32(&n->sp.mem[addr & 0x1FFC], v);
+		n->rspCodeGen += (addr >> 12) & 1;
 		return;
 	}
 	if (addr >= 0x1FC007C0 && addr < 0x1FC00800) {
@@ -587,6 +591,7 @@ static uint8_t* writable(struct N64* n, uint32_t addr) {
 	}
 	if (addr >= 0x04000000 && addr < 0x04040000) {
 		rspCatchUp(n);
+		n->rspCodeGen += (addr >> 12) & 1;
 		return &n->sp.mem[addr & 0x1FFF];
 	}
 	if (addr >= 0x1FC007C0 && addr < 0x1FC00800) {

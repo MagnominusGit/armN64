@@ -118,6 +118,13 @@ struct SI {
 
 struct RDP;
 
+// Compiled RSP code for an IMEM address, good while rspCodeGen is unchanged.
+struct RspJitEntry {
+	uint32_t gen;
+	void* code;
+};
+struct RspBlock;
+
 // Compiled code for a virtual address, good while blockGen is unchanged.
 enum { JIT_TABLE_SIZE = 1 << 14 };
 struct JitEntry {
@@ -170,6 +177,16 @@ struct N64 {
 	void (*jitEnter)(struct N64*, void* code);
 	void* jitLeave;
 	struct JitEntry jitTable[JIT_TABLE_SIZE];
+	// Compiled RSP blocks (rsp_jit_x64.c): every version compiled for each IMEM address, and the
+	// one for IMEM as it is; rspCodeGen changes with every write to IMEM.
+	bool useRspJit;
+	uint8_t* rspArena;
+	size_t rspUsed;
+	void (*rspEnter)(struct N64*, void* code, uint64_t limit);
+	void* rspLeave;
+	uint32_t rspCodeGen;
+	struct RspJitEntry rspTable[1024];
+	struct RspBlock* rspVariants[1024];
 	// CPU cycles per video field: 60 fields a second for NTSC and MPAL, 50 for PAL.
 	uint64_t fieldCycles;
 	uint64_t fields;
@@ -204,6 +221,18 @@ bool cpuPeekAddress(struct N64*, uint64_t vaddr, uint32_t* paddr);
 // rsp.c
 void rspInitTables(void);
 void rspStep(struct N64*);
+void rspTimingStep(struct N64*, uint32_t op, uint32_t pc);
+bool rspPairable(uint32_t first, uint32_t firstPc, uint32_t op);
+bool rspIsBranch(uint32_t op);
+int rspTimingRegs(uint32_t op, int* scalar, int* vector, int* nv, int* written, int* latency, int* nw);
+void rspCop2(struct N64*, uint32_t op);
+void rspVectorLoad(struct N64*, uint32_t op);
+void rspVectorStore(struct N64*, uint32_t op);
+void rspCop0(struct N64*, uint32_t op);
+void rspBreak(struct N64*);
+// rsp_jit_x64.c
+void* rspJitLookup(struct N64*, uint32_t pc);
+void rspJitFree(struct N64*);
 // blocks.c: the CPU runs from blocks of instructions fetched once, until the next event.
 void blocksRun(struct N64*);
 void blocksFree(struct N64*);

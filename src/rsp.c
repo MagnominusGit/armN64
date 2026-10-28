@@ -838,10 +838,10 @@ static bool pairs(struct RSP* r, uint32_t op) {
 	return !((code == 0x3A || code == 0x32) && w == (int) RT) && !(code == 0x12 && (int) RD == w);
 }
 
-void rspStep(struct N64* n) {
+// The timing of one instruction: when it issues, whether it pairs with the one before, and when
+// its results are ready.
+void rspTimingStep(struct N64* n, uint32_t op, uint32_t pc) {
 	struct RSP* r = &n->rsp;
-	uint32_t pc = n->sp.pc & 0xFFC;
-	uint32_t op = be32(&n->sp.mem[0x1000 | pc]);
 	uint64_t start = issueTime(r, op);
 	if (pairs(r, op)) {
 		uint64_t clock = r->clock;
@@ -864,6 +864,131 @@ void rspStep(struct N64* n) {
 	r->lastStart = start;
 	markResults(r, op, start);
 	r->scalarReady[0] = 0;
+}
+
+// For compiled code: whether op may pair with first (at firstPc) when first issued alone, and the
+// registers the timing reads and writes, as issueTime and markResults use them.
+bool rspPairable(uint32_t first, uint32_t firstPc, uint32_t op) {
+	struct RSP r = { .lastOp = first, .lastPc = firstPc, .inDelay = isBranch(first), .lastAlone = true };
+	return pairs(&r, op);
+}
+
+bool rspIsBranch(uint32_t op) {
+	return isBranch(op);
+}
+
+int rspTimingRegs(uint32_t op, int* scalar, int* vector, int* nv, int* written, int* latency, int* nw) {
+	int ns = 0;
+	*nv = *nw = 0;
+	switch (op >> 26) {
+	case 0x00:
+	case 0x04:
+	case 0x05:
+	case 0x28:
+	case 0x29:
+	case 0x2B:
+		scalar[ns++] = RS;
+		scalar[ns++] = RT;
+		break;
+	case 0x10:
+		if (RS == 0x04) {
+			scalar[ns++] = RT;
+		}
+		break;
+	case 0x12:
+		if (op & (1 << 25)) {
+			vector[(*nv)++] = RD;
+			vector[(*nv)++] = RT;
+		} else if (RS == 0x00) {
+			vector[(*nv)++] = RD;
+		} else if (RS == 0x04 || RS == 0x06) {
+			scalar[ns++] = RT;
+		}
+		break;
+	case 0x3A:
+		scalar[ns++] = RS;
+		if (RD == 11) {
+			for (int i = 0; i < 8; ++i) {
+				vector[(*nv)++] = (RT & ~7) + i;
+			}
+		} else {
+			vector[(*nv)++] = RT;
+		}
+		break;
+	default:
+		scalar[ns++] = RS;
+	}
+	// Written registers: scalar as 0-31, vector as 32-63.
+	switch (op >> 26) {
+	case 0x20:
+	case 0x21:
+	case 0x23:
+	case 0x24:
+	case 0x25:
+	case 0x27:
+		written[*nw] = RT, latency[(*nw)++] = 3;
+		break;
+	case 0x10:
+		if (RS == 0x00) {
+			written[*nw] = RT, latency[(*nw)++] = 3;
+		}
+		break;
+	case 0x12:
+		if (op & (1 << 25)) {
+			written[*nw] = 32 + SA, latency[(*nw)++] = 4;
+		} else if (RS == 0x00 || RS == 0x02) {
+			written[*nw] = RT, latency[(*nw)++] = 3;
+		} else if (RS == 0x04) {
+			written[*nw] = 32 + RD, latency[(*nw)++] = 4;
+		}
+		break;
+	case 0x32:
+		if (RD == 11) {
+			for (int i = 0; i < 8; ++i) {
+				written[*nw] = 32 + (RT & ~7) + i, latency[(*nw)++] = 4;
+			}
+		} else {
+			written[*nw] = 32 + RT, latency[(*nw)++] = 4;
+		}
+		break;
+	}
+	return ns;
+}
+
+// What compiled code calls for the instructions it doesn't run itself.
+void rspCop2(struct N64* n, uint32_t op) {
+	cop2(n, op);
+}
+
+void rspVectorLoad(struct N64* n, uint32_t op) {
+	vectorLoad(n, op);
+}
+
+void rspVectorStore(struct N64* n, uint32_t op) {
+	vectorStore(n, op);
+}
+
+void rspCop0(struct N64* n, uint32_t op) {
+	uint32_t* g = n->rsp.r;
+	if (RS == 0x00) {
+		uint32_t v = busRead32(n, rspCop0Address(RD & 15));
+		if (RT) {
+			g[RT] = v;
+		}
+	} else if (RS == 0x04) {
+		busWrite32(n, rspCop0Address(RD & 15), g[RT]);
+	}
+}
+
+void rspBreak(struct N64* n) {
+	halt(n);
+}
+
+void rspStep(struct N64* n) {
+	struct RSP* r = &n->rsp;
+	uint32_t pc = n->sp.pc & 0xFFC;
+	uint32_t op = be32(&n->sp.mem[0x1000 | pc]);
+	rspTimingStep(n, op, pc);
 	n->sp.pc = r->nextPc;
 	r->nextPc = (r->nextPc + 4) & 0xFFC;
 	uint32_t* g = r->r;

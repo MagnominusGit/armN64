@@ -25,6 +25,7 @@ void n64Destroy(struct N64* n) {
 	if (n) {
 		blocksFree(n);
 		jitFree(n);
+		rspJitFree(n);
 		rdpDestroy(n);
 		free(n->rdram);
 		free(n->rom);
@@ -74,6 +75,10 @@ bool n64LoadRom(struct N64* n, const uint8_t* data, size_t size) {
 	const char* jit = getenv("N64_JIT");
 	n->useJit = n->slice && jit && jit[0] == '1';
 	n->useBlocks = n->useJit || (n->slice && blocks && blocks[0] == '1');
+	const char* rspJit = getenv("N64_RSPJIT");
+	n->useRspJit = rspJit && rspJit[0] == '1';
+	rspJitFree(n);
+	++n->rspCodeGen;
 	return true;
 }
 
@@ -98,7 +103,13 @@ void rspCatchUp(struct N64* n) {
 	}
 	n->catchingUp = true;
 	while (n->rsp.clock < rspNow && !(n->sp.status & 1)) {
-		rspStep(n);
+		// Compiled code from the start of a block, and not from a delay slot.
+		void* code;
+		if (n->useRspJit && n->rsp.nextPc == ((n->sp.pc + 4) & 0xFFC) && (code = rspJitLookup(n, n->sp.pc & 0xFFC))) {
+			n->rspEnter(n, code, rspNow);
+		} else {
+			rspStep(n);
+		}
 	}
 	n->catchingUp = false;
 }
