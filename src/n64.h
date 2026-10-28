@@ -148,6 +148,12 @@ struct N64 {
 	// The RSP is being caught up: its own accesses to the shared registers must not catch it up again.
 	bool catchingUp;
 	uint64_t nextVi;
+	// Instruction blocks (blocks.c): one table of blocks per 4 KB RDRAM page that has any, and
+	// per page whether it does (a write there throws them away).
+	struct Block** blockPage[RDRAM_SIZE >> 12];
+	uint8_t codePage[RDRAM_SIZE >> 12];
+	uint32_t blockGen;
+	bool useBlocks;
 	// CPU cycles per video field: 60 fields a second for NTSC and MPAL, 50 for PAL.
 	uint64_t fieldCycles;
 	uint64_t fields;
@@ -171,6 +177,7 @@ int n64Picture(struct N64*, uint32_t* out, int* width, int* height);
 // cpu.c
 void cpuReset(struct N64*);
 void cpuStep(struct N64*);
+void cpuStepOp(struct N64*, uint32_t op, uint32_t paddr);
 void cpuException(struct N64*, int code, int coprocessor);
 void cpuCheckInterrupts(struct N64*);
 uint32_t cpuCount(struct N64*);
@@ -179,6 +186,23 @@ bool cpuPeekAddress(struct N64*, uint64_t vaddr, uint32_t* paddr);
 // rsp.c
 void rspInitTables(void);
 void rspStep(struct N64*);
+// blocks.c: the CPU runs from blocks of instructions fetched once, until the next event.
+void blocksRun(struct N64*);
+void blocksFree(struct N64*);
+void blocksInvalidatePage(struct N64*, uint32_t page);
+// Code may have been written: RDRAM [addr, addr + len).
+static inline void n64CodeWrite(struct N64* n, uint32_t addr, uint32_t len) {
+	uint32_t first = (addr & (RDRAM_SIZE - 1)) >> 12, last = ((addr + len - 1) & (RDRAM_SIZE - 1)) >> 12;
+	for (uint32_t p = first;; p = (p + 1) & ((RDRAM_SIZE >> 12) - 1)) {
+		if (n->codePage[p]) {
+			blocksInvalidatePage(n, p);
+		}
+		if (p == last) {
+			break;
+		}
+	}
+}
+
 // The RSP runs to the CPU's time: before the CPU touches its registers, memory or MI, and once a slice.
 void rspCatchUp(struct N64*);
 static inline void n64Event(struct N64* n, uint64_t at) {

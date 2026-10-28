@@ -23,6 +23,7 @@ struct N64* n64Create(void) {
 
 void n64Destroy(struct N64* n) {
 	if (n) {
+		blocksFree(n);
 		rdpDestroy(n);
 		free(n->rdram);
 		free(n->rom);
@@ -56,6 +57,7 @@ bool n64LoadRom(struct N64* n, const uint8_t* data, size_t size) {
 	}
 	free(n->rom);
 	n->rom = rom;
+	blocksFree(n);
 	n->romSize = size & ~3u;
 	cpuReset(n);
 	pifBoot(n);
@@ -67,6 +69,8 @@ bool n64LoadRom(struct N64* n, const uint8_t* data, size_t size) {
 	n->eventAt = 0;
 	const char* slice = getenv("N64_SLICE");
 	n->slice = slice ? strtoull(slice, NULL, 0) : 0;
+	const char* blocks = getenv("N64_BLOCKS");
+	n->useBlocks = n->slice && blocks && blocks[0] == '1';
 	return true;
 }
 
@@ -140,7 +144,9 @@ void n64RunField(struct N64* n) {
 			n64Event(n, n->pi.busyUntil ? n->pi.busyUntil : until);
 		}
 		// One cycle an instruction, plus cache fills, RCP register reads and long operations.
-		do {
+		if (n->useBlocks) {
+			blocksRun(n);
+		} else do {
 			cpuStep(n);
 			n->cycles += 1 + n->cpu.stall;
 			n->cpu.stall = 0;

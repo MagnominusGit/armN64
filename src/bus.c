@@ -22,6 +22,9 @@ static void spDma(struct N64* n, uint32_t lenReg, bool toRdram) {
 			uint8_t* sp = &n->sp.mem[base | ((mem + i) & 0xFFF)];
 			uint32_t d = (dram + i) & (RDRAM_SIZE - 1);
 			if (toRdram) {
+				if (n->codePage[d >> 12]) {
+					n64CodeWrite(n, d, 1);
+				}
 				n->rdram[d] = *sp;
 			} else {
 				*sp = n->rdram[d];
@@ -162,8 +165,14 @@ static void piDmaToRdram(struct N64* n, uint32_t len) {
 	n->pi.cartAddr = cart;
 }
 
+// Throws away code a PI DMA of len bytes into RDRAM is about to cover.
+static void piDmaCode(struct N64* n, uint32_t len) {
+	n64CodeWrite(n, n->pi.dramAddr & 0xFFFFF8, len + 16);
+}
+
 static void piDma(struct N64* n, uint32_t len, bool toRdram) {
 	if (toRdram) {
+		piDmaCode(n, len);
 		piDmaToRdram(n, len);
 	} else {
 		uint32_t dram = n->pi.dramAddr & 0xFFFFFE, cart = n->pi.cartAddr & ~1u;
@@ -194,6 +203,7 @@ static void siDma(struct N64* n, bool toPif) {
 		memcpy(n->pifRam, &n->rdram[dram], 64);
 		pifRun(n);
 	} else {
+		n64CodeWrite(n, dram, 64);
 		memcpy(&n->rdram[dram], n->pifRam, 64);
 	}
 	// The PIF takes a while to run the commands; the interrupt comes when the transfer is done.
@@ -341,6 +351,9 @@ void busWrite32(struct N64* n, uint32_t addr, uint32_t v) {
 		rspCatchUp(n);
 	}
 	if (addr < RDRAM_SIZE) {
+		if (n->codePage[addr >> 12]) {
+			blocksInvalidatePage(n, addr >> 12);
+		}
 		put32(&n->rdram[addr & ~3u], v);
 		return;
 	}
@@ -567,6 +580,9 @@ uint64_t busRead64(struct N64* n, uint32_t addr) {
 static uint8_t* writable(struct N64* n, uint32_t addr) {
 	addr &= 0x1FFFFFFF;
 	if (addr < RDRAM_SIZE) {
+		if (n->codePage[addr >> 12]) {
+			blocksInvalidatePage(n, addr >> 12);
+		}
 		return &n->rdram[addr];
 	}
 	if (addr >= 0x04000000 && addr < 0x04040000) {

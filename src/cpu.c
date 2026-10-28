@@ -1052,6 +1052,37 @@ static void traceInstruction(struct N64* n) {
 }
 #endif
 
+// cpuStep for an instruction already fetched from a cached RDRAM address (paddr): the same
+// prologue and timing, without the fetch. If the prologue takes an interrupt, the handler's first
+// instruction is fetched as usual.
+void cpuStepOp(struct N64* n, uint32_t op, uint32_t paddr) {
+	struct CPU* c = &n->cpu;
+	uint32_t now = cpuCount(n);
+	if ((uint32_t) ((uint32_t) c->cop0[CP0_COMPARE] - c->lastCount - 1) < now - c->lastCount) {
+		c->cop0[CP0_CAUSE] |= 0x8000;
+	}
+	c->lastCount = now;
+	c->inDelay = c->nextInDelay;
+	c->nextInDelay = false;
+	c->curPc = c->pc;
+	if (interruptPending(n)) {
+		cpuException(n, EXC_INT, 0);
+		c->curPc = c->pc;
+		if (!address(n, c->curPc, 4, false, &paddr)) {
+			return;
+		}
+		op = busRead32(n, paddr);
+	}
+	fetchTiming(c, c->curPc, paddr);
+#ifdef N64_TRACE
+	traceInstruction(n);
+#endif
+	c->pc = c->nextPc;
+	c->nextPc += 4;
+	execute(n, op);
+	c->gpr[0] = 0;
+}
+
 void cpuStep(struct N64* n) {
 	struct CPU* c = &n->cpu;
 	uint32_t now = cpuCount(n);
