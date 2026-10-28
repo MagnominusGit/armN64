@@ -64,6 +64,9 @@ bool n64LoadRom(struct N64* n, const uint8_t* data, size_t size) {
 	n->fieldCycles = CPU_HZ / (n->cpu.gpr[20] == 0 ? 50 : 60);
 	n->vi.reg[6] = n->cpu.gpr[20] == 0 ? 0x271 : 0x20D;
 	n->nextVi = n->fieldCycles;
+	n->eventAt = 0;
+	const char* slice = getenv("N64_SLICE");
+	n->slice = slice ? strtoull(slice, NULL, 0) : 0;
 	return true;
 }
 
@@ -76,7 +79,27 @@ void n64Interrupt(struct N64* n, uint32_t line, bool set) {
 	cpuCheckInterrupts(n);
 }
 
+void rspCatchUp(struct N64* n) {
+	if (n->catchingUp) {
+		return;
+	}
+	// The RSP runs at two thirds of the CPU clock, on its own cycle count.
+	uint64_t rspNow = n->cycles * 2 / 3;
+	if (n->sp.status & 1) {
+		n->rsp.clock = rspNow;
+		return;
+	}
+	n->catchingUp = true;
+	while (n->rsp.clock < rspNow && !(n->sp.status & 1)) {
+		rspStep(n);
+	}
+	n->catchingUp = false;
+}
+
 // One video field: the CPU runs until the field ends, with the VI interrupt at the V_INTR line.
+// With a slice, the CPU runs ahead of the RSP by up to that many cycles (or to the next event),
+// and the RSP catches up then or when the CPU touches what it shares with it. Without one, the
+// two step in lockstep.
 void n64RunField(struct N64* n) {
 	uint64_t start = n->nextVi - n->fieldCycles;
 	uint32_t lines = (n->vi.reg[6] & 0x3FF) + 1;
@@ -104,19 +127,25 @@ void n64RunField(struct N64* n) {
 			n->pi.status &= ~1u;
 			n64Interrupt(n, MI_PI, true);
 		}
-		// One cycle an instruction, plus cache fills, RCP register reads and long operations.
-		cpuStep(n);
-		n->cycles += 1 + n->cpu.stall;
-		n->cpu.stall = 0;
-		// The RSP runs at two thirds of the CPU clock, on its own cycle count.
-		uint64_t rspNow = n->cycles * 2 / 3;
-		if (n->sp.status & 1) {
-			n->rsp.clock = rspNow;
-		} else {
-			while (n->rsp.clock < rspNow && !(n->sp.status & 1)) {
-				rspStep(n);
+		uint64_t until = n->nextVi;
+		if (n->slice) {
+			until = n->cycles + n->slice < until ? n->cycles + n->slice : until;
+			if (!raised && intrAt < until) {
+				until = intrAt;
 			}
+			n->eventAt = until;
+			n64Event(n, n->ai.queued ? n->ai.endsAt : until);
+			n64Event(n, n->dp.syncAt ? n->dp.syncAt : until);
+			n64Event(n, n->si.busyUntil ? n->si.busyUntil : until);
+			n64Event(n, n->pi.busyUntil ? n->pi.busyUntil : until);
 		}
+		// One cycle an instruction, plus cache fills, RCP register reads and long operations.
+		do {
+			cpuStep(n);
+			n->cycles += 1 + n->cpu.stall;
+			n->cpu.stall = 0;
+		} while (n->slice && n->cycles < n->eventAt);
+		rspCatchUp(n);
 	}
 	if (!raised) {
 		n64Interrupt(n, MI_VI, true);

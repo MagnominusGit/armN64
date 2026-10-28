@@ -141,6 +141,12 @@ struct N64 {
 	uint32_t riReg[8];
 
 	uint64_t cycles;
+	// The earliest pending event (AI, PI, SI, DP sync): the CPU runs no further before it is handled.
+	uint64_t eventAt;
+	// CPU cycles the CPU may run ahead of the RSP before it catches up.
+	uint64_t slice;
+	// The RSP is being caught up: its own accesses to the shared registers must not catch it up again.
+	bool catchingUp;
 	uint64_t nextVi;
 	// CPU cycles per video field: 60 fields a second for NTSC and MPAL, 50 for PAL.
 	uint64_t fieldCycles;
@@ -173,6 +179,13 @@ bool cpuPeekAddress(struct N64*, uint64_t vaddr, uint32_t* paddr);
 // rsp.c
 void rspInitTables(void);
 void rspStep(struct N64*);
+// The RSP runs to the CPU's time: before the CPU touches its registers, memory or MI, and once a slice.
+void rspCatchUp(struct N64*);
+static inline void n64Event(struct N64* n, uint64_t at) {
+	if (at < n->eventAt) {
+		n->eventAt = at;
+	}
+}
 
 // fpu.c
 void fpuExecute(struct N64*, uint32_t op);

@@ -92,6 +92,7 @@ static uint64_t aiDuration(struct N64* n, uint32_t len) {
 static void aiStartNext(struct N64* n) {
 	n->ai.startedAt = n->cycles;
 	n->ai.endsAt = n->cycles + aiDuration(n, n->ai.queueLen[0]);
+	n64Event(n, n->ai.endsAt);
 	n64Interrupt(n, MI_AI, true);
 }
 
@@ -182,6 +183,7 @@ static void piDma(struct N64* n, uint32_t len, bool toRdram) {
 	uint32_t page = 1u << ((t[2] & 15) + 2);
 	uint64_t rcp = (uint64_t) ((len + page - 1) / page) * (t[0] + 1) + (uint64_t) ((len + 1) / 2) * ((t[1] + 1) + (t[3] + 1));
 	n->pi.busyUntil = n->cycles + rcp * 3 / 2;
+	n64Event(n, n->pi.busyUntil);
 	n->pi.status |= 1;
 }
 
@@ -197,6 +199,7 @@ static void siDma(struct N64* n, bool toPif) {
 	// The PIF takes a while to run the commands; the interrupt comes when the transfer is done.
 	n->si.status |= 1;
 	n->si.busyUntil = n->cycles + SI_DMA_CYCLES;
+	n64Event(n, n->si.busyUntil);
 }
 
 static uint32_t viCurrent(struct N64* n) {
@@ -207,10 +210,18 @@ static uint32_t viCurrent(struct N64* n) {
 	return (line % lines & ~1u) | field;
 }
 
+// SP memory and registers, DP and MI registers: what the RSP (and the RDP it drives) can change or see.
+static inline bool rspShared(uint32_t addr) {
+	return addr >= 0x04000000 && addr < 0x04400000;
+}
+
 uint32_t busRead32(struct N64* n, uint32_t addr) {
 	addr &= 0x1FFFFFFF;
 	if (addr < RDRAM_SIZE) {
 		return be32(&n->rdram[addr & ~3u]);
+	}
+	if (rspShared(addr)) {
+		rspCatchUp(n);
 	}
 	if (addr >= 0x04000000 && addr < 0x04040000) {
 		return be32(&n->sp.mem[addr & 0x1FFC]);
@@ -326,6 +337,9 @@ uint32_t busRead32(struct N64* n, uint32_t addr) {
 
 void busWrite32(struct N64* n, uint32_t addr, uint32_t v) {
 	addr &= 0x1FFFFFFF;
+	if (rspShared(addr)) {
+		rspCatchUp(n);
+	}
 	if (addr < RDRAM_SIZE) {
 		put32(&n->rdram[addr & ~3u], v);
 		return;
@@ -556,6 +570,7 @@ static uint8_t* writable(struct N64* n, uint32_t addr) {
 		return &n->rdram[addr];
 	}
 	if (addr >= 0x04000000 && addr < 0x04040000) {
+		rspCatchUp(n);
 		return &n->sp.mem[addr & 0x1FFF];
 	}
 	if (addr >= 0x1FC007C0 && addr < 0x1FC00800) {

@@ -867,6 +867,7 @@ void rdpRun(struct N64* n) {
 				n64Interrupt(n, MI_DP, true);
 			}
 			n->dp.syncAt = begin + r->clocks * 3 / 2;
+			n64Event(n, n->dp.syncAt);
 			break;
 		case 0x2C:
 			r->k4 = (c >> 9) & 0x1FF;
