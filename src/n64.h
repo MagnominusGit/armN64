@@ -251,6 +251,7 @@ void rspArenaFree(struct N64*);
 void blocksRun(struct N64*);
 void blocksFree(struct N64*);
 void blocksInvalidatePage(struct N64*, uint32_t page);
+bool blockIsIdleLoop(const uint32_t* ops, uint32_t count, uint32_t vaddr);
 // jit_x64.c
 void* jitCompile(struct N64*, const uint32_t* ops, uint32_t count, uint32_t vaddr, uint32_t paddr);
 void jitReset(struct N64*);

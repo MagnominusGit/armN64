@@ -379,6 +379,30 @@ static void icacheCheck(struct Emitter* e, uint32_t vaddr, uint32_t paddr, bool 
 	patchHere(e, hit);
 }
 
+// The idle loop at vaddr, when its I-cache lines are in: whole passes of two cycles up to one or two
+// cycles short of the limit, leaving the last instructions to run as usual.
+static void skipIdle(struct Emitter* e, uint32_t vaddr, uint32_t paddr) {
+	uint8_t* skip[3];
+	int sites = 0;
+	int lines = (paddr + 4) & 31 ? 1 : 2;
+	for (int i = 0; i < lines; ++i) {
+		uint32_t v = vaddr + 4 * i, p = paddr + 4 * i;
+		aLdr(e, 0, CPU, CPU_OFF(icacheTag) + 4 * ((v >> 5) & 511));
+		aMovImm(e, 1, p >> 5 | 0x80000000u);
+		aDp(e, A_SUBS, ZR, 0, 1, S_LSL, 0);
+		skip[sites++] = aBcond(e, C_NE, NULL);
+	}
+	aDp(e, A_SUBS | W64, 0, LIMIT, CYCLES, S_LSL, 0);
+	aDpImm(e, A_SUBS_IMM | W64, ZR, 0, 1);
+	skip[sites++] = aBcond(e, C_LE, NULL);
+	aDpImm(e, A_SUB_IMM | W64, 0, 0, 1);
+	aLsrImmX(e, 0, 0, 1);
+	aDp(e, A_ADD | W64, CYCLES, CYCLES, 0, S_LSL, 1);
+	for (int i = 0; i < sites; ++i) {
+		patchHere(e, skip[i]);
+	}
+}
+
 static bool isBranchOp(uint32_t op) {
 	switch (op >> 26) {
 	case 0x00:
@@ -664,6 +688,10 @@ void* jitCompile(struct N64* n, const uint32_t* ops, uint32_t count, uint32_t va
 	j->leave = e->p;
 	aB(e, n->jitLeave);
 	uint8_t* entry = e->p;
+
+	if (blockIsIdleLoop(ops, count, vaddr)) {
+		skipIdle(e, vaddr, paddr);
+	}
 
 	bool delay = false;
 	for (uint32_t k = 0; k < count; ++k) {

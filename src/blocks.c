@@ -31,6 +31,13 @@ static bool isBranch(uint32_t op) {
 	return false;
 }
 
+// The idle loop "b self; nop" (or "j self; nop"): nothing changes but the cycle count, two cycles a
+// pass once its I-cache lines are in.
+bool blockIsIdleLoop(const uint32_t* ops, uint32_t count, uint32_t vaddr) {
+	uint32_t jumpSelf = 0x08000000 | ((vaddr >> 2) & 0x03FFFFFF);
+	return count == 2 && (ops[0] == 0x1000FFFF || ops[0] == jumpSelf) && ops[1] == 0;
+}
+
 void blocksInvalidatePage(struct N64* n, uint32_t page) {
 	struct Block** t = n->blockPage[page];
 	if (t) {
