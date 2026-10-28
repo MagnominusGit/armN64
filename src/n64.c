@@ -72,11 +72,13 @@ bool n64LoadRom(struct N64* n, const uint8_t* data, size_t size) {
 	const char* slice = getenv("N64_SLICE");
 	n->slice = slice ? strtoull(slice, NULL, 0) : 0;
 	const char* blocks = getenv("N64_BLOCKS");
+#ifdef N64_HAS_JIT
 	const char* jit = getenv("N64_JIT");
-	n->useJit = n->slice && jit && jit[0] == '1';
-	n->useBlocks = n->useJit || (n->slice && blocks && blocks[0] == '1');
 	const char* rspJit = getenv("N64_RSPJIT");
+	n->useJit = n->slice && jit && jit[0] == '1';
 	n->useRspJit = rspJit && rspJit[0] == '1';
+#endif
+	n->useBlocks = n->useJit || (n->slice && blocks && blocks[0] == '1');
 	rspJitFree(n);
 	++n->rspCodeGen;
 	return true;
