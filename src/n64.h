@@ -118,6 +118,13 @@ struct SI {
 
 struct RDP;
 
+// Compiled code for a virtual address, good while blockGen is unchanged.
+enum { JIT_TABLE_SIZE = 1 << 14 };
+struct JitEntry {
+	uint32_t vaddr, gen;
+	void* code;
+};
+
 struct N64 {
 	uint8_t* rdram;
 	uint8_t* rom;
@@ -154,11 +161,15 @@ struct N64 {
 	uint8_t codePage[RDRAM_SIZE >> 12];
 	uint32_t blockGen;
 	bool useBlocks;
-	// Compiled blocks (jit_x64.c): the code arena, and how far compiled code may run.
+	// Compiled blocks (jit_x64.c): the code arena, how far compiled code may run, and the code
+	// for recent addresses. blockGen also changes with the TLB.
 	bool useJit;
 	uint8_t* jitArena;
 	size_t jitUsed;
 	uint64_t jitLimit, jitFire;
+	void (*jitEnter)(struct N64*, void* code);
+	void* jitLeave;
+	struct JitEntry jitTable[JIT_TABLE_SIZE];
 	// CPU cycles per video field: 60 fields a second for NTSC and MPAL, 50 for PAL.
 	uint64_t fieldCycles;
 	uint64_t fields;

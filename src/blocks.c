@@ -82,10 +82,25 @@ static struct Block* compile(struct N64* n, uint32_t vaddr, uint32_t paddr) {
 	return b;
 }
 
+static void jitRun(struct N64* n, void* code) {
+	if (cpuJitReady(n)) {
+		n->jitEnter(n, code);
+	} else {
+		cpuStep(n);
+		n->cycles += 1 + n->cpu.stall;
+		n->cpu.stall = 0;
+	}
+}
+
 void blocksRun(struct N64* n) {
 	struct CPU* c = &n->cpu;
 	do {
 		uint32_t v = (uint32_t) c->pc;
+		struct JitEntry* je = &n->jitTable[(v >> 2) & (JIT_TABLE_SIZE - 1)];
+		if (je->vaddr == v && je->gen == n->blockGen && c->pc == (uint64_t) (int64_t) (int32_t) v && !c->nextInDelay) {
+			jitRun(n, je->code);
+			continue;
+		}
 		uint32_t paddr = v & 0x1FFFFFFF;
 		// Cached RDRAM code (kseg0, or mapped through the TLB) runs from blocks; the rest, and a
 		// delay slot reached by leaving a block early, takes the plain step.
@@ -122,13 +137,8 @@ void blocksRun(struct N64* n) {
 			n->codePage[page] = 1;
 		}
 		if (b->code) {
-			if (cpuJitReady(n)) {
-				((void (*)(struct N64*)) b->code)(n);
-			} else {
-				cpuStep(n);
-				n->cycles += 1 + c->stall;
-				c->stall = 0;
-			}
+			*je = (struct JitEntry) { v, n->blockGen, b->code };
+			jitRun(n, b->code);
 			continue;
 		}
 		uint64_t pc = c->pc;

@@ -8,9 +8,10 @@
 // goes through cpuJitStep. Code stops after any instruction that takes the cycle count to the
 // limit (the next event, or Count reaching Compare), leaving the CPU as the interpreter would.
 //
-// Registers: rbx = n, r12 = &n->cpu, r13 = n->cycles, r14 = the limit.
+// Registers: rbx = n, r12 = &n->cpu, r13 = n->cycles, r14 = the limit. A block that ends below the
+// limit goes on to the next through n->jitTable without returning to C.
 
-enum { ARENA_SIZE = 32 << 20, BLOCK_CODE_MAX = 16 << 10 };
+enum { ARENA_SIZE = 32 << 20, BLOCK_CODE_MAX = 16 << 10, SHARED_SIZE = 256 };
 
 #define CPU_AT(f) M(R12, (int32_t) offsetof(struct CPU, f))
 #define N64_AT(f) M(RBX, (int32_t) offsetof(struct N64, f))
@@ -64,18 +65,18 @@ struct Exit {
 	enum Kind kind;
 	bool delay;
 	bool skip;
+	bool last;
 };
 
 struct Jit {
 	struct Emitter e;
 	struct Exit exits[2 * 64];
 	int exitCount;
-	uint8_t* done[64 * 4];
-	int doneCount;
+	uint8_t* leave;
 };
 
 static void exitAt(struct Jit* j, uint8_t* site, uint64_t pc, enum Kind kind, bool delay, bool skip) {
-	j->exits[j->exitCount++] = (struct Exit) { site, pc, kind, delay, skip };
+	j->exits[j->exitCount++] = (struct Exit) { site, pc, kind, delay, skip, false };
 }
 
 // Sets the flags for a branch condition and returns the condition code under which it is taken.
@@ -323,6 +324,27 @@ static bool isBranchOp(uint32_t op) {
 	return false;
 }
 
+// Goes on to the block at the pc in memory if the jump table has it, or leaves.
+static void chain(struct Jit* j) {
+	struct Emitter* e = &j->e;
+	xLoad(e, 8, RAX, CPU_AT(pc));
+	xMovsxd(e, RCX, R(RAX));
+	xAluRR(e, X_CMP, 8, R(RCX), RAX);
+	xJcc(e, CC_NE, j->leave);
+	xMovRR(e, 4, RCX, RAX);
+	xShiftI(e, X_SHR, 4, R(RCX), 2);
+	xAluI(e, X_AND, 4, R(RCX), JIT_TABLE_SIZE - 1);
+	xShiftI(e, X_SHL, 4, R(RCX), 4);
+	xLea(e, 8, RDX, MI(RBX, RCX, 1, (int32_t) offsetof(struct N64, jitTable)));
+	xAluRM(e, X_CMP, 4, RAX, M(RDX, (int32_t) offsetof(struct JitEntry, vaddr)));
+	xJcc(e, CC_NE, j->leave);
+	xLoad(e, 4, RAX, N64_AT(blockGen));
+	xAluRM(e, X_CMP, 4, RAX, M(RDX, (int32_t) offsetof(struct JitEntry, gen)));
+	xJcc(e, CC_NE, j->leave);
+	xJmpM(e, M(RDX, (int32_t) offsetof(struct JitEntry, code)));
+}
+
+// The arena starts with the way in, jitEnter(n, code), and the way out back to C.
 static uint8_t* arenaGet(struct N64* n) {
 	if (!n->jitArena) {
 		void* p = mmap(NULL, ARENA_SIZE, PROT_READ | PROT_WRITE | PROT_EXEC, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
@@ -330,12 +352,33 @@ static uint8_t* arenaGet(struct N64* n) {
 			return NULL;
 		}
 		n->jitArena = p;
+		struct Emitter e = { p, p, (uint8_t*) p + SHARED_SIZE };
+		xPush(&e, RBX);
+		xPush(&e, R12);
+		xPush(&e, R13);
+		xPush(&e, R14);
+		xPush(&e, R15);
+		xMovRR(&e, 8, RBX, RDI);
+		xLea(&e, 8, R12, M(RDI, (int32_t) offsetof(struct N64, cpu)));
+		xLoad(&e, 8, R13, M(RBX, (int32_t) offsetof(struct N64, cycles)));
+		xLoad(&e, 8, R14, M(RBX, (int32_t) offsetof(struct N64, jitLimit)));
+		xJmpR(&e, RSI);
+		n->jitLeave = e.p;
+		xStore(&e, 8, M(RBX, (int32_t) offsetof(struct N64, cycles)), R13);
+		xPop(&e, R15);
+		xPop(&e, R14);
+		xPop(&e, R13);
+		xPop(&e, R12);
+		xPop(&e, RBX);
+		xRet(&e);
+		n->jitEnter = (void (*)(struct N64*, void*)) p;
 	}
 	return n->jitArena;
 }
 
 void jitReset(struct N64* n) {
-	n->jitUsed = 0;
+	n->jitUsed = SHARED_SIZE;
+	++n->blockGen;
 }
 
 void jitFree(struct N64* n) {
@@ -343,30 +386,24 @@ void jitFree(struct N64* n) {
 		munmap(n->jitArena, ARENA_SIZE);
 		n->jitArena = NULL;
 	}
-	n->jitUsed = 0;
+	n->jitUsed = SHARED_SIZE;
 }
 
 // Code for count instructions at vaddr (cached, at paddr in RDRAM), or NULL when the arena is full.
 void* jitCompile(struct N64* n, const uint32_t* ops, uint32_t count, uint32_t vaddr, uint32_t paddr) {
 	uint8_t* arena = arenaGet(n);
+	if (n->jitUsed < SHARED_SIZE) {
+		n->jitUsed = SHARED_SIZE;
+	}
 	if (!arena || n->jitUsed + BLOCK_CODE_MAX > ARENA_SIZE) {
 		return NULL;
 	}
 	static struct Jit jit;
 	struct Jit* j = &jit;
 	j->e = (struct Emitter) { arena + n->jitUsed, arena + n->jitUsed, arena + n->jitUsed + BLOCK_CODE_MAX };
-	j->exitCount = j->doneCount = 0;
+	j->exitCount = 0;
+	j->leave = n->jitLeave;
 	struct Emitter* e = &j->e;
-
-	xPush(e, RBX);
-	xPush(e, R12);
-	xPush(e, R13);
-	xPush(e, R14);
-	xPush(e, R15);
-	xMovRR(e, 8, RBX, RDI);
-	xLea(e, 8, R12, M(RDI, (int32_t) offsetof(struct N64, cpu)));
-	xLoad(e, 8, R13, N64_AT(cycles));
-	xLoad(e, 8, R14, N64_AT(jitLimit));
 
 	bool delay = false;
 	for (uint32_t k = 0; k < count; ++k) {
@@ -393,6 +430,7 @@ void* jitCompile(struct N64* n, const uint32_t* ops, uint32_t count, uint32_t va
 			xAluI(e, X_ADD, 8, R(R13), 1);
 			if (last) {
 				exitAt(j, xJmp(e, NULL), pc, kind, delay, false);
+				j->exits[j->exitCount - 1].last = true;
 			} else {
 				xAluRR(e, X_CMP, 8, R(R13), R14);
 				exitAt(j, xJcc(e, CC_AE, NULL), pc, kind, delay, false);
@@ -419,13 +457,14 @@ void* jitCompile(struct N64* n, const uint32_t* ops, uint32_t count, uint32_t va
 		xCallR(e, RAX);
 		xLoad(e, 8, R13, N64_AT(cycles));
 		xLoad(e, 8, R14, N64_AT(jitLimit));
+		xTest(e, 1, R(RAX), RAX);
+		xJcc(e, CC_NE, j->leave);
+		xAluRR(e, X_CMP, 8, R(R13), R14);
+		xJcc(e, CC_AE, j->leave);
 		if (last) {
-			j->done[j->doneCount++] = xJmp(e, NULL);
-		} else {
-			xTest(e, 1, R(RAX), RAX);
-			j->done[j->doneCount++] = xJcc(e, CC_NE, NULL);
-			xAluRR(e, X_CMP, 8, R(R13), R14);
-			j->done[j->doneCount++] = xJcc(e, CC_AE, NULL);
+			xAluI(e, X_CMP, 1, CPU_AT(nextInDelay), 0);
+			xJcc(e, CC_NE, j->leave);
+			chain(j);
 		}
 		delay = isBranchOp(op);
 	}
@@ -449,18 +488,14 @@ void* jitCompile(struct N64* n, const uint32_t* ops, uint32_t count, uint32_t va
 				storeConst(e, CPU_AT(nextPc), x->pc + 8);
 			}
 		}
-		j->done[j->doneCount++] = xJmp(e, NULL);
+		if (x->last && !(x->kind != PLAIN && !x->skip)) {
+			xAluRR(e, X_CMP, 8, R(R13), R14);
+			xJcc(e, CC_AE, j->leave);
+			chain(j);
+		} else {
+			xJmp(e, j->leave);
+		}
 	}
-	for (int i = 0; i < j->doneCount; ++i) {
-		patchHere(e, j->done[i]);
-	}
-	xStore(e, 8, N64_AT(cycles), R13);
-	xPop(e, R15);
-	xPop(e, R14);
-	xPop(e, R13);
-	xPop(e, R12);
-	xPop(e, RBX);
-	xRet(e);
 
 	if (e->p > e->end) {
 		return NULL;

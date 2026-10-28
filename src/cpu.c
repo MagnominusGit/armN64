@@ -223,6 +223,7 @@ static void tlbWrite(struct N64* n, int i) {
 	uint64_t g = c->cop0[CP0_ENTRYLO0] & c->cop0[CP0_ENTRYLO1] & 1;
 	e->entryLo[0] = (c->cop0[CP0_ENTRYLO0] & 0x3FFFFFFE) | g;
 	e->entryLo[1] = (c->cop0[CP0_ENTRYLO1] & 0x3FFFFFFE) | g;
+	++n->blockGen;
 }
 
 static uint32_t randomIndex(struct N64* n) {
@@ -275,6 +276,7 @@ static void cop0Write(struct N64* n, int r, uint64_t v) {
 		return;
 	case CP0_ENTRYHI:
 		cop0[r] = v & 0xC00000FFFFFFE0FFull;
+		++n->blockGen;
 		return;
 	case CP0_PRID:
 	case CP0_RANDOM:
