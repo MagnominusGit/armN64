@@ -2,8 +2,6 @@
 #include "x64/emit.h"
 
 #include <stddef.h>
-#include <stdlib.h>
-#include <string.h>
 #include <sys/mman.h>
 
 // x86-64 code for blocks of RSP instructions. Each block's first instruction takes its timing from
@@ -18,13 +16,6 @@ enum { ARENA_SIZE = 4 << 20, BLOCK_CODE_MAX = 32 << 10, SHARED_SIZE = 256, BLOCK
 
 #define RSP_AT(f) M(R12, (int32_t) offsetof(struct RSP, f))
 #define N64_AT(f) M(RBX, (int32_t) offsetof(struct N64, f))
-
-struct RspBlock {
-	struct RspBlock* next;
-	void* code;
-	uint32_t count;
-	uint8_t ops[BLOCK_MAX * 4];
-};
 
 static struct Opnd gpr(int i) {
 	return M(R12, (int32_t) (offsetof(struct RSP, r) + 4 * i));
@@ -435,17 +426,7 @@ static uint8_t* arenaGet(struct N64* n) {
 	return p;
 }
 
-void rspJitFree(struct N64* n) {
-	for (int i = 0; i < 1024; ++i) {
-		struct RspBlock* b = n->rspVariants[i];
-		while (b) {
-			struct RspBlock* next = b->next;
-			free(b);
-			b = next;
-		}
-		n->rspVariants[i] = NULL;
-		n->rspTable[i].code = NULL;
-	}
+void rspArenaFree(struct N64* n) {
 	if (n->rspArena) {
 		munmap(n->rspArena, ARENA_SIZE);
 		n->rspArena = NULL;
@@ -468,7 +449,8 @@ static void chain(struct Jit* j) {
 	xJmpR(e, RAX);
 }
 
-static void* compile(struct N64* n, struct RspBlock* b, uint32_t start) {
+// Code for count instructions (as IMEM holds them) from start, or NULL when the arena is full.
+void* rspCompile(struct N64* n, const uint8_t* ops, uint32_t count, uint32_t start) {
 	uint8_t* arena = arenaGet(n);
 	if (!arena || n->rspUsed + BLOCK_CODE_MAX > ARENA_SIZE) {
 		return NULL;
@@ -482,9 +464,9 @@ static void* compile(struct N64* n, struct RspBlock* b, uint32_t start) {
 
 	bool delay = false;
 	uint32_t prev = 0;
-	for (uint32_t k = 0; k < b->count; ++k) {
-		uint32_t op = be32(&b->ops[k * 4]), pc = start + k * 4;
-		bool last = k + 1 == b->count;
+	for (uint32_t k = 0; k < count; ++k) {
+		uint32_t op = be32(&ops[k * 4]), pc = start + k * 4;
+		bool last = k + 1 == count;
 		if (k == 0) {
 			xMovRR(e, 8, RDI, RBX);
 			xMovI(e, RSI, op);
@@ -556,55 +538,4 @@ static void* compile(struct N64* n, struct RspBlock* b, uint32_t start) {
 	uint8_t* code = arena + n->rspUsed;
 	n->rspUsed += (size_t) (e->p - code + 15) & ~(size_t) 15;
 	return code;
-}
-
-// From pc to a branch's delay slot, the end of IMEM or BLOCK_MAX instructions.
-static uint32_t blockLength(const uint8_t* imem, uint32_t pc) {
-	uint32_t count = 0;
-	bool delay = false;
-	while (count < BLOCK_MAX && pc + count * 4 < 0x1000) {
-		uint32_t op = be32(&imem[pc + count * 4]);
-		// A branch in a delay slot is left to the interpreter.
-		if (delay && rspIsBranch(op)) {
-			break;
-		}
-		++count;
-		if (delay) {
-			break;
-		}
-		delay = rspIsBranch(op);
-	}
-	return count;
-}
-
-// The code for the block at pc: from the table, a block compiled before for the same instructions,
-// or a new one. NULL when the arena is full (it starts again).
-void* rspJitLookup(struct N64* n, uint32_t pc) {
-	struct RspJitEntry* t = &n->rspTable[pc >> 2];
-	if (t->gen == n->rspCodeGen && t->code) {
-		return t->code;
-	}
-	const uint8_t* imem = &n->sp.mem[0x1000];
-	uint32_t count = blockLength(imem, pc);
-	for (struct RspBlock* b = n->rspVariants[pc >> 2]; b; b = b->next) {
-		if (b->count == count && !memcmp(b->ops, &imem[pc], count * 4)) {
-			*t = (struct RspJitEntry) { n->rspCodeGen, b->code };
-			return b->code;
-		}
-	}
-	struct RspBlock* b = malloc(sizeof(*b));
-	if (!b) {
-		return NULL;
-	}
-	b->count = count;
-	memcpy(b->ops, &imem[pc], count * 4);
-	if (!(b->code = compile(n, b, pc))) {
-		free(b);
-		rspJitFree(n);
-		return NULL;
-	}
-	b->next = n->rspVariants[pc >> 2];
-	n->rspVariants[pc >> 2] = b;
-	*t = (struct RspJitEntry) { n->rspCodeGen, b->code };
-	return b->code;
 }

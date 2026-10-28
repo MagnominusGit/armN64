@@ -242,9 +242,11 @@ void rspVectorLoad(struct N64*, uint32_t op);
 void rspVectorStore(struct N64*, uint32_t op);
 void rspCop0(struct N64*, uint32_t op);
 void rspBreak(struct N64*);
-// rsp_jit_x64.c
+// rsp_jit.c, and a code generator for the host (rsp_jit_x64.c, rsp_jit_a64.c)
 void* rspJitLookup(struct N64*, uint32_t pc);
 void rspJitFree(struct N64*);
+void* rspCompile(struct N64*, const uint8_t* ops, uint32_t count, uint32_t start);
+void rspArenaFree(struct N64*);
 // blocks.c: the CPU runs from blocks of instructions fetched once, until the next event.
 void blocksRun(struct N64*);
 void blocksFree(struct N64*);
