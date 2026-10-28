@@ -277,6 +277,15 @@ static inline void xMovsx(struct Emitter* e, int dst, int srcWidth, struct Opnd 
 	xExtend(e, srcWidth == 1 ? 0xBE : 0xBF, dst, srcWidth, src);
 }
 
+// Reverses the byte order of a 32-bit or 64-bit register.
+static inline void xBswap(struct Emitter* e, int width, int reg) {
+	if (width == 8 || (reg & 8)) {
+		e8(e, 0x40 | (width == 8 ? 8 : 0) | (reg & 8 ? 1 : 0));
+	}
+	e8(e, 0x0F);
+	e8(e, 0xC8 | (reg & 7));
+}
+
 // Sign-extends 32 bits into a 64-bit register.
 static inline void xMovsxd(struct Emitter* e, int dst, struct Opnd src) {
 	emitOp1(e, 8, 0x63, dst, src);

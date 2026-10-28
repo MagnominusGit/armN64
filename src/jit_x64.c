@@ -8,10 +8,10 @@
 // goes through cpuJitStep. Code stops after any instruction that takes the cycle count to the
 // limit (the next event, or Count reaching Compare), leaving the CPU as the interpreter would.
 //
-// Registers: rbx = n, r12 = &n->cpu, r13 = n->cycles, r14 = the limit. A block that ends below the
+// Registers: rbx = n, r12 = &n->cpu, r13 = n->cycles, r14 = the limit, r15 = RDRAM. A block that ends below the
 // limit goes on to the next through n->jitTable without returning to C.
 
-enum { ARENA_SIZE = 32 << 20, BLOCK_CODE_MAX = 16 << 10, SHARED_SIZE = 256 };
+enum { ARENA_SIZE = 32 << 20, BLOCK_CODE_MAX = 32 << 10, SHARED_SIZE = 256 };
 
 #define CPU_AT(f) M(R12, (int32_t) offsetof(struct CPU, f))
 #define N64_AT(f) M(RBX, (int32_t) offsetof(struct N64, f))
@@ -68,10 +68,29 @@ struct Exit {
 	bool last;
 };
 
+// A load or store that left its inline path: for the helper, or for a D-cache line fill.
+struct Slow {
+	uint8_t* site[3];
+	int sites;
+	uint8_t* resume;
+	uint32_t op, paddr;
+	uint64_t pc;
+	bool delay, lineStart, last;
+};
+
+struct Miss {
+	uint8_t* site;
+	uint8_t* resume;
+};
+
 struct Jit {
 	struct Emitter e;
 	struct Exit exits[2 * 64];
 	int exitCount;
+	struct Slow slows[64];
+	int slowCount;
+	struct Miss misses[64];
+	int missCount;
 	uint8_t* leave;
 };
 
@@ -324,6 +343,150 @@ static bool isBranchOp(uint32_t op) {
 	return false;
 }
 
+static void chain(struct Jit* j);
+
+// The instruction through cpuJitStep, which adds its cycles. Leaves if it asks to or at the limit;
+// at the end of the block goes on to the next.
+static void emitHelper(struct Jit* j, uint32_t op, uint64_t pc, uint32_t paddr, bool delay, bool lineStart, bool last) {
+	struct Emitter* e = &j->e;
+	if (lineStart) {
+		icacheCheck(e, (uint32_t) pc, paddr, true);
+	}
+	if (delay) {
+		delayPrologue(e);
+	} else {
+		storeConst(e, CPU_AT(pc), pc + 4);
+		storeConst(e, CPU_AT(nextPc), pc + 8);
+	}
+	storeConst(e, CPU_AT(curPc), pc);
+	xStoreI(e, 1, CPU_AT(inDelay), delay);
+	xStoreI(e, 1, CPU_AT(nextInDelay), 0);
+	xStore(e, 8, N64_AT(cycles), R13);
+	xMovRR(e, 8, RDI, RBX);
+	xMovIKeepFlags(e, RSI, op);
+	xMovI64(e, RAX, (uint64_t) (uintptr_t) cpuJitStep);
+	xCallR(e, RAX);
+	xLoad(e, 8, R13, N64_AT(cycles));
+	xLoad(e, 8, R14, N64_AT(jitLimit));
+	xTest(e, 1, R(RAX), RAX);
+	xJcc(e, CC_NE, j->leave);
+	xAluRR(e, X_CMP, 8, R(R13), R14);
+	xJcc(e, CC_AE, j->leave);
+	if (last) {
+		xAluI(e, X_CMP, 1, CPU_AT(nextInDelay), 0);
+		xJcc(e, CC_NE, j->leave);
+		chain(j);
+	}
+}
+
+static int memSize(uint32_t op) {
+	switch (op >> 26) {
+	case 0x20: case 0x24: case 0x28:
+		return 1;
+	case 0x21: case 0x25: case 0x29:
+		return 2;
+	case 0x23: case 0x27: case 0x2B:
+		return 4;
+	case 0x37: case 0x3F:
+		return 8;
+	}
+	return 0;
+}
+
+// A load or store to cached RDRAM (kseg0), with fetchTiming's D-cache check. Anything else (other
+// segments, misalignment, a store to a page holding code) jumps to the slow path, before any change.
+static void emitMemory(struct Jit* j, struct Slow* slow) {
+	struct Emitter* e = &j->e;
+	uint32_t op = slow->op;
+	int rs = (op >> 21) & 31, rt = (op >> 16) & 31, size = memSize(op);
+	bool isStore = (op >> 26) >= 0x28 && (op >> 26) != 0x37;
+	struct Opnd ram = MI(R15, RAX, 1, 0);
+	slow->sites = 0;
+
+	xLoad(e, 8, RAX, gpr(rs));
+	if ((int16_t) op) {
+		xAluI(e, X_ADD, 8, R(RAX), (int16_t) op);
+	}
+	xMovsxd(e, RCX, R(RAX));
+	xAluRR(e, X_CMP, 8, R(RCX), RAX);
+	slow->site[slow->sites++] = xJcc(e, CC_NE, NULL);
+	xMovRR(e, 4, RCX, RAX);
+	xAluI(e, X_AND, 4, R(RCX), (int32_t) (0xFF800000u | (size - 1)));
+	xAluI(e, X_CMP, 4, R(RCX), (int32_t) 0x80000000u);
+	slow->site[slow->sites++] = xJcc(e, CC_NE, NULL);
+	xAluI(e, X_AND, 4, R(RAX), RDRAM_SIZE - 1);
+	if (isStore) {
+		xMovRR(e, 4, RCX, RAX);
+		xShiftI(e, X_SHR, 4, R(RCX), 12);
+		xAluI(e, X_CMP, 1, MI(RBX, RCX, 1, (int32_t) offsetof(struct N64, codePage)), 0);
+		slow->site[slow->sites++] = xJcc(e, CC_NE, NULL);
+	}
+
+	xMovRR(e, 4, RCX, RAX);
+	xShiftI(e, X_SHR, 4, R(RCX), 4);
+	xMovRR(e, 4, RDX, RCX);
+	xAluI(e, X_OR, 4, R(RDX), (int32_t) 0x80000000u);
+	xAluI(e, X_AND, 4, R(RCX), 511);
+	xAluRM(e, X_CMP, 4, RDX, MI(R12, RCX, 4, (int32_t) offsetof(struct CPU, dcacheTag)));
+	struct Miss* m = &j->misses[j->missCount++];
+	m->site = xJcc(e, CC_NE, NULL);
+	m->resume = e->p;
+	if (isStore) {
+		xStoreI(e, 1, MI(R12, RCX, 1, (int32_t) offsetof(struct CPU, dcacheDirty)), 1);
+	}
+
+	switch (op >> 26) {
+	case 0x20:
+		xMovsx(e, RDX, 1, ram);
+		xMovsxd(e, RDX, R(RDX));
+		break;
+	case 0x24:
+		xMovzx(e, RDX, 1, ram);
+		break;
+	case 0x21: case 0x25:
+		xMovzx(e, RDX, 2, ram);
+		xBswap(e, 4, RDX);
+		xShiftI(e, op >> 26 == 0x21 ? X_SAR : X_SHR, 4, R(RDX), 16);
+		if (op >> 26 == 0x21) {
+			xMovsxd(e, RDX, R(RDX));
+		}
+		break;
+	case 0x23: case 0x27:
+		xLoad(e, 4, RDX, ram);
+		xBswap(e, 4, RDX);
+		if (op >> 26 == 0x23) {
+			xMovsxd(e, RDX, R(RDX));
+		}
+		break;
+	case 0x37:
+		xLoad(e, 8, RDX, ram);
+		xBswap(e, 8, RDX);
+		break;
+	case 0x28:
+		xLoad(e, 1, RDX, gpr(rt));
+		xStore(e, 1, ram, RDX);
+		break;
+	case 0x29:
+		xMovzx(e, RDX, 2, gpr(rt));
+		xShiftI(e, X_ROL, 2, R(RDX), 8);
+		xStore(e, 2, ram, RDX);
+		break;
+	case 0x2B:
+		xLoad(e, 4, RDX, gpr(rt));
+		xBswap(e, 4, RDX);
+		xStore(e, 4, ram, RDX);
+		break;
+	case 0x3F:
+		xLoad(e, 8, RDX, gpr(rt));
+		xBswap(e, 8, RDX);
+		xStore(e, 8, ram, RDX);
+		break;
+	}
+	if (!isStore) {
+		storeGpr(e, rt, RDX);
+	}
+}
+
 // Goes on to the block at the pc in memory if the jump table has it, or leaves.
 static void chain(struct Jit* j) {
 	struct Emitter* e = &j->e;
@@ -362,6 +525,7 @@ static uint8_t* arenaGet(struct N64* n) {
 		xLea(&e, 8, R12, M(RDI, (int32_t) offsetof(struct N64, cpu)));
 		xLoad(&e, 8, R13, M(RBX, (int32_t) offsetof(struct N64, cycles)));
 		xLoad(&e, 8, R14, M(RBX, (int32_t) offsetof(struct N64, jitLimit)));
+		xLoad(&e, 8, R15, M(RBX, (int32_t) offsetof(struct N64, rdram)));
 		xJmpR(&e, RSI);
 		n->jitLeave = e.p;
 		xStore(&e, 8, M(RBX, (int32_t) offsetof(struct N64, cycles)), R13);
@@ -401,7 +565,7 @@ void* jitCompile(struct N64* n, const uint32_t* ops, uint32_t count, uint32_t va
 	static struct Jit jit;
 	struct Jit* j = &jit;
 	j->e = (struct Emitter) { arena + n->jitUsed, arena + n->jitUsed, arena + n->jitUsed + BLOCK_CODE_MAX };
-	j->exitCount = 0;
+	j->exitCount = j->slowCount = j->missCount = 0;
 	j->leave = n->jitLeave;
 	struct Emitter* e = &j->e;
 
@@ -413,6 +577,25 @@ void* jitCompile(struct N64* n, const uint32_t* ops, uint32_t count, uint32_t va
 		bool lineStart = k == 0 || !(p & 31);
 		enum Kind kind;
 		uint8_t* mark = e->p;
+		if (memSize(op)) {
+			struct Slow* slow = &j->slows[j->slowCount++];
+			*slow = (struct Slow) { .op = op, .paddr = p, .pc = pc, .delay = delay, .lineStart = lineStart, .last = last };
+			emitMemory(j, slow);
+			if (lineStart) {
+				icacheCheck(e, (uint32_t) pc, p, false);
+			}
+			xAluI(e, X_ADD, 8, R(R13), 1);
+			if (last) {
+				exitAt(j, xJmp(e, NULL), pc, PLAIN, delay, false);
+				j->exits[j->exitCount - 1].last = true;
+			} else {
+				xAluRR(e, X_CMP, 8, R(R13), R14);
+				exitAt(j, xJcc(e, CC_AE, NULL), pc, PLAIN, delay, false);
+			}
+			slow->resume = e->p;
+			delay = false;
+			continue;
+		}
 		bool inl = !(delay && isBranchOp(op));
 		if (inl) {
 			if (lineStart) {
@@ -438,35 +621,33 @@ void* jitCompile(struct N64* n, const uint32_t* ops, uint32_t count, uint32_t va
 			delay = kind != PLAIN;
 			continue;
 		}
-		if (lineStart) {
-			icacheCheck(e, (uint32_t) pc, p, true);
-		}
-		if (delay) {
-			delayPrologue(e);
-		} else {
-			storeConst(e, CPU_AT(pc), pc + 4);
-			storeConst(e, CPU_AT(nextPc), pc + 8);
-		}
-		storeConst(e, CPU_AT(curPc), pc);
-		xStoreI(e, 1, CPU_AT(inDelay), delay);
-		xStoreI(e, 1, CPU_AT(nextInDelay), 0);
-		xStore(e, 8, N64_AT(cycles), R13);
-		xMovRR(e, 8, RDI, RBX);
-		xMovIKeepFlags(e, RSI, op);
-		xMovI64(e, RAX, (uint64_t) (uintptr_t) cpuJitStep);
-		xCallR(e, RAX);
-		xLoad(e, 8, R13, N64_AT(cycles));
-		xLoad(e, 8, R14, N64_AT(jitLimit));
-		xTest(e, 1, R(RAX), RAX);
-		xJcc(e, CC_NE, j->leave);
-		xAluRR(e, X_CMP, 8, R(R13), R14);
-		xJcc(e, CC_AE, j->leave);
-		if (last) {
-			xAluI(e, X_CMP, 1, CPU_AT(nextInDelay), 0);
-			xJcc(e, CC_NE, j->leave);
-			chain(j);
-		}
+		emitHelper(j, op, pc, p, delay, lineStart, last);
 		delay = isBranchOp(op);
+	}
+
+	// D-cache line fills, as dataTiming: the fill, the write-back of a dirty line, the new tag.
+	for (int i = 0; i < j->missCount; ++i) {
+		struct Miss* m = &j->misses[i];
+		patchHere(e, m->site);
+		struct Opnd dirty = MI(R12, RCX, 1, (int32_t) offsetof(struct CPU, dcacheDirty));
+		xAluI(e, X_ADD, 8, R(R13), 40);
+		xAluI(e, X_CMP, 1, dirty, 0);
+		uint8_t* clean = xJcc(e, CC_E, NULL);
+		xAluI(e, X_ADD, 8, R(R13), 40);
+		patchHere(e, clean);
+		xStore(e, 4, MI(R12, RCX, 4, (int32_t) offsetof(struct CPU, dcacheTag)), RDX);
+		xStoreI(e, 1, dirty, 0);
+		xJmp(e, m->resume);
+	}
+	for (int i = 0; i < j->slowCount; ++i) {
+		struct Slow* sl = &j->slows[i];
+		for (int k = 0; k < sl->sites; ++k) {
+			patchHere(e, sl->site[k]);
+		}
+		emitHelper(j, sl->op, sl->pc, sl->paddr, sl->delay, sl->lineStart, sl->last);
+		if (!sl->last) {
+			xJmp(e, sl->resume);
+		}
 	}
 
 	// Leaving after an inline instruction: the state the interpreter would have after it.
