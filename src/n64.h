@@ -67,7 +67,8 @@ struct RSP {
 	uint32_t r[32];
 	uint32_t nextPc;
 	int16_t vr[32][8];
-	int64_t acc[8];
+	// The 48-bit accumulator as its high, middle and low 16 bits.
+	int16_t accH[8], accM[8], accL[8];
 	uint16_t vco, vcc;
 	uint8_t vce;
 	int16_t divIn;
@@ -226,6 +227,8 @@ bool rspPairable(uint32_t first, uint32_t firstPc, uint32_t op);
 bool rspIsBranch(uint32_t op);
 int rspTimingRegs(uint32_t op, int* scalar, int* vector, int* nv, int* written, int* latency, int* nw);
 void rspCop2(struct N64*, uint32_t op);
+// rsp_vu.c
+void rspVectorOp(struct RSP*, uint32_t op);
 void rspVectorLoad(struct N64*, uint32_t op);
 void rspVectorStore(struct N64*, uint32_t op);
 void rspCop0(struct N64*, uint32_t op);
