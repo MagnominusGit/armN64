@@ -154,6 +154,11 @@ struct N64 {
 	uint8_t codePage[RDRAM_SIZE >> 12];
 	uint32_t blockGen;
 	bool useBlocks;
+	// Compiled blocks (jit_x64.c): the code arena, and how far compiled code may run.
+	bool useJit;
+	uint8_t* jitArena;
+	size_t jitUsed;
+	uint64_t jitLimit, jitFire;
 	// CPU cycles per video field: 60 fields a second for NTSC and MPAL, 50 for PAL.
 	uint64_t fieldCycles;
 	uint64_t fields;
@@ -178,6 +183,8 @@ int n64Picture(struct N64*, uint32_t* out, int* width, int* height);
 void cpuReset(struct N64*);
 void cpuStep(struct N64*);
 void cpuStepOp(struct N64*, uint32_t op, uint32_t paddr);
+bool cpuJitReady(struct N64*);
+bool cpuJitStep(struct N64*, uint32_t op);
 void cpuException(struct N64*, int code, int coprocessor);
 void cpuCheckInterrupts(struct N64*);
 uint32_t cpuCount(struct N64*);
@@ -190,6 +197,10 @@ void rspStep(struct N64*);
 void blocksRun(struct N64*);
 void blocksFree(struct N64*);
 void blocksInvalidatePage(struct N64*, uint32_t page);
+// jit_x64.c
+void* jitCompile(struct N64*, const uint32_t* ops, uint32_t count, uint32_t vaddr, uint32_t paddr);
+void jitReset(struct N64*);
+void jitFree(struct N64*);
 // Code may have been written: RDRAM [addr, addr + len).
 static inline void n64CodeWrite(struct N64* n, uint32_t addr, uint32_t len) {
 	uint32_t first = (addr & (RDRAM_SIZE - 1)) >> 12, last = ((addr + len - 1) & (RDRAM_SIZE - 1)) >> 12;

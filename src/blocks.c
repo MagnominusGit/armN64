@@ -2,12 +2,15 @@
 
 #include <stdlib.h>
 
-// Blocks of instructions fetched once from RDRAM through kseg0, run by the interpreter's own step
+// Blocks of instructions fetched once from cached RDRAM code, run by the interpreter's own step
 // (cpuStepOp) without fetching each instruction again. A write to a page throws away its blocks.
 
 enum { BLOCK_MAX = 64, PAGE_WORDS = 1024 };
 
 struct Block {
+	void* code;
+	// The virtual address the code was compiled for (TLB-mapped code can move).
+	uint32_t vaddr;
 	uint32_t count;
 	uint32_t ops[BLOCK_MAX];
 };
@@ -47,10 +50,11 @@ void blocksFree(struct N64* n) {
 			blocksInvalidatePage(n, p);
 		}
 	}
+	jitReset(n);
 }
 
 // From paddr to a branch's delay slot, the end of the page or BLOCK_MAX instructions.
-static struct Block* compile(struct N64* n, uint32_t paddr) {
+static struct Block* compile(struct N64* n, uint32_t vaddr, uint32_t paddr) {
 	struct Block* b = malloc(sizeof(*b));
 	if (!b) {
 		return NULL;
@@ -67,6 +71,14 @@ static struct Block* compile(struct N64* n, uint32_t paddr) {
 		delay = isBranch(op);
 	}
 	b->count = count;
+	b->vaddr = vaddr;
+	b->code = NULL;
+	if (n->useJit && !(b->code = jitCompile(n, b->ops, count, vaddr, paddr))) {
+		// The code arena is full: start it again, and run this instruction on its own.
+		free(b);
+		blocksFree(n);
+		return NULL;
+	}
 	return b;
 }
 
@@ -75,10 +87,11 @@ void blocksRun(struct N64* n) {
 	do {
 		uint32_t v = (uint32_t) c->pc;
 		uint32_t paddr = v & 0x1FFFFFFF;
-		// Cached RDRAM code (kseg0) runs from blocks; the rest, and a delay slot reached by
-		// leaving a block early, takes the plain step.
-		if ((v & 0xE0000000) != 0x80000000 || paddr >= RDRAM_SIZE || (v & 3) ||
-		    c->pc != (uint64_t) (int64_t) (int32_t) v || c->nextInDelay) {
+		// Cached RDRAM code (kseg0, or mapped through the TLB) runs from blocks; the rest, and a
+		// delay slot reached by leaving a block early, takes the plain step.
+		bool mapped = (v & 0xC0000000) != 0x80000000;
+		if ((v & 0xE0000000) == 0xA0000000 || (v & 3) || c->pc != (uint64_t) (int64_t) (int32_t) v ||
+		    c->nextInDelay || (mapped && !cpuPeekAddress(n, v, &paddr)) || paddr >= RDRAM_SIZE) {
 			cpuStep(n);
 			n->cycles += 1 + c->stall;
 			c->stall = 0;
@@ -93,15 +106,30 @@ void blocksRun(struct N64* n) {
 			continue;
 		}
 		struct Block* b = t[(paddr >> 2) & (PAGE_WORDS - 1)];
+		if (b && b->vaddr != v) {
+			free(b);
+			b = t[(paddr >> 2) & (PAGE_WORDS - 1)] = NULL;
+		}
 		if (!b) {
-			b = t[(paddr >> 2) & (PAGE_WORDS - 1)] = compile(n, paddr);
-			n->codePage[page] = 1;
-			if (!b) {
+			// A full code arena throws every block away, this page's table with them.
+			if (!(b = compile(n, v, paddr))) {
 				cpuStep(n);
 				n->cycles += 1 + c->stall;
 				c->stall = 0;
 				continue;
 			}
+			t[(paddr >> 2) & (PAGE_WORDS - 1)] = b;
+			n->codePage[page] = 1;
+		}
+		if (b->code) {
+			if (cpuJitReady(n)) {
+				((void (*)(struct N64*)) b->code)(n);
+			} else {
+				cpuStep(n);
+				n->cycles += 1 + c->stall;
+				c->stall = 0;
+			}
+			continue;
 		}
 		uint64_t pc = c->pc;
 		uint32_t gen = n->blockGen;

@@ -1083,6 +1083,39 @@ void cpuStepOp(struct N64* n, uint32_t op, uint32_t paddr) {
 	c->gpr[0] = 0;
 }
 
+// Before compiled code runs: cpuStep's timer check, and the limit the code runs to, the next event or
+// the cycle at which Count reaches Compare. False when an interrupt is due, for cpuStep to take.
+bool cpuJitReady(struct N64* n) {
+	struct CPU* c = &n->cpu;
+	uint32_t now = cpuCount(n);
+	if ((uint32_t) ((uint32_t) c->cop0[CP0_COMPARE] - c->lastCount - 1) < now - c->lastCount) {
+		c->cop0[CP0_CAUSE] |= 0x8000;
+	}
+	c->lastCount = now;
+	if (interruptPending(n)) {
+		return false;
+	}
+	uint32_t delta = (uint32_t) c->cop0[CP0_COMPARE] - now;
+	n->jitFire = ((n->cycles >> 1) + (delta ? delta : 1ull << 32)) << 1;
+	n->jitLimit = n->eventAt < n->jitFire ? n->eventAt : n->jitFire;
+	return true;
+}
+
+// One instruction for compiled code, which has stored curPc, pc, nextPc and the delay flags.
+// Returns whether the code must stop: the program left the straight line, a write threw blocks
+// away, an interrupt is due, or a COP0 or CACHE instruction may have changed what the code assumes.
+bool cpuJitStep(struct N64* n, uint32_t op) {
+	struct CPU* c = &n->cpu;
+	uint64_t pc = c->pc;
+	uint32_t gen = n->blockGen;
+	execute(n, op);
+	c->gpr[0] = 0;
+	n->cycles += 1 + c->stall;
+	c->stall = 0;
+	n->jitLimit = n->eventAt < n->jitFire ? n->eventAt : n->jitFire;
+	return c->pc != pc || n->blockGen != gen || interruptPending(n) || op >> 26 == 0x10 || op >> 26 == 0x2F;
+}
+
 void cpuStep(struct N64* n) {
 	struct CPU* c = &n->cpu;
 	uint32_t now = cpuCount(n);

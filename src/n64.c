@@ -24,6 +24,7 @@ struct N64* n64Create(void) {
 void n64Destroy(struct N64* n) {
 	if (n) {
 		blocksFree(n);
+		jitFree(n);
 		rdpDestroy(n);
 		free(n->rdram);
 		free(n->rom);
@@ -70,7 +71,9 @@ bool n64LoadRom(struct N64* n, const uint8_t* data, size_t size) {
 	const char* slice = getenv("N64_SLICE");
 	n->slice = slice ? strtoull(slice, NULL, 0) : 0;
 	const char* blocks = getenv("N64_BLOCKS");
-	n->useBlocks = n->slice && blocks && blocks[0] == '1';
+	const char* jit = getenv("N64_JIT");
+	n->useJit = n->slice && jit && jit[0] == '1';
+	n->useBlocks = n->useJit || (n->slice && blocks && blocks[0] == '1');
 	return true;
 }
 
