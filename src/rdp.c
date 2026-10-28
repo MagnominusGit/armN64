@@ -49,6 +49,8 @@ struct Stage {
 	struct Input a, b, m, d;
 	const int* alpha[4];
 	bool noise;
+	// Every input is 0-255 (or 1.0 outside the multiplier), so the 9-bit sign rules change nothing.
+	bool raw;
 };
 
 struct RDP {
@@ -73,15 +75,22 @@ struct RDP {
 	// The pixel being drawn, and where the combiner's inputs come from for the current combine mode.
 	struct Pixel pix;
 	struct Stage stage[2];
+	// otherModes taken apart (setupModes): the cycle type, depth and alpha tests, and the blender's
+	// P, A, M and B inputs for each cycle.
+	int cycleType, zMode;
+	bool zCompare, zUpdate, zPrim, alphaCompare, cvgAlpha, forceBlend;
+	uint8_t blendSel[2][4];
 };
 
 static void setupCombiner(struct RDP* r);
+static void setupModes(struct RDP* r);
 
 static struct RDP* state(struct N64* n) {
 	if (!n->rdp) {
 		n->rdp = calloc(1, sizeof(struct RDP));
 		if (n->rdp) {
 			setupCombiner(n->rdp);
+			setupModes(n->rdp);
 		}
 	}
 	return n->rdp;
@@ -176,7 +185,7 @@ static uint8_t tmemByte(struct RDP* r, uint32_t addr) {
 	return r->tmem[addr & 0xFFF];
 }
 
-static struct Color tlutColor(struct RDP* r, int index) {
+static inline __attribute__((always_inline)) struct Color tlutColor(struct RDP* r, int index) {
 	uint32_t a = 0x800 + index * 8;
 	uint16_t v = (uint16_t) (tmemByte(r, a) << 8 | tmemByte(r, a + 1));
 	if ((r->otherModes >> 46) & 1) {
@@ -186,7 +195,7 @@ static struct Color tlutColor(struct RDP* r, int index) {
 	return (struct Color) { cr << 3 | cr >> 2, cg << 3 | cg >> 2, cb << 3 | cb >> 2, v & 1 ? 255 : 0 };
 }
 
-static struct Color texel(struct RDP* r, struct Tile* t, int s, int tt) {
+static inline __attribute__((always_inline)) struct Color texel(struct RDP* r, struct Tile* t, int s, int tt) {
 	uint32_t base = t->tmem * 8 + tt * t->line * 8;
 	uint32_t swap = tt & 1 ? 4 : 0;
 	bool tlut = (r->otherModes >> 47) & 1;
@@ -235,7 +244,7 @@ static struct Color texel(struct RDP* r, struct Tile* t, int s, int tt) {
 }
 
 // Applies the tile's shift, offset, clamp, mirror and mask to a 10.5 coordinate.
-static int wrapCoord(int c, int shift, int lo, int hi, int cm, int mask, int* frac) {
+static inline __attribute__((always_inline)) int wrapCoord(int c, int shift, int lo, int hi, int cm, int mask, int* frac) {
 	if (shift < 11) {
 		c >>= shift;
 	} else {
@@ -481,6 +490,14 @@ static const int* alphaSource(struct RDP* r, int sel, bool multiplier) {
 	return &zero;
 }
 
+static bool smallInput(struct RDP* r, const int* v, bool multiplier) {
+	struct Pixel* p = &r->pix;
+	if (v == &one) {
+		return !multiplier;
+	}
+	return !(v >= &p->combined.r && v <= &p->combined.a) && v != &r->k4 && v != &r->k5 && v != &p->lodFrac;
+}
+
 static void setupCombiner(struct RDP* r) {
 	uint64_t c = r->combine;
 	for (int cycle = 0; cycle < 2; ++cycle) {
@@ -494,6 +511,26 @@ static void setupCombiner(struct RDP* r) {
 		s->alpha[1] = alphaSource(r, cycle ? (c >> 3) & 7 : (c >> 12) & 7, false);
 		s->alpha[2] = alphaSource(r, cycle ? (c >> 18) & 7 : (c >> 41) & 7, true);
 		s->alpha[3] = alphaSource(r, cycle ? c & 7 : (c >> 9) & 7, false);
+		s->raw = smallInput(r, s->a.v, false) && smallInput(r, s->b.v, false) && smallInput(r, s->m.v, true) &&
+		         smallInput(r, s->d.v, false) && smallInput(r, s->alpha[0], false) && smallInput(r, s->alpha[1], false) &&
+		         smallInput(r, s->alpha[2], true) && smallInput(r, s->alpha[3], false);
+	}
+}
+
+static void setupModes(struct RDP* r) {
+	uint64_t m = r->otherModes;
+	r->cycleType = (m >> 52) & 3;
+	r->zCompare = (m >> 4) & 1;
+	r->zUpdate = (m >> 5) & 1;
+	r->zPrim = (m >> 2) & 1;
+	r->zMode = (m >> 10) & 3;
+	r->alphaCompare = m & 1;
+	r->cvgAlpha = (m >> 13) & 1;
+	r->forceBlend = (m >> 14) & 1;
+	for (int cycle = 0; cycle < 2; ++cycle) {
+		for (int i = 0; i < 4; ++i) {
+			r->blendSel[cycle][i] = (m >> (30 - cycle * 2 - i * 4)) & 3;
+		}
 	}
 }
 
@@ -517,8 +554,12 @@ static i4 ext9x4(i4 v) {
 // combine() through the inputs setupCombiner found, for modes without noise; color and alpha
 // keep the same 9 bits ((x & 0x1FFFF) >> 8 is (x >> 8) & 0x1FF).
 static struct Color combineInputs(const struct Stage* s) {
-	i4 a = ext9x4(input4(&s->a, s->alpha[0])), b = ext9x4(input4(&s->b, s->alpha[1]));
-	i4 m = (input4(&s->m, s->alpha[2]) << 23) >> 23, d = ext9x4(input4(&s->d, s->alpha[3]));
+	i4 a = input4(&s->a, s->alpha[0]), b = input4(&s->b, s->alpha[1]);
+	i4 m = input4(&s->m, s->alpha[2]), d = input4(&s->d, s->alpha[3]);
+	if (!s->raw) {
+		a = ext9x4(a), b = ext9x4(b), d = ext9x4(d);
+		m = (m << 23) >> 23;
+	}
 	return color((((a - b) * m + (d << 8) + 0x80) >> 8) & 0x1FF);
 }
 
@@ -527,9 +568,8 @@ static struct Color combineCycle(struct RDP* r, struct Pixel* p, int cycle) {
 }
 
 static struct Color blendColor(struct RDP* r, struct Color pixel, struct Color memory, struct Pixel* p, int cycle) {
-	uint64_t m = r->otherModes;
-	int sp = (m >> (30 - cycle * 2)) & 3, sa = (m >> (26 - cycle * 2)) & 3;
-	int sm = (m >> (22 - cycle * 2)) & 3, sb = (m >> (18 - cycle * 2)) & 3;
+	const uint8_t* sel = r->blendSel[cycle];
+	int sp = sel[0], sa = sel[1], sm = sel[2], sb = sel[3];
 	const struct Color* choices[4] = { &pixel, &memory, &r->blend, &r->fog };
 	struct Color P = *choices[sp], M = *choices[sm];
 	int a = sa == 0 ? pixel.a : sa == 1 ? r->fog.a : sa == 2 ? p->shade.a : 0;
@@ -544,27 +584,24 @@ static struct Color blendColor(struct RDP* r, struct Color pixel, struct Color m
 
 // The blender's first input (P) for a cycle, without blending.
 static struct Color blendInput(struct RDP* r, struct Color pixel, struct Color memory, int cycle) {
-	int sp = (r->otherModes >> (30 - cycle * 2)) & 3;
+	int sp = r->blendSel[cycle][0];
 	struct Color out = sp == 0 ? pixel : sp == 1 ? memory : sp == 2 ? r->blend : r->fog;
 	out.a = pixel.a;
 	return out;
 }
 
 static void shadePixel(struct N64* n, struct RDP* r, int x, int y, struct Pixel* p) {
-	uint64_t m = r->otherModes;
-	int cycleType = (m >> 52) & 3;
+	int cycleType = r->cycleType;
 	r->clocks += cycleType == 1 ? 2 : 1;
-	bool zCompare = (m >> 4) & 1, zUpdate = (m >> 5) & 1;
-	int z = (m >> 2) & 1 ? r->primZ : p->z;
+	int z = r->zPrim ? r->primZ : p->z;
 	if (z < 0) {
 		z = 0;
 	} else if (z > 0x3FFFF) {
 		z = 0x3FFFF;
 	}
-	if (r->zAddr && zCompare) {
+	if (r->zAddr && r->zCompare) {
 		int old = zDecompress(zRead(n, r, x, y));
-		int mode = (m >> 10) & 3;
-		bool pass = mode == 3 ? z <= old + 0x10 && z >= old - 0x10 : z <= old;
+		bool pass = r->zMode == 3 ? z <= old + 0x10 && z >= old - 0x10 : z <= old;
 		if (!pass) {
 			return;
 		}
@@ -578,18 +615,18 @@ static void shadePixel(struct N64* n, struct RDP* r, int x, int y, struct Pixel*
 	}
 	r->lastCombined = c;
 	c = (struct Color) { clamp9(c.r), clamp9(c.g), clamp9(c.b), clamp9(c.a) };
-	if ((m & 1) && c.a < r->blend.a) {
+	if (r->alphaCompare && c.a < r->blend.a) {
 		return;
 	}
 	// With alpha as coverage, alpha becomes the 3-bit coverage; a pixel with none isn't written.
-	if (((m >> 13) & 1) && c.a < 32) {
+	if (r->cvgAlpha && c.a < 32) {
 		return;
 	}
 	struct Color memory = readPixel(n, r, x, y);
 	// The blend formula applies only with force blend (or at partly covered edges, which aren't
 	// modelled yet); otherwise a cycle passes its first input through. In 2-cycle mode the first
 	// cycle always blends (fog), and its result is the second cycle's pixel.
-	bool force = (m >> 14) & 1;
+	bool force = r->forceBlend;
 	struct Color out = c;
 	if (cycleType == 1) {
 		struct Color first = blendColor(r, c, memory, p, 0);
@@ -598,7 +635,7 @@ static void shadePixel(struct N64* n, struct RDP* r, int x, int y, struct Pixel*
 		out = force ? blendColor(r, c, memory, p, 0) : blendInput(r, c, memory, 0);
 	}
 	writePixel(n, r, x, y, out);
-	if (r->zAddr && zUpdate) {
+	if (r->zAddr && r->zUpdate) {
 		zWrite(n, r, x, y, zCompress(z));
 	}
 }
@@ -609,7 +646,25 @@ static void fillRect(struct N64* n, struct RDP* r, int x0, int y0, int x1, int y
 	if (x1 >= x0 && y1 >= y0) {
 		r->clocks += (uint64_t) (x1 - x0 + 1) * (y1 - y0 + 1) / (r->colorSize == 3 ? 2 : 4);
 	}
+	int bytes = r->colorSize == 3 ? 4 : 2;
 	for (int y = y0; y <= y1; ++y) {
+		// A row that stays inside RDRAM, at an address the pixel size divides: big-endian stores.
+		uint32_t first = r->colorAddr + (y * r->colorWidth + x0) * bytes;
+		uint32_t last = r->colorAddr + (y * r->colorWidth + x1) * bytes + bytes - 1;
+		if (r->colorSize >= 2 && x1 >= x0 && !(r->colorAddr & (bytes - 1)) && first <= last && last < RDRAM_SIZE) {
+			uint8_t* row = &n->rdram[first];
+			if (bytes == 4) {
+				for (int x = x0; x <= x1; ++x) {
+					put32(row + (x - x0) * 4, r->fillColor);
+				}
+			} else {
+				uint16_t even = __builtin_bswap16((uint16_t) (r->fillColor >> 16)), odd = __builtin_bswap16((uint16_t) r->fillColor);
+				for (int x = x0; x <= x1; ++x) {
+					memcpy(row + (x - x0) * 2, x & 1 ? &odd : &even, 2);
+				}
+			}
+			continue;
+		}
 		for (int x = x0; x <= x1; ++x) {
 			uint32_t i = y * r->colorWidth + x;
 			if (r->colorSize == 1) {
@@ -1044,6 +1099,7 @@ void rdpRun(struct N64* n) {
 			break;
 		case 0x2F:
 			r->otherModes = c;
+			setupModes(r);
 			break;
 		case 0x30:
 			loadTlut(n, r, c);
