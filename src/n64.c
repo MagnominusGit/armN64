@@ -79,6 +79,8 @@ bool n64LoadRom(struct N64* n, const uint8_t* data, size_t size) {
 	n->useRspJit = rspJit && rspJit[0] == '1';
 #endif
 	n->useBlocks = n->useJit || (n->slice && blocks && blocks[0] == '1');
+	const char* rdpThreads = getenv("N64_RDP_THREADS");
+	n->rdpThreads = rdpThreads ? atoi(rdpThreads) : 0;
 	rspJitFree(n);
 	++n->rspCodeGen;
 	return true;
@@ -178,6 +180,7 @@ void n64RunField(struct N64* n) {
 
 // The picture the VI scans out, scaled by its X and Y scale registers, as 0x00RRGGBB.
 int n64Picture(struct N64* n, uint32_t* out, int* width, int* height) {
+	rdpWait(n);
 	uint32_t* v = n->vi.reg;
 	int type = v[0] & 3;
 	uint32_t origin = v[1] & 0xFFFFFF;

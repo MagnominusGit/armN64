@@ -92,6 +92,7 @@ struct Jit {
 	struct Miss misses[64];
 	int missCount;
 	uint8_t* leave;
+	bool rdpThreads;
 };
 
 static void exitAt(struct Jit* j, uint8_t* site, uint64_t pc, enum Kind kind, bool delay, bool skip) {
@@ -470,10 +471,15 @@ static void emitMemory(struct Jit* j, struct Slow* slow) {
 	patchHere(e, kseg0);
 	xAluI(e, X_AND, 4, R(RAX), RDRAM_SIZE - 1);
 	patchHere(e, mapped);
-	if (isStore) {
+	if (isStore || j->rdpThreads) {
 		xMovRR(e, 4, RCX, RAX);
 		xShiftI(e, X_SHR, 4, R(RCX), 12);
-		xAluI(e, X_CMP, 1, MI(RBX, RCX, 1, (int32_t) offsetof(struct N64, codePage)), 0);
+		// Stores go slow on any flag (code, RDP), loads on pages the RDP may still be drawing to.
+		if (isStore) {
+			xAluI(e, X_CMP, 1, MI(RBX, RCX, 1, (int32_t) offsetof(struct N64, pageFlags)), 0);
+		} else {
+			xTestI(e, 1, MI(RBX, RCX, 1, (int32_t) offsetof(struct N64, pageFlags)), PAGE_RDP_WRITES);
+		}
 		slow->site[slow->sites++] = xJcc(e, CC_NE, NULL);
 	}
 
@@ -624,6 +630,7 @@ void* jitCompile(struct N64* n, const uint32_t* ops, uint32_t count, uint32_t va
 	j->e = (struct Emitter) { arena + n->jitUsed, arena + n->jitUsed, arena + n->jitUsed + BLOCK_CODE_MAX };
 	j->exitCount = j->slowCount = j->missCount = 0;
 	j->leave = n->jitLeave;
+	j->rdpThreads = n->rdpThreads > 0;
 	struct Emitter* e = &j->e;
 
 	if (blockIsIdleLoop(ops, count, vaddr)) {

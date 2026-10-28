@@ -1,5 +1,7 @@
 #include "n64.h"
 
+#include <pthread.h>
+#include <stdatomic.h>
 #include <stdlib.h>
 #include <string.h>
 
@@ -51,6 +53,8 @@ struct Stage {
 	bool noise;
 	// Every input is 0-255 (or 1.0 outside the multiplier), so the 9-bit sign rules change nothing.
 	bool raw;
+	// An input is the combined value, which in the first cycle is the previous pixel's.
+	bool readsCombined;
 };
 
 struct RDP {
@@ -82,6 +86,11 @@ struct RDP {
 	uint8_t blendSel[2][4];
 	// The rows this renderer draws: y % rowCount == rowIndex (rowCount 0: none).
 	int rowIndex, rowCount;
+	// Primitives drawn so far, and the primitive, y and x of the pixel that left lastCombined, for
+	// finding the latest across renderers.
+	uint64_t seq, lastPos;
+	// Other threads drawing the commands (the main thread's state only).
+	struct Renderers* renderers;
 };
 
 static bool ownsRow(const struct RDP* r, int y) {
@@ -104,6 +113,9 @@ static struct RDP* state(struct N64* n) {
 }
 
 static uint64_t word(struct N64* n, uint32_t addr) {
+	if (!(n->dp.status & 1) && (n->pageFlags[(addr & (RDRAM_SIZE - 8)) >> 12] & PAGE_RDP_WRITES)) {
+		rdpWait(n);
+	}
 	const uint8_t* p = n->dp.status & 1 ? &n->sp.mem[addr & 0xFF8] : &n->rdram[addr & (RDRAM_SIZE - 8)];
 	return (uint64_t) be32(p) << 32 | be32(p + 4);
 }
@@ -518,6 +530,12 @@ static void setupCombiner(struct RDP* r) {
 		s->alpha[1] = alphaSource(r, cycle ? (c >> 3) & 7 : (c >> 12) & 7, false);
 		s->alpha[2] = alphaSource(r, cycle ? (c >> 18) & 7 : (c >> 41) & 7, true);
 		s->alpha[3] = alphaSource(r, cycle ? c & 7 : (c >> 9) & 7, false);
+		const int* combined = &r->pix.combined.r;
+		const int* inputs[8] = { s->a.v, s->b.v, s->m.v, s->d.v, s->alpha[0], s->alpha[1], s->alpha[2], s->alpha[3] };
+		s->readsCombined = false;
+		for (int i = 0; i < 8; ++i) {
+			s->readsCombined |= inputs[i] >= combined && inputs[i] <= combined + 3;
+		}
 		s->raw = smallInput(r, s->a.v, false) && smallInput(r, s->b.v, false) && smallInput(r, s->m.v, true) &&
 		         smallInput(r, s->d.v, false) && smallInput(r, s->alpha[0], false) && smallInput(r, s->alpha[1], false) &&
 		         smallInput(r, s->alpha[2], true) && smallInput(r, s->alpha[3], false);
@@ -620,6 +638,7 @@ static void shadePixel(struct N64* n, struct RDP* r, int x, int y, struct Pixel*
 		c = combineCycle(r, p, 1);
 	}
 	r->lastCombined = c;
+	r->lastPos = r->seq << 24 | (uint64_t) y << 12 | (uint32_t) x;
 	c = (struct Color) { clamp9(c.r), clamp9(c.g), clamp9(c.b), clamp9(c.a) };
 	if (r->alphaCompare && c.a < r->blend.a) {
 		return;
@@ -1123,6 +1142,9 @@ static uint64_t primitiveClocks(struct RDP* r, const uint64_t* w, int op) {
 // Every command but the full sync, drawing the rows r owns.
 static void execute(struct N64* n, struct RDP* r, const uint64_t* w, int op) {
 	uint64_t c = w[0];
+	if ((op >= 0x08 && op <= 0x0F) || op == 0x24 || op == 0x25 || op == 0x36) {
+		++r->seq;
+	}
 	switch (op) {
 	case 0x08:
 	case 0x09:
@@ -1249,6 +1271,338 @@ static void execute(struct N64* n, struct RDP* r, const uint64_t* w, int op) {
 	}
 }
 
+// ---- Drawing on other threads
+//
+// With N64_RDP_THREADS, renderer threads draw the commands, each the scanlines y % count == index,
+// from a copy of the command stream, each with its own RDP state. The main thread keeps the RDP's
+// time, and flags the RDRAM pages the commands draw to or read: anything else touching those
+// pages first waits for the renderers (rdpWait), so the emulation sees what drawing in place would
+// have left. In the stream, a barrier stops every renderer until all reach it: before a texture
+// load from pages drawn to since the last one, before drawing to pages loaded from, and before the
+// color or depth image changes. A primitive that needs the pixel drawn before it (the combined
+// value in the first cycle, noise) is drawn by renderer 0 alone, between barriers.
+
+enum { RING_SIZE = 1 << 18, RENDERERS_MAX = 8, ENTRY_ALONE = 1 << 16, ENTRY_BARRIER = 1 << 17 };
+
+// RDP clocks of commands to gather before waking the renderers (waits wake them at once).
+enum { WAKE_CLOCKS = 4096 };
+
+struct Renderer {
+	pthread_t thread;
+	struct Renderers* all;
+	struct RDP* rdp;
+	int index;
+	// How far through the stream it has drawn.
+	_Atomic uint64_t done;
+};
+
+struct Renderers {
+	struct N64* n;
+	int count;
+	struct Renderer renderer[RENDERERS_MAX];
+	pthread_mutex_t lock;
+	pthread_cond_t work, idle;
+	pthread_barrier_t barrier;
+	bool quit;
+	// The stream: a header word (command, words, ENTRY_*) and the command's words, and the RDP
+	// clocks of the commands put in since the renderers were last woken.
+	uint64_t ring[RING_SIZE];
+	_Atomic uint64_t written;
+	uint64_t unannounced;
+	// Pages flagged for the RDP, and pages drawn to and loaded from since the last barrier.
+	uint16_t marked[RDRAM_SIZE >> 12];
+	int markedCount;
+	uint8_t since[RDRAM_SIZE >> 12];
+	uint16_t sinceList[RDRAM_SIZE >> 12];
+	int sinceCount;
+};
+
+enum { SINCE_DRAWN = 1, SINCE_LOADED = 2 };
+
+static uint64_t oldestDone(struct Renderers* all) {
+	uint64_t done = UINT64_MAX;
+	for (int i = 0; i < all->count; ++i) {
+		uint64_t d = atomic_load_explicit(&all->renderer[i].done, memory_order_acquire);
+		done = d < done ? d : done;
+	}
+	return done;
+}
+
+static void wake(struct Renderers* all) {
+	pthread_mutex_lock(&all->lock);
+	pthread_cond_broadcast(&all->work);
+	pthread_mutex_unlock(&all->lock);
+	all->unannounced = 0;
+}
+
+// Wakes the renderers and waits until all have drawn up to pos.
+static void waitFor(struct Renderers* all, uint64_t pos) {
+	all->unannounced = 0;
+	pthread_mutex_lock(&all->lock);
+	pthread_cond_broadcast(&all->work);
+	while (oldestDone(all) < pos) {
+		pthread_cond_wait(&all->idle, &all->lock);
+	}
+	pthread_mutex_unlock(&all->lock);
+}
+
+// Draws a primitive that depends on the pixel before it: renderer 0 draws every row, after taking
+// the latest combiner output from the others; the rest only follow its state changes.
+static void drawAlone(struct Renderer* me, const uint64_t* w, int op) {
+	struct Renderers* all = me->all;
+	struct RDP* r = me->rdp;
+	int rows = r->rowCount;
+	pthread_barrier_wait(&all->barrier);
+	if (me->index == 0) {
+		for (int i = 1; i < all->count; ++i) {
+			struct RDP* other = all->renderer[i].rdp;
+			if (other->lastPos > r->lastPos) {
+				r->lastPos = other->lastPos;
+				r->lastCombined = other->lastCombined;
+			}
+		}
+		r->rowCount = 1;
+	} else {
+		r->rowCount = 0;
+	}
+	execute(all->n, r, w, op);
+	r->rowCount = rows;
+	pthread_barrier_wait(&all->barrier);
+}
+
+static void* rendererMain(void* arg) {
+	struct Renderer* me = arg;
+	struct Renderers* all = me->all;
+	uint64_t pos = 0;
+	for (;;) {
+		if (pos == atomic_load_explicit(&all->written, memory_order_acquire)) {
+			pthread_mutex_lock(&all->lock);
+			atomic_store_explicit(&me->done, pos, memory_order_release);
+			pthread_cond_broadcast(&all->idle);
+			while (!all->quit && pos == atomic_load_explicit(&all->written, memory_order_acquire)) {
+				pthread_cond_wait(&all->work, &all->lock);
+			}
+			bool quit = all->quit && pos == atomic_load_explicit(&all->written, memory_order_acquire);
+			pthread_mutex_unlock(&all->lock);
+			if (quit) {
+				return NULL;
+			}
+			continue;
+		}
+		uint64_t header = all->ring[pos % RING_SIZE];
+		int words = (header >> 8) & 0xFF, op = header & 0x3F;
+		uint64_t w[22];
+		for (int i = 0; i < words; ++i) {
+			w[i] = all->ring[(pos + 1 + i) % RING_SIZE];
+		}
+		if (header & ENTRY_BARRIER) {
+			pthread_barrier_wait(&all->barrier);
+		} else if (header & ENTRY_ALONE) {
+			drawAlone(me, w, op);
+		} else {
+			execute(all->n, me->rdp, w, op);
+		}
+		pos += 1 + words;
+		atomic_store_explicit(&me->done, pos, memory_order_release);
+	}
+}
+
+static struct Renderers* startRenderers(struct N64* n, struct RDP* r) {
+	struct Renderers* all = calloc(1, sizeof(*all));
+	if (!all) {
+		return NULL;
+	}
+	all->n = n;
+	all->count = n->rdpThreads < RENDERERS_MAX ? n->rdpThreads : RENDERERS_MAX;
+	pthread_mutex_init(&all->lock, NULL);
+	pthread_cond_init(&all->work, NULL);
+	pthread_cond_init(&all->idle, NULL);
+	pthread_barrier_init(&all->barrier, NULL, all->count);
+	for (int i = 0; i < all->count; ++i) {
+		struct Renderer* me = &all->renderer[i];
+		me->all = all;
+		me->index = i;
+		me->rdp = malloc(sizeof(struct RDP));
+		memcpy(me->rdp, r, sizeof(struct RDP));
+		me->rdp->renderers = NULL;
+		me->rdp->rowIndex = i;
+		me->rdp->rowCount = all->count;
+		setupCombiner(me->rdp);
+		pthread_create(&me->thread, NULL, rendererMain, me);
+	}
+	return all;
+}
+
+static void stopRenderers(struct Renderers* all) {
+	pthread_mutex_lock(&all->lock);
+	all->quit = true;
+	pthread_cond_broadcast(&all->work);
+	pthread_mutex_unlock(&all->lock);
+	for (int i = 0; i < all->count; ++i) {
+		pthread_join(all->renderer[i].thread, NULL);
+		free(all->renderer[i].rdp);
+	}
+	pthread_barrier_destroy(&all->barrier);
+	pthread_cond_destroy(&all->idle);
+	pthread_cond_destroy(&all->work);
+	pthread_mutex_destroy(&all->lock);
+	free(all);
+}
+
+void rdpWait(struct N64* n) {
+	if (!n->rdpPending) {
+		return;
+	}
+	struct Renderers* all = n->rdp->renderers;
+	waitFor(all, atomic_load_explicit(&all->written, memory_order_relaxed));
+	for (int i = 0; i < all->markedCount; ++i) {
+		n->pageFlags[all->marked[i]] &= ~PAGE_RDP;
+	}
+	all->markedCount = 0;
+	for (int i = 0; i < all->sinceCount; ++i) {
+		all->since[all->sinceList[i]] = 0;
+	}
+	all->sinceCount = 0;
+	n->rdpPending = false;
+}
+
+static void put(struct Renderers* all, uint64_t header, const uint64_t* w, int words) {
+	uint64_t pos = atomic_load_explicit(&all->written, memory_order_relaxed);
+	if (pos + 1 + words - oldestDone(all) > RING_SIZE) {
+		waitFor(all, pos + 1 + words - RING_SIZE);
+	}
+	all->ring[pos % RING_SIZE] = header | (uint64_t) words << 8;
+	for (int i = 0; i < words; ++i) {
+		all->ring[(pos + 1 + i) % RING_SIZE] = w[i];
+	}
+	atomic_store_explicit(&all->written, pos + 1 + words, memory_order_release);
+}
+
+static void barrier(struct Renderers* all) {
+	put(all, ENTRY_BARRIER, NULL, 0);
+	for (int i = 0; i < all->sinceCount; ++i) {
+		all->since[all->sinceList[i]] = 0;
+	}
+	all->sinceCount = 0;
+}
+
+// The pages of RDRAM [addr, addr + len), wrapping.
+#define FOR_PAGES(addr, len, p) \
+	for (uint32_t p = ((addr) & (RDRAM_SIZE - 1)) >> 12, p##End = ((addr) + (len) - 1) & (RDRAM_SIZE - 1), p##Done = 0; !p##Done; \
+	     p##Done = p == p##End >> 12, p = (p + 1) & ((RDRAM_SIZE >> 12) - 1))
+
+// Whether any page in the range was drawn to (or loaded from) since the last barrier.
+static bool touchedSince(struct Renderers* all, uint32_t addr, uint32_t len, int what) {
+	FOR_PAGES(addr, len, p) {
+		if (all->since[p] & what) {
+			return true;
+		}
+	}
+	return false;
+}
+
+static void mark(struct N64* n, struct Renderers* all, uint32_t addr, uint32_t len, uint8_t flag, int what) {
+	FOR_PAGES(addr, len, p) {
+		if (!(n->pageFlags[p] & PAGE_RDP)) {
+			all->marked[all->markedCount++] = (uint16_t) p;
+		}
+		n->pageFlags[p] |= flag;
+		if (!all->since[p]) {
+			all->sinceList[all->sinceCount++] = (uint16_t) p;
+		}
+		all->since[p] |= what;
+	}
+	n->rdpPending = true;
+}
+
+// The RDRAM a texture load reads, as loadTile and loadTlut address it (rounded up a little).
+static void loadSource(struct RDP* r, const uint64_t* w, int op, uint32_t* addr, uint32_t* len) {
+	uint64_t c = w[0];
+	int sl = (c >> 44) & 0xFFF, tl = (c >> 32) & 0xFFF, sh = (c >> 12) & 0xFFF, th = c & 0xFFF;
+	uint32_t bpp = r->texSize == 0 ? 0 : 1u << (r->texSize - 1);
+	if (op == 0x30) {
+		*addr = r->texAddr + (uint32_t) (sl >> 2) * 2;
+		*len = (uint32_t) ((sh >> 2) - (sl >> 2) + 1) * 2;
+	} else if (op == 0x33) {
+		uint32_t count = (uint32_t) (sh - sl + 1);
+		*addr = r->texAddr + (tl * r->texWidth + sl) * bpp;
+		*len = (r->texSize == 0 ? (count + 1) / 2 : count * bpp) + 8;
+	} else {
+		uint32_t row = r->texWidth * (bpp ? bpp : 1);
+		uint32_t t0 = (uint32_t) (tl >> 2), t1 = (uint32_t) (th >> 2);
+		*addr = r->texAddr + t0 * row;
+		*len = (t1 - t0) * row + ((uint32_t) (sh >> 2) + 1) * 4 + 8;
+	}
+	if (*len > RDRAM_SIZE) {
+		*len = RDRAM_SIZE;
+	}
+}
+
+// The scanlines a primitive may draw on, first to last.
+static void primitiveRows(struct RDP* r, const uint64_t* w, int op, int* y0, int* y1) {
+	int x0, x1;
+	if (op >= 0x08 && op <= 0x0F) {
+		struct Edges e = edges(w);
+		int end;
+		triangleRows(r, &e, y0, &end);
+		*y1 = end - 1;
+	} else if (op == 0x24 || op == 0x25) {
+		int cx0, cy0;
+		textureRectBounds(r, w[0], &cx0, &cy0, &x0, y0, &x1, y1);
+	} else {
+		x1 = ((w[0] >> 44) & 0xFFF) >> 2, *y1 = ((w[0] >> 32) & 0xFFF) >> 2;
+		x0 = ((w[0] >> 12) & 0xFFF) >> 2, *y0 = (w[0] & 0xFFF) >> 2;
+		clipRect(r, &x0, y0, &x1, y1);
+	}
+}
+
+// Hands a command to the renderers, with the barriers and flags it needs.
+static void submit(struct N64* n, struct RDP* r, const uint64_t* w, int op, int words) {
+	struct Renderers* all = r->renderers;
+	uint64_t header = (uint64_t) op;
+	if ((op == 0x3E || op == 0x3F) && all->sinceCount) {
+		barrier(all);
+	} else if (op == 0x30 || op == 0x33 || op == 0x34) {
+		uint32_t addr, len;
+		loadSource(r, w, op, &addr, &len);
+		if (touchedSince(all, addr, len, SINCE_DRAWN)) {
+			barrier(all);
+		}
+		mark(n, all, addr, len, PAGE_RDP_READS, SINCE_LOADED);
+	} else if ((op >= 0x08 && op <= 0x0F) || op == 0x24 || op == 0x25 || op == 0x36) {
+		int y0, y1;
+		primitiveRows(r, w, op, &y0, &y1);
+		uint32_t bpp = r->colorSize == 1 ? 1 : r->colorSize == 3 ? 4 : 2;
+		uint32_t right = (uint32_t) ((r->scissorX1 >> 2) + 1);
+		bool depth = r->zAddr && (r->zCompare || r->zUpdate);
+		if (y1 >= y0) {
+			uint32_t color = r->colorAddr + (uint32_t) y0 * r->colorWidth * bpp;
+			uint32_t colorLen = (uint32_t) (y1 - y0) * r->colorWidth * bpp + right * bpp;
+			uint32_t z = r->zAddr + (uint32_t) y0 * r->colorWidth * 2;
+			uint32_t zLen = (uint32_t) (y1 - y0) * r->colorWidth * 2 + right * 2;
+			if (touchedSince(all, color, colorLen, SINCE_LOADED) || (depth && touchedSince(all, z, zLen, SINCE_LOADED))) {
+				barrier(all);
+			}
+			mark(n, all, color, colorLen, PAGE_RDP_WRITES, SINCE_DRAWN);
+			if (depth) {
+				mark(n, all, z, zLen, PAGE_RDP_WRITES, SINCE_DRAWN);
+			}
+			// Rows that run into each other, or depth and color images that overlap row for
+			// different rows, can't be split between renderers.
+			bool overlap = depth && r->zAddr != r->colorAddr && z < color + colorLen && color < z + zLen;
+			if (right - 1 > r->colorWidth || overlap) {
+				header |= ENTRY_ALONE;
+			}
+		}
+		bool shades = !(op == 0x36 && r->cycleType == 3) && !((op == 0x24 || op == 0x25) && r->cycleType == 2);
+		const struct Stage* first = &r->stage[r->cycleType == 1 ? 0 : 1];
+		if (shades && (first->readsCombined || first->noise || (r->cycleType == 1 && r->stage[1].noise))) {
+			header |= ENTRY_ALONE;
+		}
+	}
+	put(all, header, w, words);
+}
+
 // Runs the commands from DP_CURRENT to DP_END, keeping the RDP's time: a full sync interrupts the CPU
 // once the commands before it would be done.
 void rdpRun(struct N64* n) {
@@ -1256,6 +1610,9 @@ void rdpRun(struct N64* n) {
 		return;
 	}
 	struct RDP* r = state(n);
+	if (n->rdpThreads && !r->renderers) {
+		r->renderers = startRenderers(n, r);
+	}
 	uint64_t begin = n->dp.busyUntil > n->cycles ? n->dp.busyUntil : n->cycles;
 	r->clocks = 0;
 	while (n->dp.current < n->dp.end) {
@@ -1279,13 +1636,31 @@ void rdpRun(struct N64* n) {
 			n64Event(n, n->dp.syncAt);
 			continue;
 		}
-		r->clocks += primitiveClocks(r, w, op);
-		execute(n, r, w, op);
+		uint64_t clocks = primitiveClocks(r, w, op);
+		r->clocks += clocks;
+		if (!r->renderers) {
+			execute(n, r, w, op);
+			continue;
+		}
+		submit(n, r, w, op, words);
+		r->renderers->unannounced += clocks;
+		// The main thread keeps the state the cost model and the flags need; it draws nothing.
+		bool draws = (op >= 0x08 && op <= 0x0F) || op == 0x24 || op == 0x25 || op == 0x36;
+		if (!draws && op != 0x30 && op != 0x33 && op != 0x34) {
+			execute(n, r, w, op);
+		}
+	}
+	if (r->renderers && r->renderers->unannounced >= WAKE_CLOCKS) {
+		wake(r->renderers);
 	}
 	n->dp.busyUntil = begin + r->clocks * 3 / 2;
 }
 
 void rdpDestroy(struct N64* n) {
+	if (n->rdp && n->rdp->renderers) {
+		rdpWait(n);
+		stopRenderers(n->rdp->renderers);
+	}
 	free(n->rdp);
 	n->rdp = NULL;
 }

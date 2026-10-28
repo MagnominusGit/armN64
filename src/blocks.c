@@ -47,7 +47,7 @@ void blocksInvalidatePage(struct N64* n, uint32_t page) {
 		free(t);
 		n->blockPage[page] = NULL;
 	}
-	n->codePage[page] = 0;
+	n->pageFlags[page] &= ~PAGE_CODE;
 	++n->blockGen;
 }
 
@@ -141,7 +141,7 @@ void blocksRun(struct N64* n) {
 				continue;
 			}
 			t[(paddr >> 2) & (PAGE_WORDS - 1)] = b;
-			n->codePage[page] = 1;
+			n->pageFlags[page] |= PAGE_CODE;
 		}
 		if (b->code) {
 			*je = (struct JitEntry) { v, n->blockGen, b->code };

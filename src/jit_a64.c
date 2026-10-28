@@ -9,7 +9,7 @@
 // takes the cycle count to the limit.
 //
 // Registers: x19 = n, x20 = &n->cpu, x21 = n->cycles, x22 = the limit, x23 = RDRAM, x24 = jitTable,
-// x25 = tlbCache, x26 = codePage, x27 = cpu.dcacheTag, x28 = cpu.dcacheDirty. Each block starts with
+// x25 = tlbCache, x26 = pageFlags, x27 = cpu.dcacheTag, x28 = cpu.dcacheDirty. Each block starts with
 // a branch to the way out, for the conditional branches that can't reach it.
 
 enum { ARENA_SIZE = 32 << 20, BLOCK_CODE_MAX = 32 << 10, SHARED_SIZE = 256 };
@@ -132,6 +132,7 @@ struct Jit {
 	struct Miss misses[64];
 	int missCount;
 	uint8_t* leave;
+	bool rdpThreads;
 };
 
 static void exitAt(struct Jit* j, uint8_t* site, uint64_t pc, enum Kind kind, bool delay, bool skip) {
@@ -524,10 +525,11 @@ static void emitMemory(struct Jit* j, struct Slow* slow) {
 	patchHere(e, kseg0);
 	aAndBits(e, 0, 0, 0, 23);
 	patchHere(e, mapped);
-	if (isStore) {
+	// Stores go slow on any flag (code, RDP), loads on pages the RDP may still be drawing to.
+	if (isStore || j->rdpThreads) {
 		aLsrImm(e, 1, 0, 12);
 		aLdst(e, L_LDRB, 1, CODE, 1, L_UXTW);
-		slow->site[slow->sites++] = aCbnz(e, 1, NULL);
+		slow->site[slow->sites++] = isStore ? aCbnz(e, 1, NULL) : aTbnz(e, 1, 1, NULL);
 	}
 
 	// The line index from the virtual address, the tag from the physical one.
@@ -639,7 +641,7 @@ static uint8_t* arenaGet(struct N64* n) {
 	loadN(&e, RAM, N64_OFF(rdram), 8);
 	aAddImmX(&e, TABLE, N, N64_OFF(jitTable));
 	aAddImmX(&e, TLB, N, N64_OFF(tlbCache));
-	aAddImmX(&e, CODE, N, N64_OFF(codePage));
+	aAddImmX(&e, CODE, N, N64_OFF(pageFlags));
 	aAddImmX(&e, DTAG, CPU, CPU_OFF(dcacheTag));
 	aAddImmX(&e, DIRTY, CPU, CPU_OFF(dcacheDirty));
 	aBr(&e, 1);
@@ -684,6 +686,7 @@ void* jitCompile(struct N64* n, const uint32_t* ops, uint32_t count, uint32_t va
 	uint8_t* start = arena + n->jitUsed;
 	j->e = (struct Emitter) { start, start, start + BLOCK_CODE_MAX };
 	j->exitCount = j->slowCount = j->missCount = 0;
+	j->rdpThreads = n->rdpThreads > 0;
 	struct Emitter* e = &j->e;
 	j->leave = e->p;
 	aB(e, n->jitLeave);

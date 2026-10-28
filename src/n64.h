@@ -119,6 +119,9 @@ struct SI {
 
 struct RDP;
 
+// Per 4 KB page of RDRAM: it holds compiled code, or RDP commands not yet drawn write or read it.
+enum { PAGE_CODE = 1, PAGE_RDP_WRITES = 2, PAGE_RDP_READS = 4, PAGE_RDP = 6 };
+
 // Compiled RSP code for an IMEM address, good while rspCodeGen is unchanged.
 struct RspJitEntry {
 	uint32_t gen;
@@ -171,9 +174,9 @@ struct N64 {
 	bool catchingUp;
 	uint64_t nextVi;
 	// Instruction blocks (blocks.c): one table of blocks per 4 KB RDRAM page that has any, and
-	// per page whether it does (a write there throws them away).
+	// what each page holds (PAGE_*): a write to compiled code throws it away.
 	struct Block** blockPage[RDRAM_SIZE >> 12];
-	uint8_t codePage[RDRAM_SIZE >> 12];
+	uint8_t pageFlags[RDRAM_SIZE >> 12];
 	uint32_t blockGen;
 	bool useBlocks;
 	// Compiled blocks (jit_x64.c): the code arena, how far compiled code may run, and the code
@@ -197,6 +200,9 @@ struct N64 {
 	uint32_t rspCodeGen;
 	struct RspJitEntry rspTable[1024];
 	struct RspBlock* rspVariants[1024];
+	// RDP threads (N64_RDP_THREADS), and whether they have commands not yet drawn.
+	int rdpThreads;
+	bool rdpPending;
 	// CPU cycles per video field: 60 fields a second for NTSC and MPAL, 50 for PAL.
 	uint64_t fieldCycles;
 	uint64_t fields;
@@ -256,12 +262,36 @@ bool blockIsIdleLoop(const uint32_t* ops, uint32_t count, uint32_t vaddr);
 void* jitCompile(struct N64*, const uint32_t* ops, uint32_t count, uint32_t vaddr, uint32_t paddr);
 void jitReset(struct N64*);
 void jitFree(struct N64*);
-// Code may have been written: RDRAM [addr, addr + len).
-static inline void n64CodeWrite(struct N64* n, uint32_t addr, uint32_t len) {
+// rdp.c: waits for RDP commands still being drawn by other threads.
+void rdpWait(struct N64*);
+
+// RDRAM [addr, addr + len) is about to be written: throws away code there, and waits for RDP
+// commands that draw there or read it.
+static inline void n64RdramWrite(struct N64* n, uint32_t addr, uint32_t len) {
 	uint32_t first = (addr & (RDRAM_SIZE - 1)) >> 12, last = ((addr + len - 1) & (RDRAM_SIZE - 1)) >> 12;
 	for (uint32_t p = first;; p = (p + 1) & ((RDRAM_SIZE >> 12) - 1)) {
-		if (n->codePage[p]) {
+		if (n->pageFlags[p] & PAGE_RDP) {
+			rdpWait(n);
+		}
+		if (n->pageFlags[p] & PAGE_CODE) {
 			blocksInvalidatePage(n, p);
+		}
+		if (p == last) {
+			break;
+		}
+	}
+}
+
+// RDRAM [addr, addr + len) is about to be read: waits for RDP commands that draw there.
+static inline void n64RdramRead(struct N64* n, uint32_t addr, uint32_t len) {
+	if (!n->rdpPending) {
+		return;
+	}
+	uint32_t first = (addr & (RDRAM_SIZE - 1)) >> 12, last = ((addr + len - 1) & (RDRAM_SIZE - 1)) >> 12;
+	for (uint32_t p = first;; p = (p + 1) & ((RDRAM_SIZE >> 12) - 1)) {
+		if (n->pageFlags[p] & PAGE_RDP_WRITES) {
+			rdpWait(n);
+			return;
 		}
 		if (p == last) {
 			break;
