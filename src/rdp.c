@@ -80,7 +80,13 @@ struct RDP {
 	int cycleType, zMode;
 	bool zCompare, zUpdate, zPrim, alphaCompare, cvgAlpha, forceBlend;
 	uint8_t blendSel[2][4];
+	// The rows this renderer draws: y % rowCount == rowIndex (rowCount 0: none).
+	int rowIndex, rowCount;
 };
+
+static bool ownsRow(const struct RDP* r, int y) {
+	return r->rowCount == 1 || (r->rowCount && (uint32_t) y % (uint32_t) r->rowCount == (uint32_t) r->rowIndex);
+}
 
 static void setupCombiner(struct RDP* r);
 static void setupModes(struct RDP* r);
@@ -89,6 +95,7 @@ static struct RDP* state(struct N64* n) {
 	if (!n->rdp) {
 		n->rdp = calloc(1, sizeof(struct RDP));
 		if (n->rdp) {
+			n->rdp->rowCount = 1;
 			setupCombiner(n->rdp);
 			setupModes(n->rdp);
 		}
@@ -592,7 +599,6 @@ static struct Color blendInput(struct RDP* r, struct Color pixel, struct Color m
 
 static void shadePixel(struct N64* n, struct RDP* r, int x, int y, struct Pixel* p) {
 	int cycleType = r->cycleType;
-	r->clocks += cycleType == 1 ? 2 : 1;
 	int z = r->zPrim ? r->primZ : p->z;
 	if (z < 0) {
 		z = 0;
@@ -643,11 +649,11 @@ static void shadePixel(struct N64* n, struct RDP* r, int x, int y, struct Pixel*
 // ---- Primitives
 
 static void fillRect(struct N64* n, struct RDP* r, int x0, int y0, int x1, int y1) {
-	if (x1 >= x0 && y1 >= y0) {
-		r->clocks += (uint64_t) (x1 - x0 + 1) * (y1 - y0 + 1) / (r->colorSize == 3 ? 2 : 4);
-	}
 	int bytes = r->colorSize == 3 ? 4 : 2;
 	for (int y = y0; y <= y1; ++y) {
+		if (!ownsRow(r, y)) {
+			continue;
+		}
 		// A row that stays inside RDRAM, at an address the pixel size divides: big-endian stores.
 		uint32_t first = r->colorAddr + (y * r->colorWidth + x0) * bytes;
 		uint32_t last = r->colorAddr + (y * r->colorWidth + x1) * bytes + bytes - 1;
@@ -776,24 +782,34 @@ static int levelOfDetail(struct RDP* r, int primTile, int s, int t, int sx, int 
 	return frac;
 }
 
-static void textureRect(struct N64* n, struct RDP* r, uint64_t w0, uint64_t w1, bool flip) {
-	int xl = (w0 >> 44) & 0xFFF, yl = (w0 >> 32) & 0xFFF, tile = (w0 >> 24) & 7;
+// A texture rectangle's first pixel, and its pixels after the scissor.
+static void textureRectBounds(struct RDP* r, uint64_t w0, int* cx0, int* cy0, int* x0, int* y0, int* x1, int* y1) {
+	int xl = (w0 >> 44) & 0xFFF, yl = (w0 >> 32) & 0xFFF;
 	int xh = (w0 >> 12) & 0xFFF, yh = w0 & 0xFFF;
+	int cycleType = (r->otherModes >> 52) & 3;
+	*cx0 = *x0 = xh >> 2;
+	*cy0 = *y0 = yh >> 2;
+	*x1 = cycleType >= 2 ? xl >> 2 : ((xl + 3) >> 2) - 1;
+	*y1 = cycleType >= 2 ? yl >> 2 : ((yl + 3) >> 2) - 1;
+	clipRect(r, x0, y0, x1, y1);
+}
+
+static void textureRect(struct N64* n, struct RDP* r, uint64_t w0, uint64_t w1, bool flip) {
+	int tile = (w0 >> 24) & 7;
 	int s0 = (int16_t) (w1 >> 48), t0 = (int16_t) (w1 >> 32);
 	int dsdx = (int16_t) (w1 >> 16), dtdy = (int16_t) w1;
 	int cycleType = (r->otherModes >> 52) & 3;
-	int x0 = xh >> 2, y0 = yh >> 2;
-	int x1 = cycleType >= 2 ? xl >> 2 : ((xl + 3) >> 2) - 1;
-	int y1 = cycleType >= 2 ? yl >> 2 : ((yl + 3) >> 2) - 1;
 	if (cycleType == 2) {
 		dsdx /= 4;
 	}
-	int cx0 = x0, cy0 = y0;
-	clipRect(r, &x0, &y0, &x1, &y1);
-	uint64_t copied = 0;
+	int cx0, cy0, x0, y0, x1, y1;
+	textureRectBounds(r, w0, &cx0, &cy0, &x0, &y0, &x1, &y1);
 	r->maxLevel = 0;
 	bool doLod = cycleType < 2 && (((r->otherModes >> 48) & 1) || lodFracUsed(r));
 	for (int y = y0; y <= y1; ++y) {
+		if (!ownsRow(r, y)) {
+			continue;
+		}
 		for (int x = x0; x <= x1; ++x) {
 			int dx = x - cx0, dy = y - cy0;
 			int s = ((s0 << 5) + (flip ? dy * dsdx : dx * dsdx)) >> 5;
@@ -809,7 +825,6 @@ static void textureRect(struct N64* n, struct RDP* r, uint64_t w0, uint64_t w1, 
 			p->tex0 = sample(r, t1, s, t);
 			p->tex1 = cycleType == 1 ? sample(r, t2, s, t) : p->tex0;
 			if (cycleType == 2) {
-				++copied;
 				if ((r->otherModes & 1) && p->tex0.a == 0) {
 					continue;
 				}
@@ -830,22 +845,66 @@ static void textureRect(struct N64* n, struct RDP* r, uint64_t w0, uint64_t w1, 
 			shadePixel(n, r, x, y, p);
 		}
 	}
-	r->clocks += copied / 4;
 }
 
 static int32_t fix(uint64_t w, int shift) {
 	return (int32_t) (uint32_t) (w >> shift);
 }
 
+// A triangle's edges: the y of its bottom, middle and top in quarter lines, and x and its slope
+// along the low, high (major) and middle edges.
+struct Edges {
+	int yl, ym, yh;
+	int64_t xl, dxl, xh, dxh, xm, dxm;
+};
+
+static struct Edges edges(const uint64_t* w) {
+	return (struct Edges) {
+		.yl = ((int32_t) ((w[0] >> 32) & 0x3FFF) << 18) >> 18,
+		.ym = ((int32_t) ((w[0] >> 16) & 0x3FFF) << 18) >> 18,
+		.yh = ((int32_t) (w[0] & 0x3FFF) << 18) >> 18,
+		.xl = fix(w[1], 32), .dxl = fix(w[1], 0),
+		.xh = fix(w[2], 32), .dxh = fix(w[2], 0),
+		.xm = fix(w[3], 32), .dxm = fix(w[3], 0),
+	};
+}
+
+// The first and past-the-last scanline a triangle may cover inside the scissor.
+static void triangleRows(const struct RDP* r, const struct Edges* t, int* first, int* end) {
+	int top = t->yh < r->scissorY0 ? r->scissorY0 : t->yh;
+	int bottom = t->yl > r->scissorY1 ? r->scissorY1 : t->yl;
+	*first = (top + 3) >> 2;
+	*end = (bottom + 3) >> 2;
+}
+
+// The pixels a triangle covers on scanline y (none if x1 < x0); false if it misses the line.
+static bool span(const struct RDP* r, const struct Edges* t, int y, int* x0, int* x1) {
+	// Edges are evaluated at the middle of the scanline, in quarter lines.
+	int64_t q = (int64_t) y * 4 + 2;
+	if (q < t->yh || q >= t->yl) {
+		return false;
+	}
+	int64_t dy = q - (t->yh & ~3);
+	int64_t major = t->xh + t->dxh * dy / 4;
+	int64_t minor = q < t->ym ? t->xm + t->dxm * dy / 4 : t->xl + t->dxl * (q - t->ym) / 4;
+	int64_t left = major < minor ? major : minor, right = major < minor ? minor : major;
+	*x0 = (int) ((left + 0xFFFF) >> 16);
+	*x1 = (int) ((right + 0xFFFF) >> 16) - 1;
+	if (*x0 < r->scissorX0 >> 2) {
+		*x0 = r->scissorX0 >> 2;
+	}
+	if (*x1 > (r->scissorX1 >> 2) - 1) {
+		*x1 = (r->scissorX1 >> 2) - 1;
+	}
+	return true;
+}
+
 static void triangle(struct N64* n, struct RDP* r, const uint64_t* w, int op) {
 	bool shade = op & 4, tex = op & 2, zbuf = op & 1;
 	int tile = (w[0] >> 48) & 7;
-	int yl = ((int32_t) ((w[0] >> 32) & 0x3FFF) << 18) >> 18;
-	int ym = ((int32_t) ((w[0] >> 16) & 0x3FFF) << 18) >> 18;
-	int yh = ((int32_t) (w[0] & 0x3FFF) << 18) >> 18;
-	int64_t xl = fix(w[1], 32), dxl = fix(w[1], 0);
-	int64_t xh = fix(w[2], 32), dxh = fix(w[2], 0);
-	int64_t xm = fix(w[3], 32), dxm = fix(w[3], 0);
+	struct Edges e = edges(w);
+	int64_t xh = e.xh, dxh = e.dxh;
+	int yh = e.yh;
 	int idx = 4;
 	int64_t sv[4] = { 0 }, sdx[4] = { 0 }, sde[4] = { 0 };
 	int64_t tv[3] = { 0 }, tdx[3] = { 0 }, tde[3] = { 0 }, tdy[3] = { 0 };
@@ -878,25 +937,15 @@ static void triangle(struct N64* n, struct RDP* r, const uint64_t* w, int op) {
 	}
 	int cycleType = (r->otherModes >> 52) & 3;
 	bool persp = (r->otherModes >> 51) & 1;
-	int top = yh < r->scissorY0 ? r->scissorY0 : yh;
-	int bottom = yl > r->scissorY1 ? r->scissorY1 : yl;
-	for (int y = (top + 3) >> 2; y < (bottom + 3) >> 2; ++y) {
-		// Edges and attributes are evaluated at the middle of the scanline, in quarter lines.
-		int64_t q = (int64_t) y * 4 + 2;
-		if (q < yh || q >= yl) {
+	int first, end;
+	triangleRows(r, &e, &first, &end);
+	for (int y = first; y < end; ++y) {
+		int x0, x1;
+		if (!ownsRow(r, y) || !span(r, &e, y, &x0, &x1)) {
 			continue;
 		}
-		int64_t dy = q - (yh & ~3);
-		int64_t major = xh + dxh * dy / 4;
-		int64_t minor = q < ym ? xm + dxm * dy / 4 : xl + dxl * (q - ym) / 4;
-		int64_t left = major < minor ? major : minor, right = major < minor ? minor : major;
-		int x0 = (int) ((left + 0xFFFF) >> 16), x1 = (int) ((right + 0xFFFF) >> 16) - 1;
-		if (x0 < r->scissorX0 >> 2) {
-			x0 = r->scissorX0 >> 2;
-		}
-		if (x1 > (r->scissorX1 >> 2) - 1) {
-			x1 = (r->scissorX1 >> 2) - 1;
-		}
+		// Attributes too are evaluated at the middle of the scanline.
+		int64_t dy = (int64_t) y * 4 + 2 - (yh & ~3);
 		int64_t ey = dy / 4;
 		// Each attribute at x0, then plus its x gradient a pixel (x moves dx by whole 65536s, so the
 		// shifted products step exactly).
@@ -1036,8 +1085,172 @@ static int commandWords(int op) {
 	return op == 0x24 || op == 0x25 ? 2 : 1;
 }
 
-// Rough cost model: one or two clocks a pixel by cycle type, four pixels a clock to fill or copy,
-// and a fixed setup per primitive. A full sync interrupts the CPU once that time has passed.
+// The RDP's time for a primitive, from its shape alone: one or two clocks a pixel by cycle type,
+// four pixels a clock to fill or copy, and a fixed setup per triangle and texture rectangle.
+static uint64_t primitiveClocks(struct RDP* r, const uint64_t* w, int op) {
+	int perPixel = r->cycleType == 1 ? 2 : 1;
+	if (op >= 0x08 && op <= 0x0F) {
+		struct Edges e = edges(w);
+		uint64_t pixels = 0;
+		int first, end;
+		triangleRows(r, &e, &first, &end);
+		for (int y = first; y < end; ++y) {
+			int x0, x1;
+			if (span(r, &e, y, &x0, &x1) && x1 >= x0) {
+				pixels += (uint64_t) (x1 - x0 + 1);
+			}
+		}
+		return pixels * perPixel + 20;
+	}
+	int x0, y0, x1, y1;
+	if (op == 0x24 || op == 0x25) {
+		int cx0, cy0;
+		textureRectBounds(r, w[0], &cx0, &cy0, &x0, &y0, &x1, &y1);
+	} else if (op == 0x36) {
+		x1 = ((w[0] >> 44) & 0xFFF) >> 2, y1 = ((w[0] >> 32) & 0xFFF) >> 2;
+		x0 = ((w[0] >> 12) & 0xFFF) >> 2, y0 = (w[0] & 0xFFF) >> 2;
+		clipRect(r, &x0, &y0, &x1, &y1);
+	} else {
+		return 0;
+	}
+	uint64_t pixels = x1 >= x0 && y1 >= y0 ? (uint64_t) (x1 - x0 + 1) * (y1 - y0 + 1) : 0;
+	if (op == 0x36) {
+		return r->cycleType == 3 ? pixels / (r->colorSize == 3 ? 2 : 4) : pixels * perPixel;
+	}
+	return (r->cycleType == 2 ? pixels / 4 : pixels * perPixel) + 10;
+}
+
+// Every command but the full sync, drawing the rows r owns.
+static void execute(struct N64* n, struct RDP* r, const uint64_t* w, int op) {
+	uint64_t c = w[0];
+	switch (op) {
+	case 0x08:
+	case 0x09:
+	case 0x0A:
+	case 0x0B:
+	case 0x0C:
+	case 0x0D:
+	case 0x0E:
+	case 0x0F:
+		triangle(n, r, w, op);
+		break;
+	case 0x24:
+	case 0x25:
+		textureRect(n, r, w[0], w[1], op == 0x25);
+		break;
+	case 0x2C:
+		r->k4 = (c >> 9) & 0x1FF;
+		r->k5 = c & 0x1FF;
+		break;
+	case 0x2D:
+		r->scissorX0 = (c >> 44) & 0xFFF;
+		r->scissorY0 = (c >> 32) & 0xFFF;
+		r->scissorX1 = (c >> 12) & 0xFFF;
+		r->scissorY1 = c & 0xFFF;
+		break;
+	case 0x2E:
+		r->primZ = (int) ((c >> 16) & 0x7FFF) << 3;
+		r->primDz = c & 0xFFFF;
+		break;
+	case 0x2F:
+		r->otherModes = c;
+		setupModes(r);
+		break;
+	case 0x30:
+		loadTlut(n, r, c);
+		break;
+	case 0x32: {
+		struct Tile* t = &r->tile[(c >> 24) & 7];
+		t->sl = (c >> 44) & 0xFFF;
+		t->tl = (c >> 32) & 0xFFF;
+		t->sh = (c >> 12) & 0xFFF;
+		t->th = c & 0xFFF;
+		break;
+	}
+	case 0x33:
+		loadTile(n, r, c, true);
+		break;
+	case 0x34:
+		loadTile(n, r, c, false);
+		break;
+	case 0x35: {
+		struct Tile* t = &r->tile[(c >> 24) & 7];
+		t->format = (c >> 53) & 7;
+		t->size = (c >> 51) & 3;
+		t->line = (c >> 41) & 0x1FF;
+		t->tmem = (c >> 32) & 0x1FF;
+		t->palette = (c >> 20) & 15;
+		t->cmT = (c >> 18) & 3;
+		t->maskT = (c >> 14) & 15;
+		t->shiftT = (c >> 10) & 15;
+		t->cmS = (c >> 8) & 3;
+		t->maskS = (c >> 4) & 15;
+		t->shiftS = c & 15;
+		break;
+	}
+	case 0x36: {
+		int x1 = ((c >> 44) & 0xFFF) >> 2, y1 = ((c >> 32) & 0xFFF) >> 2;
+		int x0 = ((c >> 12) & 0xFFF) >> 2, y0 = (c & 0xFFF) >> 2;
+		int cycleType = (r->otherModes >> 52) & 3;
+		clipRect(r, &x0, &y0, &x1, &y1);
+		if (cycleType == 3) {
+			fillRect(n, r, x0, y0, x1, y1);
+		} else {
+			for (int y = y0; y <= y1; ++y) {
+				if (!ownsRow(r, y)) {
+					continue;
+				}
+				for (int x = x0; x <= x1; ++x) {
+					struct Pixel* p = &r->pix;
+					*p = (struct Pixel) { 0 };
+					p->z = r->primZ;
+					shadePixel(n, r, x, y, p);
+				}
+			}
+		}
+		break;
+	}
+	case 0x37:
+		r->fillColor = (uint32_t) c;
+		break;
+	case 0x38:
+		r->fog = unpack((uint32_t) c);
+		break;
+	case 0x39:
+		r->blend = unpack((uint32_t) c);
+		break;
+	case 0x3A:
+		r->prim = unpack((uint32_t) c);
+		r->primLod = (c >> 32) & 0xFF;
+		r->minLevel = (c >> 40) & 0x1F;
+		break;
+	case 0x3B:
+		r->env = unpack((uint32_t) c);
+		break;
+	case 0x3C:
+		r->combine = c;
+		setupCombiner(r);
+		break;
+	case 0x3D:
+		r->texFormat = (c >> 53) & 7;
+		r->texSize = (c >> 51) & 3;
+		r->texWidth = ((c >> 32) & 0x3FF) + 1;
+		r->texAddr = c & 0x3FFFFFF;
+		break;
+	case 0x3E:
+		r->zAddr = c & 0x3FFFFFF;
+		break;
+	case 0x3F:
+		r->colorFormat = (c >> 53) & 7;
+		r->colorSize = (c >> 51) & 3;
+		r->colorWidth = ((c >> 32) & 0x3FF) + 1;
+		r->colorAddr = c & 0x3FFFFFF;
+		break;
+	}
+}
+
+// Runs the commands from DP_CURRENT to DP_END, keeping the RDP's time: a full sync interrupts the CPU
+// once the commands before it would be done.
 void rdpRun(struct N64* n) {
 	if (n->dp.status & 2) {
 		return;
@@ -1057,138 +1270,17 @@ void rdpRun(struct N64* n) {
 			w[i] = word(n, n->dp.current + i * 8);
 		}
 		n->dp.current += words * 8;
-		uint64_t c = w[0];
-		switch (op) {
-		case 0x08:
-		case 0x09:
-		case 0x0A:
-		case 0x0B:
-		case 0x0C:
-		case 0x0D:
-		case 0x0E:
-		case 0x0F:
-			triangle(n, r, w, op);
-			r->clocks += 20;
-			break;
-		case 0x24:
-		case 0x25:
-			textureRect(n, r, w[0], w[1], op == 0x25);
-			r->clocks += 10;
-			break;
-		case 0x29:
+		if (op == 0x29) {
 			++n->stats.dpSyncs;
 			if (n->dp.syncAt) {
 				n64Interrupt(n, MI_DP, true);
 			}
 			n->dp.syncAt = begin + r->clocks * 3 / 2;
 			n64Event(n, n->dp.syncAt);
-			break;
-		case 0x2C:
-			r->k4 = (c >> 9) & 0x1FF;
-			r->k5 = c & 0x1FF;
-			break;
-		case 0x2D:
-			r->scissorX0 = (c >> 44) & 0xFFF;
-			r->scissorY0 = (c >> 32) & 0xFFF;
-			r->scissorX1 = (c >> 12) & 0xFFF;
-			r->scissorY1 = c & 0xFFF;
-			break;
-		case 0x2E:
-			r->primZ = (int) ((c >> 16) & 0x7FFF) << 3;
-			r->primDz = c & 0xFFFF;
-			break;
-		case 0x2F:
-			r->otherModes = c;
-			setupModes(r);
-			break;
-		case 0x30:
-			loadTlut(n, r, c);
-			break;
-		case 0x32: {
-			struct Tile* t = &r->tile[(c >> 24) & 7];
-			t->sl = (c >> 44) & 0xFFF;
-			t->tl = (c >> 32) & 0xFFF;
-			t->sh = (c >> 12) & 0xFFF;
-			t->th = c & 0xFFF;
-			break;
+			continue;
 		}
-		case 0x33:
-			loadTile(n, r, c, true);
-			break;
-		case 0x34:
-			loadTile(n, r, c, false);
-			break;
-		case 0x35: {
-			struct Tile* t = &r->tile[(c >> 24) & 7];
-			t->format = (c >> 53) & 7;
-			t->size = (c >> 51) & 3;
-			t->line = (c >> 41) & 0x1FF;
-			t->tmem = (c >> 32) & 0x1FF;
-			t->palette = (c >> 20) & 15;
-			t->cmT = (c >> 18) & 3;
-			t->maskT = (c >> 14) & 15;
-			t->shiftT = (c >> 10) & 15;
-			t->cmS = (c >> 8) & 3;
-			t->maskS = (c >> 4) & 15;
-			t->shiftS = c & 15;
-			break;
-		}
-		case 0x36: {
-			int x1 = ((c >> 44) & 0xFFF) >> 2, y1 = ((c >> 32) & 0xFFF) >> 2;
-			int x0 = ((c >> 12) & 0xFFF) >> 2, y0 = (c & 0xFFF) >> 2;
-			int cycleType = (r->otherModes >> 52) & 3;
-			clipRect(r, &x0, &y0, &x1, &y1);
-			if (cycleType == 3) {
-				fillRect(n, r, x0, y0, x1, y1);
-			} else {
-				for (int y = y0; y <= y1; ++y) {
-					for (int x = x0; x <= x1; ++x) {
-						struct Pixel* p = &r->pix;
-						*p = (struct Pixel) { 0 };
-						p->z = r->primZ;
-						shadePixel(n, r, x, y, p);
-					}
-				}
-			}
-			break;
-		}
-		case 0x37:
-			r->fillColor = (uint32_t) c;
-			break;
-		case 0x38:
-			r->fog = unpack((uint32_t) c);
-			break;
-		case 0x39:
-			r->blend = unpack((uint32_t) c);
-			break;
-		case 0x3A:
-			r->prim = unpack((uint32_t) c);
-			r->primLod = (c >> 32) & 0xFF;
-			r->minLevel = (c >> 40) & 0x1F;
-			break;
-		case 0x3B:
-			r->env = unpack((uint32_t) c);
-			break;
-		case 0x3C:
-			r->combine = c;
-			setupCombiner(r);
-			break;
-		case 0x3D:
-			r->texFormat = (c >> 53) & 7;
-			r->texSize = (c >> 51) & 3;
-			r->texWidth = ((c >> 32) & 0x3FF) + 1;
-			r->texAddr = c & 0x3FFFFFF;
-			break;
-		case 0x3E:
-			r->zAddr = c & 0x3FFFFFF;
-			break;
-		case 0x3F:
-			r->colorFormat = (c >> 53) & 7;
-			r->colorSize = (c >> 51) & 3;
-			r->colorWidth = ((c >> 32) & 0x3FF) + 1;
-			r->colorAddr = c & 0x3FFFFFF;
-			break;
-		}
+		r->clocks += primitiveClocks(r, w, op);
+		execute(n, r, w, op);
 	}
 	n->dp.busyUntil = begin + r->clocks * 3 / 2;
 }
