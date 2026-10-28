@@ -1,7 +1,9 @@
 #include "n64.h"
 
 #include <string.h>
-#if defined(__SSE2__)
+#if defined(__SSSE3__)
+#include <tmmintrin.h>
+#elif defined(__SSE2__)
 #include <emmintrin.h>
 #endif
 
@@ -140,6 +142,28 @@ static v8 maskOf(unsigned b) {
 
 // The element a vector instruction takes from vt: all lanes, pairs, quads or one lane.
 static v8 element(v8 t, int e) {
+#if defined(__SSSE3__)
+	// Byte indices for PSHUFB.
+	static const uint8_t masks[16][16] __attribute__((aligned(16))) = {
+		{ 0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15 },
+		{ 0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15 },
+		{ 0, 1, 0, 1, 4, 5, 4, 5, 8, 9, 8, 9, 12, 13, 12, 13 },
+		{ 2, 3, 2, 3, 6, 7, 6, 7, 10, 11, 10, 11, 14, 15, 14, 15 },
+		{ 0, 1, 0, 1, 0, 1, 0, 1, 8, 9, 8, 9, 8, 9, 8, 9 },
+		{ 2, 3, 2, 3, 2, 3, 2, 3, 10, 11, 10, 11, 10, 11, 10, 11 },
+		{ 4, 5, 4, 5, 4, 5, 4, 5, 12, 13, 12, 13, 12, 13, 12, 13 },
+		{ 6, 7, 6, 7, 6, 7, 6, 7, 14, 15, 14, 15, 14, 15, 14, 15 },
+		{ 0, 1, 0, 1, 0, 1, 0, 1, 0, 1, 0, 1, 0, 1, 0, 1 },
+		{ 2, 3, 2, 3, 2, 3, 2, 3, 2, 3, 2, 3, 2, 3, 2, 3 },
+		{ 4, 5, 4, 5, 4, 5, 4, 5, 4, 5, 4, 5, 4, 5, 4, 5 },
+		{ 6, 7, 6, 7, 6, 7, 6, 7, 6, 7, 6, 7, 6, 7, 6, 7 },
+		{ 8, 9, 8, 9, 8, 9, 8, 9, 8, 9, 8, 9, 8, 9, 8, 9 },
+		{ 10, 11, 10, 11, 10, 11, 10, 11, 10, 11, 10, 11, 10, 11, 10, 11 },
+		{ 12, 13, 12, 13, 12, 13, 12, 13, 12, 13, 12, 13, 12, 13, 12, 13 },
+		{ 14, 15, 14, 15, 14, 15, 14, 15, 14, 15, 14, 15, 14, 15, 14, 15 },
+	};
+	return (v8) _mm_shuffle_epi8((__m128i) t, *(const __m128i*) masks[e]);
+#else
 	switch (e) {
 	case 2: return __builtin_shuffle(t, (v8) { 0, 0, 2, 2, 4, 4, 6, 6 });
 	case 3: return __builtin_shuffle(t, (v8) { 1, 1, 3, 3, 5, 5, 7, 7 });
@@ -151,6 +175,30 @@ static v8 element(v8 t, int e) {
 		return splat(t[e & 7]);
 	}
 	return t;
+#endif
+}
+
+// s + t + c or s - t - c (c is 0 or 1 a lane), saturated to 16 signed bits.
+static v8 addSaturated(v8 s, v8 t, v8 c, bool sub) {
+#if defined(__SSE2__)
+	__m128i parts[2];
+	for (int half = 0; half < 2; ++half) {
+		__m128i a = half ? _mm_unpackhi_epi16((__m128i) s, (__m128i) s) : _mm_unpacklo_epi16((__m128i) s, (__m128i) s);
+		__m128i b = half ? _mm_unpackhi_epi16((__m128i) t, (__m128i) t) : _mm_unpacklo_epi16((__m128i) t, (__m128i) t);
+		__m128i k = half ? _mm_unpackhi_epi16((__m128i) c, (__m128i) c) : _mm_unpacklo_epi16((__m128i) c, (__m128i) c);
+		a = _mm_srai_epi32(a, 16), b = _mm_srai_epi32(b, 16), k = _mm_srai_epi32(k, 16);
+		parts[half] = sub ? _mm_sub_epi32(_mm_sub_epi32(a, b), k) : _mm_add_epi32(_mm_add_epi32(a, b), k);
+	}
+	return (v8) _mm_packs_epi32(parts[0], parts[1]);
+#else
+	w8 v = __builtin_convertvector(s, w8);
+	w8 wt = __builtin_convertvector(t, w8), wc = __builtin_convertvector(c, w8);
+	v = sub ? v - wt - wc : v + wt + wc;
+	w8 lo = { -32768, -32768, -32768, -32768, -32768, -32768, -32768, -32768 };
+	w8 hi = { 32767, 32767, 32767, 32767, 32767, 32767, 32767, 32767 };
+	w8 under = v < lo, over = v > hi;
+	return __builtin_convertvector((under & lo) | (over & hi) | (~(under | over) & v), v8);
+#endif
 }
 
 struct Acc {
@@ -292,15 +340,9 @@ void rspVectorOp(struct RSP* r, uint32_t op) {
 		break;
 	case 0x10:
 	case 0x11: {
-		w8 carry = __builtin_convertvector(maskOf(r->vco) & splat(1), w8);
-		w8 ws = __builtin_convertvector(s, w8), wt = __builtin_convertvector(t, w8);
-		w8 v = func == 0x10 ? ws + wt + carry : ws - wt - carry;
-		w8 lo = { -32768, -32768, -32768, -32768, -32768, -32768, -32768, -32768 };
-		w8 hi = { 32767, 32767, 32767, 32767, 32767, 32767, 32767, 32767 };
-		a.l = __builtin_convertvector(v, v8);
-		w8 under = v < lo, over = v > hi;
-		v = (under & lo) | (over & hi) | (~(under | over) & v);
-		d = __builtin_convertvector(v, v8);
+		v8 carry = maskOf(r->vco) & splat(1);
+		a.l = func == 0x10 ? s + t + carry : s - t - carry;
+		d = addSaturated(s, t, carry, func == 0x11);
 		r->vco = 0;
 		break;
 	}
