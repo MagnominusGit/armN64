@@ -13,6 +13,44 @@ struct Color {
 	int r, g, b, a;
 };
 
+struct Pixel {
+	struct Color shade, tex0, tex1, combined;
+	int z;
+	int lodFrac;
+};
+
+// Colors as four lanes: red, green, blue and alpha.
+typedef int32_t i4 __attribute__((vector_size(16)));
+
+static i4 splat4(int v) {
+	return (i4) { v, v, v, v };
+}
+
+static i4 lanes(struct Color c) {
+	i4 v;
+	memcpy(&v, &c, sizeof(v));
+	return v;
+}
+
+static struct Color color(i4 v) {
+	struct Color c;
+	memcpy(&c, &v, sizeof(c));
+	return c;
+}
+
+// A combiner input for one cycle: three channel values, or with step 0 one value for all three.
+struct Input {
+	const int* v;
+	int step;
+};
+
+// One combiner cycle's inputs, (a - b) * m + d for color and alpha, and whether it uses noise.
+struct Stage {
+	struct Input a, b, m, d;
+	const int* alpha[4];
+	bool noise;
+};
+
 struct RDP {
 	uint8_t tmem[0x1000];
 	struct Tile tile[8];
@@ -32,11 +70,19 @@ struct RDP {
 	int k4, k5;
 	// RDP clocks spent on the commands so far.
 	uint64_t clocks;
+	// The pixel being drawn, and where the combiner's inputs come from for the current combine mode.
+	struct Pixel pix;
+	struct Stage stage[2];
 };
+
+static void setupCombiner(struct RDP* r);
 
 static struct RDP* state(struct N64* n) {
 	if (!n->rdp) {
 		n->rdp = calloc(1, sizeof(struct RDP));
+		if (n->rdp) {
+			setupCombiner(n->rdp);
+		}
 	}
 	return n->rdp;
 }
@@ -60,10 +106,8 @@ static const int zShift[8] = { 6, 5, 4, 3, 2, 1, 0, 0 };
 static const int zBase[8] = { 0, 0x20000, 0x30000, 0x38000, 0x3C000, 0x3E000, 0x3F000, 0x3F800 };
 
 static uint16_t zCompress(int z) {
-	int e = 0;
-	while (e < 7 && z >= zBase[e + 1]) {
-		++e;
-	}
+	int e = __builtin_clz(~((uint32_t) z << 14));
+	e = e > 7 ? 7 : e;
 	int m = ((z - zBase[e]) >> zShift[e]) & 0x7FF;
 	return (uint16_t) ((e << 11 | m) << 2);
 }
@@ -232,32 +276,16 @@ static struct Color sample(struct RDP* r, int tileIndex, int s, int t) {
 	                   tile->maskS, &f);
 	int t1 = wrapCoord(t + (32 << (tile->shiftT < 11 ? tile->shiftT : 0)), tile->shiftT, tile->tl, tile->th, tile->cmT,
 	                   tile->maskT, &f);
-	struct Color c0 = texel(r, tile, s0, t0), c1 = texel(r, tile, s1, t0), c2 = texel(r, tile, s0, t1);
-	struct Color out;
+	i4 c0 = lanes(texel(r, tile, s0, t0)), c1 = lanes(texel(r, tile, s1, t0)), c2 = lanes(texel(r, tile, s0, t1));
 	// Three-point filtering: the triangle of texels nearest the sample point.
 	if (fs + ft < 32) {
-		out.r = c0.r + ((c1.r - c0.r) * fs + (c2.r - c0.r) * ft) / 32;
-		out.g = c0.g + ((c1.g - c0.g) * fs + (c2.g - c0.g) * ft) / 32;
-		out.b = c0.b + ((c1.b - c0.b) * fs + (c2.b - c0.b) * ft) / 32;
-		out.a = c0.a + ((c1.a - c0.a) * fs + (c2.a - c0.a) * ft) / 32;
-	} else {
-		struct Color c3 = texel(r, tile, s1, t1);
-		int gs = 32 - fs, gt = 32 - ft;
-		out.r = c3.r + ((c2.r - c3.r) * gs + (c1.r - c3.r) * gt) / 32;
-		out.g = c3.g + ((c2.g - c3.g) * gs + (c1.g - c3.g) * gt) / 32;
-		out.b = c3.b + ((c2.b - c3.b) * gs + (c1.b - c3.b) * gt) / 32;
-		out.a = c3.a + ((c2.a - c3.a) * gs + (c1.a - c3.a) * gt) / 32;
+		return color(c0 + ((c1 - c0) * fs + (c2 - c0) * ft) / 32);
 	}
-	return out;
+	i4 c3 = lanes(texel(r, tile, s1, t1));
+	return color(c3 + ((c2 - c3) * (32 - fs) + (c1 - c3) * (32 - ft)) / 32);
 }
 
 // ---- Combiner and blender
-
-struct Pixel {
-	struct Color shade, tex0, tex1, combined;
-	int z;
-	int lodFrac;
-};
 
 static int rgbInput(struct RDP* r, struct Pixel* p, int sel, int channel, int which) {
 	const int* c;
@@ -381,6 +409,123 @@ static struct Color combine(struct RDP* r, struct Pixel* p, int cycle) {
 	return out;
 }
 
+static const int one = 0x100, zero = 0;
+
+// Where rgbInput and alphaInput take each input from, as pointers into the RDP state.
+static struct Input rgbSource(struct RDP* r, int sel, int which, bool* noise) {
+	struct Pixel* p = &r->pix;
+	switch (sel) {
+	case 0:
+		return (struct Input) { &p->combined.r, 1 };
+	case 1:
+		return (struct Input) { &p->tex0.r, 1 };
+	case 2:
+		return (struct Input) { &p->tex1.r, 1 };
+	case 3:
+		return (struct Input) { &r->prim.r, 1 };
+	case 4:
+		return (struct Input) { &p->shade.r, 1 };
+	case 5:
+		return (struct Input) { &r->env.r, 1 };
+	}
+	if ((which == 0 || which == 3) && sel == 6) {
+		return (struct Input) { &one, 0 };
+	}
+	if (which == 0 && sel == 7) {
+		*noise = true;
+	}
+	if (which == 1 && sel == 7) {
+		return (struct Input) { &r->k4, 0 };
+	}
+	if (which == 2) {
+		static const size_t pixelAlpha[] = { offsetof(struct Pixel, combined.a), offsetof(struct Pixel, tex0.a),
+		                                     offsetof(struct Pixel, tex1.a) };
+		switch (sel) {
+		case 7: case 8: case 9:
+			return (struct Input) { (const int*) ((const uint8_t*) p + pixelAlpha[sel - 7]), 0 };
+		case 10:
+			return (struct Input) { &r->prim.a, 0 };
+		case 11:
+			return (struct Input) { &p->shade.a, 0 };
+		case 12:
+			return (struct Input) { &r->env.a, 0 };
+		case 13:
+			return (struct Input) { &p->lodFrac, 0 };
+		case 14:
+			return (struct Input) { &r->primLod, 0 };
+		case 15:
+			return (struct Input) { &r->k5, 0 };
+		}
+	}
+	return (struct Input) { &zero, 0 };
+}
+
+static const int* alphaSource(struct RDP* r, int sel, bool multiplier) {
+	struct Pixel* p = &r->pix;
+	switch (sel) {
+	case 0:
+		return multiplier ? &p->lodFrac : &p->combined.a;
+	case 1:
+		return &p->tex0.a;
+	case 2:
+		return &p->tex1.a;
+	case 3:
+		return &r->prim.a;
+	case 4:
+		return &p->shade.a;
+	case 5:
+		return &r->env.a;
+	case 6:
+		return multiplier ? &r->primLod : &one;
+	}
+	return &zero;
+}
+
+static void setupCombiner(struct RDP* r) {
+	uint64_t c = r->combine;
+	for (int cycle = 0; cycle < 2; ++cycle) {
+		struct Stage* s = &r->stage[cycle];
+		s->noise = false;
+		s->a = rgbSource(r, cycle ? (c >> 37) & 15 : (c >> 52) & 15, 0, &s->noise);
+		s->m = rgbSource(r, cycle ? (c >> 32) & 31 : (c >> 47) & 31, 2, &s->noise);
+		s->b = rgbSource(r, cycle ? (c >> 24) & 15 : (c >> 28) & 15, 1, &s->noise);
+		s->d = rgbSource(r, cycle ? (c >> 6) & 7 : (c >> 15) & 7, 3, &s->noise);
+		s->alpha[0] = alphaSource(r, cycle ? (c >> 21) & 7 : (c >> 44) & 7, false);
+		s->alpha[1] = alphaSource(r, cycle ? (c >> 3) & 7 : (c >> 12) & 7, false);
+		s->alpha[2] = alphaSource(r, cycle ? (c >> 18) & 7 : (c >> 41) & 7, true);
+		s->alpha[3] = alphaSource(r, cycle ? c & 7 : (c >> 9) & 7, false);
+	}
+}
+
+// An input's three channels (from a struct Color, or one value), with alpha in the last lane.
+static i4 input4(const struct Input* in, const int* alpha) {
+	i4 v;
+	if (in->step) {
+		memcpy(&v, in->v, sizeof(v));
+	} else {
+		v = splat4(*in->v);
+	}
+	v[3] = *alpha;
+	return v;
+}
+
+static i4 ext9x4(i4 v) {
+	v &= 0x1FF;
+	return v - (((v & 0x180) == 0x180) & 0x200);
+}
+
+// combine() through the inputs setupCombiner found, for modes without noise; color and alpha
+// keep the same 9 bits ((x & 0x1FFFF) >> 8 is (x >> 8) & 0x1FF).
+static struct Color combineInputs(const struct Stage* s) {
+	i4 a = ext9x4(input4(&s->a, s->alpha[0])), b = ext9x4(input4(&s->b, s->alpha[1]));
+	i4 m = (input4(&s->m, s->alpha[2]) << 23) >> 23, d = ext9x4(input4(&s->d, s->alpha[3]));
+	return color((((a - b) * m + (d << 8) + 0x80) >> 8) & 0x1FF);
+}
+
+static struct Color combineCycle(struct RDP* r, struct Pixel* p, int cycle) {
+	return r->stage[cycle].noise ? combine(r, p, cycle) : combineInputs(&r->stage[cycle]);
+}
+
 static struct Color blendColor(struct RDP* r, struct Color pixel, struct Color memory, struct Pixel* p, int cycle) {
 	uint64_t m = r->otherModes;
 	int sp = (m >> (30 - cycle * 2)) & 3, sa = (m >> (26 - cycle * 2)) & 3;
@@ -392,9 +537,9 @@ static struct Color blendColor(struct RDP* r, struct Color pixel, struct Color m
 	// The blender works with 5-bit factors and doesn't normalise: (P * a + M * (b + 1)) / 32, wrapping
 	// at 8 bits, so "one" for b adds.
 	int fa = a >> 3, fb = (b >> 3) + 1;
-	struct Color out = { ((P.r * fa + M.r * fb) >> 5) & 255, ((P.g * fa + M.g * fb) >> 5) & 255,
-	                     ((P.b * fa + M.b * fb) >> 5) & 255, pixel.a };
-	return out;
+	i4 out = ((lanes(P) * fa + lanes(M) * fb) >> 5) & 255;
+	out[3] = pixel.a;
+	return color(out);
 }
 
 // The blender's first input (P) for a cycle, without blending.
@@ -426,10 +571,10 @@ static void shadePixel(struct N64* n, struct RDP* r, int x, int y, struct Pixel*
 	}
 	// One-cycle mode runs the combiner's second-cycle equation.
 	p->combined = r->lastCombined;
-	struct Color c = combine(r, p, cycleType == 1 ? 0 : 1);
+	struct Color c = combineCycle(r, p, cycleType == 1 ? 0 : 1);
 	if (cycleType == 1) {
 		p->combined = c;
-		c = combine(r, p, 1);
+		c = combineCycle(r, p, 1);
 	}
 	r->lastCombined = c;
 	c = (struct Color) { clamp9(c.r), clamp9(c.g), clamp9(c.b), clamp9(c.a) };
@@ -598,18 +743,19 @@ static void textureRect(struct N64* n, struct RDP* r, uint64_t w0, uint64_t w1, 
 			int dx = x - cx0, dy = y - cy0;
 			int s = ((s0 << 5) + (flip ? dy * dsdx : dx * dsdx)) >> 5;
 			int t = ((t0 << 5) + (flip ? dx * dtdy : dy * dtdy)) >> 5;
-			struct Pixel p = { 0 };
+			struct Pixel* p = &r->pix;
+			*p = (struct Pixel) { 0 };
 			int t1 = tile, t2 = tile + 1;
 			if (doLod) {
 				int sx = s + (flip ? 0 : dsdx >> 5), tx = t + (flip ? dtdy >> 5 : 0);
 				int sy = s + (flip ? dsdx >> 5 : 0), ty = t + (flip ? 0 : dtdy >> 5);
-				p.lodFrac = levelOfDetail(r, tile, s, t, sx, tx, sy, ty, &t1, &t2);
+				p->lodFrac = levelOfDetail(r, tile, s, t, sx, tx, sy, ty, &t1, &t2);
 			}
-			p.tex0 = sample(r, t1, s, t);
-			p.tex1 = cycleType == 1 ? sample(r, t2, s, t) : p.tex0;
+			p->tex0 = sample(r, t1, s, t);
+			p->tex1 = cycleType == 1 ? sample(r, t2, s, t) : p->tex0;
 			if (cycleType == 2) {
 				++copied;
-				if ((r->otherModes & 1) && p.tex0.a == 0) {
+				if ((r->otherModes & 1) && p->tex0.a == 0) {
 					continue;
 				}
 				// Copying into an 8-bit image moves the texel bytes themselves (palette indices).
@@ -622,11 +768,11 @@ static void textureRect(struct N64* n, struct RDP* r, uint64_t w0, uint64_t w1, 
 					n->rdram[(r->colorAddr + y * r->colorWidth + x) & (RDRAM_SIZE - 1)] = tmemByte(r, a);
 					continue;
 				}
-				writePixel(n, r, x, y, p.tex0);
+				writePixel(n, r, x, y, p->tex0);
 				continue;
 			}
-			p.z = r->primZ;
-			shadePixel(n, r, x, y, &p);
+			p->z = r->primZ;
+			shadePixel(n, r, x, y, p);
 		}
 	}
 	r->clocks += copied / 4;
@@ -697,37 +843,50 @@ static void triangle(struct N64* n, struct RDP* r, const uint64_t* w, int op) {
 			x1 = (r->scissorX1 >> 2) - 1;
 		}
 		int64_t ey = dy / 4;
+		// Each attribute at x0, then plus its x gradient a pixel (x moves dx by whole 65536s, so the
+		// shifted products step exactly).
+		int64_t dx0 = (int64_t) x0 * 65536 + 32768 - xh - dxh * dy / 4;
+		int64_t shadeAt[4], zAt = 0, texAt[3];
+		for (int i = 0; i < 4; ++i) {
+			shadeAt[i] = sv[i] + sde[i] * ey + (sdx[i] * dx0 >> 16);
+		}
+		for (int i = 0; i < 3; ++i) {
+			texAt[i] = tv[i] + tde[i] * ey + (tdx[i] * dx0 >> 16);
+		}
+		if (zbuf) {
+			zAt = zv + zde * ey + (zdx * dx0 >> 16);
+		}
 		for (int x = x0; x <= x1; ++x) {
-			int64_t dx = (int64_t) x * 65536 + 32768 - xh - dxh * dy / 4;
-			struct Pixel p = { 0 };
+			struct Pixel* p = &r->pix;
+			*p = (struct Pixel) { 0 };
 			if (shade) {
-				int ch[4];
+				p->shade = (struct Color) { clamp8((int) (shadeAt[0] >> 16)), clamp8((int) (shadeAt[1] >> 16)),
+				                            clamp8((int) (shadeAt[2] >> 16)), clamp8((int) (shadeAt[3] >> 16)) };
 				for (int i = 0; i < 4; ++i) {
-					int64_t v = sv[i] + sde[i] * ey + (sdx[i] * dx >> 16);
-					ch[i] = clamp8((int) (v >> 16));
+					shadeAt[i] += sdx[i];
 				}
-				p.shade = (struct Color) { ch[0], ch[1], ch[2], ch[3] };
 			}
 			if (zbuf) {
-				int64_t v = zv + zde * ey + (zdx * dx >> 16);
-				p.z = (int) (v >> 13);
+				p->z = (int) (zAt >> 13);
+				zAt += zdx;
 			}
 			if (tex) {
-				int64_t sS = tv[0] + tde[0] * ey + (tdx[0] * dx >> 16);
-				int64_t sT = tv[1] + tde[1] * ey + (tdx[1] * dx >> 16);
-				int64_t sW = tv[2] + tde[2] * ey + (tdx[2] * dx >> 16);
+				int64_t sS = texAt[0], sT = texAt[1], sW = texAt[2];
+				for (int i = 0; i < 3; ++i) {
+					texAt[i] += tdx[i];
+				}
 				int s, t, t1 = tile, t2 = tile + 1;
 				texCoords(sS, sT, sW, persp, &s, &t);
 				if (doLod) {
 					int sx, tx, sy, ty;
 					texCoords(sS + tdx[0], sT + tdx[1], sW + tdx[2], persp, &sx, &tx);
 					texCoords(sS + tdy[0], sT + tdy[1], sW + tdy[2], persp, &sy, &ty);
-					p.lodFrac = levelOfDetail(r, tile, s, t, sx, tx, sy, ty, &t1, &t2);
+					p->lodFrac = levelOfDetail(r, tile, s, t, sx, tx, sy, ty, &t1, &t2);
 				}
-				p.tex0 = sample(r, t1, s, t);
-				p.tex1 = cycleType == 1 ? sample(r, t2, s, t) : p.tex0;
+				p->tex0 = sample(r, t1, s, t);
+				p->tex1 = cycleType == 1 ? sample(r, t2, s, t) : p->tex0;
 			}
-			shadePixel(n, r, x, y, &p);
+			shadePixel(n, r, x, y, p);
 		}
 	}
 }
@@ -928,9 +1087,10 @@ void rdpRun(struct N64* n) {
 			} else {
 				for (int y = y0; y <= y1; ++y) {
 					for (int x = x0; x <= x1; ++x) {
-						struct Pixel p = { 0 };
-						p.z = r->primZ;
-						shadePixel(n, r, x, y, &p);
+						struct Pixel* p = &r->pix;
+						*p = (struct Pixel) { 0 };
+						p->z = r->primZ;
+						shadePixel(n, r, x, y, p);
 					}
 				}
 			}
@@ -955,6 +1115,7 @@ void rdpRun(struct N64* n) {
 			break;
 		case 0x3C:
 			r->combine = c;
+			setupCombiner(r);
 			break;
 		case 0x3D:
 			r->texFormat = (c >> 53) & 7;
