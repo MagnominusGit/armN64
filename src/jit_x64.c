@@ -70,7 +70,7 @@ struct Exit {
 
 // A load or store that left its inline path: for the helper, or for a D-cache line fill.
 struct Slow {
-	uint8_t* site[3];
+	uint8_t* site[8];
 	int sites;
 	uint8_t* resume;
 	uint32_t op, paddr;
@@ -393,8 +393,9 @@ static int memSize(uint32_t op) {
 	return 0;
 }
 
-// A load or store to cached RDRAM (kseg0), with fetchTiming's D-cache check. Anything else (other
-// segments, misalignment, a store to a page holding code) jumps to the slow path, before any change.
+// A load or store to cached RDRAM, through kseg0 or a page in the TLB cache, with dataTiming's
+// D-cache check. Anything else (other segments, misalignment, a page the cache doesn't have, a
+// store to a page holding code) jumps to the slow path, before any change.
 static void emitMemory(struct Jit* j, struct Slow* slow) {
 	struct Emitter* e = &j->e;
 	uint32_t op = slow->op;
@@ -410,11 +411,41 @@ static void emitMemory(struct Jit* j, struct Slow* slow) {
 	xMovsxd(e, RCX, R(RAX));
 	xAluRR(e, X_CMP, 8, R(RCX), RAX);
 	slow->site[slow->sites++] = xJcc(e, CC_NE, NULL);
+	xMovRR(e, 4, R8, RAX);
 	xMovRR(e, 4, RCX, RAX);
 	xAluI(e, X_AND, 4, R(RCX), (int32_t) (0xFF800000u | (size - 1)));
 	xAluI(e, X_CMP, 4, R(RCX), (int32_t) 0x80000000u);
+	uint8_t* kseg0 = xJcc(e, CC_E, NULL);
+
+	// Mapped: the physical page from the TLB cache.
+	if (size > 1) {
+		xTestI(e, 4, R(RAX), size - 1);
+		slow->site[slow->sites++] = xJcc(e, CC_NE, NULL);
+	}
+	struct Opnd entry = MI(RBX, RDX, 8, (int32_t) offsetof(struct N64, tlbCache));
+	xMovRR(e, 4, RCX, RAX);
+	xShiftI(e, X_SHR, 4, R(RCX), 12);
+	xMovRR(e, 4, RDX, RCX);
+	xAluI(e, X_AND, 4, R(RDX), TLB_CACHE_SIZE - 1);
+	xAluI(e, X_OR, 4, R(RCX), (int32_t) 0x80000000u);
+	xAluRM(e, X_CMP, 4, RCX, entry);
 	slow->site[slow->sites++] = xJcc(e, CC_NE, NULL);
+	entry.disp += 4;
+	xLoad(e, 4, RCX, entry);
+	if (isStore) {
+		xTestI(e, 1, R(RCX), 1);
+		slow->site[slow->sites++] = xJcc(e, CC_E, NULL);
+	}
+	xAluI(e, X_AND, 4, R(RCX), ~0xFFF);
+	xAluI(e, X_AND, 4, R(RAX), 0xFFF);
+	xAluRR(e, X_OR, 4, R(RAX), RCX);
+	xAluI(e, X_CMP, 4, R(RAX), RDRAM_SIZE);
+	slow->site[slow->sites++] = xJcc(e, CC_AE, NULL);
+	uint8_t* mapped = xJmp(e, NULL);
+
+	patchHere(e, kseg0);
 	xAluI(e, X_AND, 4, R(RAX), RDRAM_SIZE - 1);
+	patchHere(e, mapped);
 	if (isStore) {
 		xMovRR(e, 4, RCX, RAX);
 		xShiftI(e, X_SHR, 4, R(RCX), 12);
@@ -422,11 +453,13 @@ static void emitMemory(struct Jit* j, struct Slow* slow) {
 		slow->site[slow->sites++] = xJcc(e, CC_NE, NULL);
 	}
 
-	xMovRR(e, 4, RCX, RAX);
+	// The line index from the virtual address, the tag from the physical one.
+	xMovRR(e, 4, RCX, R8);
 	xShiftI(e, X_SHR, 4, R(RCX), 4);
-	xMovRR(e, 4, RDX, RCX);
-	xAluI(e, X_OR, 4, R(RDX), (int32_t) 0x80000000u);
 	xAluI(e, X_AND, 4, R(RCX), 511);
+	xMovRR(e, 4, RDX, RAX);
+	xShiftI(e, X_SHR, 4, R(RDX), 4);
+	xAluI(e, X_OR, 4, R(RDX), (int32_t) 0x80000000u);
 	xAluRM(e, X_CMP, 4, RDX, MI(R12, RCX, 4, (int32_t) offsetof(struct CPU, dcacheTag)));
 	struct Miss* m = &j->misses[j->missCount++];
 	m->site = xJcc(e, CC_NE, NULL);

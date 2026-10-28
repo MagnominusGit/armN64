@@ -126,6 +126,13 @@ struct RspJitEntry {
 };
 struct RspBlock;
 
+// A virtual 4 KB page the TLB maps: the page number with bit 31 set, and the physical page with
+// bit 0 set if stores may go there.
+enum { TLB_CACHE_SIZE = 256 };
+struct TlbCacheEntry {
+	uint32_t tag, page;
+};
+
 // Compiled code for a virtual address, good while blockGen is unchanged.
 enum { JIT_TABLE_SIZE = 1 << 14 };
 struct JitEntry {
@@ -178,6 +185,8 @@ struct N64 {
 	void (*jitEnter)(struct N64*, void* code);
 	void* jitLeave;
 	struct JitEntry jitTable[JIT_TABLE_SIZE];
+	// Pages the TLB mapped recently, for compiled loads and stores; emptied when the TLB changes.
+	struct TlbCacheEntry tlbCache[TLB_CACHE_SIZE];
 	// Compiled RSP blocks (rsp_jit_x64.c): every version compiled for each IMEM address, and the
 	// one for IMEM as it is; rspCodeGen changes with every write to IMEM.
 	bool useRspJit;
