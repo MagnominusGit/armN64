@@ -81,6 +81,7 @@ struct Gles {
 	unsigned char (*glUnmapBuffer)(GLenum);
 	void (*glDispatchCompute)(GLuint, GLuint, GLuint);
 	void (*glMemoryBarrier)(GLbitfield);
+	void (*glFlush)(void);
 	const unsigned char* (*glGetString)(GLenum);
 };
 
@@ -114,7 +115,7 @@ static bool loadGl(struct Gles* g) {
 	       LOAD(glDeleteProgram) && LOAD(glGetUniformLocation) && LOAD(glUniform1iv) && LOAD(glGenBuffers) &&
 	       LOAD(glDeleteBuffers) && LOAD(glBindBuffer) && LOAD(glBindBufferBase) && LOAD(glBufferData) &&
 	       LOAD(glBufferSubData) && LOAD(glMapBufferRange) && LOAD(glUnmapBuffer) && LOAD(glDispatchCompute) &&
-	       LOAD(glMemoryBarrier) && LOAD(glGetString);
+	       LOAD(glMemoryBarrier) && LOAD(glGetString) && LOAD(glFlush);
 }
 
 static bool fail(char* error, size_t size, const char* what) {
@@ -298,4 +299,6 @@ void glesUniforms(struct Gles* g, const int* values, int count) {
 void glesDispatch(struct Gles* g, unsigned x, unsigned y) {
 	g->glDispatchCompute(x, y, 1);
 	g->glMemoryBarrier(GL_SHADER_STORAGE_BARRIER_BIT);
+	// Each dispatch its own submission: the kernel's GPU hang check times submissions.
+	g->glFlush();
 }
