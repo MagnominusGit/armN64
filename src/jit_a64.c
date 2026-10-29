@@ -145,6 +145,9 @@ struct Jit {
 	int slowCount;
 	struct Miss misses[64];
 	int missCount;
+	// Stores to pages with compiled code, which check that they miss its words.
+	struct Miss codeChecks[64];
+	int codeCheckCount;
 	uint8_t* leave;
 	bool rdpThreads;
 	struct Cache cache;
@@ -794,11 +797,21 @@ static void emitMemory(struct Jit* j, struct Slow* slow) {
 		aLdst(e, L_LDR, 5, TLB, 1, L_UXTW | 0x1000);
 	}
 	aDp(e, A_ADD, 6, 0, 5, S_LSL, 0);
-	// Stores go slow on any flag (code, RDP), loads on pages the RDP may still be drawing to.
-	if (isStore || j->rdpThreads) {
+	// Stores go slow on any flag (code, RDP) unless the page has only code that they miss; loads
+	// on pages the RDP may still be drawing to.
+	if (isStore) {
 		aLsrImm(e, 1, 6, 12);
 		aLdst(e, L_LDRB, 1, PAGES, 1, L_UXTW);
-		slow->site[slow->sites++] = isStore ? aCbnz(e, 1, NULL) : aTbnz(e, 1, 1, NULL);
+		struct Miss* k = &j->codeChecks[j->codeCheckCount++];
+		k->site = aCbnz(e, 1, NULL);
+		k->resume = e->p;
+		k->slow = slow;
+		k->size = size;
+		slow->keep = true;
+	} else if (j->rdpThreads) {
+		aLsrImm(e, 1, 6, 12);
+		aLdst(e, L_LDRB, 1, PAGES, 1, L_UXTW);
+		slow->site[slow->sites++] = aTbnz(e, 1, 1, NULL);
 	}
 
 	// The line index from the virtual address; a hit when its tag is this physical line and the
@@ -986,7 +999,7 @@ void* jitCompile(struct N64* n, const uint32_t* ops, uint32_t count, uint32_t va
 	struct Jit* j = &jit;
 	uint8_t* start = arena + n->jitUsed;
 	j->e = (struct Emitter) { start, start, start + BLOCK_CODE_MAX };
-	j->exitCount = j->slowCount = j->missCount = 0;
+	j->exitCount = j->slowCount = j->missCount = j->codeCheckCount = 0;
 	j->rdpThreads = n->rdpThreads > 0;
 	struct Emitter* e = &j->e;
 	j->leave = e->p;
@@ -1006,7 +1019,7 @@ void* jitCompile(struct N64* n, const uint32_t* ops, uint32_t count, uint32_t va
 		bool lineStart = k == 0 || !(p & 31);
 		enum Kind kind;
 		uint8_t* mark = e->p;
-		int exits = j->exitCount, misses = j->missCount;
+		int exits = j->exitCount, misses = j->missCount, codeChecks = j->codeCheckCount;
 		struct Cache cache = j->cache;
 		bool branch = isBranchOp(op);
 		struct Slow* slow = &j->slows[j->slowCount];
@@ -1045,11 +1058,29 @@ void* jitCompile(struct N64* n, const uint32_t* ops, uint32_t count, uint32_t va
 		e->p = mark;
 		j->exitCount = exits;
 		j->missCount = misses;
+		j->codeCheckCount = codeChecks;
 		j->cache = cache;
 		emitHelper(j, op, pc, p, delay, lineStart, last);
 		// The interpreter may have changed any register, and the call the scratch ones.
 		cacheClear(&j->cache);
 		delay = branch;
+	}
+
+	// Stores to a page with code only: on unless they hit a word a block holds (n64HoldsCode), its
+	// bit in codeWords. An aligned store touches one word, or two for SD.
+	for (int i = 0; i < j->codeCheckCount; ++i) {
+		struct Miss* k = &j->codeChecks[i];
+		patchHere(e, k->site);
+		aDpImm(e, A_SUBS_IMM, ZR, 1, PAGE_CODE);
+		k->slow->site[k->slow->sites++] = aBcond(e, C_NE, NULL);
+		aAddImmX(e, IP, N, N64_OFF(codeWords));
+		aLsrImm(e, 2, 6, 5);
+		aLdst(e, L_LDRB, 2, IP, 2, L_UXTW);
+		aUbfx(e, 3, 6, 2, 3);
+		aDp(e, A_LSRV, 2, 2, 3, S_LSL, 0);
+		aLogicImm(e, A_ANDS_IMM, ZR, 2, k->size == 8 ? 3 : 1);
+		k->slow->site[k->slow->sites++] = aBcond(e, C_NE, NULL);
+		aB(e, k->resume);
 	}
 
 	// D-cache line fills, as dataTiming: the fill, the write-back of a dirty line, the new tag. A
