@@ -435,10 +435,18 @@ void rspTimingStep(struct N64* n, uint32_t op, uint32_t pc) {
 	r->inDelay = isBranch(op);
 	r->lastAlone = !paired;
 	r->lastOp = op;
+	r->lastDesc = rspTimingDesc(op);
 	r->lastPc = pc;
 	r->lastStart = start;
 	markResults(r, op, start);
 	r->scalarReady[0] = 0;
+}
+
+// What pairs() needs of the instruction before: bit 0 a branch, bit 1 a vector op, bit 2 CFC2 or
+// CTC2, bits 8-15 the vector register it writes plus one (0 for none).
+uint16_t rspTimingDesc(uint32_t op) {
+	bool control = (op >> 26) == 0x12 && (RS == 0x02 || RS == 0x06);
+	return (uint16_t) (isBranch(op) | isVectorOp(op) << 1 | control << 2 | (vectorWritten(op) + 1) << 8);
 }
 
 // For compiled code: whether op may pair with first (at firstPc) when first issued alone, and the

@@ -81,6 +81,8 @@ struct RSP {
 	uint64_t vectorReady[32];
 	// Dual issue: the previous instruction, when it started, and whether it could still take a partner.
 	uint32_t lastOp, lastPc;
+	// What pairing needs of lastOp (rspTimingDesc).
+	uint16_t lastDesc;
 	uint64_t lastStart;
 	bool lastAlone;
 	bool inDelay;
@@ -333,6 +335,7 @@ bool cpuPeekAddress(struct N64*, uint64_t vaddr, uint32_t* paddr);
 void rspInitTables(void);
 void rspStep(struct N64*);
 void rspTimingStep(struct N64*, uint32_t op, uint32_t pc);
+uint16_t rspTimingDesc(uint32_t op);
 bool rspPairable(uint32_t first, uint32_t firstPc, uint32_t op);
 bool rspIsBranch(uint32_t op);
 int rspTimingRegs(uint32_t op, int* scalar, int* vector, int* nv, int* written, int* latency, int* nw);

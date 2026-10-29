@@ -4,8 +4,8 @@
 #include <stddef.h>
 #include <sys/mman.h>
 
-// AArch64 code for blocks of RSP instructions, as rsp_jit_x64.c does it: the first instruction's
-// timing from rspTimingStep, the rest compiled in; scalar instructions and DMEM loads and stores
+// AArch64 code for blocks of RSP instructions, as rsp_jit_x64.c does it, but with every
+// instruction's timing compiled in (the first one's pairing checked against lastDesc); scalar instructions and DMEM loads and stores
 // inline, the vector unit and COP0 through C.
 //
 // Registers: x19 = n, x20 = &n->rsp, x21 = clock, x22 = the limit, x23 = lastStart,
@@ -86,10 +86,9 @@ static void exitAt(struct Jit* j, uint8_t* site, uint32_t op, uint32_t pc, enum 
 
 // rspTimingStep for an instruction whose predecessor (prev, at pc - 4) is in the same block, which
 // issued alone or paired as w24 says. Paired when it may and all it reads was ready at lastStart.
-static void emitTiming(struct Emitter* e, uint32_t op, uint32_t prev, uint32_t pc) {
+static void emitTimingAs(struct Emitter* e, uint32_t op, bool pairable) {
 	int scalar[8], vector[16], nv, written[16], latency[16], nw;
 	int ns = rspTimingRegs(op, scalar, vector, &nv, written, latency, &nw);
-	bool pairable = rspPairable(prev, (pc - 4) & 0xFFC, op);
 	if (pairable) {
 		aMovImm(e, 0, 0);
 	} else {
@@ -128,6 +127,59 @@ static void emitTiming(struct Emitter* e, uint32_t op, uint32_t prev, uint32_t p
 		aDpImm(e, A_ADD_IMM | W64, 1, START, latency[i]);
 		aStrX(e, 1, RSP, written[i] < 32 ? RSP_OFF(scalarReady) + 8 * written[i] : RSP_OFF(vectorReady) + 8 * (written[i] - 32));
 	}
+}
+
+static void emitTiming(struct Emitter* e, uint32_t op, uint32_t prev, uint32_t pc) {
+	emitTimingAs(e, op, rspPairable(prev, (pc - 4) & 0xFFC, op));
+}
+
+// The first instruction's timing: whether it may pair with the instruction before, which another
+// block or the interpreter left in lastAlone, lastPc, inDelay and lastDesc (as rspTimingStep's
+// pairs() decides it), then as emitTiming.
+static void emitEntryTiming(struct Emitter* e, uint32_t op) {
+	loadTiming(e);
+	uint16_t self = rspTimingDesc(op);
+	if (self & 4) {
+		emitTimingAs(e, op, false);
+		return;
+	}
+	int rt = (op >> 16) & 31, rd = (op >> 11) & 31, sa = (op >> 6) & 31, code = op >> 26;
+	int forbidden[3], count = 0;
+	if (self & 2) {
+		forbidden[count++] = rt, forbidden[count++] = rd, forbidden[count++] = sa;
+	} else {
+		if (code == 0x3A || code == 0x32) {
+			forbidden[count++] = rt;
+		}
+		if (code == 0x12) {
+			forbidden[count++] = rd;
+		}
+	}
+	uint8_t* alone[8];
+	int sites = 0;
+	alone[sites++] = aCbz(e, ALONE, NULL);
+	aLdr(e, 0, RSP, RSP_OFF(lastPc));
+	alone[sites++] = aTbnz(e, 0, 2, NULL);
+	aLdrb(e, 0, RSP, RSP_OFF(inDelay));
+	alone[sites++] = aCbnz(e, 0, NULL);
+	// Not a branch, not CFC2 or CTC2, and the other unit (vector or scalar) than op's.
+	aLdrh(e, 0, RSP, RSP_OFF(lastDesc));
+	aLogicImm(e, A_AND_IMM, 1, 0, 7);
+	aDpImm(e, A_SUBS_IMM, ZR, 1, self & 2 ? 0 : 2);
+	alone[sites++] = aBcond(e, C_NE, NULL);
+	// Nor reading a vector register it writes.
+	aLsrImm(e, 1, 0, 8);
+	for (int i = 0; i < count; ++i) {
+		aDpImm(e, A_SUBS_IMM, ZR, 1, (unsigned) forbidden[i] + 1);
+		alone[sites++] = aBcond(e, C_EQ, NULL);
+	}
+	emitTimingAs(e, op, true);
+	uint8_t* done = aB(e, NULL);
+	for (int i = 0; i < sites; ++i) {
+		patchHere(e, alone[i]);
+	}
+	emitTimingAs(e, op, false);
+	patchHere(e, done);
 }
 
 // The DMEM address of rs + offset in w1, and whether the access of size bytes wraps past the end.
@@ -1021,11 +1073,7 @@ void* rspCompile(struct N64* n, const uint8_t* ops, uint32_t count, uint32_t sta
 		uint32_t op = be32(&ops[k * 4]), pc = start + k * 4;
 		bool last = k + 1 == count;
 		if (k == 0) {
-			aMovX(e, 0, N);
-			aMovImm(e, 1, op);
-			aMovImm(e, 2, pc);
-			callC(e, rspTimingStep);
-			loadTiming(e);
+			emitEntryTiming(e, op);
 		} else {
 			emitTiming(e, op, prev, pc);
 		}
@@ -1079,6 +1127,8 @@ void* rspCompile(struct N64* n, const uint8_t* ops, uint32_t count, uint32_t sta
 		}
 		aMovImm(e, 0, x->op);
 		aStr(e, 0, RSP, RSP_OFF(lastOp));
+		aMovImm(e, 0, rspTimingDesc(x->op));
+		aStrh(e, 0, RSP, RSP_OFF(lastDesc));
 		aMovImm(e, 0, x->pc);
 		aStr(e, 0, RSP, RSP_OFF(lastPc));
 		aMovImm(e, 0, x->kind == BRANCH);
