@@ -260,15 +260,6 @@ static void branchLikely(struct CPU* c, bool taken, uint64_t target) {
 	}
 }
 
-// Compiled code in the virtual pages a TLB entry covers (both of its pair) can no longer be reached
-// through the jump table.
-static void tlbPagesChanged(struct N64* n, const struct TLBEntry* e) {
-	uint32_t size = (uint32_t) e->pageMask + 0x2000, base = (uint32_t) e->entryHi & ~(size - 1);
-	for (uint32_t off = 0; off < size; off += 0x1000) {
-		++n->vpageGen[(base + off) >> 12];
-	}
-}
-
 static void tlbWrite(struct N64* n, int i) {
 	struct CPU* c = &n->cpu;
 	struct TLBEntry* e = &c->tlb[i & 31];
@@ -281,8 +272,6 @@ static void tlbWrite(struct N64* n, int i) {
 	// Writing an entry as it was maps nothing differently.
 	if (old.pageMask != e->pageMask || old.entryHi != e->entryHi || old.entryLo[0] != e->entryLo[0] || old.entryLo[1] != e->entryLo[1]) {
 		++n->blockGen;
-		tlbPagesChanged(n, &old);
-		tlbPagesChanged(n, e);
 		cpuTlbChanged(n);
 	}
 }
@@ -340,7 +329,6 @@ static void cop0Write(struct N64* n, int r, uint64_t v) {
 		uint64_t asid = cop0[r] & 0xFF;
 		cop0[r] = v & 0xC00000FFFFFFE0FFull;
 		if ((cop0[r] & 0xFF) != asid) {
-			jitTableClear(n, true, -1);
 			++n->blockGen;
 			cpuTlbChanged(n);
 		}

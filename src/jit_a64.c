@@ -1208,13 +1208,12 @@ static void chain(struct Jit* j) {
 	aBcond(e, C_NE, j->leave);
 	aUbfx(e, 1, 0, 2, 14);
 	aAddImmX(e, 2, N, N64_OFF(jitTable));
-	aDp(e, A_ADD | W64, 2, 2, 1, S_LSL, 5);
+	aDp(e, A_ADD | W64, 2, 2, 1, S_LSL, 4);
 	aLdr(e, 3, 2, (unsigned) offsetof(struct JitEntry, vaddr));
 	aDp(e, A_SUBS, ZR, 3, 0, S_LSL, 0);
 	aBcond(e, C_NE, j->leave);
-	aLdrX(e, 4, 2, (unsigned) offsetof(struct JitEntry, genAt));
 	aLdr(e, 3, 2, (unsigned) offsetof(struct JitEntry, gen));
-	aLdr(e, 4, 4, 0);
+	loadN(e, 4, N64_OFF(blockGen), 4);
 	aDp(e, A_SUBS, ZR, 3, 4, S_LSL, 0);
 	aBcond(e, C_NE, j->leave);
 	aLdrX(e, 5, 2, (unsigned) offsetof(struct JitEntry, code));

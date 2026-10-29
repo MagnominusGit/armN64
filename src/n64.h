@@ -149,17 +149,10 @@ enum { VPAGES = 1 << 20, VPAGE_FILLED = 1024 };
 
 // Compiled code for a virtual address, good while blockGen is unchanged.
 enum { JIT_TABLE_SIZE = 1 << 14 };
-// A table entry stays good while the counter at genAt holds gen: for code mapped through the TLB,
-// its virtual page's (vpageGen); otherwise a constant one. Writes to its RDRAM page (page) and a new
-// code arena clear entries outright.
 struct JitEntry {
 	uint32_t vaddr, gen;
-	const uint32_t* genAt;
 	void* code;
-	uint32_t page, unused;
 };
-// The code generators index the table by shifting by 5.
-_Static_assert(sizeof(struct JitEntry) == 32, "jump table entries are 32 bytes");
 
 // The 64DD drive (dd.c): IPL ROM, disk (SDK layout) and where its LBAs are, buffers and registers.
 struct DD {
@@ -255,9 +248,6 @@ struct N64 {
 	void (*jitEnter)(struct N64*, void* code);
 	void* jitLeave;
 	struct JitEntry jitTable[JIT_TABLE_SIZE];
-	// A counter for each 4 KB virtual page that TLB changes to it bump, and the constant one.
-	uint32_t* vpageGen;
-	uint32_t steadyGen;
 	// Pages for compiled loads and stores: what to add to an address in each 4 KB virtual page for
 	// the physical one, 1 << 20 entries for loads, then as many for stores. A page not looked up
 	// since the TLB last changed, or not writable for stores, adds up to the page past RDRAM. The
@@ -392,8 +382,6 @@ static inline bool n64HoldsCode(struct N64* n, uint32_t p, uint32_t addr, uint32
 	}
 	return false;
 }
-
-void jitTableClear(struct N64*, bool mappedOnly, int page);
 
 // RDRAM [addr, addr + len) is about to be written: throws away blocks there, and waits for RDP
 // commands that draw there or read it.

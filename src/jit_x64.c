@@ -835,12 +835,11 @@ static void chain(struct Jit* j) {
 	xMovRR(e, 4, RCX, RAX);
 	xShiftI(e, X_SHR, 4, R(RCX), 2);
 	xAluI(e, X_AND, 4, R(RCX), JIT_TABLE_SIZE - 1);
-	xShiftI(e, X_SHL, 4, R(RCX), 5);
+	xShiftI(e, X_SHL, 4, R(RCX), 4);
 	xLea(e, 8, RDX, MI(RBX, RCX, 1, (int32_t) offsetof(struct N64, jitTable)));
 	xAluRM(e, X_CMP, 4, RAX, M(RDX, (int32_t) offsetof(struct JitEntry, vaddr)));
 	xJcc(e, CC_NE, j->leave);
-	xLoad(e, 8, RAX, M(RDX, (int32_t) offsetof(struct JitEntry, genAt)));
-	xLoad(e, 4, RAX, M(RAX, 0));
+	xLoad(e, 4, RAX, N64_AT(blockGen));
 	xAluRM(e, X_CMP, 4, RAX, M(RDX, (int32_t) offsetof(struct JitEntry, gen)));
 	xJcc(e, CC_NE, j->leave);
 	xJmpM(e, M(RDX, (int32_t) offsetof(struct JitEntry, code)));
