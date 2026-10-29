@@ -106,6 +106,25 @@ void pifBoot(struct N64* n) {
 	n->riReg[4] = 0x00063634;
 	put32(&n->rdram[0x318], RDRAM_SIZE);
 	put32(&n->rdram[0x3F0], RDRAM_SIZE);
+	// A dump without boot code (development cartridges were loaded another way): what the 6102's
+	// leaves for the game, its first MiB at the entry point and the boot values at 0x300.
+	bool blank = !disk && n->romSize > 0x1000;
+	for (int i = 0x40; blank && i < 0x1000; ++i) {
+		blank = !n->rom[i];
+	}
+	if (blank) {
+		uint32_t entry = be32(n->rom + 8), size = n->romSize - 0x1000 < 0x100000 ? n->romSize - 0x1000 : 0x100000;
+		for (uint32_t i = 0; i < size; ++i) {
+			n->rdram[((entry & 0x1FFFFFFF) + i) & (RDRAM_SIZE - 1)] = n->rom[0x1000 + i];
+		}
+		const uint32_t values[6] = { (uint32_t) c->gpr[20], (uint32_t) c->gpr[19], 0xB0000000, (uint32_t) c->gpr[23], (uint32_t) c->gpr[22], (uint32_t) c->gpr[21] };
+		for (int i = 0; i < 6; ++i) {
+			put32(&n->rdram[0x300 + i * 4], values[i]);
+		}
+		n->bootChecksumReads = 0;
+		c->pc = (uint64_t) (int64_t) (int32_t) entry;
+		c->nextPc = c->pc + 4;
+	}
 }
 
 static void controller(struct N64* n, const uint8_t* cmd, uint8_t* resp, int rx) {
