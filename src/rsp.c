@@ -42,6 +42,16 @@ static void vectorLoad(struct N64* n, uint32_t op) {
 		return;
 	}
 	uint32_t addr = (r->r[RS] + (uint32_t) (offset * scale[kind])) & 0xFFF;
+	// Whole lanes from DMEM without wrapping: LSV, LLV, LDV and LQV at even elements and in-range
+	// addresses, LQV from a 16-byte boundary.
+	int size = scale[kind];
+	if (kind >= 1 && kind <= 4 && !(e & 1) && e + size <= 16 && addr + size <= 0x1000 && (kind < 4 || !(addr & 15))) {
+		const uint8_t* m = &n->sp.mem[addr];
+		for (int i = 0; i < size / 2; ++i) {
+			r->vr[vt][e / 2 + i] = (int16_t) (m[2 * i] << 8 | m[2 * i + 1]);
+		}
+		return;
+	}
 	switch (kind) {
 	case 0:
 	case 1:
@@ -131,6 +141,17 @@ static void vectorStore(struct N64* n, uint32_t op) {
 		return;
 	}
 	uint32_t addr = (r->r[RS] + (uint32_t) (offset * scale[kind])) & 0xFFF;
+	// Whole lanes to DMEM without wrapping, as for loads.
+	int size = scale[kind];
+	if (kind >= 1 && kind <= 4 && !(e & 1) && e + size <= 16 && addr + size <= 0x1000 && (kind < 4 || !(addr & 15))) {
+		uint8_t* m = &n->sp.mem[addr];
+		for (int i = 0; i < size / 2; ++i) {
+			uint16_t v = (uint16_t) r->vr[vt][e / 2 + i];
+			m[2 * i] = (uint8_t) (v >> 8);
+			m[2 * i + 1] = (uint8_t) v;
+		}
+		return;
+	}
 	switch (kind) {
 	case 0:
 	case 1:
