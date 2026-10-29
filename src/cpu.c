@@ -1109,7 +1109,8 @@ bool cpuJitReady(struct N64* n) {
 
 // One instruction for compiled code, which has stored curPc, pc, nextPc and the delay flags.
 // Returns whether the code must stop: the program left the straight line, a write threw blocks
-// away, an interrupt is due, or a COP0 or CACHE instruction may have changed what the code assumes.
+// away, an interrupt is due, a write to Count or Compare moved the timer's limit, or a CACHE
+// instruction changed the I-cache the code checks.
 bool cpuJitStep(struct N64* n, uint32_t op) {
 	struct CPU* c = &n->cpu;
 	uint64_t pc = c->pc;
@@ -1119,7 +1120,9 @@ bool cpuJitStep(struct N64* n, uint32_t op) {
 	n->cycles += 1 + c->stall;
 	c->stall = 0;
 	n->jitLimit = n->eventAt < n->jitFire ? n->eventAt : n->jitFire;
-	return c->pc != pc || n->blockGen != gen || interruptPending(n) || op >> 26 == 0x10 || op >> 26 == 0x2F;
+	bool timer = op >> 26 == 0x10 && (RS == 0x04 || RS == 0x05) && (RD == CP0_COUNT || RD == CP0_COMPARE);
+	bool icache = op >> 26 == 0x2F && ((op >> 16) & 3) == 0;
+	return c->pc != pc || n->blockGen != gen || interruptPending(n) || timer || icache;
 }
 
 void cpuStep(struct N64* n) {

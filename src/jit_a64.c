@@ -125,7 +125,13 @@ struct Miss {
 
 struct Jit {
 	struct Emitter e;
-	struct Exit exits[2 * 64];
+	// The instruction being emitted: where its slow path (the interpreter) is entered from, the
+	// cycles it holds the pipeline for, and whether it wrote Status (w2 is then nonzero if that
+	// leaves an interrupt due).
+	struct Slow* slow;
+	int extraCycles;
+	bool interruptCheck;
+	struct Exit exits[3 * 64];
 	int exitCount;
 	struct Slow slows[64];
 	int slowCount;
@@ -157,6 +163,100 @@ static int branchCondition(struct Emitter* e, uint32_t op, int rs, int rt) {
 	}
 	aDpImm(e, A_SUBS_IMM | W64, ZR, 0, 0);
 	return rt & 1 ? C_GE : C_LT;
+}
+
+// rd = rn & value, through a scratch register if AArch64 can't encode the constant.
+static void andConst(struct Emitter* e, int rd, int rn, uint32_t value) {
+	if (!aLogicImm(e, A_AND_IMM, rd, rn, value)) {
+		aMovImm(e, 17, value);
+		aDp(e, A_AND, rd, rn, 17, S_LSL, 0);
+	}
+}
+
+static int memSize(uint32_t op);
+static void emitMemory(struct Jit* j, struct Slow* slow);
+
+// Leaves the instruction for the interpreter, before it has changed anything, when cond holds.
+static void slowIf(struct Jit* j, int cond) {
+	j->slow->site[j->slow->sites++] = aBcond(&j->e, cond, NULL);
+}
+
+// The interpreter raises "coprocessor unusable" when Status.CU1 is off.
+static void needCop1(struct Jit* j) {
+	aLdr(&j->e, 16, CPU, CPU_OFF(cop0) + 8 * CP0_STATUS);
+	j->slow->site[j->slow->sites++] = aTbz(&j->e, 16, 29, NULL);
+}
+
+// Whether fpuExecute runs op without raising an exception (it only raises RI).
+static bool fpuOpValid(uint32_t op) {
+	int fmt = (op >> 21) & 31, func = op & 0x3F;
+	if (fmt <= 6) {
+		return fmt != 3;
+	}
+	if (fmt != 16 && fmt != 17 && fmt != 20 && fmt != 21) {
+		return false;
+	}
+	return func <= 15 || func == 32 || func == 33 || func == 36 || func == 37 || func >= 0x30;
+}
+
+// MFC0 and DMFC0 of anything but Random; MTC0 and DMTC0 of Status, EPC and ErrorEPC.
+static bool emitCop0(struct Jit* j, uint32_t op) {
+	struct Emitter* e = &j->e;
+	int rs = (op >> 21) & 31, rt = (op >> 16) & 31, rd = (op >> 11) & 31;
+	unsigned reg = CPU_OFF(cop0) + 8 * rd;
+	if (rs == 0x00 || rs == 0x01) {
+		if (rd == CP0_RANDOM) {
+			return false;
+		}
+		if (rt) {
+			if (rd == CP0_COUNT) {
+				// Count: half the cycles before this instruction, from countBase.
+				aLsrImmX(e, 0, CYCLES, 1);
+				aLdrX(e, 1, CPU, CPU_OFF(countBase));
+				aDp(e, A_SUB | W64, 0, 0, 1, S_LSL, 0);
+				if (rs == 0x00) {
+					aSxtw(e, 0, 0);
+				} else {
+					aMov(e, 0, 0);
+				}
+			} else {
+				aLdrX(e, 0, CPU, reg);
+				if (rs == 0x00) {
+					aSxtw(e, 0, 0);
+				}
+			}
+			storeGpr(e, rt, 0);
+		}
+		return true;
+	}
+	if (rs != 0x04 && rs != 0x05) {
+		return false;
+	}
+	if (rd == CP0_STATUS) {
+		loadGpr32(e, 0, rt);
+		andConst(e, 0, 0, 0xFFF7FFFF);
+		aStrX(e, 0, CPU, reg);
+		// Interrupts on (IE, not EXL or ERL) and one of them pending.
+		aAndBits(e, 1, 0, 0, 3);
+		aDpImm(e, A_SUBS_IMM, ZR, 1, 1);
+		aMovImm(e, 2, 0);
+		uint8_t* off = aBcond(e, C_NE, NULL);
+		aLdr(e, 2, CPU, CPU_OFF(cop0) + 8 * CP0_CAUSE);
+		aDp(e, A_AND, 2, 2, 0, S_LSL, 0);
+		aAndBits(e, 2, 2, 8, 8);
+		patchHere(e, off);
+		j->interruptCheck = true;
+		return true;
+	}
+	if (rd == CP0_EPC || rd == CP0_ERROREPC) {
+		loadGpr(e, 0, rt);
+		if (rs == 0x04) {
+			aSxtw(e, 0, 0);
+		}
+		aStrX(e, 0, CPU, reg);
+		return true;
+	}
+	return false;
 }
 
 static bool emitInline(struct Jit* j, uint32_t op, uint64_t pc, enum Kind* kind) {
@@ -227,6 +327,35 @@ static bool emitInline(struct Jit* j, uint32_t op, uint64_t pc, enum Kind* kind)
 				storeGpr(e, rd, 0);
 			}
 			return true;
+		case 0x18: case 0x19:
+			// The products' low and high words, sign-extended; the multiplier holds the pipeline.
+			loadGpr32(e, 0, rs);
+			loadGpr32(e, 1, rt);
+			if (f == 0x18) {
+				aSmull(e, 0, 0, 1);
+			} else {
+				aUmull(e, 0, 0, 1);
+			}
+			aSxtw(e, 1, 0);
+			aStrX(e, 1, CPU, CPU_OFF(lo));
+			aAsrImmX(e, 0, 0, 32);
+			aSxtw(e, 0, 0);
+			aStrX(e, 0, CPU, CPU_OFF(hi));
+			j->extraCycles = 3;
+			return true;
+		case 0x20: case 0x22: case 0x2C: case 0x2E: {
+			// Overflow raises an exception, through the interpreter, before rd changes.
+			uint32_t wide = f >= 0x2C ? W64 : 0;
+			loadGpr(e, 0, rs);
+			loadGpr(e, 1, rt);
+			aDp(e, ((f & 2) ? A_SUBS : A_ADDS) | wide, 0, 0, 1, S_LSL, 0);
+			slowIf(j, C_VS);
+			if (!wide) {
+				aSxtw(e, 0, 0);
+			}
+			storeGpr(e, rd, 0);
+			return true;
+		}
 		case 0x21: case 0x23:
 			if (rd) {
 				loadGpr32(e, 0, rs);
@@ -292,6 +421,18 @@ static bool emitInline(struct Jit* j, uint32_t op, uint64_t pc, enum Kind* kind)
 	case 0x04: case 0x05: case 0x06: case 0x07:
 	case 0x14: case 0x15: case 0x16: case 0x17:
 		break;
+	case 0x08: case 0x18: {
+		uint32_t wide = op >> 26 == 0x18 ? W64 : 0;
+		loadGpr(e, 0, rs);
+		movConst(e, 1, (uint64_t) (int64_t) imm);
+		aDp(e, A_ADDS | wide, 0, 0, 1, S_LSL, 0);
+		slowIf(j, C_VS);
+		if (!wide) {
+			aSxtw(e, 0, 0);
+		}
+		storeGpr(e, rt, 0);
+		return true;
+	}
 	case 0x09:
 		if (rt) {
 			loadGpr32(e, 0, rs);
@@ -321,6 +462,34 @@ static bool emitInline(struct Jit* j, uint32_t op, uint64_t pc, enum Kind* kind)
 	case 0x0F:
 		storeGprConst(e, rt, sext32((uint32_t) (uint16_t) op << 16));
 		return true;
+	case 0x10:
+		return emitCop0(j, op);
+	case 0x11:
+		if (((op >> 21) & 31) == 0x08) {
+			break;
+		}
+		if (!fpuOpValid(op)) {
+			return false;
+		}
+		// The FPU's own code, called directly: it raises nothing once CU1 is on. Its stall counts.
+		needCop1(j);
+		aMovX(e, 0, N);
+		aMovImm(e, 1, op);
+		aMovImm64(e, IP, (uint64_t) (uintptr_t) fpuExecute);
+		aBlr(e, IP);
+		aLdr(e, 0, CPU, CPU_OFF(stall));
+		aDp(e, A_ADD | W64, CYCLES, CYCLES, 0, S_LSL, 0);
+		aStr(e, ZR, CPU, CPU_OFF(stall));
+		// A move to r0 is undone, as the interpreter zeroes r0 after every instruction.
+		if (((op >> 21) & 31) <= 2 && !rt) {
+			aStrX(e, ZR, CPU, gprOff(0));
+		}
+		return true;
+	case 0x20: case 0x21: case 0x23: case 0x24: case 0x25: case 0x27: case 0x37:
+	case 0x28: case 0x29: case 0x2B: case 0x3F:
+	case 0x31: case 0x35: case 0x39: case 0x3D:
+		emitMemory(j, j->slow);
+		return true;
 	case 0x19:
 		if (rt) {
 			loadGpr(e, 0, rs);
@@ -335,8 +504,17 @@ static bool emitInline(struct Jit* j, uint32_t op, uint64_t pc, enum Kind* kind)
 
 	// Conditional branches. The link register is written whether or not the branch is taken, after
 	// the condition has read the source.
-	bool likely = (op >> 26) >= 0x14 || ((op >> 26) == 0x01 && (rt & 2));
-	int cc = branchCondition(e, op, rs, rt);
+	bool likely = (op >> 26) >= 0x14 || ((op >> 26) == 0x01 && (rt & 2)) || ((op >> 26) == 0x11 && (rt & 2));
+	int cc;
+	if (op >> 26 == 0x11) {
+		// BC1F, BC1T and the likely ones: FCR31's condition bit.
+		needCop1(j);
+		aLdr(e, 0, CPU, CPU_OFF(fcr31));
+		aLogicImm(e, A_ANDS_IMM, ZR, 0, 1u << 23);
+		cc = rt & 1 ? C_NE : C_EQ;
+	} else {
+		cc = branchCondition(e, op, rs, rt);
+	}
 	if ((op >> 26) == 0x01 && (rt & 0x10)) {
 		storeGprConst(e, 31, pc + 8);
 	}
@@ -464,16 +642,26 @@ static int memSize(uint32_t op) {
 		return 4;
 	case 0x37: case 0x3F:
 		return 8;
+	case 0x31: case 0x39:
+		return 4;
+	case 0x35: case 0x3D:
+		return 8;
 	}
 	return 0;
 }
 
-// rd = rn & value, through a scratch register if AArch64 can't encode the constant.
-static void andConst(struct Emitter* e, int rd, int rn, uint32_t value) {
-	if (!aLogicImm(e, A_AND_IMM, rd, rn, value)) {
-		aMovImm(e, 17, value);
-		aDp(e, A_AND, rd, rn, 17, S_LSL, 0);
+// x5 = the FPR an FPU load or store of size bytes uses, as get32/set32 and get64/set64 find it:
+// with Status.FR clear, odd 32-bit registers are the high half of the even one below.
+static void fprAddress(struct Emitter* e, int ft, int size) {
+	unsigned own = CPU_OFF(fpr) + 8 * ft;
+	aAddImmX(e, 5, CPU, own);
+	if (!(ft & 1)) {
+		return;
 	}
+	aAddImmX(e, 6, CPU, CPU_OFF(fpr) + 8 * (ft & ~1) + (size == 4 ? 4 : 0));
+	aLdr(e, 7, CPU, CPU_OFF(cop0) + 8 * CP0_STATUS);
+	aLogicImm(e, A_ANDS_IMM, ZR, 7, 1u << 26);
+	aCselX(e, 5, 6, 5, C_EQ);
 }
 
 // A load or store to cached RDRAM, through kseg0 or a page in the TLB cache, with dataTiming's
@@ -483,8 +671,12 @@ static void emitMemory(struct Jit* j, struct Slow* slow) {
 	struct Emitter* e = &j->e;
 	uint32_t op = slow->op;
 	int rs = (op >> 21) & 31, rt = (op >> 16) & 31, size = memSize(op);
-	bool isStore = (op >> 26) >= 0x28 && (op >> 26) != 0x37;
-	slow->sites = 0;
+	int code = op >> 26;
+	bool fpu = code == 0x31 || code == 0x35 || code == 0x39 || code == 0x3D;
+	bool isStore = code >= 0x28 && code != 0x37 && code != 0x31 && code != 0x35;
+	if (fpu) {
+		needCop1(j);
+	}
 
 	loadGpr(e, 0, rs);
 	if ((int16_t) op) {
@@ -591,6 +783,31 @@ static void emitMemory(struct Jit* j, struct Slow* slow) {
 		aRevX(e, 4, 4);
 		aLdst(e, L_STRX, 4, RAM, 0, L_UXTW);
 		break;
+	case 0x31: case 0x35:
+		aLdst(e, size == 4 ? L_LDR : L_LDRX, 4, RAM, 0, L_UXTW);
+		if (size == 4) {
+			aRev(e, 4, 4);
+		} else {
+			aRevX(e, 4, 4);
+		}
+		fprAddress(e, rt, size);
+		if (size == 4) {
+			aStr(e, 4, 5, 0);
+		} else {
+			aStrX(e, 4, 5, 0);
+		}
+		return;
+	case 0x39: case 0x3D:
+		fprAddress(e, rt, size);
+		if (size == 4) {
+			aLdr(e, 4, 5, 0);
+			aRev(e, 4, 4);
+		} else {
+			aLdrX(e, 4, 5, 0);
+			aRevX(e, 4, 4);
+		}
+		aLdst(e, size == 4 ? L_STR : L_STRX, 4, RAM, 0, L_UXTW);
+		return;
 	}
 	if (!isStore) {
 		storeGpr(e, rt, 4);
@@ -704,40 +921,27 @@ void* jitCompile(struct N64* n, const uint32_t* ops, uint32_t count, uint32_t va
 		bool lineStart = k == 0 || !(p & 31);
 		enum Kind kind;
 		uint8_t* mark = e->p;
-		if (memSize(op)) {
-			struct Slow* slow = &j->slows[j->slowCount++];
-			*slow = (struct Slow) { .op = op, .paddr = p, .pc = pc, .delay = delay, .lineStart = lineStart, .last = last };
-			emitMemory(j, slow);
-			if (lineStart) {
+		int exits = j->exitCount, misses = j->missCount;
+		bool branch = isBranchOp(op);
+		struct Slow* slow = &j->slows[j->slowCount];
+		*slow = (struct Slow) { .op = op, .paddr = p, .pc = pc, .delay = delay, .lineStart = lineStart, .last = last };
+		j->slow = slow;
+		j->extraCycles = 0;
+		j->interruptCheck = false;
+		// A branch's I-cache check comes first (a likely branch not taken leaves inside it); the rest
+		// check after, so slow paths and Count reads see the cycles before this fetch.
+		if (lineStart && branch && !delay) {
+			icacheCheck(e, (uint32_t) pc, p, false);
+		}
+		if (!(delay && branch) && emitInline(j, op, pc, &kind)) {
+			if (lineStart && !branch) {
 				icacheCheck(e, (uint32_t) pc, p, false);
 			}
-			aDpImm(e, A_ADD_IMM | W64, CYCLES, CYCLES, 1);
-			if (last) {
-				exitAt(j, aB(e, NULL), pc, PLAIN, delay, false);
-				j->exits[j->exitCount - 1].last = true;
-			} else {
-				aDp(e, A_SUBS | W64, ZR, CYCLES, LIMIT, S_LSL, 0);
-				exitAt(j, aBcond(e, C_HS, NULL), pc, PLAIN, delay, false);
+			aDpImm(e, A_ADD_IMM | W64, CYCLES, CYCLES, 1 + j->extraCycles);
+			if (j->interruptCheck) {
+				// An interrupt now due is taken before the next instruction.
+				exitAt(j, aCbnz(e, 2, NULL), pc, kind, delay, false);
 			}
-			slow->resume = e->p;
-			delay = false;
-			continue;
-		}
-		bool inl = !(delay && isBranchOp(op));
-		if (inl) {
-			if (lineStart) {
-				icacheCheck(e, (uint32_t) pc, p, false);
-			}
-			inl = emitInline(j, op, pc, &kind);
-			if (!inl) {
-				e->p = mark;
-				if (j->exitCount && j->exits[j->exitCount - 1].site >= mark) {
-					--j->exitCount;
-				}
-			}
-		}
-		if (inl) {
-			aDpImm(e, A_ADD_IMM | W64, CYCLES, CYCLES, 1);
 			if (last) {
 				exitAt(j, aB(e, NULL), pc, kind, delay, false);
 				j->exits[j->exitCount - 1].last = true;
@@ -745,11 +949,18 @@ void* jitCompile(struct N64* n, const uint32_t* ops, uint32_t count, uint32_t va
 				aDp(e, A_SUBS | W64, ZR, CYCLES, LIMIT, S_LSL, 0);
 				exitAt(j, aBcond(e, C_HS, NULL), pc, kind, delay, false);
 			}
+			if (slow->sites) {
+				slow->resume = e->p;
+				++j->slowCount;
+			}
 			delay = kind != PLAIN;
 			continue;
 		}
+		e->p = mark;
+		j->exitCount = exits;
+		j->missCount = misses;
 		emitHelper(j, op, pc, p, delay, lineStart, last);
-		delay = isBranchOp(op);
+		delay = branch;
 	}
 
 	// D-cache line fills, as dataTiming: the fill, the write-back of a dirty line, the new tag.
