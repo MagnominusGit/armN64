@@ -2423,6 +2423,10 @@ static struct RDP* beginCommands(struct N64* n, uint64_t* begin) {
 
 // One command: a full sync interrupts the CPU once the commands before it would be done.
 static void command(struct N64* n, struct RDP* r, const uint64_t* w, int op, int words, uint64_t begin) {
+	++n->checkCounts[0][op];
+	if (n->checkLen[0] < 4096) {
+		n->checkSeq[0][n->checkLen[0]++] = w[0];
+	}
 	if (op == 0x29) {
 		if (r->gpu) {
 			gpuSubmit(n, r);

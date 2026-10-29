@@ -49,6 +49,8 @@ struct Hle {
 	float fogMul, fogOffset;
 	uint32_t modeH, modeL;
 	uint32_t half1;
+	// Counting the commands instead of drawing them (N64HLECHECK).
+	bool dry;
 	uint64_t list[LIST_MAX];
 	size_t count;
 };
@@ -70,10 +72,25 @@ static uint32_t address(struct Hle* h, uint32_t a) {
 	return (h->segments[(a >> 24) & 15] + (a & 0xFFFFFF)) & 0xFFFFFF;
 }
 
+static void flush(struct N64* n, struct Hle* h) {
+	if (!h->dry) {
+		rdpCommands(n, h->list, h->count);
+	} else {
+		for (size_t i = 0; i < h->count;) {
+			int op = (h->list[i] >> 56) & 0x3F;
+			++n->checkCounts[1][op];
+			if (n->checkLen[1] < 4096) {
+				n->checkSeq[1][n->checkLen[1]++] = h->list[i];
+			}
+			i += op >= 0x08 && op <= 0x0F ? 4 + (op & 4 ? 8 : 0) + (op & 2 ? 8 : 0) + (op & 1 ? 2 : 0) : op == 0x24 || op == 0x25 ? 2 : 1;
+		}
+	}
+	h->count = 0;
+}
+
 static void emit(struct N64* n, struct Hle* h, uint64_t w) {
 	if (h->count == LIST_MAX) {
-		rdpCommands(n, h->list, h->count);
-		h->count = 0;
+		flush(n, h);
 	}
 	h->list[h->count++] = w;
 }
@@ -324,6 +341,15 @@ static void drawTriangle(struct N64* n, struct Hle* h, int i0, int i1, int i2) {
 	if (i0 >= VERTICES || i1 >= VERTICES || i2 >= VERTICES) {
 		return;
 	}
+	// All three outside the same side of the view: rejected, as the microcodes do.
+	uint32_t outside = 0x3F;
+	for (int k = 0; k < 3; ++k) {
+		const struct Vertex* v = &h->v[k == 0 ? i0 : k == 1 ? i1 : i2];
+		outside &= (v->x < -v->w) | (v->x > v->w) << 1 | (v->y < -v->w) << 2 | (v->y > v->w) << 3 | (v->z < -v->w) << 4 | (v->z > v->w) << 5;
+	}
+	if (outside & 0xF) {
+		return;
+	}
 	struct Vertex poly[2][9];
 	int count = 3;
 	poly[0][0] = h->v[i0], poly[0][1] = h->v[i1], poly[0][2] = h->v[i2];
@@ -473,6 +499,9 @@ static void runList(struct N64* n, struct Hle* h, uint32_t start) {
 		}
 		if (f3dex2) {
 			switch (op) {
+			case 0x00:
+				emit(n, h, 0);
+				break;
 			case 0x01: {
 				int count = (w0 >> 12) & 0xFF, last = (w0 >> 1) & 0x7F;
 				loadVertices(n, h, w1, last - count, count);
@@ -557,6 +586,9 @@ static void runList(struct N64* n, struct Hle* h, uint32_t start) {
 		} else {
 			int scale = f3dex ? 2 : 10;
 			switch (op) {
+			case 0xC0:
+				emit(n, h, 0);
+				break;
 			case 0x01: {
 				int p = (w0 >> 16) & 0xFF;
 				matrix(n, h, w1, p & 1, p & 2, p & 4);
@@ -692,8 +724,8 @@ static int family(struct N64* n, uint32_t data, uint32_t size, uint32_t list) {
 }
 
 // Runs the graphics task in DMEM at high level when its microcode is one of the known families;
-// false leaves it to the RSP.
-bool hleGraphics(struct N64* n) {
+// false leaves it to the RSP. Dry, it only counts the RDP commands it would send.
+bool hleGraphics(struct N64* n, bool dry) {
 	const uint8_t* task = &n->sp.mem[0xFC0];
 	if (be32(task) != 1) {
 		return false;
@@ -711,6 +743,7 @@ bool hleGraphics(struct N64* n) {
 	}
 	struct Hle* h = n->hle;
 	h->family = f;
+	h->dry = dry;
 	memset(h->segments, 0, sizeof(h->segments));
 	static const float identity[16] = { 1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1 };
 	h->depth = 0;
@@ -724,9 +757,10 @@ bool hleGraphics(struct N64* n) {
 	// The lookat directions the microcodes' data starts with (texture generation without a lookat).
 	static const float lookat[2][3] = { { 1, 0, 0 }, { 0, 1, 0 } };
 	memcpy(h->lookat, lookat, sizeof(lookat));
+	// So do the other modes (the data's set-other-modes command).
+	h->modeH = 0x080CFF, h->modeL = 0;
 	h->count = 0;
 	runList(n, h, be32(task + 0x30));
-	rdpCommands(n, h->list, h->count);
-	h->count = 0;
+	flush(n, h);
 	return true;
 }

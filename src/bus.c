@@ -53,7 +53,43 @@ static void spWriteStatus(struct N64* n, uint32_t v) {
 		++n->stats.rspTasks;
 		// A graphics task run at high level ends as its microcode would: halted at a break with the
 		// task-done signal.
-		if (n->accuracy == ACCURACY_HLE && hleGraphics(n)) {
+		if (n->hleCheck && be32(&n->sp.mem[0xFC0]) == 1 && !(be32(&n->sp.mem[0xFC4]) & 1)) {
+			// The last graphics task's commands, from its microcode and at high level.
+			static uint64_t task;
+			int shown = 0;
+			for (int op = 0; op < 64; ++op) {
+				if (n->checkCounts[0][op] != n->checkCounts[1][op] && shown++ < 12) {
+					fprintf(stderr, "HLECHECK task %llu field %llu op %02x microcode %u high level %u\n", (unsigned long long) task, (unsigned long long) n->fields, op, n->checkCounts[0][op], n->checkCounts[1][op]);
+				}
+			}
+			// The first command that differs, triangles left out.
+			uint32_t i = 0, j = 0;
+			while (shown && i < n->checkLen[0] && j < n->checkLen[1]) {
+				uint64_t a = n->checkSeq[0][i], b = n->checkSeq[1][j];
+				if (((a >> 56) & 0x38) == 0x08) {
+					++i;
+					continue;
+				}
+				if (((b >> 56) & 0x38) == 0x08) {
+					++j;
+					continue;
+				}
+				int op = (a >> 56) & 0x3F;
+				bool sync = op == 0x00 || (op >= 0x26 && op <= 0x29), image = op >= 0x3D;
+				uint64_t mask = sync ? 0x3Full << 56 : image ? ~0xFC000000ull : ~0ull;
+				if ((a ^ b) & mask) {
+					fprintf(stderr, "HLESEQ task %llu microcode #%u %016llx (after %016llx) high level #%u %016llx (after %016llx)\n", (unsigned long long) task,
+					        i, (unsigned long long) a, (unsigned long long) (i ? n->checkSeq[0][i - 1] : 0), j, (unsigned long long) b, (unsigned long long) (j ? n->checkSeq[1][j - 1] : 0));
+					break;
+				}
+				++i, ++j;
+			}
+			memset(n->checkCounts, 0, sizeof(n->checkCounts));
+			n->checkLen[0] = n->checkLen[1] = 0;
+			hleGraphics(n, true);
+			++task;
+		}
+		if (n->accuracy == ACCURACY_HLE && hleGraphics(n, false)) {
 			*s |= 0x203;
 			if (*s & 0x40) {
 				n64Interrupt(n, MI_SP, true);

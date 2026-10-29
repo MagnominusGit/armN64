@@ -193,6 +193,13 @@ struct N64 {
 	struct DP dp;
 	struct RDP* rdp;
 	struct Hle* hle;
+	// N64HLECHECK=1: each graphics task also runs at high level without drawing, and the RDP commands
+	// it would send are counted against those the microcode sends ([0] microcode, [1] high level).
+	bool hleCheck;
+	uint32_t checkCounts[2][64];
+	// The first commands' first words, for finding where the two part.
+	uint64_t checkSeq[2][4096];
+	uint32_t checkLen[2];
 	struct VI vi;
 	struct AI ai;
 	struct PI pi;
@@ -428,7 +435,7 @@ void rdpRun(struct N64*);
 void rdpCommands(struct N64*, const uint64_t* list, size_t count);
 
 // hle.c
-bool hleGraphics(struct N64*);
+bool hleGraphics(struct N64*, bool dry);
 void rdpDestroy(struct N64*);
 
 // carts.c

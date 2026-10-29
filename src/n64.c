@@ -93,6 +93,7 @@ static void start(struct N64* n) {
 	n->accuracy = !accuracy ? ACCURACY_LLE_ACCURATE : !strcmp(accuracy, "lle-compatible") ? ACCURACY_LLE_COMPATIBLE :
 	              !strcmp(accuracy, "hle") ? ACCURACY_HLE : ACCURACY_LLE_ACCURATE;
 	n->compat = n->accuracy >= ACCURACY_LLE_COMPATIBLE;
+	n->hleCheck = getenv("N64HLECHECK") != NULL;
 	const char* mouse = getenv("N64_MOUSE");
 	n->mousePort = mouse && *mouse >= '1' && *mouse <= '4' ? *mouse - '0' : 0;
 	if (n->compat) {
