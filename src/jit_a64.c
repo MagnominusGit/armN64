@@ -931,6 +931,168 @@ static void emitMemory(struct Jit* j, struct Slow* slow) {
 }
 
 // Goes on to the block at the pc in memory if the jump table has it, or leaves.
+// Runs of loads and stores through the same base register (context switches, prologues, copies):
+// how many instructions from ops[k] make one, 0 for under three. The run stops before the block's
+// last instruction, a load that changes the base, or an offset not a multiple of its size.
+static uint32_t fusedRunLength(const uint32_t* ops, uint32_t k, uint32_t count) {
+	int rs = (ops[k] >> 21) & 31;
+	int32_t lo = (int16_t) ops[k], hi = lo;
+	uint32_t n = 0;
+	while (k + n + 1 < count) {
+		uint32_t op = ops[k + n];
+		int code = op >> 26;
+		bool memory = (code >= 0x20 && code <= 0x2B && code != 0x22 && code != 0x26 && code != 0x2A) || code == 0x37 || code == 0x3F;
+		int size = memory ? memSize(op) : 1;
+		int32_t off = (int16_t) op;
+		bool load = code < 0x28 || code == 0x37;
+		if (!memory || (int) ((op >> 21) & 31) != rs || (off & (size - 1)) || (load && (int) ((op >> 16) & 31) == rs)) {
+			break;
+		}
+		lo = off < lo ? off : lo;
+		hi = off + size - 1 > hi ? off + size - 1 : hi;
+		if (hi - lo >= 512) {
+			break;
+		}
+		++n;
+	}
+	return n >= 3 ? n : 0;
+}
+
+// The run, when nothing in it can leave its fast path: the cycles can't reach the limit, its
+// I-cache lines are in, the base is aligned for every access, all of them are in one RDRAM page with
+// no flags, and every D-cache line they span is in. Every access then hits and takes one cycle, so
+// the run is its loads and stores in order and its cycles at once. Anything else takes the
+// instructions one by one (emitted after this), from the start of the run. Returns the branch to
+// the end of the run.
+static uint8_t* fuseRun(struct Jit* j, const uint32_t* ops, uint32_t len, uint32_t vaddr, uint32_t paddr) {
+	struct Emitter* e = &j->e;
+	uint8_t* out[96];
+	int sites = 0;
+	int rs = (ops[0] >> 21) & 31, align = 1;
+	int32_t lo = (int16_t) ops[0], hi = lo;
+	bool stores = false;
+	for (uint32_t i = 0; i < len; ++i) {
+		int32_t off = (int16_t) ops[i];
+		int size = memSize(ops[i]);
+		lo = off < lo ? off : lo;
+		hi = off + size - 1 > hi ? off + size - 1 : hi;
+		align = size > align ? size : align;
+		stores |= ops[i] >> 26 >= 0x28 && ops[i] >> 26 != 0x37;
+	}
+	// The base first: the instructions one by one hold it from here whichever way the checks go.
+	int b = readReg(j, rs);
+	aMovImm(e, 1, len);
+	aDp(e, A_SUBS | W64, ZR, LEFT, 1, S_LSL, 0);
+	out[sites++] = aBcond(e, C_LE, NULL);
+	for (uint32_t p = paddr & ~31u; p < paddr + 4 * len; p += 32) {
+		uint32_t v = vaddr + (p - paddr);
+		aLdr(e, 0, CPU, CPU_OFF(icacheTag) + 4 * ((v >> 5) & 511));
+		aMovImm(e, 1, p >> 5 | 0x80000000u);
+		aDp(e, A_SUBS, ZR, 0, 1, S_LSL, 0);
+		out[sites++] = aBcond(e, C_NE, NULL);
+	}
+	if (align > 1) {
+		aLogicImm(e, A_ANDS_IMM, ZR, b, align - 1);
+		out[sites++] = aBcond(e, C_NE, NULL);
+	}
+	if (b == ZR) {
+		aMovImm(e, 0, (uint32_t) lo);
+		aMovImm(e, 8, (uint32_t) hi);
+	} else {
+		aAddImm(e, 0, b, lo, 1);
+		aAddImm(e, 8, b, hi, 1);
+	}
+	aDp(e, A_EOR, 1, 0, 8, S_LSL, 0);
+	aLsrImm(e, 1, 1, 12);
+	out[sites++] = aCbnz(e, 1, NULL);
+	aLsrImm(e, 1, 0, 12);
+	if (stores) {
+		aDpImm(e, A_ADD_IMM | W64, 3, TLB, VPAGES * 4);
+		aLdst(e, L_LDR, 5, 3, 1, L_UXTW | 0x1000);
+	} else {
+		aLdst(e, L_LDR, 5, TLB, 1, L_UXTW | 0x1000);
+	}
+	aDp(e, A_ADD, 6, 0, 5, S_LSL, 0);
+	aLsrImm(e, 1, 6, 12);
+	aLdst(e, L_LDRB, 1, PAGES, 1, L_UXTW);
+	if (stores) {
+		out[sites++] = aCbnz(e, 1, NULL);
+	} else {
+		out[sites++] = aTbnz(e, 1, 7, NULL);
+		if (j->rdpThreads) {
+			out[sites++] = aTbnz(e, 1, 1, NULL);
+		}
+	}
+	// The D-cache lines from the first address's to the last's.
+	for (int32_t step = 0; step <= hi - lo + 15; step += 16) {
+		int32_t at = step > hi - lo ? hi - lo : step;
+		if (at) {
+			aAddImm(e, 1, 0, at, 3);
+			aUbfx(e, 1, 1, 4, 9);
+		} else {
+			aUbfx(e, 1, 0, 4, 9);
+		}
+		aLdst(e, L_LDR, 3, DTAG, 1, L_UXTW | 0x1000);
+		aAddImm(e, 4, 6, at, 17);
+		aDp(e, A_EOR, 3, 3, 4, S_LSL, 0);
+		aLogicImm(e, A_ANDS_IMM, ZR, 3, 0xFFFFFFF0u);
+		out[sites++] = aBcond(e, C_NE, NULL);
+	}
+	// x7 = the host address of the base's physical address less lo rounded down to 8, so every
+	// access is at a positive offset that is a multiple of its size.
+	int32_t floor8 = lo & ~7;
+	aMov(e, 7, 6);
+	if (lo - floor8) {
+		aDpImm(e, A_SUB_IMM | W64, 7, 7, (unsigned) (lo - floor8));
+	}
+	aDp(e, A_ADD | W64, 7, RAM, 7, S_LSL, 0);
+	if (stores) {
+		aMovImm(e, 3, 1);
+	}
+	for (uint32_t i = 0; i < len; ++i) {
+		uint32_t op = ops[i];
+		int rt = (op >> 16) & 31, code = op >> 26;
+		unsigned d = (unsigned) ((int16_t) op - floor8);
+		if (code < 0x28 || code == 0x37) {
+			switch (code) {
+			case 0x20: aLdrb(e, 4, 7, d); aSxtbX(e, 4, 4); break;
+			case 0x24: aLdrb(e, 4, 7, d); break;
+			case 0x21: aLdrh(e, 4, 7, d); aRev16(e, 4, 4); aSxthX(e, 4, 4); break;
+			case 0x25: aLdrh(e, 4, 7, d); aRev16(e, 4, 4); break;
+			case 0x23: aLdr(e, 4, 7, d); aRev(e, 4, 4); aSxtw(e, 4, 4); break;
+			case 0x27: aLdr(e, 4, 7, d); aRev(e, 4, 4); break;
+			default: aLdrX(e, 4, 7, d); aRevX(e, 4, 4);
+			}
+			if (rt) {
+				aStrX(e, 4, CPU, gprOff(rt));
+			}
+			continue;
+		}
+		int v = ZR;
+		if (rt) {
+			aLdrX(e, 4, CPU, gprOff(rt));
+			v = 4;
+		}
+		switch (code) {
+		case 0x28: aStrb(e, v, 7, d); break;
+		case 0x29: if (rt) { aRev16(e, 4, 4); } aStrh(e, v, 7, d); break;
+		case 0x2B: if (rt) { aRev(e, 4, 4); } aStr(e, v, 7, d); break;
+		default: if (rt) { aRevX(e, 4, 4); } aStrX(e, v, 7, d);
+		}
+		// The line it wrote is dirty.
+		aAddImm(e, 1, 0, (int16_t) op - lo, 2);
+		aUbfx(e, 1, 1, 4, 9);
+		aLdst(e, L_STRB, 3, DIRTY, 1, L_UXTW);
+	}
+	aMovImm(e, 1, len);
+	aDp(e, A_SUB | W64, LEFT, LEFT, 1, S_LSL, 0);
+	uint8_t* done = aB(e, NULL);
+	for (int i = 0; i < sites; ++i) {
+		patchHere(e, out[i]);
+	}
+	return done;
+}
+
 // A poll loop (blockPollPass) about to go round again, pc back at its start, skips the whole passes
 // of pass cycles that fit before the limit when all its I-cache and D-cache lines are in: every pass
 // then reads the same memory, takes the same branch and costs the same.
@@ -1088,8 +1250,21 @@ void* jitCompile(struct N64* n, const uint32_t* ops, uint32_t count, uint32_t va
 
 	cacheClear(&j->cache);
 	bool delay = false;
+	// A fused run's end, where its fast path joins the instructions one by one.
+	uint8_t* fusedDone = NULL;
+	uint32_t fusedEnd = 0;
 	for (uint32_t k = 0; k < count; ++k) {
 		uint32_t op = ops[k], p = paddr + k * 4;
+		if (fusedDone && k == fusedEnd) {
+			patchHere(e, fusedDone);
+			cacheClear(&j->cache);
+			fusedDone = NULL;
+		}
+		uint32_t run = delay ? 0 : fusedRunLength(ops, k, count);
+		if (run && !fusedDone) {
+			fusedDone = fuseRun(j, ops + k, run, vaddr + 4 * k, p);
+			fusedEnd = k + run;
+		}
 		uint64_t pc = sext32(vaddr + k * 4);
 		bool last = k + 1 == count;
 		bool lineStart = k == 0 || !(p & 31);
