@@ -25,12 +25,18 @@ void rspInitTables(void) {
 		uint64_t b = (1ull << 34) / a;
 		// The first entry would be 0x20000; the table holds 0xFFFF there.
 		reciprocals[i] = i == 0 ? 0xFFFF : (uint16_t) ((b + 1) >> 8);
+		// The least b from 1 << 17 with a * (b + 1)^2 >= 1 << 44, found by halving.
 		a = (i + 512) >> (i & 1);
-		b = 1 << 17;
-		while (a * (b + 1) * (b + 1) < (1ull << 44)) {
-			++b;
+		uint64_t low = 1 << 17, high = 1 << 23;
+		while (low < high) {
+			b = (low + high) / 2;
+			if (a * (b + 1) * (b + 1) < (1ull << 44)) {
+				low = b + 1;
+			} else {
+				high = b;
+			}
 		}
-		inverseRoots[i] = (uint16_t) (b >> 1);
+		inverseRoots[i] = (uint16_t) (low >> 1);
 	}
 }
 
