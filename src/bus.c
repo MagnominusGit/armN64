@@ -23,7 +23,12 @@ static void spDma(struct N64* n, uint32_t lenReg, bool toRdram) {
 		} else {
 			n64RdramRead(n, dram, len);
 		}
-		for (uint32_t i = 0; i < len; ++i) {
+		if ((mem & 0xFFF) + len <= 0x1000 && (dram & (RDRAM_SIZE - 1)) + len <= RDRAM_SIZE) {
+			// The row wraps neither memory.
+			uint8_t* sp = &n->sp.mem[base | (mem & 0xFFF)];
+			uint8_t* d = &n->rdram[dram & (RDRAM_SIZE - 1)];
+			memcpy(toRdram ? d : sp, toRdram ? sp : d, len);
+		} else for (uint32_t i = 0; i < len; ++i) {
 			uint8_t* sp = &n->sp.mem[base | ((mem + i) & 0xFFF)];
 			uint32_t d = (dram + i) & (RDRAM_SIZE - 1);
 			if (toRdram) {
@@ -48,8 +53,14 @@ static void spWriteStatus(struct N64* n, uint32_t v) {
 		*s &= ~1u;
 		++n->stats.rspTasks;
 		// N64TASKDUMP=number,file: the RSP's memories, registers and RDRAM as that task starts.
-		if (getenv("N64TASKDUMP") && n->stats.rspTasks == strtoull(getenv("N64TASKDUMP"), NULL, 10)) {
-			FILE* f = fopen(strchr(getenv("N64TASKDUMP"), ',') + 1, "wb");
+		static const char* taskDump;
+		static bool looked;
+		if (!looked) {
+			taskDump = getenv("N64TASKDUMP");
+			looked = true;
+		}
+		if (taskDump && n->stats.rspTasks == strtoull(taskDump, NULL, 10)) {
+			FILE* f = fopen(strchr(taskDump, ',') + 1, "wb");
 			fwrite(n->sp.mem, 1, sizeof(n->sp.mem), f);
 			fwrite(&n->sp, 1, sizeof(n->sp), f);
 			fwrite(&n->rsp, 1, sizeof(n->rsp), f);
