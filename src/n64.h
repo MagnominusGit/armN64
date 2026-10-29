@@ -67,7 +67,7 @@ struct SP {
 struct RSP {
 	uint32_t r[32];
 	uint32_t nextPc;
-	int16_t vr[32][8];
+	int16_t vr[32][8] __attribute__((aligned(16)));
 	// The 48-bit accumulator as its high, middle and low 16 bits.
 	int16_t accH[8], accM[8], accL[8];
 	uint16_t vco, vcc;

@@ -9,11 +9,12 @@
 // inline, the vector unit and COP0 through C.
 //
 // Registers: x19 = n, x20 = &n->rsp, x21 = clock, x22 = the limit, x23 = lastStart,
-// w24 = lastAlone, x25 = DMEM, w26 = IMEM's generation before a call.
+// w24 = lastAlone, x25 = DMEM, w26 = IMEM's generation before a call, x27 = the vector registers
+// (vr, then the accumulator, VCO, VCC and VCE), x28 = vectorConstants.
 
 enum { ARENA_SIZE = 4 << 20, BLOCK_CODE_MAX = 32 << 10, SHARED_SIZE = 256, BLOCK_MAX = 64 };
 
-enum { N = 19, RSP = 20, CLOCK = 21, LIMIT = 22, START = 23, ALONE = 24, DMEM = 25, GEN = 26, IP = 16 };
+enum { N = 19, RSP = 20, CLOCK = 21, LIMIT = 22, START = 23, ALONE = 24, DMEM = 25, GEN = 26, VR = 27, VCONST = 28, IP = 16 };
 
 #define RSP_OFF(f) ((unsigned) offsetof(struct RSP, f))
 #define N64_OFF(f) ((unsigned) offsetof(struct N64, f))
@@ -165,6 +166,455 @@ static void byteLoop(struct Emitter* e, bool store, int size, bool sign) {
 		aLslImm(e, 0, 0, 32 - 8 * size);
 		aAsrImm(e, 0, 0, 32 - 8 * size);
 	}
+}
+
+// The vector unit in NEON, as rsp_vu.c computes it: lanes are .8H, x27 points at vr. Each
+// instruction loads what it reads and stores what it writes; v0 = vs, v1 = the element of vt,
+// v2 = the result, v3-v5 = the accumulator's high, middle and low slices, v16-v31 scratch.
+
+// Byte indices for TBL for the quarter elements (4-7), then each lane's bit.
+static const uint16_t vectorConstants[5 * 8] __attribute__((aligned(16))) = {
+	0x0100, 0x0100, 0x0100, 0x0100, 0x0908, 0x0908, 0x0908, 0x0908,
+	0x0302, 0x0302, 0x0302, 0x0302, 0x0B0A, 0x0B0A, 0x0B0A, 0x0B0A,
+	0x0504, 0x0504, 0x0504, 0x0504, 0x0D0C, 0x0D0C, 0x0D0C, 0x0D0C,
+	0x0706, 0x0706, 0x0706, 0x0706, 0x0F0E, 0x0F0E, 0x0F0E, 0x0F0E,
+	1, 2, 4, 8, 16, 32, 64, 128,
+};
+
+enum { VR_ACCH = 512, VR_ACCM = 528, VR_ACCL = 544, VR_VCO = 560, VR_VCC = 562, VR_VCE = 564, CONST_LANES = 64 };
+
+// Three-register operations on .8H (or .16B for the bitwise ones), and .4S/.4H widening forms.
+enum {
+	V_ADD = 0x4E608400, V_SUB = 0x6E608400, V_MUL = 0x4E609C00,
+	V_SMULL = 0x0E60C000, V_SMULL2 = 0x4E60C000, V_UMULL = 0x2E60C000, V_UMULL2 = 0x6E60C000,
+	V_UZP2 = 0x4E405800, V_ZIP1 = 0x4E403800, V_ZIP2 = 0x4E407800, V_TRN1 = 0x4E402800, V_TRN2 = 0x4E406800,
+	V_AND = 0x4E201C00, V_ORR = 0x4EA01C00, V_EOR = 0x6E201C00, V_BIC = 0x4E601C00, V_ORN = 0x4EE01C00,
+	V_BIT = 0x6EA01C00, V_BIF = 0x6EE01C00, V_BSL = 0x6E601C00,
+	V_CMEQ = 0x6E608C00, V_CMGT = 0x4E603400, V_CMGE = 0x4E603C00, V_CMHI = 0x6E603400, V_CMTST = 0x4E608C00,
+	V_SADDL = 0x0E600000, V_SADDL2 = 0x4E600000, V_SSUBL = 0x0E602000, V_SSUBL2 = 0x4E602000,
+	V_SADDW = 0x0E601000, V_SADDW2 = 0x4E601000, V_SSUBW = 0x0E603000, V_SSUBW2 = 0x4E603000,
+	V_TBL = 0x4E000000,
+};
+
+// Two-register operations: compares with zero, NOT, NEG, the narrowing SQXTN and the lane sum.
+enum {
+	V_CMEQ0 = 0x4E609800, V_CMLT0 = 0x4E60A800, V_CMGT0 = 0x4E608800, V_CMGE0 = 0x6E608800, V_CMLE0 = 0x6E609800,
+	V_NOT = 0x6E205800, V_NEG = 0x6E60B800, V_SQXTN = 0x0E614800, V_SQXTN2 = 0x4E614800, V_ADDV = 0x4E71B800,
+};
+
+static void v3(struct Emitter* e, uint32_t op, int d, int n, int m) {
+	emit32(e, op | (m << 16) | (n << 5) | d);
+}
+
+static void v2(struct Emitter* e, uint32_t op, int d, int n) {
+	emit32(e, op | (n << 5) | d);
+}
+
+// Shifts of every lane by an immediate.
+static void vSshr(struct Emitter* e, int d, int n, int shift) {
+	emit32(e, 0x4F000400 | ((32 - shift) << 16) | (n << 5) | d);
+}
+
+static void vUshr(struct Emitter* e, int d, int n, int shift) {
+	emit32(e, 0x6F000400 | ((32 - shift) << 16) | (n << 5) | d);
+}
+
+static void vShl(struct Emitter* e, int d, int n, int shift) {
+	emit32(e, 0x4F005400 | ((16 + shift) << 16) | (n << 5) | d);
+}
+
+// Every lane to 0x8000; all bits clear; lane i of n everywhere; w to every lane.
+static void vMin(struct Emitter* e, int d) {
+	emit32(e, 0x4F04A400 | d);
+}
+
+static void vZero(struct Emitter* e, int d) {
+	emit32(e, 0x4F00E400 | d);
+}
+
+static void vDupLane(struct Emitter* e, int d, int n, int lane) {
+	emit32(e, 0x4E000400 | ((lane << 2 | 2) << 16) | (n << 5) | d);
+}
+
+static void vDupW(struct Emitter* e, int d, int w) {
+	emit32(e, 0x4E020C00 | (w << 5) | d);
+}
+
+static void vLoad(struct Emitter* e, int v, int base, unsigned off) {
+	emit32(e, 0x3DC00000 | (off / 16) << 10 | (base << 5) | v);
+}
+
+static void vStore(struct Emitter* e, int v, int base, unsigned off) {
+	emit32(e, 0x3D800000 | (off / 16) << 10 | (base << 5) | v);
+}
+
+// w = the lanes of mask v as bits (bits in rsp_vu.c), and v = the mask of bits w (maskOf); t is scratch.
+static void vBits(struct Emitter* e, int w, int v, int t) {
+	vLoad(e, t, VCONST, CONST_LANES);
+	v3(e, V_AND, t, v, t);
+	v2(e, V_ADDV, t, t);
+	emit32(e, 0x0E023C00 | (t << 5) | w);
+}
+
+static void vMaskOf(struct Emitter* e, int v, int w, int t) {
+	vDupW(e, v, w);
+	vLoad(e, t, VCONST, CONST_LANES);
+	v3(e, V_CMTST, v, v, t);
+}
+
+// d = the high halves of the products a * b: signed by signed, unsigned by unsigned, and signed by
+// unsigned (or the other way round), as mulhiSS, mulhiUU, mulhiSU and mulhiUS.
+static void vMulhi(struct Emitter* e, int d, int a, int b, bool signedA, bool signedB) {
+	bool s = signedA || signedB;
+	v3(e, s ? V_SMULL : V_UMULL, 16, a, b);
+	v3(e, s ? V_SMULL2 : V_UMULL2, 17, a, b);
+	v3(e, V_UZP2, d, 16, 17);
+	if (signedA != signedB) {
+		// The unsigned operand's sign bit counted as 0x10000: add the signed one where it is set.
+		vSshr(e, 18, signedA ? b : a, 15);
+		v3(e, V_AND, 18, 18, signedA ? a : b);
+		v3(e, V_ADD, d, d, 18);
+	}
+}
+
+// acc (v3-v5) += (h, m, l), wrapping at 48 bits, as accAdd: carries from the low and middle
+// slices (masks, so subtracting one adds 1). h, m and l must not be v24-v27 or v31.
+static void vAccAdd(struct Emitter* e, int h, int m, int l) {
+	v3(e, V_ADD, 24, 5, l);
+	v3(e, V_CMHI, 25, 5, 24);
+	v3(e, V_ADD, 26, 4, m);
+	v3(e, V_CMHI, 27, 4, 26);
+	v3(e, V_SUB, 4, 26, 25);
+	v2(e, V_CMEQ0, 31, 4);
+	v3(e, V_AND, 25, 25, 31);
+	v3(e, V_ADD, 3, 3, h);
+	v3(e, V_SUB, 3, 3, 27);
+	v3(e, V_SUB, 3, 3, 25);
+	v3(e, V_ORR, 5, 24, 24);
+}
+
+// d = bits 16-47 of the accumulator saturated to 16 signed bits (clampSigned), the low slice when
+// they fit (clampLow), or saturated to 16 unsigned bits (clampUnsigned).
+static void vClampSigned(struct Emitter* e, int d) {
+	v3(e, V_ZIP1, 24, 4, 3);
+	v3(e, V_ZIP2, 25, 4, 3);
+	v2(e, V_SQXTN, d, 24);
+	v2(e, V_SQXTN2, d, 25);
+}
+
+static void vClampLow(struct Emitter* e, int d) {
+	vSshr(e, 24, 4, 15);
+	v3(e, V_CMEQ, 24, 3, 24);
+	v2(e, V_CMGE0, d, 3);
+	v3(e, V_BIT, d, 5, 24);
+}
+
+static void vClampUnsigned(struct Emitter* e, int d) {
+	v2(e, V_CMLT0, 24, 3);
+	v2(e, V_CMGT0, 25, 3);
+	v2(e, V_CMLT0, 26, 4);
+	v3(e, V_ORR, 25, 25, 26);
+	v3(e, V_ORR, d, 4, 25);
+	v3(e, V_BIC, d, d, 24);
+}
+
+static void vLoadAcc(struct Emitter* e) {
+	vLoad(e, 3, VR, VR_ACCH);
+	vLoad(e, 4, VR, VR_ACCM);
+	vLoad(e, 5, VR, VR_ACCL);
+}
+
+static void vStoreAcc(struct Emitter* e) {
+	vStore(e, 3, VR, VR_ACCH);
+	vStore(e, 4, VR, VR_ACCM);
+	vStore(e, 5, VR, VR_ACCL);
+}
+
+// The vector instructions compiled to NEON; false for the rest, which call their C functions.
+static bool emitVectorOp(struct Emitter* e, uint32_t op) {
+	int el = (op >> 21) & 15, vt = (op >> 16) & 31, vs = (op >> 11) & 31, vd = (op >> 6) & 31;
+	int func = op & 0x3F;
+	bool known = func <= 0x01 || (func >= 0x04 && func <= 0x09) || (func >= 0x0C && func <= 0x11) || func == 0x14 ||
+	             func == 0x15 || func == 0x1D || (func >= 0x20 && func <= 0x25) || (func >= 0x27 && func <= 0x2D);
+	if (!known) {
+		return false;
+	}
+	if (func == 0x1D) {
+		if (el >= 8 && el <= 10) {
+			vLoad(e, 2, VR, VR_ACCH + 16 * (el - 8));
+		} else {
+			vZero(e, 2);
+		}
+		vStore(e, 2, VR, 16 * vd);
+		return true;
+	}
+	vLoad(e, 0, VR, 16 * vs);
+	vLoad(e, 1, VR, 16 * vt);
+	if (el == 2 || el == 3) {
+		v3(e, el == 2 ? V_TRN1 : V_TRN2, 1, 1, 1);
+	} else if (el >= 4 && el <= 7) {
+		vLoad(e, 16, VCONST, 16 * (el - 4));
+		v3(e, V_TBL, 1, 1, 16);
+	} else if (el >= 8) {
+		vDupLane(e, 1, 1, el & 7);
+	}
+	switch (func) {
+	case 0x00: case 0x01: case 0x08: case 0x09:
+		// VMULF, VMULU, VMACF, VMACU: acc (+)= s * t * 2, rounded when not adding.
+		vMulhi(e, 17, 0, 1, true, true);
+		v3(e, V_MUL, 16, 0, 1);
+		vShl(e, 18, 16, 1);
+		vShl(e, 19, 17, 1);
+		vUshr(e, 20, 16, 15);
+		v3(e, V_ORR, 19, 19, 20);
+		vMin(e, 20);
+		v3(e, V_CMEQ, 21, 0, 20);
+		v3(e, V_CMEQ, 22, 1, 20);
+		v3(e, V_AND, 21, 21, 22);
+		if (func < 0x08) {
+			v3(e, V_EOR, 5, 18, 20);
+			vUshr(e, 22, 18, 15);
+			v3(e, V_ADD, 4, 19, 22);
+			vSshr(e, 3, 4, 15);
+			v3(e, V_BIC, 3, 3, 21);
+		} else {
+			vLoadAcc(e);
+			vSshr(e, 28, 19, 15);
+			v3(e, V_BIC, 28, 28, 21);
+			vAccAdd(e, 28, 19, 18);
+		}
+		vStoreAcc(e);
+		if (func & 1) {
+			vClampUnsigned(e, 2);
+		} else {
+			vClampSigned(e, 2);
+		}
+		break;
+	case 0x04:
+		vMulhi(e, 5, 0, 1, false, false);
+		vZero(e, 3);
+		vZero(e, 4);
+		vStoreAcc(e);
+		v3(e, V_ORR, 2, 5, 5);
+		break;
+	case 0x05: case 0x06:
+		// VMUDM, VMUDN: the middle slice from a mixed product, the low from the plain one.
+		vMulhi(e, 4, 0, 1, func == 0x05, func == 0x06);
+		v3(e, V_MUL, 5, 0, 1);
+		vSshr(e, 3, 4, 15);
+		vStoreAcc(e);
+		v3(e, V_ORR, 2, func == 0x05 ? 4 : 5, func == 0x05 ? 4 : 5);
+		break;
+	case 0x07:
+		vMulhi(e, 3, 0, 1, true, true);
+		v3(e, V_MUL, 4, 0, 1);
+		vZero(e, 5);
+		vStoreAcc(e);
+		vClampSigned(e, 2);
+		break;
+	case 0x0C:
+		vLoadAcc(e);
+		vMulhi(e, 28, 0, 1, false, false);
+		vZero(e, 29);
+		vAccAdd(e, 29, 29, 28);
+		vStoreAcc(e);
+		vClampLow(e, 2);
+		break;
+	case 0x0D: case 0x0E:
+		vLoadAcc(e);
+		vMulhi(e, 28, 0, 1, func == 0x0D, func == 0x0E);
+		v3(e, V_MUL, 29, 0, 1);
+		vSshr(e, 30, 28, 15);
+		vAccAdd(e, 30, 28, 29);
+		vStoreAcc(e);
+		if (func == 0x0D) {
+			vClampSigned(e, 2);
+		} else {
+			vClampLow(e, 2);
+		}
+		break;
+	case 0x0F:
+		vLoadAcc(e);
+		vMulhi(e, 28, 0, 1, true, true);
+		v3(e, V_MUL, 29, 0, 1);
+		vZero(e, 30);
+		vAccAdd(e, 28, 29, 30);
+		vStoreAcc(e);
+		vClampSigned(e, 2);
+		break;
+	case 0x10: case 0x11: {
+		// VADD, VSUB: with VCO's carries, the sum wrapping into the accumulator and saturated into vd.
+		bool sub = func == 0x11;
+		aLdrh(e, 0, VR, VR_VCO);
+		vMaskOf(e, 16, 0, 17);
+		vUshr(e, 16, 16, 15);
+		v3(e, sub ? V_SUB : V_ADD, 5, 0, 1);
+		v3(e, sub ? V_SUB : V_ADD, 5, 5, 16);
+		vStore(e, 5, VR, VR_ACCL);
+		v3(e, sub ? V_SSUBL : V_SADDL, 17, 0, 1);
+		v3(e, sub ? V_SSUBL2 : V_SADDL2, 18, 0, 1);
+		v3(e, sub ? V_SSUBW : V_SADDW, 17, 17, 16);
+		v3(e, sub ? V_SSUBW2 : V_SADDW2, 18, 18, 16);
+		v2(e, V_SQXTN, 2, 17);
+		v2(e, V_SQXTN2, 2, 18);
+		aStrh(e, ZR, VR, VR_VCO);
+		break;
+	}
+	case 0x14:
+		v3(e, V_ADD, 2, 0, 1);
+		v3(e, V_CMHI, 16, 0, 2);
+		vBits(e, 0, 16, 17);
+		aStrh(e, 0, VR, VR_VCO);
+		vStore(e, 2, VR, VR_ACCL);
+		break;
+	case 0x15:
+		v3(e, V_SUB, 2, 0, 1);
+		v3(e, V_CMHI, 16, 1, 0);
+		vBits(e, 0, 16, 17);
+		v2(e, V_CMEQ0, 16, 2);
+		v2(e, V_NOT, 16, 16);
+		vBits(e, 1, 16, 17);
+		aDp(e, A_ORR, 0, 0, 1, S_LSL, 8);
+		aStrh(e, 0, VR, VR_VCO);
+		vStore(e, 2, VR, VR_ACCL);
+		break;
+	case 0x20: case 0x21: case 0x22: case 0x23: {
+		// VLT, VEQ, VNE, VGE: VCC from the comparison, with VCO's carries and not-equals.
+		aLdrh(e, 0, VR, VR_VCO);
+		vMaskOf(e, 16, 0, 17);
+		aLsrImm(e, 0, 0, 8);
+		vMaskOf(e, 18, 0, 17);
+		v3(e, V_CMEQ, 19, 0, 1);
+		switch (func) {
+		case 0x20:
+			v3(e, V_CMGT, 20, 1, 0);
+			v3(e, V_AND, 21, 19, 18);
+			v3(e, V_AND, 21, 21, 16);
+			v3(e, V_ORR, 20, 20, 21);
+			break;
+		case 0x21:
+			v3(e, V_BIC, 20, 19, 18);
+			break;
+		case 0x22:
+			v3(e, V_ORN, 20, 18, 19);
+			break;
+		default:
+			v3(e, V_CMGT, 20, 0, 1);
+			v3(e, V_AND, 21, 18, 16);
+			v3(e, V_BIC, 21, 19, 21);
+			v3(e, V_ORR, 20, 20, 21);
+		}
+		if (func == 0x21) {
+			v3(e, V_ORR, 2, 1, 1);
+		} else {
+			v3(e, V_ORR, 2, 1, 1);
+			v3(e, V_BIT, 2, 0, 20);
+		}
+		vBits(e, 0, 20, 17);
+		aStrh(e, 0, VR, VR_VCC);
+		aStrh(e, ZR, VR, VR_VCO);
+		vStore(e, 2, VR, VR_ACCL);
+		break;
+	}
+	case 0x24: {
+		// VCL.
+		aLdrh(e, 0, VR, VR_VCC);
+		vMaskOf(e, 20, 0, 17);
+		aLsrImm(e, 0, 0, 8);
+		vMaskOf(e, 21, 0, 17);
+		aLdrh(e, 0, VR, VR_VCO);
+		vMaskOf(e, 22, 0, 17);
+		aLsrImm(e, 0, 0, 8);
+		vMaskOf(e, 23, 0, 17);
+		aLdrb(e, 0, VR, VR_VCE);
+		vMaskOf(e, 24, 0, 17);
+		v3(e, V_ADD, 25, 0, 1);
+		v3(e, V_CMHI, 26, 0, 25);
+		v2(e, V_CMEQ0, 27, 25);
+		v3(e, V_ORN, 28, 27, 26);
+		v3(e, V_BIC, 29, 27, 26);
+		v3(e, V_BSL, 24, 28, 29);
+		v3(e, V_BIC, 28, 22, 23);
+		v3(e, V_BIT, 20, 24, 28);
+		v3(e, V_ORR, 28, 22, 23);
+		v3(e, V_CMHI, 29, 1, 0);
+		v2(e, V_NOT, 29, 29);
+		v3(e, V_BIF, 21, 29, 28);
+		v2(e, V_NEG, 30, 1);
+		v3(e, V_ORR, 31, 0, 0);
+		v3(e, V_BIT, 31, 30, 20);
+		v3(e, V_ORR, 2, 0, 0);
+		v3(e, V_BIT, 2, 1, 21);
+		v3(e, V_BIT, 2, 31, 22);
+		vBits(e, 0, 20, 17);
+		vBits(e, 1, 21, 17);
+		aDp(e, A_ORR, 0, 0, 1, S_LSL, 8);
+		aStrh(e, 0, VR, VR_VCC);
+		aStrh(e, ZR, VR, VR_VCO);
+		aStrb(e, ZR, VR, VR_VCE);
+		vStore(e, 2, VR, VR_ACCL);
+		break;
+	}
+	case 0x25: {
+		// VCH.
+		v3(e, V_EOR, 20, 0, 1);
+		v2(e, V_CMLT0, 20, 20);
+		v3(e, V_ADD, 21, 0, 1);
+		v3(e, V_SUB, 22, 0, 1);
+		v2(e, V_CMLT0, 23, 1);
+		v2(e, V_CMLE0, 24, 21);
+		v3(e, V_ORR, 25, 23, 23);
+		v3(e, V_BIT, 25, 24, 20);
+		v2(e, V_CMGE0, 26, 22);
+		v3(e, V_ORR, 27, 26, 26);
+		v3(e, V_BIT, 27, 23, 20);
+		v2(e, V_NEG, 28, 1);
+		v3(e, V_ORR, 29, 0, 0);
+		v3(e, V_BIT, 29, 28, 25);
+		v3(e, V_ORR, 2, 0, 0);
+		v3(e, V_BIT, 2, 1, 27);
+		v3(e, V_BIT, 2, 29, 20);
+		vBits(e, 0, 25, 17);
+		vBits(e, 1, 27, 17);
+		aDp(e, A_ORR, 0, 0, 1, S_LSL, 8);
+		aStrh(e, 0, VR, VR_VCC);
+		// VCO: the sign lanes, and the lanes not equal: sum not 0 or -1 where signs differ, diff not 0.
+		v2(e, V_CMEQ0, 28, 21);
+		v2(e, V_NOT, 29, 21);
+		v2(e, V_CMEQ0, 29, 29);
+		v3(e, V_ORR, 30, 28, 29);
+		v2(e, V_NOT, 30, 30);
+		v2(e, V_CMEQ0, 31, 22);
+		v2(e, V_NOT, 31, 31);
+		v3(e, V_BIT, 31, 30, 20);
+		vBits(e, 0, 20, 17);
+		vBits(e, 1, 31, 17);
+		aDp(e, A_ORR, 0, 0, 1, S_LSL, 8);
+		aStrh(e, 0, VR, VR_VCO);
+		v3(e, V_AND, 29, 29, 20);
+		vBits(e, 0, 29, 17);
+		aStrb(e, 0, VR, VR_VCE);
+		vStore(e, 2, VR, VR_ACCL);
+		break;
+	}
+	case 0x27:
+		aLdrh(e, 0, VR, VR_VCC);
+		vMaskOf(e, 16, 0, 17);
+		v3(e, V_ORR, 2, 1, 1);
+		v3(e, V_BIT, 2, 0, 16);
+		aStrh(e, ZR, VR, VR_VCO);
+		vStore(e, 2, VR, VR_ACCL);
+		break;
+	default:
+		// VAND, VNAND, VOR, VNOR, VXOR, VNXOR.
+		v3(e, func <= 0x29 ? V_AND : func <= 0x2B ? V_ORR : V_EOR, 2, 0, 1);
+		if (func & 1) {
+			v2(e, V_NOT, 2, 2);
+		}
+		vStore(e, 2, VR, VR_ACCL);
+	}
+	vStore(e, 2, VR, 16 * vd);
+	return true;
 }
 
 // SIMD loads and stores of 2, 4, 8 or 16 bytes (H, S, D, Q): at base + wm (uxtw), or at [base].
@@ -454,6 +904,9 @@ static enum Kind emitInstruction(struct Jit* j, uint32_t op, uint32_t pc, bool d
 		}
 		return PLAIN;
 	case 0x12:
+		if ((op & (1 << 25)) && emitVectorOp(e, op)) {
+			return PLAIN;
+		}
 		if ((op & (1 << 25)) && rspVectorFn(op)) {
 			aMovX(e, 0, RSP);
 			aAddImmX(e, 1, RSP, RSP_OFF(vr[(op >> 6) & 31]));
@@ -495,22 +948,26 @@ static uint8_t* arenaGet(struct N64* n) {
 	n->rspUsed = SHARED_SIZE;
 	// rspJitEnter(n, code, limit), and the way back out.
 	struct Emitter e = { p, p, (uint8_t*) p + SHARED_SIZE };
-	aPush(&e, 29, 30, 80);
+	aPush(&e, 29, 30, 96);
 	aStp(&e, 19, 20, 16);
 	aStp(&e, 21, 22, 32);
 	aStp(&e, 23, 24, 48);
 	aStp(&e, 25, 26, 64);
+	aStp(&e, 27, 28, 80);
 	aMovX(&e, N, 0);
 	aAddImmX(&e, RSP, N, N64_OFF(rsp));
 	aMovX(&e, LIMIT, 2);
 	aAddImmX(&e, DMEM, N, N64_OFF(sp.mem));
+	aAddImmX(&e, VR, RSP, RSP_OFF(vr));
+	aMovImm64(&e, VCONST, (uint64_t) (uintptr_t) vectorConstants);
 	aBr(&e, 1);
 	n->rspLeave = e.p;
 	aLdp(&e, 19, 20, 16);
 	aLdp(&e, 21, 22, 32);
 	aLdp(&e, 23, 24, 48);
 	aLdp(&e, 25, 26, 64);
-	aPop(&e, 29, 30, 80);
+	aLdp(&e, 27, 28, 80);
+	aPop(&e, 29, 30, 96);
 	aRet(&e);
 	__builtin___clear_cache((char*) p, (char*) e.p);
 	n->rspEnter = (void (*)(struct N64*, void*, uint64_t)) p;
