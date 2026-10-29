@@ -74,7 +74,7 @@ static void cacheOp(struct CPU* c, uint32_t op, uint64_t vaddr) {
 void cpuReset(struct N64* n) {
 	struct CPU* c = &n->cpu;
 	memset(c, 0, sizeof(*c));
-	memset(n->tlbCache, 0, sizeof(n->tlbCache));
+	memset(n->tlbCache, 0xFF, sizeof(n->tlbCache));
 	c->cop0[CP0_STATUS] = 0x34000000;
 	c->cop0[CP0_CONFIG] = 0x7006E463;
 	c->cop0[CP0_PRID] = 0x00000B22;
@@ -155,7 +155,10 @@ static bool translate(struct N64* n, uint64_t vaddr, bool store, uint32_t* paddr
 			return false;
 		}
 		*paddr = ((uint32_t) (lo >> 6) << 12 & ~offsetMask) | (v & offsetMask);
-		n->tlbCache[(v >> 12) & (TLB_CACHE_SIZE - 1)] = (struct TlbCacheEntry) { v >> 12 | 0x80000000u, (*paddr & ~0xFFFu) | ((lo >> 2) & 1) };
+		if ((*paddr & ~0xFFFu) < RDRAM_SIZE) {
+			uint32_t delta = (*paddr & ~0xFFFu) - (v & ~0xFFFu);
+			n->tlbCache[(v >> 12) & (TLB_CACHE_SIZE - 1)] = (struct TlbCacheEntry) { v >> 12, delta | ((lo >> 2) & 1) };
+		}
 		return true;
 	}
 	c->exception = true;
@@ -226,7 +229,7 @@ static void tlbWrite(struct N64* n, int i) {
 	e->entryLo[0] = (c->cop0[CP0_ENTRYLO0] & 0x3FFFFFFE) | g;
 	e->entryLo[1] = (c->cop0[CP0_ENTRYLO1] & 0x3FFFFFFE) | g;
 	++n->blockGen;
-	memset(n->tlbCache, 0, sizeof(n->tlbCache));
+	memset(n->tlbCache, 0xFF, sizeof(n->tlbCache));
 }
 
 static uint32_t randomIndex(struct N64* n) {
@@ -280,7 +283,7 @@ static void cop0Write(struct N64* n, int r, uint64_t v) {
 	case CP0_ENTRYHI:
 		cop0[r] = v & 0xC00000FFFFFFE0FFull;
 		++n->blockGen;
-		memset(n->tlbCache, 0, sizeof(n->tlbCache));
+		memset(n->tlbCache, 0xFF, sizeof(n->tlbCache));
 		return;
 	case CP0_PRID:
 	case CP0_RANDOM:

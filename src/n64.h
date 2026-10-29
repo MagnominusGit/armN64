@@ -129,11 +129,12 @@ struct RspJitEntry {
 };
 struct RspBlock;
 
-// A virtual 4 KB page the TLB maps: the page number with bit 31 set, and the physical page with
-// bit 0 set if stores may go there.
+// A virtual 4 KB page the TLB maps to a page inside RDRAM: the page number (all ones when empty),
+// and what to add to a virtual address in it for the physical one, with bit 0 set if stores may go
+// there.
 enum { TLB_CACHE_SIZE = 256 };
 struct TlbCacheEntry {
-	uint32_t tag, page;
+	uint32_t tag, delta;
 };
 
 // Compiled code for a virtual address, good while blockGen is unchanged.

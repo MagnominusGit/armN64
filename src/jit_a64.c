@@ -10,18 +10,19 @@
 //
 // Registers: x19 = n, x20 = &n->cpu, x21 = cycles left to the limit (the limit less n->cycles),
 // x22 = the limit, x23 = RDRAM,
-// x27 = cpu.dcacheTag, x28 = cpu.dcacheDirty; x24-x26 and x9-x15 hold guest registers within a
+// x25 = tlbCache, x26 = pageFlags, x27 = cpu.dcacheTag, x28 = cpu.dcacheDirty; x24 and x9-x15 hold
+// guest registers within a
 // block (each written through to memory at once, so memory is always up to date); x0-x8, x16 and
 // x17 are scratch. Each block starts with a branch to the way out, for the conditional branches that
 // can't reach it.
 
 enum { ARENA_SIZE = 32 << 20, BLOCK_CODE_MAX = 32 << 10, SHARED_SIZE = 256 };
 
-enum { N = 19, CPU = 20, LEFT = 21, LIMIT = 22, RAM = 23, DTAG = 27, DIRTY = 28, IP = 16, IP1 = 17 };
+enum { N = 19, CPU = 20, LEFT = 21, LIMIT = 22, RAM = 23, TLB = 25, PAGES = 26, DTAG = 27, DIRTY = 28, IP = 16, IP1 = 17 };
 
 // The host registers that hold guest registers; the last seven don't survive calls.
-enum { POOL = 10, POOL_SAVED = 3 };
-static const uint8_t pool[POOL] = { 24, 25, 26, 9, 10, 11, 12, 13, 14, 15 };
+enum { POOL = 8, POOL_SAVED = 1 };
+static const uint8_t pool[POOL] = { 24, 9, 10, 11, 12, 13, 14, 15 };
 
 // Which guest register each pool register holds, and when it was last used.
 struct Cache {
@@ -776,9 +777,9 @@ static void emitMemory(struct Jit* j, struct Slow* slow) {
 	aDp(e, A_SUBS | W64, ZR, 1, 0, S_LSL, 0);
 	slow->site[slow->sites++] = aBcond(e, C_NE, NULL);
 	aMov(e, 8, 0);
-	andConst(e, 1, 0, 0xFF800000u | (size - 1));
-	aMovImm(e, 2, 0x80000000u);
-	aDp(e, A_SUBS, ZR, 1, 2, S_LSL, 0);
+	// kseg0 and aligned: then w1 is the physical address.
+	aLogicImm(e, A_EOR_IMM, 1, 0, 0x80000000u);
+	aLogicImm(e, A_ANDS_IMM, ZR, 1, 0xFF800000u | (size - 1));
 	uint8_t* kseg0 = aBcond(e, C_EQ, NULL);
 
 	// Mapped: the physical page from the TLB cache.
@@ -788,9 +789,7 @@ static void emitMemory(struct Jit* j, struct Slow* slow) {
 	}
 	aLsrImm(e, 1, 0, 12);
 	aAndBits(e, 2, 1, 0, 8);
-	aLogicImm(e, A_ORR_IMM, 1, 1, 0x80000000u);
-	aAddImmX(e, 3, N, N64_OFF(tlbCache));
-	aDp(e, A_ADD | W64, 3, 3, 2, S_LSL, 3);
+	aDp(e, A_ADD | W64, 3, TLB, 2, S_LSL, 3);
 	aLdpW(e, 4, 5, 3, 0);
 	aDp(e, A_SUBS, ZR, 4, 1, S_LSL, 0);
 	slow->site[slow->sites++] = aBcond(e, C_NE, NULL);
@@ -798,20 +797,16 @@ static void emitMemory(struct Jit* j, struct Slow* slow) {
 		slow->site[slow->sites++] = aTbz(e, 5, 0, NULL);
 	}
 	andConst(e, 5, 5, ~0xFFFu);
-	aAndBits(e, 0, 0, 0, 12);
-	aDp(e, A_ORR, 0, 0, 5, S_LSL, 0);
-	aDpImm(e, A_SUBS_IMM, ZR, 0, RDRAM_SIZE);
-	slow->site[slow->sites++] = aBcond(e, C_HS, NULL);
+	aDp(e, A_ADD, 0, 0, 5, S_LSL, 0);
 	uint8_t* mapped = aB(e, NULL);
 
 	patchHere(e, kseg0);
-	aAndBits(e, 0, 0, 0, 23);
+	aMov(e, 0, 1);
 	patchHere(e, mapped);
 	// Stores go slow on any flag (code, RDP), loads on pages the RDP may still be drawing to.
 	if (isStore || j->rdpThreads) {
 		aLsrImm(e, 1, 0, 12);
-		aAddImmX(e, 6, N, N64_OFF(pageFlags));
-		aLdst(e, L_LDRB, 1, 6, 1, L_UXTW);
+		aLdst(e, L_LDRB, 1, PAGES, 1, L_UXTW);
 		slow->site[slow->sites++] = isStore ? aCbnz(e, 1, NULL) : aTbnz(e, 1, 1, NULL);
 	}
 
@@ -951,6 +946,8 @@ static uint8_t* arenaGet(struct N64* n) {
 	loadN(&e, LIMIT, N64_OFF(jitLimit), 8);
 	aDp(&e, A_SUB | W64, LEFT, LIMIT, 0, S_LSL, 0);
 	loadN(&e, RAM, N64_OFF(rdram), 8);
+	aAddImmX(&e, TLB, N, N64_OFF(tlbCache));
+	aAddImmX(&e, PAGES, N, N64_OFF(pageFlags));
 	aAddImmX(&e, DTAG, CPU, CPU_OFF(dcacheTag));
 	aAddImmX(&e, DIRTY, CPU, CPU_OFF(dcacheDirty));
 	aBr(&e, 1);

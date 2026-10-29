@@ -647,7 +647,6 @@ static void emitMemory(struct Jit* j, struct Slow* slow) {
 	xShiftI(e, X_SHR, 4, R(RCX), 12);
 	xMovRR(e, 4, RDX, RCX);
 	xAluI(e, X_AND, 4, R(RDX), TLB_CACHE_SIZE - 1);
-	xAluI(e, X_OR, 4, R(RCX), (int32_t) 0x80000000u);
 	xAluRM(e, X_CMP, 4, RCX, entry);
 	slow->site[slow->sites++] = xJcc(e, CC_NE, NULL);
 	entry.disp += 4;
@@ -657,10 +656,7 @@ static void emitMemory(struct Jit* j, struct Slow* slow) {
 		slow->site[slow->sites++] = xJcc(e, CC_E, NULL);
 	}
 	xAluI(e, X_AND, 4, R(RCX), ~0xFFF);
-	xAluI(e, X_AND, 4, R(RAX), 0xFFF);
-	xAluRR(e, X_OR, 4, R(RAX), RCX);
-	xAluI(e, X_CMP, 4, R(RAX), RDRAM_SIZE);
-	slow->site[slow->sites++] = xJcc(e, CC_AE, NULL);
+	xAluRR(e, X_ADD, 4, R(RAX), RCX);
 	uint8_t* mapped = xJmp(e, NULL);
 
 	patchHere(e, kseg0);
