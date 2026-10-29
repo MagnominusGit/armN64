@@ -96,7 +96,7 @@ static bool systemBlockGood(const struct DD* d, uint32_t block, uint32_t size) {
 			return false;
 		}
 	}
-	if (block >= DISKID_LBA) {
+	if (block >= 12) {
 		return true;
 	}
 	if (b[4] != 0x10 || (b[5] & 0xF0) != 0x10 || be32(b + 0x18) != 0xFFFFFFFF) {
@@ -138,8 +138,8 @@ static bool layout(struct DD* d) {
 		}
 	}
 	// The system and ID copies a drive reads: those whose sectors all agree (and, for system data,
-	// that look like it); the rest of those blocks fail as on a disk. The IPL relies on that: a
-	// retail disk whose LBA 12 reads is a copy.
+	// that look like it); the rest of those blocks fail as on a disk. The IPL relies on that: LBA 12
+	// reads on a development disk and must not on a retail one.
 	uint32_t sysSize = d->sysOffset / BLOCK0 >= 2 && (d->sysOffset / BLOCK0) % 8 >= 2 ? 0xC0 : 0xE8;
 	for (uint32_t lba = 0; lba < 16; ++lba) {
 		d->readable[lba] = systemBlockGood(d, lba, lba < 12 ? sysSize : 0xE8);
