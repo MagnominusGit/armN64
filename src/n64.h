@@ -141,6 +141,27 @@ struct JitEntry {
 	void* code;
 };
 
+// The 64DD drive (dd.c): IPL ROM, disk (SDK layout) and where its LBAs are, buffers and registers.
+struct DD {
+	uint8_t* ipl;
+	uint8_t* disk;
+	size_t diskSize;
+	int diskType;
+	uint32_t sysOffset, idOffset;
+	bool readable[16];
+	uint32_t lbaOffset[0x10DC + 1];
+	uint16_t physLba[0x4000];
+	uint8_t c2s[0x400], ds[0x100], ms[0x40];
+	uint16_t data, currentTrack, id;
+	uint8_t currentSector, sectorSizeBuf, sectorSize, sectorBlock, setType, errors;
+	bool requestUser, requestC2, busy, resetState, spindleStopped, headRetracted, writeProtect, mechaError;
+	bool diskChanged, diskPresent, seeking;
+	bool bmStart, bmReset, bmError, blockTransfer, readMode, c1Single, c1Double;
+	bool irqMecha, irqBm;
+	// When the command's response and the next sector are due (0 for none).
+	uint64_t mechaAt, bmAt;
+};
+
 struct N64 {
 	uint8_t* rdram;
 	uint8_t* rom;
@@ -218,6 +239,7 @@ struct N64 {
 	struct {
 		uint64_t piDmas, piBytes, rspTasks, dpSyncs, aiBuffers, siDmas;
 	} stats;
+	struct DD dd;
 };
 
 // n64.c
@@ -226,6 +248,18 @@ void n64Destroy(struct N64*);
 bool n64LoadRom(struct N64*, const uint8_t* data, size_t size);
 void n64RunField(struct N64*);
 void n64Interrupt(struct N64*, uint32_t line, bool set);
+// The 64DD (dd.c): with an IPL ROM, and a disk image if given; with no cartridge it boots from the IPL.
+bool n64LoadDisk(struct N64*, const uint8_t* ipl, size_t iplSize, const uint8_t* disk, size_t diskSize);
+bool ddLoad(struct N64*, const uint8_t* ipl, size_t iplSize, const uint8_t* disk, size_t diskSize);
+void ddFree(struct N64*);
+bool ddPresent(const struct N64*);
+bool ddInterrupt(const struct N64*);
+uint32_t ddRead32(struct N64*, uint32_t addr);
+void ddWrite32(struct N64*, uint32_t addr, uint32_t v);
+uint8_t ddReadByte(struct N64*, uint32_t addr);
+void ddWriteByte(struct N64*, uint32_t addr, uint8_t v);
+void ddMechaResponse(struct N64*);
+void ddBmRequest(struct N64*);
 void aiUpdate(struct N64*);
 int n64Picture(struct N64*, uint32_t* out, int* width, int* height);
 

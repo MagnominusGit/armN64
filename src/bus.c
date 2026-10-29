@@ -140,6 +140,9 @@ static uint8_t cartByte(struct N64* n, uint32_t c) {
 	if (c >= 0x08000000 && c < 0x08020000) {
 		return n->save[c - 0x08000000];
 	}
+	if (c >= 0x05000000 && c < 0x06400000) {
+		return ddReadByte(n, c);
+	}
 	return 0;
 }
 
@@ -197,6 +200,8 @@ static void piDma(struct N64* n, uint32_t len, bool toRdram) {
 			uint32_t c = cart + i;
 			if (c >= 0x08000000 && c < 0x08020000) {
 				n->save[c - 0x08000000] = n->rdram[(dram + i) & (RDRAM_SIZE - 1)];
+			} else if (c >= 0x05000000 && c < 0x06000000) {
+				ddWriteByte(n, c, n->rdram[(dram + i) & (RDRAM_SIZE - 1)]);
 			}
 		}
 		n->pi.dramAddr = dram + len;
@@ -245,6 +250,9 @@ static inline bool rspShared(uint32_t addr) {
 
 uint32_t busRead32(struct N64* n, uint32_t addr) {
 	addr &= 0x1FFFFFFF;
+	if (addr >= 0x05000000 && addr < 0x06400000) {
+		return ddRead32(n, addr);
+	}
 	if (addr < RDRAM_SIZE) {
 		if (n->pageFlags[addr >> 12] & PAGE_RDP_WRITES) {
 			rdpWait(n);
@@ -368,6 +376,10 @@ uint32_t busRead32(struct N64* n, uint32_t addr) {
 
 void busWrite32(struct N64* n, uint32_t addr, uint32_t v) {
 	addr &= 0x1FFFFFFF;
+	if (addr >= 0x05000000 && addr < 0x06400000) {
+		ddWrite32(n, addr, v);
+		return;
+	}
 	if (rspShared(addr)) {
 		rspCatchUp(n);
 	}

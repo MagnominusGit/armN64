@@ -19,7 +19,7 @@ else()
 	set(JIT_SOURCES src/jit_none.c)
 endif()
 
-add_library(n64 STATIC src/n64.c src/blocks.c ${JIT_SOURCES} src/cpu.c src/fpu.c src/bus.c src/pif.c src/rsp.c src/rsp_vu.c src/rdp.c src/carts.c)
+add_library(n64 STATIC src/n64.c src/blocks.c ${JIT_SOURCES} src/cpu.c src/fpu.c src/bus.c src/pif.c src/rsp.c src/rsp_vu.c src/rdp.c src/carts.c src/dd.c)
 target_include_directories(n64 PUBLIC src)
 find_package(Threads REQUIRED)
 target_link_libraries(n64 m Threads::Threads)

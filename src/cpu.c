@@ -117,6 +117,12 @@ void cpuCheckInterrupts(struct N64* n) {
 	} else {
 		cop0[CP0_CAUSE] &= ~0x400ull;
 	}
+	// The cartridge line (IP3): the 64DD's.
+	if (ddInterrupt(n)) {
+		cop0[CP0_CAUSE] |= 0x800;
+	} else {
+		cop0[CP0_CAUSE] &= ~0x800ull;
+	}
 }
 
 static bool interruptPending(struct N64* n) {

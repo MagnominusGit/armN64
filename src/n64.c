@@ -35,10 +35,13 @@ void n64Destroy(struct N64* n) {
 		rdpDestroy(n);
 		free(n->rdram);
 		free(n->vpages);
+		ddFree(n);
 		free(n->rom);
 		free(n);
 	}
 }
+
+static void start(struct N64* n);
 
 // Cartridge images come big-endian (.z64), halfword-swapped (.v64) or word-swapped (.n64).
 bool n64LoadRom(struct N64* n, const uint8_t* data, size_t size) {
@@ -66,11 +69,17 @@ bool n64LoadRom(struct N64* n, const uint8_t* data, size_t size) {
 	}
 	free(n->rom);
 	n->rom = rom;
-	blocksFree(n);
 	n->romSize = size & ~3u;
+	start(n);
+	return true;
+}
+
+// From power-on: the PIF's boot from the cartridge, or from the 64DD's IPL without one.
+static void start(struct N64* n) {
+	blocksFree(n);
 	cpuReset(n);
 	pifBoot(n);
-	n->eeprom16k = cartEeprom16k(rom);
+	n->eeprom16k = n->rom ? cartEeprom16k(n->rom) : false;
 	memset(n->eeprom, 0xFF, sizeof(n->eeprom));
 	n->fieldCycles = CPU_HZ / (n->cpu.gpr[20] == 0 ? 50 : 60);
 	n->vi.reg[6] = n->cpu.gpr[20] == 0 ? 0x271 : 0x20D;
@@ -90,6 +99,15 @@ bool n64LoadRom(struct N64* n, const uint8_t* data, size_t size) {
 	n->rdpThreads = rdpThreads ? atoi(rdpThreads) : 0;
 	rspJitFree(n);
 	++n->rspCodeGen;
+}
+
+bool n64LoadDisk(struct N64* n, const uint8_t* ipl, size_t iplSize, const uint8_t* disk, size_t diskSize) {
+	if (!ddLoad(n, ipl, iplSize, disk, diskSize)) {
+		return false;
+	}
+	if (!n->rom) {
+		start(n);
+	}
 	return true;
 }
 
@@ -156,6 +174,12 @@ void n64RunField(struct N64* n) {
 			n->pi.status &= ~1u;
 			n64Interrupt(n, MI_PI, true);
 		}
+		if (n->dd.mechaAt && n->cycles >= n->dd.mechaAt) {
+			ddMechaResponse(n);
+		}
+		if (n->dd.bmAt && n->cycles >= n->dd.bmAt) {
+			ddBmRequest(n);
+		}
 		uint64_t until = n->nextVi;
 		if (n->slice) {
 			until = n->cycles + n->slice < until ? n->cycles + n->slice : until;
@@ -167,6 +191,8 @@ void n64RunField(struct N64* n) {
 			n64Event(n, n->dp.syncAt ? n->dp.syncAt : until);
 			n64Event(n, n->si.busyUntil ? n->si.busyUntil : until);
 			n64Event(n, n->pi.busyUntil ? n->pi.busyUntil : until);
+			n64Event(n, n->dd.mechaAt ? n->dd.mechaAt : until);
+			n64Event(n, n->dd.bmAt ? n->dd.bmAt : until);
 		}
 		// One cycle an instruction, plus cache fills, RCP register reads and long operations.
 		if (n->useBlocks) {

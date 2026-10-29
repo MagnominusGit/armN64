@@ -3,6 +3,7 @@
 
 #include <stdio.h>
 #include <stdlib.h>
+#include <string.h>
 #include <time.h>
 
 static uint8_t* readFile(const char* path, size_t* size) {
@@ -51,7 +52,31 @@ int main(int argc, char** argv) {
 	size_t size;
 	uint8_t* data = readFile(argv[1], &size);
 	struct N64* n = n64Create();
-	if (!data || !n || !n64LoadRom(n, data, size)) {
+	// 64DD: N64DDIPL=the IPL ROM. A .ndd game boots from it; N64DDDISK=disk adds one to a cartridge.
+	const char* iplPath = getenv("N64DDIPL");
+	const char* diskPath = getenv("N64DDDISK");
+	size_t len = strlen(argv[1]);
+	bool diskGame = len > 4 && !strcmp(argv[1] + len - 4, ".ndd");
+	if (diskGame) {
+		diskPath = argv[1];
+	}
+	if (iplPath && n) {
+		size_t iplSize, diskSize = 0;
+		uint8_t* ipl = readFile(iplPath, &iplSize);
+		uint8_t* disk = diskPath ? (diskGame ? data : readFile(diskPath, &diskSize)) : NULL;
+		if (diskGame) {
+			diskSize = size;
+		}
+		if (!ipl || (diskPath && !disk) || !n64LoadDisk(n, ipl, iplSize, disk, diskSize)) {
+			fprintf(stderr, "can't load the 64DD IPL %s or disk %s\n", iplPath, diskPath ? diskPath : "-");
+			return 1;
+		}
+		free(ipl);
+		if (disk != data) {
+			free(disk);
+		}
+	}
+	if (!data || !n || (!diskGame && !n64LoadRom(n, data, size)) || (diskGame && !iplPath)) {
 		fprintf(stderr, "can't load %s\n", argv[1]);
 		return 1;
 	}

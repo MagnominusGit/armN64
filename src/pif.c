@@ -26,6 +26,9 @@ static const struct {
 // Leaves the machine as the PIF boot ROM does when it hands over to the cartridge's boot code.
 void pifBoot(struct N64* n) {
 	struct CPU* c = &n->cpu;
+	// Without a cartridge, the 64DD's IPL ROM boots, its lockout chip known by the ROM's ID.
+	bool disk = n->romSize < 0x1000 && ddPresent(n);
+	const uint8_t* boot = disk ? n->dd.ipl : n->rom;
 	uint32_t crc = n->romSize >= 0x1000 ? crc32(n->rom + 0x40, 0x1000 - 0x40) : 0;
 	uint8_t seed = 0x3F;
 	n->cic = 6102;
@@ -35,7 +38,15 @@ void pifBoot(struct N64* n) {
 			seed = cics[i].seed;
 		}
 	}
-	memcpy(n->sp.mem + 0x40, n->rom + 0x40, 0xFC0);
+	if (disk) {
+		bool us = !memcmp(boot + 0x3B, "NDDE", 4), dev = !memcmp(boot + 0x3B, "NDXJ", 4);
+		n->cic = us ? 8501 : dev ? 8401 : 8303;
+		seed = us ? 0xDE : 0xDD;
+	}
+	if (!boot) {
+		return;
+	}
+	memcpy(n->sp.mem + 0x40, boot + 0x40, 0xFC0);
 	// The PIF leaves a short routine in IMEM, which the 6105 boot code relies on.
 	static const uint32_t imem[8] = {
 		0x3C0DBFC0, 0x8DA807FC, 0x25AD07C0, 0x31080080, 0x5500FFFC, 0x3C0DBFC0, 0x8DA80024, 0x3C0BB000,
@@ -44,16 +55,16 @@ void pifBoot(struct N64* n) {
 		put32(&n->sp.mem[0x1000 + i * 4], imem[i]);
 	}
 	n->sp.status = 1;
-	uint32_t dom1 = be32(n->rom);
+	uint32_t dom1 = be32(boot);
 	n->pi.timing[0] = dom1 & 0xFF;
 	n->pi.timing[1] = (dom1 >> 8) & 0xFF;
 	n->pi.timing[2] = (dom1 >> 16) & 0x0F;
 	n->pi.timing[3] = (dom1 >> 20) & 0x03;
 	n->vi.reg[3] = 1023;
 	c->gpr[11] = 0xFFFFFFFFA4000040ull;
-	c->gpr[19] = 0;
+	c->gpr[19] = disk;
 	// TV type from the cartridge's region: 0 PAL, 1 NTSC, 2 MPAL (Brazil).
-	switch (n->rom[0x3E]) {
+	switch (boot[0x3E]) {
 	case 'D': case 'F': case 'H': case 'I': case 'L': case 'P': case 'S': case 'U': case 'W': case 'X': case 'Y':
 		c->gpr[20] = 0;
 		break;
