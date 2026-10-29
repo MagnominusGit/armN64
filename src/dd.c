@@ -533,7 +533,7 @@ static void writeHalf(struct N64* n, unsigned index, uint16_t v) {
 	case 20:
 		d->sectorSizeBuf = v & 0xFF;
 		break;
-	case 22:
+	case 24:
 		d->sectorSize = v & 0xFF;
 		d->sectorBlock = v >> 8;
 		break;
