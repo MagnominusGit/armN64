@@ -85,8 +85,8 @@ struct RDP {
 	struct Stage stage[2];
 	// otherModes taken apart (setupModes): the cycle type, depth and alpha tests, and the blender's
 	// P, A, M and B inputs for each cycle.
-	int cycleType, zMode;
-	bool zCompare, zUpdate, zPrim, alphaCompare, cvgAlpha, cvgTimesAlpha, forceBlend, texConvert;
+	int cycleType, zMode, cvgDest;
+	bool antialias, zCompare, zUpdate, zPrim, alphaCompare, cvgAlpha, cvgTimesAlpha, forceBlend, texConvert;
 	uint8_t blendSel[2][4];
 	// The rows this renderer draws: y % rowCount == rowIndex (rowCount 0: none).
 	int rowIndex, rowCount;
@@ -161,12 +161,14 @@ static struct Color readPixel(struct N64* n, struct RDP* r, int x, int y) {
 	}
 	if (r->colorSize == 3) {
 		uint32_t a = (r->colorAddr + i * 4) & (RDRAM_SIZE - 4);
-		return unpack(be32(&n->rdram[a]));
+		struct Color c = unpack(be32(&n->rdram[a]));
+		c.a &= 0xE0;
+		return c;
 	}
 	uint32_t a = (r->colorAddr + i * 2) & (RDRAM_SIZE - 2);
 	uint16_t p = (uint16_t) (n->rdram[a] << 8 | n->rdram[a + 1]);
 	int cr = (p >> 11) & 31, cg = (p >> 6) & 31, cb = (p >> 1) & 31;
-	return (struct Color) { cr << 3 | cr >> 2, cg << 3 | cg >> 2, cb << 3 | cb >> 2, p & 1 ? 255 : 0 };
+	return (struct Color) { cr << 3 | cr >> 2, cg << 3 | cg >> 2, cb << 3 | cb >> 2, p & 1 ? 0xE0 : 0 };
 }
 
 static void writePixel(struct N64* n, struct RDP* r, int x, int y, struct Color c) {
@@ -597,6 +599,8 @@ static void setupModes(struct RDP* r) {
 	r->zPrim = (m >> 2) & 1;
 	r->zMode = (m >> 10) & 3;
 	r->alphaCompare = m & 1;
+	r->antialias = (m >> 3) & 1;
+	r->cvgDest = (m >> 8) & 3;
 	r->cvgAlpha = (m >> 13) & 1;
 	r->cvgTimesAlpha = (m >> 12) & 1;
 	r->texConvert = r->cycleType < 2 && (!((m >> 43) & 1) || (r->cycleType == 1 && (!((m >> 42) & 1) || ((m >> 41) & 1))));
@@ -690,30 +694,35 @@ static void shadePixel(struct N64* n, struct RDP* r, int x, int y, struct Pixel*
 	r->lastCombined = c;
 	r->lastPos = r->seq << 24 | (uint64_t) y << 12 | (uint32_t) x;
 	c = (struct Color) { clamp9(c.r), clamp9(c.g), clamp9(c.b), clamp9(c.a) };
-	// With alpha as coverage, alpha becomes the coverage (full: partial edges aren't modelled), or
-	// with coverage times alpha the 3-bit coverage it leaves; a pixel with none isn't written.
+	// Coverage is full (8) as partial edges aren't modelled; coverage times alpha scales it, and alpha
+	// as coverage replaces alpha with it.
+	int cvg = r->cvgTimesAlpha ? c.a >> 5 : 8;
 	if (r->cvgAlpha) {
-		if (!r->cvgTimesAlpha) {
-			c.a = 255;
-		} else if (c.a < 32) {
-			return;
-		}
+		c.a = r->cvgTimesAlpha ? cvg << 5 : 255;
+	}
+	if (r->antialias && !cvg) {
+		return;
 	}
 	if (r->alphaCompare && c.a < r->blend.a) {
 		return;
 	}
 	struct Color memory = readPixel(n, r, x, y);
-	// The blend formula applies only with force blend (or at partly covered edges, which aren't
-	// modelled yet); otherwise a cycle passes its first input through. In 2-cycle mode the first
-	// cycle always blends (fog), and its result is the second cycle's pixel.
-	bool force = r->forceBlend;
+	// The blend formula applies with force blend, or with antialiasing when the coverage doesn't
+	// overflow; otherwise a cycle passes its first input through. In 2-cycle mode the first cycle
+	// always blends (fog), and its result is the second cycle's pixel.
+	int memCvg = memory.a >> 5;
+	bool blend = r->forceBlend || (r->antialias && !((cvg + memCvg) & 8));
 	struct Color out = c;
 	if (cycleType == 1) {
 		struct Color first = blendColor(r, c, memory, p, 0);
-		out = force ? blendColor(r, first, memory, p, 1) : blendInput(r, first, memory, 1);
+		out = blend ? blendColor(r, first, memory, p, 1) : blendInput(r, first, memory, 1);
 	} else {
-		out = force ? blendColor(r, c, memory, p, 0) : blendInput(r, c, memory, 0);
+		out = blend ? blendColor(r, c, memory, p, 0) : blendInput(r, c, memory, 0);
 	}
+	// The image keeps the coverage (the alpha bit of 16-bit pixels, the top 3 alpha bits of 32-bit
+	// ones), as cvg_dest says.
+	int kept = r->cvgDest == 0 ? (blend ? cvg + memCvg : cvg - 1) : r->cvgDest == 1 ? (cvg + memCvg) & 7 : r->cvgDest == 2 ? 7 : memCvg;
+	out.a = (kept & 8 ? 7 : kept & 7) << 5;
 	writePixel(n, r, x, y, out);
 	if (r->zAddr && r->zUpdate) {
 		zWrite(n, r, x, y, zCompress(z));

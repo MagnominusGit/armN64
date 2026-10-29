@@ -179,11 +179,13 @@ ivec4 readPixel(int x, int y) {
 		return ivec4(v, v, v, 0xE0);
 	}
 	if (size == 3) {
-		return unpackColor(int(fbColor));
+		ivec4 c = unpackColor(int(fbColor));
+		c.a &= 0xE0;
+		return c;
 	}
 	uint p = fbColor;
 	int cr = int(p >> 11) & 31, cg = int(p >> 6) & 31, cb = int(p >> 1) & 31;
-	return ivec4(cr << 3 | cr >> 2, cg << 3 | cg >> 2, cb << 3 | cb >> 2, (p & 1u) != 0u ? 255 : 0);
+	return ivec4(cr << 3 | cr >> 2, cg << 3 | cg >> 2, cb << 3 | cb >> 2, (p & 1u) != 0u ? 0xE0 : 0);
 }
 
 void writePixel(int x, int y, ivec4 c) {
@@ -504,23 +506,29 @@ void shadePixel(int x, int y) {
 	lastCombined = c;
 	shaded = true;
 	c = ivec4(clamp9(c.r), clamp9(c.g), clamp9(c.b), clamp9(c.a));
+	bool antialias = ((omLo >> 3) & 1u) != 0u, cvgTimesAlpha = ((omLo >> 12) & 1u) != 0u;
+	int cvg = cvgTimesAlpha ? c.a >> 5 : 8;
 	if (((omLo >> 13) & 1u) != 0u) {
-		if (((omLo >> 12) & 1u) == 0u) {
-			c.a = 255;
-		} else if (c.a < 32) {
-			return;
-		}
+		c.a = cvgTimesAlpha ? cvg << 5 : 255;
+	}
+	if (antialias && cvg == 0) {
+		return;
 	}
 	if ((omLo & 1u) != 0u && c.a < gBlend.a) {
 		return;
 	}
 	ivec4 memory = readPixel(x, y);
-	bool force = ((omLo >> 14) & 1u) != 0u;
-	// In 2-cycle mode the first cycle always blends; the last blends only with force blend.
+	int memCvg = memory.a >> 5;
+	bool blend = ((omLo >> 14) & 1u) != 0u || (antialias && ((cvg + memCvg) & 8) == 0);
+	// In 2-cycle mode the first cycle always blends; the last blends only with force blend or
+	// antialiasing without coverage overflow.
 	int cycles = cycleType == 1 ? 2 : 1;
 	for (int cycle = 0; cycle < cycles; ++cycle) {
-		c = cycle < cycles - 1 || force ? blendColor(c, memory, cycle) : blendInput(c, memory, cycle);
+		c = cycle < cycles - 1 || blend ? blendColor(c, memory, cycle) : blendInput(c, memory, cycle);
 	}
+	int cvgDest = int(omLo >> 8) & 3;
+	int kept = cvgDest == 0 ? (blend ? cvg + memCvg : cvg - 1) : cvgDest == 1 ? (cvg + memCvg) & 7 : cvgDest == 2 ? 7 : memCvg;
+	c.a = ((kept & 8) != 0 ? 7 : kept & 7) << 5;
 	writePixel(x, y, c);
 	if (zbuf && zUpdate) {
 		fbZ = zCompress(z);
