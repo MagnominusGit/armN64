@@ -467,6 +467,28 @@ static bool emitInline(struct Jit* j, uint32_t op, uint64_t pc, enum Kind* kind)
 			j->extraCycles = 3;
 			return true;
 		}
+		case 0x1A: case 0x1B: {
+			// LO the quotient and HI the remainder, sign-extended (INT32_MIN / -1 wraps, as SDIV does).
+			// By zero HI is the dividend and LO all ones, or 1 for a negative dividend in DIV.
+			int s = readReg(j, rs), t = readReg(j, rt);
+			emit32(e, (f == 0x1A ? 0x1AC00C00 : 0x1AC00800) | (t << 16) | (s << 5) | 0);
+			emit32(e, 0x1B008000 | (t << 16) | (s << 10) | (0 << 5) | 1);
+			aSxtw(e, 1, 1);
+			aStrX(e, 1, CPU, CPU_OFF(hi));
+			aSxtw(e, 0, 0);
+			uint8_t* nonzero = aCbnz(e, t, NULL);
+			if (f == 0x1A) {
+				aLsrImm(e, 2, s, 31);
+				aLslImmX(e, 2, 2, 1);
+				aDpImm(e, A_SUB_IMM | W64, 0, 2, 1);
+			} else {
+				movConst(e, 0, ~0ull);
+			}
+			patchHere(e, nonzero);
+			aStrX(e, 0, CPU, CPU_OFF(lo));
+			j->extraCycles = 36;
+			return true;
+		}
 		case 0x20: case 0x22: case 0x2C: case 0x2E: {
 			// Overflow raises an exception, through the interpreter, before rd changes.
 			uint32_t wide = f >= 0x2C ? W64 : 0;
@@ -609,6 +631,37 @@ static bool emitInline(struct Jit* j, uint32_t op, uint64_t pc, enum Kind* kind)
 			}
 		}
 		return true;
+	case 0x2F: {
+		// CACHE on the D-cache, as cacheOp: the line the address indexes is written back if dirty
+		// (not for action 3) and emptied by actions 0, 4 and 5. I-cache ones leave the block through
+		// the interpreter; the secondary cache isn't there.
+		int which = (op >> 16) & 3, action = (op >> 18) & 7;
+		if (which == 0) {
+			return false;
+		}
+		if (which != 1) {
+			return true;
+		}
+		int base = readReg(j, rs);
+		if (base == ZR) {
+			aMovImm(e, 0, (uint32_t) imm);
+		} else {
+			aAddImm(e, 0, base, imm, 1);
+		}
+		aUbfx(e, 1, 0, 4, 9);
+		if (action != 3) {
+			aLdst(e, L_LDRB, 3, DIRTY, 1, L_UXTW);
+			uint8_t* clean = aCbz(e, 3, NULL);
+			aLdst(e, L_STRB, ZR, DIRTY, 1, L_UXTW);
+			aDpImm(e, A_SUB_IMM | W64, LEFT, LEFT, 40);
+			patchHere(e, clean);
+		}
+		if (action == 0 || action == 4 || action == 5) {
+			aMovImm(e, 2, DCACHE_NONE);
+			aLdst(e, L_STR, 2, DTAG, 1, L_UXTW | 0x1000);
+		}
+		return true;
+	}
 	case 0x20: case 0x21: case 0x23: case 0x24: case 0x25: case 0x27: case 0x37:
 	case 0x28: case 0x29: case 0x2B: case 0x3F:
 	case 0x31: case 0x35: case 0x39: case 0x3D:
