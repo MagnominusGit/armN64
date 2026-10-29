@@ -1300,6 +1300,18 @@ void* jitCompile(struct N64* n, const uint32_t* ops, uint32_t count, uint32_t va
 		skipIdle(e, vaddr, paddr);
 	}
 	uint32_t pollPass = blockPollPass(ops, count, vaddr);
+	// A conditional branch or jump at the end back to the start.
+	bool loopsBack = false;
+	if (count >= 2) {
+		uint32_t b = ops[count - 2];
+		uint32_t at = vaddr + 4 * (count - 2);
+		int code = b >> 26;
+		if ((code >= 0x04 && code <= 0x07) || (code >= 0x14 && code <= 0x17) || (code == 0x01 && !(b & 0x00100000))) {
+			loopsBack = at + 4 + ((uint32_t) (int16_t) b << 2) == vaddr;
+		} else if (code == 0x02) {
+			loopsBack = (((at + 4) & 0xF0000000) | ((b & 0x03FFFFFF) << 2)) == vaddr;
+		}
+	}
 
 	cacheClear(&j->cache);
 	bool delay = false;
@@ -1433,6 +1445,17 @@ void* jitCompile(struct N64* n, const uint32_t* ops, uint32_t count, uint32_t va
 	for (int i = 0; i < j->exitCount; ++i) {
 		struct Exit* x = &j->exits[i];
 		patchHere(e, x->site);
+		if (loopsBack && x->last && x->delay && !x->skip) {
+			// A loop going round again with cycles left: straight back to the start, before the
+			// state for leaving, which the next pass writes anew.
+			aLdrX(e, 0, CPU, CPU_OFF(nextPc));
+			movConst(e, 1, sext32(vaddr));
+			aDp(e, A_SUBS | W64, ZR, 0, 1, S_LSL, 0);
+			uint8_t* away = aBcond(e, C_NE, NULL);
+			aDp(e, A_SUBS | W64, ZR, LEFT, ZR, S_LSL, 0);
+			aBcond(e, C_GT, entry);
+			patchHere(e, away);
+		}
 		storeConst(e, CPU_OFF(curPc), x->pc);
 		storeByte(e, CPU_OFF(inDelay), x->delay);
 		storeByte(e, CPU_OFF(nextInDelay), x->kind != PLAIN && !x->skip);
