@@ -653,7 +653,7 @@ static bool emitInline(struct Jit* j, uint32_t op, uint64_t pc, enum Kind* kind)
 			aLdst(e, L_LDRB, 3, DIRTY, 1, L_UXTW);
 			uint8_t* clean = aCbz(e, 3, NULL);
 			aLdst(e, L_STRB, ZR, DIRTY, 1, L_UXTW);
-			aDpImm(e, A_SUB_IMM | W64, LEFT, LEFT, 40);
+			aDpImm(e, A_SUB_IMM | W64, LEFT, LEFT, DCACHE_WRITEBACK);
 			patchHere(e, clean);
 		}
 		if (action == 0 || action == 4 || action == 5) {
@@ -719,10 +719,10 @@ static void icacheCheck(struct Emitter* e, uint32_t vaddr, uint32_t paddr, bool 
 	aStr(e, 1, CPU, tag);
 	if (toStall) {
 		aLdr(e, 0, CPU, CPU_OFF(stall));
-		aDpImm(e, A_ADD_IMM, 0, 0, 48);
+		aDpImm(e, A_ADD_IMM, 0, 0, ICACHE_FILL);
 		aStr(e, 0, CPU, CPU_OFF(stall));
 	} else {
-		aDpImm(e, A_SUB_IMM | W64, LEFT, LEFT, 48);
+		aDpImm(e, A_SUB_IMM | W64, LEFT, LEFT, ICACHE_FILL);
 	}
 	patchHere(e, hit);
 }
@@ -1415,10 +1415,10 @@ void* jitCompile(struct N64* n, const uint32_t* ops, uint32_t count, uint32_t va
 		aLsrImm(e, 2, 6, 23);
 		m->slow->site[m->slow->sites++] = aCbnz(e, 2, NULL);
 		aLogicImm(e, A_AND_IMM, 2, 6, ~0xFu);
-		aDpImm(e, A_SUB_IMM | W64, LEFT, LEFT, 40);
+		aDpImm(e, A_SUB_IMM | W64, LEFT, LEFT, DCACHE_FILL);
 		aLdst(e, L_LDRB, 3, DIRTY, 1, L_UXTW);
 		uint8_t* clean = aCbz(e, 3, NULL);
-		aDpImm(e, A_SUB_IMM | W64, LEFT, LEFT, 40);
+		aDpImm(e, A_SUB_IMM | W64, LEFT, LEFT, DCACHE_WRITEBACK);
 		patchHere(e, clean);
 		aLdst(e, L_STR, 2, DTAG, 1, L_UXTW | 0x1000);
 		aLdst(e, L_STRB, ZR, DIRTY, 1, L_UXTW);

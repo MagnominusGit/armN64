@@ -123,6 +123,10 @@ struct SI {
 struct RDP;
 
 // Per 4 KB page of RDRAM: it holds compiled code, or RDP commands not yet drawn write or read it.
+// CPU cycles for cache line fills and the write-back of a dirty data line (cpu.c and both code
+// generators).
+enum { ICACHE_FILL = 48, DCACHE_FILL = 40, DCACHE_WRITEBACK = 40 };
+
 enum { PAGE_CODE = 1, PAGE_RDP_WRITES = 2, PAGE_RDP_READS = 4, PAGE_RDP = 6 };
 
 // Compiled RSP code for an IMEM address, good while rspCodeGen is unchanged.

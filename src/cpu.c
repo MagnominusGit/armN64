@@ -14,7 +14,7 @@ enum { ST_IE = 1, ST_EXL = 2, ST_ERL = 4, ST_FR = 1 << 26, ST_CU1 = 1 << 29, ST_
 // Timing, in CPU cycles on top of one a instruction: cache line fills and write-backs, and reads of
 // RCP registers (cache figures as in the VR4300 manual and ares; the RCP read cost is fitted to
 // pdrome's instruction timing ROM, which counts loop iterations per field on hardware).
-enum { ICACHE_FILL = 48, DCACHE_FILL = 40, DCACHE_WRITEBACK = 40, RCP_READ = 22 };
+enum { RCP_READ = 22 };
 
 static bool cached(uint64_t vaddr) {
 	return ((uint32_t) vaddr & 0xE0000000) != 0xA0000000;

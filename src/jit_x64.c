@@ -525,9 +525,9 @@ static void icacheCheck(struct Emitter* e, uint32_t vaddr, uint32_t paddr, bool 
 	uint8_t* hit = xJcc(e, CC_E, NULL);
 	xStoreI(e, 4, tag, want);
 	if (toStall) {
-		xAluI(e, X_ADD, 4, CPU_AT(stall), 48);
+		xAluI(e, X_ADD, 4, CPU_AT(stall), ICACHE_FILL);
 	} else {
-		xAluI(e, X_ADD, 8, R(R13), 48);
+		xAluI(e, X_ADD, 8, R(R13), ICACHE_FILL);
 	}
 	patchHere(e, hit);
 }
@@ -1002,10 +1002,10 @@ void* jitCompile(struct N64* n, const uint32_t* ops, uint32_t count, uint32_t va
 		xMovRR(e, 4, RDX, RAX);
 		xAluI(e, X_AND, 4, R(RDX), ~0xF);
 		struct Opnd dirty = MI(R12, RCX, 1, (int32_t) offsetof(struct CPU, dcacheDirty));
-		xAluI(e, X_ADD, 8, R(R13), 40);
+		xAluI(e, X_ADD, 8, R(R13), DCACHE_FILL);
 		xAluI(e, X_CMP, 1, dirty, 0);
 		uint8_t* clean = xJcc(e, CC_E, NULL);
-		xAluI(e, X_ADD, 8, R(R13), 40);
+		xAluI(e, X_ADD, 8, R(R13), DCACHE_WRITEBACK);
 		patchHere(e, clean);
 		xStore(e, 4, MI(R12, RCX, 4, (int32_t) offsetof(struct CPU, dcacheTag)), RDX);
 		xStoreI(e, 1, dirty, 0);
