@@ -46,6 +46,7 @@ void pifBoot(struct N64* n) {
 	if (!boot) {
 		return;
 	}
+	n->bootChecksumReads = !disk && cartBootChecksum(n->rom, n->romSize, n->cic, n->bootChecksum) ? 3 : 0;
 	memcpy(n->sp.mem + 0x40, boot + 0x40, 0xFC0);
 	// The PIF leaves a short routine in IMEM, which the 6105 boot code relies on.
 	static const uint32_t imem[8] = {

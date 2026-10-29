@@ -191,6 +191,11 @@ struct N64 {
 	uint32_t riReg[8];
 	// The boot code hasn't read RI_SELECT yet (see busRead32).
 	bool coldBoot;
+	// Dumps whose header checksum isn't the boot code's (Virtual Console extractions, prototypes) hang
+	// in the boot code on a console. The boot code's own first reads of the two header words get the
+	// checksum it works out (bits 0 and 1 of bootChecksumReads); the game sees the header as it is.
+	uint32_t bootChecksum[2];
+	uint8_t bootChecksumReads;
 
 	uint64_t cycles;
 	// The earliest pending event (AI, PI, SI, DP sync): the CPU runs no further before it is handled.
@@ -401,6 +406,7 @@ void rdpDestroy(struct N64*);
 
 // carts.c
 bool cartEeprom16k(const uint8_t* rom);
+bool cartBootChecksum(const uint8_t* rom, size_t size, int cic, uint32_t out[2]);
 
 // pif.c
 void pifBoot(struct N64*);

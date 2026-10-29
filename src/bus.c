@@ -276,6 +276,10 @@ uint32_t busRead32(struct N64* n, uint32_t addr) {
 			return n->pi.romLatch;
 		}
 		uint32_t off = (addr - 0x10000000) & ~3u;
+		if (n->bootChecksumReads && (off == 0x10 || off == 0x14) && (n->bootChecksumReads & (off == 0x10 ? 1 : 2))) {
+			n->bootChecksumReads &= off == 0x10 ? 2 : 1;
+			return n->bootChecksum[off == 0x14];
+		}
 		return off + 4 <= n->romSize ? be32(&n->rom[off]) : 0;
 	}
 	if (addr >= 0x1FC007C0 && addr < 0x1FC00800) {
