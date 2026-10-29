@@ -721,6 +721,9 @@ bool hleGraphics(struct N64* n) {
 	h->texOn = false;
 	h->texScaleS = h->texScaleT = 1;
 	h->lights = 1;
+	// The lookat directions the microcodes' data starts with (texture generation without a lookat).
+	static const float lookat[2][3] = { { 1, 0, 0 }, { 0, 1, 0 } };
+	memcpy(h->lookat, lookat, sizeof(lookat));
 	h->count = 0;
 	runList(n, h, be32(task + 0x30));
 	rdpCommands(n, h->list, h->count);
