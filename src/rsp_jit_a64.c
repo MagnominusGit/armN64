@@ -167,6 +167,71 @@ static void byteLoop(struct Emitter* e, bool store, int size, bool sign) {
 	}
 }
 
+// SIMD loads and stores of 2, 4, 8 or 16 bytes (H, S, D, Q): at base + wm (uxtw), or at [base].
+static uint32_t vectorSize(int size) {
+	return size == 2 ? 0x40000000 : size == 4 ? 0x80000000 : size == 8 ? 0xC0000000 : 0x00800000;
+}
+
+static void aLdrV(struct Emitter* e, int vt, int base, int wm, int size) {
+	emit32(e, 0x3C604800 | vectorSize(size) | (wm << 16) | (base << 5) | vt);
+}
+
+static void aStrV(struct Emitter* e, int vt, int base, int wm, int size) {
+	emit32(e, 0x3C204800 | vectorSize(size) | (wm << 16) | (base << 5) | vt);
+}
+
+static void aLdrVAt(struct Emitter* e, int vt, int base, int size) {
+	emit32(e, 0x3D400000 | vectorSize(size) | (base << 5) | vt);
+}
+
+static void aStrVAt(struct Emitter* e, int vt, int base, int size) {
+	emit32(e, 0x3D000000 | vectorSize(size) | (base << 5) | vt);
+}
+
+// REV16 of every byte pair in vt.
+static void aRev16V(struct Emitter* e, int vd, int vn) {
+	emit32(e, 0x4E201800 | (vn << 5) | vd);
+}
+
+// LSV, LLV, LDV and LQV (SSV to SQV) at an even element that fits: the lanes move whole through v0,
+// byte-swapped. Addresses past the end of DMEM, and LQV/SQV off a 16-byte boundary, take the
+// general path in C.
+static bool emitVectorMemory(struct Emitter* e, uint32_t op, bool store) {
+	int kind = (op >> 11) & 31, el = (op >> 7) & 15, vt = (op >> 16) & 31;
+	if (kind < 1 || kind > 4 || (el & 1) || el + (1 << kind) > 16) {
+		return false;
+	}
+	int size = 1 << kind;
+	int32_t offset = ((int32_t) ((op & 0x7F) << 25) >> 25) * size;
+	uint8_t* wraps = dmemAddress(e, (op >> 21) & 31, offset, size);
+	uint8_t* unaligned = NULL;
+	if (size == 16) {
+		aLslImm(e, 0, 1, 28);
+		aDpImm(e, A_SUBS_IMM, ZR, 0, 0);
+		unaligned = aBcond(e, C_NE, NULL);
+	}
+	aAddImmX(e, 2, RSP, RSP_OFF(vr[vt][el / 2]));
+	if (store) {
+		aLdrVAt(e, 0, 2, size);
+		aRev16V(e, 0, 0);
+		aStrV(e, 0, DMEM, 1, size);
+	} else {
+		aLdrV(e, 0, DMEM, 1, size);
+		aRev16V(e, 0, 0);
+		aStrVAt(e, 0, 2, size);
+	}
+	uint8_t* done = aB(e, NULL);
+	patchHere(e, wraps);
+	if (unaligned) {
+		patchHere(e, unaligned);
+	}
+	aMovX(e, 0, N);
+	aMovImm(e, 1, op);
+	callC(e, store ? (const void*) rspVectorStore : (const void*) rspVectorLoad);
+	patchHere(e, done);
+	return true;
+}
+
 static void emitMemory(struct Emitter* e, uint32_t op) {
 	int rs = (op >> 21) & 31, rt = (op >> 16) & 31;
 	int code = op >> 26;
@@ -407,6 +472,9 @@ static enum Kind emitInstruction(struct Jit* j, uint32_t op, uint32_t pc, bool d
 		emitMemory(e, op);
 		return PLAIN;
 	case 0x32: case 0x3A:
+		if (emitVectorMemory(e, op, op >> 26 == 0x3A)) {
+			return PLAIN;
+		}
 		aMovX(e, 0, N);
 		aMovImm(e, 1, op);
 		callC(e, op >> 26 == 0x32 ? (const void*) rspVectorLoad : (const void*) rspVectorStore);
