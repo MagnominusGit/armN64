@@ -247,6 +247,11 @@ int rspTimingRegs(uint32_t op, int* scalar, int* vector, int* nv, int* written, 
 void rspCop2(struct N64*, uint32_t op);
 // rsp_vu.c
 void rspVectorOp(struct RSP*, uint32_t op);
+// The function for a vector instruction, given vd, vs and vt and the element's byte indices
+// (rspElementMask); NULL for those rspVectorOp does itself (VRNDP, VRNDN, the divides and VMOV).
+typedef void RspVectorFn(struct RSP*, int16_t* vd, const int16_t* vs, const int16_t* vt, const uint8_t* element);
+RspVectorFn* rspVectorFn(uint32_t op);
+const uint8_t* rspElementMask(uint32_t op);
 void rspVectorLoad(struct N64*, uint32_t op);
 void rspVectorStore(struct N64*, uint32_t op);
 void rspCop0(struct N64*, uint32_t op);

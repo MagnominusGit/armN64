@@ -389,6 +389,15 @@ static enum Kind emitInstruction(struct Jit* j, uint32_t op, uint32_t pc, bool d
 		}
 		return PLAIN;
 	case 0x12:
+		if ((op & (1 << 25)) && rspVectorFn(op)) {
+			aMovX(e, 0, RSP);
+			aAddImmX(e, 1, RSP, RSP_OFF(vr[(op >> 6) & 31]));
+			aAddImmX(e, 2, RSP, RSP_OFF(vr[(op >> 11) & 31]));
+			aAddImmX(e, 3, RSP, RSP_OFF(vr[(op >> 16) & 31]));
+			aMovImm64(e, 4, (uint64_t) (uintptr_t) rspElementMask(op));
+			callC(e, rspVectorFn(op));
+			return PLAIN;
+		}
 		aMovX(e, 0, N);
 		aMovImm(e, 1, op);
 		callC(e, rspCop2);
