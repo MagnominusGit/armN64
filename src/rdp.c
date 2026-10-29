@@ -2230,6 +2230,11 @@ void rdpRun(struct N64* n) {
 		}
 		uint64_t clocks = primitiveClocks(r, w, op);
 		r->clocks += clocks;
+		n->dp.bufBusy += (uint32_t) clocks;
+		n->dp.pipeBusy += (uint32_t) clocks;
+		if (op == 0x30 || op == 0x33 || op == 0x34) {
+			n->dp.tmemBusy += (uint32_t) clocks;
+		}
 		if (r->gpu) {
 			gpuCommand(n, r, w, op);
 			continue;

@@ -90,6 +90,10 @@ struct DP {
 	uint32_t start, end, current, status;
 	// When the RDP finishes the commands it has, and when its pending full-sync interrupt is due.
 	uint64_t busyUntil, syncAt;
+	// The 24-bit counters: RCP cycles since the clock counter was cleared (from clockBase in CPU
+	// cycles), and RDP clocks with the command buffer busy, the pipeline busy and TMEM loading.
+	uint64_t clockBase;
+	uint32_t bufBusy, pipeBusy, tmemBusy;
 };
 
 struct VI {
@@ -253,7 +257,12 @@ struct N64 {
 	// CPU cycles per video field: 60 fields a second for NTSC and MPAL, 50 for PAL.
 	uint64_t fieldCycles;
 	uint64_t fields;
+	// Controller 1: buttons in the top half, stick (or with a mouse, the X and Y movement) below.
 	uint32_t buttons;
+	// The port (1-4) with an N64 Mouse (N64_MOUSE=port), 0 for none, and its buttons and movement in
+	// the same layout.
+	int mousePort;
+	uint32_t mouse;
 	const char* unimplemented;
 	// Activity counts for diagnostics.
 	struct {

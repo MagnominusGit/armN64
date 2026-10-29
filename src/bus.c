@@ -325,6 +325,14 @@ uint32_t busRead32(struct N64* n, uint32_t addr) {
 			return n->dp.current;
 		case 0x0C:
 			return n->dp.status | 0x80;
+		case 0x10:
+			return (uint32_t) ((n->cycles - n->dp.clockBase) * 2 / 3) & 0xFFFFFF;
+		case 0x14:
+			return n->dp.bufBusy & 0xFFFFFF;
+		case 0x18:
+			return n->dp.pipeBusy & 0xFFFFFF;
+		case 0x1C:
+			return n->dp.tmemBusy & 0xFFFFFF;
 		}
 		return 0;
 	case 0x043:
@@ -473,6 +481,18 @@ void busWrite32(struct N64* n, uint32_t addr, uint32_t v) {
 			if (v & 4) {
 				n->dp.status &= ~2u;
 				rdpRun(n);
+			}
+			if (v & 0x40) {
+				n->dp.tmemBusy = 0;
+			}
+			if (v & 0x80) {
+				n->dp.pipeBusy = 0;
+			}
+			if (v & 0x100) {
+				n->dp.bufBusy = 0;
+			}
+			if (v & 0x200) {
+				n->dp.clockBase = n->cycles;
 			}
 			break;
 		}
