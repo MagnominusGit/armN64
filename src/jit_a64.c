@@ -108,6 +108,7 @@ struct Exit {
 	bool delay;
 	bool skip;
 	bool last;
+	bool jumped;
 };
 
 struct Slow {
@@ -139,6 +140,8 @@ struct Jit {
 	struct Slow* slow;
 	int extraCycles;
 	bool interruptCheck;
+	// The instruction set pc and nextPc itself (ERET): the block leaves after it.
+	bool jumped;
 	struct Exit exits[3 * 64];
 	int exitCount;
 	struct Slow slows[64];
@@ -247,7 +250,7 @@ static void setReg(struct Jit* j, int g, int r) {
 }
 
 static void exitAt(struct Jit* j, uint8_t* site, uint64_t pc, enum Kind kind, bool delay, bool skip) {
-	j->exits[j->exitCount++] = (struct Exit) { site, pc, kind, delay, skip, false };
+	j->exits[j->exitCount++] = (struct Exit) { site, pc, kind, delay, skip, false, false };
 }
 
 // Sets the flags for a branch condition and returns the condition under which it is taken.
@@ -309,6 +312,24 @@ static bool emitCop0(struct Jit* j, uint32_t op) {
 	struct Emitter* e = &j->e;
 	int rs = (op >> 21) & 31, rt = (op >> 16) & 31, rd = (op >> 11) & 31;
 	unsigned reg = CPU_OFF(cop0) + 8 * rd;
+	if (op == 0x42000018 && !j->slow->delay) {
+		// ERET: to ErrorEPC with ERL cleared when it is set, else to EPC with EXL cleared.
+		aLdrX(e, 0, CPU, CPU_OFF(cop0) + 8 * CP0_STATUS);
+		aLdrX(e, 1, CPU, CPU_OFF(cop0) + 8 * CP0_EPC);
+		aMovImm(e, 2, 2);
+		uint8_t* exl = aTbz(e, 0, 2, NULL);
+		aLdrX(e, 1, CPU, CPU_OFF(cop0) + 8 * CP0_ERROREPC);
+		aMovImm(e, 2, 4);
+		patchHere(e, exl);
+		aDp(e, A_BIC | W64, 0, 0, 2, S_LSL, 0);
+		aStrX(e, 0, CPU, CPU_OFF(cop0) + 8 * CP0_STATUS);
+		aStrX(e, 1, CPU, CPU_OFF(pc));
+		aDpImm(e, A_ADD_IMM | W64, 1, 1, 4);
+		aStrX(e, 1, CPU, CPU_OFF(nextPc));
+		aStrb(e, ZR, CPU, CPU_OFF(llBit));
+		j->jumped = true;
+		return true;
+	}
 	if (rs == 0x00 || rs == 0x01) {
 		if (rd == CP0_RANDOM) {
 			return false;
@@ -1027,6 +1048,7 @@ void* jitCompile(struct N64* n, const uint32_t* ops, uint32_t count, uint32_t va
 		j->slow = slow;
 		j->extraCycles = 0;
 		j->interruptCheck = false;
+		j->jumped = false;
 		// A branch's I-cache check comes first (a likely branch not taken leaves inside it); the rest
 		// check after, so slow paths and Count reads see the cycles before this fetch.
 		if (lineStart && branch && !delay) {
@@ -1041,7 +1063,10 @@ void* jitCompile(struct N64* n, const uint32_t* ops, uint32_t count, uint32_t va
 				// An interrupt now due is taken before the next instruction.
 				exitAt(j, aCbnz(e, 2, NULL), pc, kind, delay, false);
 			}
-			if (last) {
+			if (j->jumped) {
+				exitAt(j, aB(e, NULL), pc, kind, delay, false);
+				j->exits[j->exitCount - 1].jumped = true;
+			} else if (last) {
 				exitAt(j, aB(e, NULL), pc, kind, delay, false);
 				j->exits[j->exitCount - 1].last = true;
 			} else {
@@ -1128,6 +1153,10 @@ void* jitCompile(struct N64* n, const uint32_t* ops, uint32_t count, uint32_t va
 		storeConst(e, CPU_OFF(curPc), x->pc);
 		storeByte(e, CPU_OFF(inDelay), x->delay);
 		storeByte(e, CPU_OFF(nextInDelay), x->kind != PLAIN && !x->skip);
+		if (x->jumped) {
+			aB(e, j->leave);
+			continue;
+		}
 		if (x->skip) {
 			aDpImm(e, A_SUB_IMM | W64, LEFT, LEFT, 1);
 			storeConst(e, CPU_OFF(pc), x->pc + 8);
