@@ -1,5 +1,6 @@
 #include "n64.h"
 
+#include <stdlib.h>
 #include <string.h>
 
 static uint32_t crc32(const uint8_t* data, size_t size) {
@@ -68,8 +69,10 @@ void pifBoot(struct N64* n) {
 	n->vi.reg[3] = 1023;
 	c->gpr[11] = 0xFFFFFFFFA4000040ull;
 	c->gpr[19] = disk;
-	// TV type from the cartridge's region: 0 PAL, 1 NTSC, 2 MPAL (Brazil).
-	switch (boot[0x3E]) {
+	// TV type from the cartridge's region (N64_TV=ntsc, pal or mpal picks the console's instead,
+	// for dumps whose header names another region): 0 PAL, 1 NTSC, 2 MPAL (Brazil).
+	const char* tv = getenv("N64_TV");
+	switch (tv && !strcmp(tv, "ntsc") ? 'E' : tv && !strcmp(tv, "pal") ? 'P' : tv && !strcmp(tv, "mpal") ? 'B' : boot[0x3E]) {
 	case 'D': case 'F': case 'H': case 'I': case 'L': case 'P': case 'S': case 'U': case 'W': case 'X': case 'Y':
 		c->gpr[20] = 0;
 		break;
