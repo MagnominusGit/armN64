@@ -1,4 +1,4 @@
-# arch-N64
+# armN64
 
 A lean, low-level Nintendo 64 emulator for x86-64 and ARM handhelds.
 

@@ -17,7 +17,7 @@ State at commit 9cdb2a8 (2026-10-17). Reference emulator: parallel-n64 with the 
 
 The ROM counts loop iterations between two scanlines (a loop of four 1-cycle instructions and one VI register read). Hardware counts are in the ROM.
 
-| Instruction | Hardware | arch-N64 |
+| Instruction | Hardware | armN64 |
 |---|---|---|
 | ADD (and other 1-cycle ops) | 0xDB1C | 0xDB2C |
 | DIV / DIVU | 0x5E71 | 0x5E4B |
