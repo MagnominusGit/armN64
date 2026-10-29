@@ -4,7 +4,8 @@
 #include <stddef.h>
 
 // A GLES 3.1 compute context without a window, loaded at run time (libEGL/libGLESv2 through dlopen),
-// with one compute program and storage buffers at bindings 0-3.
+// with one compute program and storage buffers at bindings 0-3. Several can be used on one thread;
+// each call makes its own context current.
 struct Gles;
 
 struct Gles* glesCreate(const char* source, char* error, size_t errorSize);

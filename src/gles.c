@@ -118,6 +118,26 @@ static bool loadGl(struct Gles* g) {
 	       LOAD(glMemoryBarrier) && LOAD(glGetString) && LOAD(glFlush);
 }
 
+// The context current on this thread, and how many contexts share the initialized display (EGL
+// keeps one per display, so it is terminated with the last of them).
+static _Thread_local struct Gles* current;
+static EGLDisplay sharedDisplay;
+static int displayUsers;
+
+static void use(struct Gles* g) {
+	if (current != g) {
+		g->eglMakeCurrent(g->display, g->surface, g->surface, g->context);
+		current = g;
+	}
+}
+
+static void release(struct Gles* g, EGLDisplay display) {
+	if (display == sharedDisplay && displayUsers > 0) {
+		return;
+	}
+	g->eglTerminate(display);
+}
+
 static bool fail(char* error, size_t size, const char* what) {
 	snprintf(error, size, "%s", what);
 	return false;
@@ -181,8 +201,11 @@ static bool context(struct Gles* g, char* error, size_t errorSize) {
 		}
 		if (makeContext(g, display)) {
 			g->display = display;
+			sharedDisplay = display;
+			++displayUsers;
+			current = g;
 		} else {
-			g->eglTerminate(display);
+			release(g, display);
 		}
 	}
 	if (!g->context) {
@@ -244,18 +267,21 @@ void glesDestroy(struct Gles* g) {
 		return;
 	}
 	if (g->context) {
+		use(g);
 		if (g->program) {
 			g->glDeleteBuffers(4, g->buffer);
 			g->glDeleteProgram(g->program);
 		}
 		g->eglMakeCurrent(g->display, NULL, NULL, NULL);
 		g->eglDestroyContext(g->display, g->context);
+		current = NULL;
+		--displayUsers;
 	}
 	if (g->surface) {
 		g->eglDestroySurface(g->display, g->surface);
 	}
 	if (g->display) {
-		g->eglTerminate(g->display);
+		release(g, g->display);
 	}
 	if (g->gles) {
 		dlclose(g->gles);
@@ -271,32 +297,38 @@ const char* glesRenderer(struct Gles* g) {
 }
 
 void glesData(struct Gles* g, int binding, const void* data, size_t size) {
+	use(g);
 	g->glBindBuffer(GL_SHADER_STORAGE_BUFFER, g->buffer[binding]);
 	g->glBufferData(GL_SHADER_STORAGE_BUFFER, (GLsizeiptr) (size ? size : 16), data, GL_DYNAMIC_DRAW);
 	g->glBindBufferBase(GL_SHADER_STORAGE_BUFFER, binding, g->buffer[binding]);
 }
 
 void glesSubData(struct Gles* g, int binding, size_t offset, const void* data, size_t size) {
+	use(g);
 	g->glBindBuffer(GL_SHADER_STORAGE_BUFFER, g->buffer[binding]);
 	g->glBufferSubData(GL_SHADER_STORAGE_BUFFER, (GLintptr) offset, (GLsizeiptr) size, data);
 }
 
 const void* glesMap(struct Gles* g, int binding, size_t offset, size_t size) {
+	use(g);
 	g->glMemoryBarrier(GL_BUFFER_UPDATE_BARRIER_BIT);
 	g->glBindBuffer(GL_SHADER_STORAGE_BUFFER, g->buffer[binding]);
 	return g->glMapBufferRange(GL_SHADER_STORAGE_BUFFER, (GLintptr) offset, (GLsizeiptr) size, GL_MAP_READ_BIT);
 }
 
 void glesUnmap(struct Gles* g, int binding) {
+	use(g);
 	g->glBindBuffer(GL_SHADER_STORAGE_BUFFER, g->buffer[binding]);
 	g->glUnmapBuffer(GL_SHADER_STORAGE_BUFFER);
 }
 
 void glesUniforms(struct Gles* g, const int* values, int count) {
+	use(g);
 	g->glUniform1iv(g->uniforms, count, values);
 }
 
 void glesDispatch(struct Gles* g, unsigned x, unsigned y) {
+	use(g);
 	g->glDispatchCompute(x, y, 1);
 	g->glMemoryBarrier(GL_SHADER_STORAGE_BARRIER_BIT);
 	// Each dispatch its own submission: the kernel's GPU hang check times submissions.

@@ -271,6 +271,10 @@ struct N64 {
 	// renderer threads where that can't start.
 	bool rdpGpu;
 	bool rdpPending;
+	// N64_VI_GPU: the VI's filters run by a GLES 3.1 compute shader (n64.c), falling back to the CPU
+	// where that can't start.
+	bool viGpu;
+	struct Gles* viGles;
 	// CPU cycles per video field: 60 fields a second for NTSC and MPAL, 50 for PAL.
 	uint64_t fieldCycles;
 	uint64_t fields;
@@ -308,6 +312,9 @@ void ddMechaResponse(struct N64*);
 void ddBmRequest(struct N64*);
 void aiUpdate(struct N64*);
 int n64Picture(struct N64*, uint32_t* out, int* width, int* height);
+// With N64_VI_GPU, starts the picture on the GPU and returns without waiting for it (a frontend
+// shows it from there); false when the VI shows nothing or the GPU isn't used.
+bool n64PictureStart(struct N64*, int* width, int* height);
 
 // cpu.c
 void cpuReset(struct N64*);

@@ -1,5 +1,8 @@
 #include "n64.h"
+#include "gles.h"
+#include "vi_gpu_glsl.h"
 
+#include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 
@@ -44,6 +47,7 @@ void n64Destroy(struct N64* n) {
 		jitFree(n);
 		rspJitFree(n);
 		rdpDestroy(n);
+		glesDestroy(n->viGles);
 		free(n->hle);
 		free(n->rdram);
 		free(n->hidden);
@@ -125,6 +129,8 @@ static void start(struct N64* n) {
 	if (n->rdpGpu && !n->rdpThreads) {
 		n->rdpThreads = 1;
 	}
+	const char* viGpu = getenv("N64_VI_GPU");
+	n->viGpu = viGpu && viGpu[0] == '1';
 	rspJitFree(n);
 	++n->rspCodeGen;
 }
@@ -354,13 +360,18 @@ static void viRestoreRow(int16_t* restrict out, const uint8_t* restrict at, cons
 	}
 }
 
-// The picture the VI scans out, scaled by its X and Y scale registers, as 0x00RRGGBB.
-int n64Picture(struct N64* n, uint32_t* out, int* width, int* height) {
-	rdpWait(n);
+// What the VI scans out: the framebuffer, the picture's size and the filters on.
+struct ViSetup {
+	uint32_t origin, stride;
+	int w, h;
+	bool wide, gammaOn, divot, dither, aa;
+};
+
+static bool viSetup(struct N64* n, struct ViSetup* s) {
 	uint32_t* v = n->vi.reg;
 	int type = v[0] & 3;
-	uint32_t origin = v[1] & 0xFFFFFF;
-	uint32_t stride = v[2] & 0xFFF;
+	s->origin = v[1] & 0xFFFFFF;
+	s->stride = v[2] & 0xFFF;
 	int hStart = (v[9] >> 16) & 0x3FF, hEnd = v[9] & 0x3FF;
 	int vStart = (v[10] >> 16) & 0x3FF, vEnd = v[10] & 0x3FF;
 	uint32_t xScale = v[12] & 0xFFF, yScale = v[13] & 0xFFF;
@@ -373,28 +384,90 @@ int n64Picture(struct N64* n, uint32_t* out, int* width, int* height) {
 	}
 	int w = (int) (((hEnd - hStart) * xScale + 512) >> 10);
 	int h = (int) ((((vEnd - vStart) >> 1) * yScale + 512) >> 10);
-	if (type < 2 || w <= 0 || h <= 0 || stride == 0) {
+	if (type < 2 || w <= 0 || h <= 0 || s->stride == 0) {
+		return false;
+	}
+	s->w = w > 640 ? 640 : w;
+	s->h = h > 480 ? 480 : h;
+	s->gammaOn = v[0] & 8, s->divot = v[0] & 16, s->dither = v[0] & 0x10000, s->aa = ((v[0] >> 8) & 3) <= 1, s->wide = type == 3;
+	return true;
+}
+
+// Starts the filters on the GPU: uploads the rows they read (y-1 to h, columns -3 to w+2) and their
+// hidden bits. False when the GPU can't start or the rows wrap around RDRAM.
+static bool viGpuStart(struct N64* n, const struct ViSetup* s) {
+	if (!n->viGles) {
+		char error[512];
+		n->viGles = glesCreate(viGpuSource, error, sizeof(error));
+		if (!n->viGles) {
+			fprintf(stderr, "GPU VI unavailable (%s), using the CPU\n", error);
+			n->viGpu = false;
+			return false;
+		}
+		fprintf(stderr, "GPU VI on %s\n", glesRenderer(n->viGles));
+		glesData(n->viGles, 2, NULL, 640 * 480 * 4);
+	}
+	uint32_t size = s->wide ? 4 : 2;
+	int64_t first = -(int64_t) s->stride - 3, last = (int64_t) s->h * s->stride + s->w + 2;
+	uint32_t a0 = (s->origin + (uint32_t) first * size) & (RDRAM_SIZE - size), bytes = (uint32_t) (last - first + 1) * size;
+	if (a0 + bytes > RDRAM_SIZE) {
+		return false;
+	}
+	uint32_t begin = a0 & ~3u, end = (a0 + bytes + 3) & ~3u;
+	glesData(n->viGles, 0, &n->rdram[begin], end - begin);
+	uint32_t hiddenBegin = (a0 >> 1) & ~3u, hiddenEnd = (((a0 + bytes) >> 1) + 3) & ~3u;
+	glesData(n->viGles, 1, s->wide ? NULL : &n->hidden[hiddenBegin], s->wide ? 0 : hiddenEnd - hiddenBegin);
+	int u[8] = { (int) s->origin, (int) s->stride, s->wide, s->w, s->h, (int) begin, (int) hiddenBegin,
+	             s->aa | s->dither << 1 | s->divot << 2 | s->gammaOn << 3 };
+	glesUniforms(n->viGles, u, 8);
+	glesDispatch(n->viGles, (unsigned) (s->w + 15) / 16, (unsigned) (s->h + 15) / 16);
+	return true;
+}
+
+bool n64PictureStart(struct N64* n, int* width, int* height) {
+	rdpWait(n);
+	struct ViSetup s;
+	if (!n->viGpu || !viSetup(n, &s) || !viGpuStart(n, &s)) {
+		*width = *height = 0;
+		return false;
+	}
+	*width = s.w;
+	*height = s.h;
+	return true;
+}
+
+// The picture the VI scans out, scaled by its X and Y scale registers, as 0x00RRGGBB.
+int n64Picture(struct N64* n, uint32_t* out, int* width, int* height) {
+	rdpWait(n);
+	struct ViSetup s;
+	if (!viSetup(n, &s)) {
 		*width = *height = 0;
 		return 0;
 	}
-	if (w > 640) {
-		w = 640;
+	int w = s.w, h = s.h;
+	*width = w;
+	*height = h;
+	if (n->viGpu && viGpuStart(n, &s)) {
+		const uint32_t* picture = glesMap(n->viGles, 2, 0, (size_t) w * h * 4);
+		if (picture) {
+			memcpy(out, picture, (size_t) w * h * 4);
+			glesUnmap(n->viGles, 2);
+			return w * h;
+		}
 	}
-	if (h > 480) {
-		h = 480;
-	}
+	uint32_t origin = s.origin, stride = s.stride;
+	bool gammaOn = s.gammaOn, divot = s.divot, dither = s.dither, aa = s.aa, wide = s.wide;
 	// With gamma on, the VI outputs the square root of each channel (scaled to 8 bits).
 	static uint8_t gamma[256];
 	if (!gamma[255]) {
 		for (int i = 0; i < 256; ++i) {
-			int s = 0;
-			while ((s + 1) * (s + 1) <= i * 256) {
-				++s;
+			int g = 0;
+			while ((g + 1) * (g + 1) <= i * 256) {
+				++g;
 			}
-			gamma[i] = (uint8_t) (s > 255 ? 255 : s);
+			gamma[i] = (uint8_t) (g > 255 ? 255 : g);
 		}
 	}
-	bool gammaOn = v[0] & 8, divot = v[0] & 16, dither = v[0] & 0x10000, aa = ((v[0] >> 8) & 3) <= 1, wide = type == 3;
 	// Rows y-1, y and y+1 (a ring of three), decoded from column -3 to w+2.
 	static struct ViRow rows[3];
 	static int16_t full[3][642], restored[3][642], line[3][642], divoted[3][640];
@@ -467,7 +540,5 @@ int n64Picture(struct N64* n, uint32_t* out, int* width, int* height) {
 			}
 		}
 	}
-	*width = w;
-	*height = h;
 	return w * h;
 }
