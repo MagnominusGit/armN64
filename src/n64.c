@@ -393,6 +393,25 @@ static bool viSetup(struct N64* n, struct ViSetup* s) {
 	return true;
 }
 
+// The RDRAM the filters read: rows y-1 to h, columns -3 to w+2. False when it wraps around RDRAM.
+static bool viRange(const struct ViSetup* s, uint32_t* addr, uint32_t* len) {
+	uint32_t size = s->wide ? 4 : 2;
+	int64_t first = -(int64_t) s->stride - 3, last = (int64_t) s->h * s->stride + s->w + 2;
+	*addr = (s->origin + (uint32_t) first * size) & (RDRAM_SIZE - size);
+	*len = (uint32_t) (last - first + 1) * size;
+	return *addr + *len <= RDRAM_SIZE;
+}
+
+// Waits for the RDP commands drawing what the VI reads.
+static void viWait(struct N64* n, const struct ViSetup* s) {
+	uint32_t addr, len;
+	if (viRange(s, &addr, &len)) {
+		rdpWaitDrawn(n, addr, len);
+	} else {
+		rdpWait(n);
+	}
+}
+
 // Starts the filters on the GPU: uploads the rows they read (y-1 to h, columns -3 to w+2) and their
 // hidden bits. False when the GPU can't start or the rows wrap around RDRAM.
 static bool viGpuStart(struct N64* n, const struct ViSetup* s) {
@@ -407,10 +426,8 @@ static bool viGpuStart(struct N64* n, const struct ViSetup* s) {
 		fprintf(stderr, "GPU VI on %s\n", glesRenderer(n->viGles));
 		glesData(n->viGles, 2, NULL, 640 * 480 * 4);
 	}
-	uint32_t size = s->wide ? 4 : 2;
-	int64_t first = -(int64_t) s->stride - 3, last = (int64_t) s->h * s->stride + s->w + 2;
-	uint32_t a0 = (s->origin + (uint32_t) first * size) & (RDRAM_SIZE - size), bytes = (uint32_t) (last - first + 1) * size;
-	if (a0 + bytes > RDRAM_SIZE) {
+	uint32_t a0, bytes;
+	if (!viRange(s, &a0, &bytes)) {
 		return false;
 	}
 	uint32_t begin = a0 & ~3u, end = (a0 + bytes + 3) & ~3u;
@@ -425,9 +442,13 @@ static bool viGpuStart(struct N64* n, const struct ViSetup* s) {
 }
 
 bool n64PictureStart(struct N64* n, int* width, int* height) {
-	rdpWait(n);
 	struct ViSetup s;
-	if (!n->viGpu || !viSetup(n, &s) || !viGpuStart(n, &s)) {
+	if (!n->viGpu || !viSetup(n, &s)) {
+		*width = *height = 0;
+		return false;
+	}
+	viWait(n, &s);
+	if (!viGpuStart(n, &s)) {
 		*width = *height = 0;
 		return false;
 	}
@@ -438,12 +459,12 @@ bool n64PictureStart(struct N64* n, int* width, int* height) {
 
 // The picture the VI scans out, scaled by its X and Y scale registers, as 0x00RRGGBB.
 int n64Picture(struct N64* n, uint32_t* out, int* width, int* height) {
-	rdpWait(n);
 	struct ViSetup s;
 	if (!viSetup(n, &s)) {
 		*width = *height = 0;
 		return 0;
 	}
+	viWait(n, &s);
 	int w = s.w, h = s.h;
 	*width = w;
 	*height = h;

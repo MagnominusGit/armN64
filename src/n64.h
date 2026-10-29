@@ -367,6 +367,7 @@ void jitReset(struct N64*);
 void jitFree(struct N64*);
 // rdp.c: waits for RDP commands still being drawn by other threads.
 void rdpWait(struct N64*);
+void rdpWaitDrawn(struct N64*, uint32_t addr, uint32_t len);
 
 // Whether any word of RDRAM [addr, addr + len) inside page p is part of a block.
 static inline bool n64HoldsCode(struct N64* n, uint32_t p, uint32_t addr, uint32_t len) {

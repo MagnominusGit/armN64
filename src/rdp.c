@@ -1587,6 +1587,8 @@ struct Renderers {
 	uint16_t marked[RDRAM_SIZE >> 12];
 	int markedCount;
 	uint8_t since[RDRAM_SIZE >> 12];
+	// For each page, where in the stream the last command drawing to it ends.
+	uint64_t drawnUntil[RDRAM_SIZE >> 12];
 	uint16_t sinceList[RDRAM_SIZE >> 12];
 	int sinceCount;
 };
@@ -1779,18 +1781,43 @@ static bool touchedSince(struct Renderers* all, uint32_t addr, uint32_t len, int
 	return false;
 }
 
-static void mark(struct N64* n, struct Renderers* all, uint32_t addr, uint32_t len, uint8_t flag, int what) {
+static void mark(struct N64* n, struct Renderers* all, uint32_t addr, uint32_t len, uint8_t flag, int what, uint64_t until) {
 	FOR_PAGES(addr, len, p) {
 		if (!(n->pageFlags[p] & PAGE_RDP)) {
 			all->marked[all->markedCount++] = (uint16_t) p;
 		}
 		n->pageFlags[p] |= flag;
+		if (flag == PAGE_RDP_WRITES) {
+			all->drawnUntil[p] = until;
+		}
 		if (!all->since[p]) {
 			all->sinceList[all->sinceCount++] = (uint16_t) p;
 		}
 		all->since[p] |= what;
 	}
 	n->rdpPending = true;
+}
+
+// Waits until the RDP commands drawing to [addr, addr + len) are drawn, not the rest (the
+// renderers keep going); the pages stay flagged for the next full wait.
+void rdpWaitDrawn(struct N64* n, uint32_t addr, uint32_t len) {
+	if (!n->rdpPending) {
+		return;
+	}
+	struct Renderers* all = n->rdp->renderers;
+	if (!all) {
+		rdpWait(n);
+		return;
+	}
+	uint64_t until = 0;
+	FOR_PAGES(addr, len, p) {
+		if ((n->pageFlags[p] & PAGE_RDP_WRITES) && all->drawnUntil[p] > until) {
+			until = all->drawnUntil[p];
+		}
+	}
+	if (until > oldestDone(all)) {
+		waitFor(all, until);
+	}
 }
 
 // The RDRAM a texture load reads, as loadTile and loadTlut address it (rounded up a little).
@@ -1846,7 +1873,7 @@ static void submit(struct N64* n, struct RDP* r, const uint64_t* w, int op, int 
 		if (touchedSince(all, addr, len, SINCE_DRAWN)) {
 			barrier(all);
 		}
-		mark(n, all, addr, len, PAGE_RDP_READS, SINCE_LOADED);
+		mark(n, all, addr, len, PAGE_RDP_READS, SINCE_LOADED, 0);
 	} else if ((op >= 0x08 && op <= 0x0F) || op == 0x24 || op == 0x25 || op == 0x36) {
 		int y0, y1;
 		primitiveRows(r, w, op, &y0, &y1);
@@ -1861,9 +1888,10 @@ static void submit(struct N64* n, struct RDP* r, const uint64_t* w, int op, int 
 			if (touchedSince(all, color, colorLen, SINCE_LOADED) || (depth && touchedSince(all, z, zLen, SINCE_LOADED))) {
 				barrier(all);
 			}
-			mark(n, all, color, colorLen, PAGE_RDP_WRITES, SINCE_DRAWN);
+			uint64_t until = atomic_load_explicit(&all->written, memory_order_relaxed) + 1 + words;
+			mark(n, all, color, colorLen, PAGE_RDP_WRITES, SINCE_DRAWN, until);
 			if (depth) {
-				mark(n, all, z, zLen, PAGE_RDP_WRITES, SINCE_DRAWN);
+				mark(n, all, z, zLen, PAGE_RDP_WRITES, SINCE_DRAWN, until);
 			}
 			// Rows that run into each other, or depth and color images that overlap row for
 			// different rows, can't be split between renderers.
