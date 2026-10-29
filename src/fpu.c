@@ -56,13 +56,15 @@ static bool flush(struct N64* n) {
 	return n->cpu.fcr31 & (1u << 24);
 }
 
+// A new NaN (each host makes its own default NaN: x86 negative, ARM positive) is the VR4300's
+// default NaN; NaNs carried through from operands stay as they are.
 static void setS(struct N64* n, int r, float f) {
 	if (flush(n) && fpclassify(f) == FP_SUBNORMAL) {
 		f = copysignf(0.0f, f);
 	}
 	uint32_t v;
 	memcpy(&v, &f, 4);
-	set32(n, r, v);
+	set32(n, r, (v & 0x7FFFFFFF) == 0x7FC00000 ? 0x7FBFFFFF : v);
 }
 
 static void setD(struct N64* n, int r, double d) {
@@ -71,7 +73,7 @@ static void setD(struct N64* n, int r, double d) {
 	}
 	uint64_t v;
 	memcpy(&v, &d, 8);
-	set64(n, r, v);
+	set64(n, r, (v & 0x7FFFFFFFFFFFFFFFull) == 0x7FF8000000000000ull ? 0x7FF7FFFFFFFFFFFFull : v);
 }
 
 static const int roundModes[4] = { FE_TONEAREST, FE_TOWARDZERO, FE_UPWARD, FE_DOWNWARD };
