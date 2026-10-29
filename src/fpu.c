@@ -91,6 +91,16 @@ static double roundWith(double v, int mode) {
 	}
 }
 
+// Rounded values to integers the same on every host: out of range or NaN gives the most negative
+// integer (what x86 gives; a C cast is undefined there and ARM saturates).
+static int32_t toWord(double v) {
+	return v >= -2147483648.0 && v < 2147483648.0 ? (int32_t) v : INT32_MIN;
+}
+
+static int64_t toLong(double v) {
+	return v >= -9223372036854775808.0 && v < 9223372036854775808.0 ? (int64_t) v : INT64_MIN;
+}
+
 static double source(struct N64* n, int fmt, int r) {
 	switch (fmt) {
 	case 16:
@@ -232,13 +242,13 @@ void fpuExecute(struct N64* n, uint32_t op) {
 	case 9:
 	case 10:
 	case 11:
-		set64(n, FD, (uint64_t) (int64_t) roundWith(a, func - 8));
+		set64(n, FD, (uint64_t) toLong(roundWith(a, func - 8)));
 		return;
 	case 12:
 	case 13:
 	case 14:
 	case 15:
-		set32(n, FD, (uint32_t) (int32_t) roundWith(a, func - 12));
+		set32(n, FD, (uint32_t) toWord(roundWith(a, func - 12)));
 		return;
 	case 32:
 		setS(n, FD, (float) a);
@@ -247,10 +257,10 @@ void fpuExecute(struct N64* n, uint32_t op) {
 		setD(n, FD, a);
 		return;
 	case 36:
-		set32(n, FD, (uint32_t) (int32_t) roundWith(a, c->fcr31 & 3));
+		set32(n, FD, (uint32_t) toWord(roundWith(a, c->fcr31 & 3)));
 		return;
 	case 37:
-		set64(n, FD, (uint64_t) (int64_t) roundWith(a, c->fcr31 & 3));
+		set64(n, FD, (uint64_t) toLong(roundWith(a, c->fcr31 & 3)));
 		return;
 	}
 	cpuException(n, EXC_RI, 0);
