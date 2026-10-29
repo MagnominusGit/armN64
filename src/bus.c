@@ -151,6 +151,14 @@ static uint8_t cartByte(struct N64* n, uint32_t c) {
 // part way into the buffer, which then writes back only up to the block length counted from the
 // buffer's start; the address continues 8-byte aligned (n64brew, Peter Lemon's PI tests).
 static void piDmaToRdram(struct N64* n, uint32_t len) {
+	if (n->compat) {
+		for (uint32_t i = 0; i < len; ++i) {
+			n->rdram[(n->pi.dramAddr + i) & (RDRAM_SIZE - 1)] = cartByte(n, n->pi.cartAddr + i);
+		}
+		n->pi.dramAddr = (n->pi.dramAddr + len) & 0xFFFFFF;
+		n->pi.cartAddr += len;
+		return;
+	}
 	uint32_t dram = n->pi.dramAddr & 0xFFFFFE, cart = n->pi.cartAddr & ~1u;
 	uint8_t buf[128];
 	bool first = true;
@@ -540,10 +548,10 @@ void busWrite32(struct N64* n, uint32_t addr, uint32_t v) {
 	case 0x046:
 		switch (addr & 0x3F) {
 		case 0x00:
-			n->pi.dramAddr = v & 0xFFFFFE;
+			n->pi.dramAddr = v & (n->compat ? 0xFFFFFF : 0xFFFFFE);
 			break;
 		case 0x04:
-			n->pi.cartAddr = v & ~1u;
+			n->pi.cartAddr = n->compat ? v : v & ~1u;
 			break;
 		case 0x08:
 			piDma(n, (v & 0xFFFFFF) + 1, false);

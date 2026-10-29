@@ -232,7 +232,9 @@ bool cpuPeekAddress(struct N64* n, uint64_t vaddr, uint32_t* paddr) {
 }
 
 static bool address(struct N64* n, uint64_t vaddr, int align, bool store, uint32_t* paddr) {
-	if (vaddr & (align - 1)) {
+	if ((vaddr & (align - 1)) && n->compat) {
+		vaddr &= ~(uint64_t) (align - 1);
+	} else if (vaddr & (align - 1)) {
 		n->cpu.cop0[CP0_BADVADDR] = vaddr;
 		cpuException(n, store ? EXC_ADES : EXC_ADEL, 0);
 		return false;

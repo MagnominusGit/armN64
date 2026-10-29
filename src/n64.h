@@ -202,6 +202,10 @@ struct N64 {
 	uint64_t eventAt;
 	// CPU cycles the CPU may run ahead of the RSP before it catches up.
 	uint64_t slice;
+	// Compatibility mode (N64_COMPAT=1), for hacks made on emulators: RDRAM starts zeroed, misaligned
+	// CPU accesses align down instead of raising address errors, PI DMA copies between the exact
+	// addresses, and a blanked VI window still shows the picture.
+	bool compat;
 	// The RSP is being caught up: its own accesses to the shared registers must not catch it up again.
 	bool catchingUp;
 	uint64_t nextVi;

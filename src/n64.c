@@ -85,6 +85,11 @@ bool n64LoadRom(struct N64* n, const uint8_t* data, size_t size) {
 
 // From power-on: the PIF's boot from the cartridge, or from the 64DD's IPL without one.
 static void start(struct N64* n) {
+	const char* compat = getenv("N64_COMPAT");
+	n->compat = compat && *compat == '1';
+	if (n->compat) {
+		memset(n->rdram, 0, RDRAM_SIZE);
+	}
 	blocksFree(n);
 	cpuReset(n);
 	pifBoot(n);
@@ -241,6 +246,13 @@ int n64Picture(struct N64* n, uint32_t* out, int* width, int* height) {
 	int hStart = (v[9] >> 16) & 0x3FF, hEnd = v[9] & 0x3FF;
 	int vStart = (v[10] >> 16) & 0x3FF, vEnd = v[10] & 0x3FF;
 	uint32_t xScale = v[12] & 0xFFF, yScale = v[13] & 0xFFF;
+	// In compatibility mode, an empty window (osViBlack) shows the picture anyway in the TV type's
+	// usual one, as emulators that draw the RDP's image directly do.
+	if (n->compat && (hEnd <= hStart || vEnd <= vStart)) {
+		bool pal = n->fieldCycles == CPU_HZ / 50;
+		hStart = pal ? 0x80 : 0x6C, hEnd = pal ? 0x300 : 0x2EC;
+		vStart = pal ? 0x5F : 0x25, vEnd = pal ? 0x239 : 0x1FF;
+	}
 	int w = (int) (((hEnd - hStart) * xScale + 512) >> 10);
 	int h = (int) ((((vEnd - vStart) >> 1) * yScale + 512) >> 10);
 	if (type < 2 || w <= 0 || h <= 0 || stride == 0) {
