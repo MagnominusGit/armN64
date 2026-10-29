@@ -1966,8 +1966,9 @@ static void gpuSubmit(struct N64* n, struct RDP* r) {
 	}
 	glesData(g->gl, 2, d, total * sizeof(int32_t));
 	glesData(g->gl, 1, g->tmem, (size_t) g->tmemCount * 0x1000);
-	int u[8] = { (int) binsAt, (int) listsAt, tx0, ty0, (int) across, (int) g->lastUsed, 0, 0 };
-	glesUniforms(g->gl, u, 8);
+	int u[12] = { (int) binsAt, (int) listsAt, tx0, ty0, (int) across, (int) g->lastUsed, (int) r->colorAddr, (int) r->colorWidth,
+	              r->colorSize, (int) r->zAddr, 0, 0 };
+	glesUniforms(g->gl, u, 12);
 	glesDispatch(g->gl, across, down);
 	g->batchBase[g->batchCount] = g->lastUsed;
 	g->batchTiles[g->batchCount++] = across * down;
@@ -2049,7 +2050,7 @@ static void gpuCommand(struct N64* n, struct RDP* r, const uint64_t* w, int op) 
 	uint32_t colorLen = (uint32_t) (y1 - y0) * r->colorWidth * bpp + right * bpp;
 	uint32_t z = r->zAddr + (uint32_t) y0 * r->colorWidth * 2;
 	uint32_t zLen = (uint32_t) (y1 - y0) * r->colorWidth * 2 + right * 2;
-	bool overlap = depth && r->zAddr != r->colorAddr && z < color + colorLen && color < z + zLen;
+	bool overlap = depth && z < color + colorLen && color < z + zLen;
 	bool shades = !(op == 0x36 && r->cycleType == 3) && !((op == 0x24 || op == 0x25) && r->cycleType == 2);
 	const struct Stage* firstStage = &r->stage[r->cycleType == 1 ? 0 : 1];
 	bool alone = right - 1 > r->colorWidth || overlap ||

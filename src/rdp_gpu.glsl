@@ -10,8 +10,9 @@ layout(std430, binding = 1) readonly buffer Tmem { uint tmem[]; };
 layout(std430, binding = 2) readonly buffer Data { int data[]; };
 layout(std430, binding = 3) writeonly buffer Last { uint lastOut[]; };
 
-// 0 bins, 1 bin lists, 2 first tile x, 3 first tile y, 4 tiles across, 5 lastOut base
-uniform int u[8];
+// 0 bins, 1 bin lists, 2 first tile x, 3 first tile y, 4 tiles across, 5 lastOut base, 6 color image,
+// 7 its width, 8 its pixel size, 9 depth image
+uniform int u[12];
 
 const uint RDRAM_MASK = 0x7FFFFFu;
 const int TILES_ACROSS = 64;
@@ -99,60 +100,101 @@ int bits64(uvec2 v, int sh) {
 
 // ---- Z buffer
 
-const int zShift[8] = int[8](6, 5, 4, 3, 2, 1, 0, 0);
-const int zBase[8] = int[8](0, 0x20000, 0x30000, 0x38000, 0x3C000, 0x3E000, 0x3F000, 0x3F800);
+// zShift and zBase in rdp.c, for exponents 0-7.
+int zShift(int e) {
+	return e < 6 ? 6 - e : 0;
+}
+
+int zBase(int e) {
+	return e == 0 ? 0 : 0x40000 - (0x40000 >> e);
+}
 
 uint zCompress(int z) {
 	uint x = ~(uint(z) << 14);
 	int e = 31 - findMSB(x);
 	e = e > 7 ? 7 : e;
-	int m = ((z - zBase[e]) >> zShift[e]) & 0x7FF;
+	int m = ((z - zBase(e)) >> zShift(e)) & 0x7FF;
 	return uint((e << 11 | m) << 2);
 }
 
 int zDecompress(uint v) {
 	int e = int(v >> 13) & 7, m = int(v >> 2) & 0x7FF;
-	return zBase[e] + (m << zShift[e]);
+	return zBase(e) + (m << zShift(e));
 }
 
-// ---- Framebuffer
+// ---- Framebuffer: in a batch the color and depth images stay put, and every pixel of them belongs
+// to one invocation (rdp.c draws on the CPU where rows or the two images run into each other), so
+// each invocation keeps its pixel's color and depth (big-endian values) and writes them back at the
+// end.
+
+uint fbColor, fbZ;
+bool colorDirty, zDirty;
+uint colorAt, zAt;
+
+uint rword(uint a) {
+	return rbyte(a) << 24 | rbyte(a + 1u) << 16 | rbyte(a + 2u) << 8 | rbyte(a + 3u);
+}
+
+void loadPixel(int x, int y) {
+	uint i = uint(y * u[7] + x);
+	uint addr = uint(u[6]);
+	int size = u[8];
+	if (size == 1) {
+		colorAt = (addr + i) & RDRAM_MASK;
+		fbColor = rbyte(colorAt);
+	} else if (size == 3) {
+		colorAt = (addr + i * 4u) & (RDRAM_MASK & ~3u);
+		fbColor = rword(colorAt);
+	} else {
+		colorAt = (addr + i * 2u) & (RDRAM_MASK & ~1u);
+		fbColor = rhalf(colorAt);
+	}
+	zAt = (uint(u[9]) + i * 2u) & (RDRAM_MASK & ~1u);
+	fbZ = u[9] != 0 ? rhalf(zAt) : 0u;
+	colorDirty = zDirty = false;
+}
+
+void storePixel() {
+	if (colorDirty) {
+		int size = u[8];
+		if (size == 1) {
+			wbyte(colorAt, fbColor);
+		} else if (size == 3) {
+			uint v = fbColor;
+			rdram[colorAt >> 2] = (v >> 24) | ((v >> 8) & 0xFF00u) | ((v << 8) & 0xFF0000u) | (v << 24);
+		} else {
+			whalf(colorAt, fbColor);
+		}
+	}
+	if (zDirty) {
+		whalf(zAt, fbZ);
+	}
+}
 
 ivec4 readPixel(int x, int y) {
-	uint i = uint(y * data[gS + S_CWIDTH] + x);
-	uint addr = uint(data[gS + S_CADDR]);
-	int size = data[gS + S_CSIZE];
+	int size = u[8];
 	if (size == 1) {
-		int v = int(rbyte(addr + i));
+		int v = int(fbColor);
 		return ivec4(v, v, v, 0xE0);
 	}
 	if (size == 3) {
-		uint a = (addr + i * 4u) & (RDRAM_MASK & ~3u);
-		return ivec4(int(rbyte(a)), int(rbyte(a + 1u)), int(rbyte(a + 2u)), int(rbyte(a + 3u)));
+		return unpackColor(int(fbColor));
 	}
-	uint p = rhalf((addr + i * 2u) & (RDRAM_MASK & ~1u));
+	uint p = fbColor;
 	int cr = int(p >> 11) & 31, cg = int(p >> 6) & 31, cb = int(p >> 1) & 31;
 	return ivec4(cr << 3 | cr >> 2, cg << 3 | cg >> 2, cb << 3 | cb >> 2, (p & 1u) != 0u ? 255 : 0);
 }
 
 void writePixel(int x, int y, ivec4 c) {
-	uint i = uint(y * data[gS + S_CWIDTH] + x);
-	uint addr = uint(data[gS + S_CADDR]);
-	int size = data[gS + S_CSIZE];
+	int size = u[8];
+	colorDirty = true;
 	if (size == 1) {
-		wbyte(addr + i, uint(c.r));
-		return;
+		fbColor = uint(c.r) & 255u;
+	} else if (size == 3) {
+		fbColor = uint(c.r & 255) << 24 | uint(c.g & 255) << 16 | uint(c.b & 255) << 8 | uint(c.a & 255);
+	} else {
+		fbColor = uint((c.r >> 3) << 11 | (c.g >> 3) << 6 | (c.b >> 3) << 1 | (c.a >= 128 ? 1 : 0));
 	}
-	if (size == 3) {
-		uint a = (addr + i * 4u) & (RDRAM_MASK & ~3u);
-		rdram[a >> 2] = uint(c.r & 255) | uint(c.g & 255) << 8 | uint(c.b & 255) << 16 | uint(c.a & 255) << 24;
-		return;
-	}
-	uint p = uint((c.r >> 3) << 11 | (c.g >> 3) << 6 | (c.b >> 3) << 1 | (c.a >= 128 ? 1 : 0));
-	whalf((addr + i * 2u) & (RDRAM_MASK & ~1u), p);
-}
-
-uint zAddress(int x, int y) {
-	return (uint(data[gS + S_ZADDR]) + uint(y * data[gS + S_CWIDTH] + x) * 2u) & (RDRAM_MASK & ~1u);
 }
 
 // ---- Textures
@@ -265,37 +307,47 @@ ivec4 div32(ivec4 v) {
 	return (v + ((v >> 31) & 31)) >> 5;
 }
 
+// The texels go through one texel() call (a loop the compiler leaves alone): the shader stays small.
 ivec4 sampleTile(int t, int s, int tt) {
 	t &= 7;
 	int fs, ft, f;
 	int s0 = wrapS(t, s, fs);
 	int t0 = wrapT(t, tt, ft);
 	bool bilinear = ((omHi >> 13) & 1u) != 0u && ((omHi >> 20) & 3u) < 2u;
-	if (!bilinear) {
-		return texel(t, s0, t0);
+	int s1 = s0, t1 = t0;
+	if (bilinear) {
+		int shiftS = tileField(t, T_SHIFTS), shiftT = tileField(t, T_SHIFTT);
+		s1 = wrapS(t, s + (32 << (shiftS < 11 ? shiftS : 0)), f);
+		t1 = wrapT(t, tt + (32 << (shiftT < 11 ? shiftT : 0)), f);
 	}
-	int shiftS = tileField(t, T_SHIFTS), shiftT = tileField(t, T_SHIFTT);
-	int s1 = wrapS(t, s + (32 << (shiftS < 11 ? shiftS : 0)), f);
-	int t1 = wrapT(t, tt + (32 << (shiftT < 11 ? shiftT : 0)), f);
-	ivec4 c0 = texel(t, s0, t0), c1 = texel(t, s1, t0), c2 = texel(t, s0, t1);
-	if (fs + ft < 32) {
+	bool upper = bilinear && fs + ft >= 32;
+	int first = upper ? 1 : 0, end = bilinear ? (upper ? 4 : 3) : 1;
+	ivec4 c0 = ivec4(0), c1 = ivec4(0), c2 = ivec4(0), c3 = ivec4(0);
+	for (int k = first; k < end; ++k) {
+		ivec4 c = texel(t, k == 1 || k == 3 ? s1 : s0, k >= 2 ? t1 : t0);
+		if (k == 0) {
+			c0 = c;
+		} else if (k == 1) {
+			c1 = c;
+		} else if (k == 2) {
+			c2 = c;
+		} else {
+			c3 = c;
+		}
+	}
+	if (!bilinear) {
+		return c0;
+	}
+	if (!upper) {
 		return c0 + div32((c1 - c0) * fs + (c2 - c0) * ft);
 	}
-	ivec4 c3 = texel(t, s1, t1);
 	return c3 + div32((c2 - c3) * (32 - fs) + (c1 - c3) * (32 - ft));
 }
 
 // ---- Combiner and blender
 
-int rgbIn(int sel, int which, int ch) {
-	switch (sel) {
-	case 0: return pCombined[ch];
-	case 1: return pTex0[ch];
-	case 2: return pTex1[ch];
-	case 3: return gPrim[ch];
-	case 4: return pShade[ch];
-	case 5: return gEnv[ch];
-	}
+// The inputs that aren't colors: one value for all three channels.
+int rgbScalar(int sel, int which) {
 	if (which == 0 && sel == 6) {
 		return 0x100;
 	}
@@ -321,6 +373,18 @@ int rgbIn(int sel, int which, int ch) {
 	return 0;
 }
 
+ivec3 rgbIn(int sel, int which) {
+	switch (sel) {
+	case 0: return pCombined.rgb;
+	case 1: return pTex0.rgb;
+	case 2: return pTex1.rgb;
+	case 3: return gPrim.rgb;
+	case 4: return pShade.rgb;
+	case 5: return gEnv.rgb;
+	}
+	return ivec3(rgbScalar(sel, which));
+}
+
 int alphaIn(int sel, bool multiplier) {
 	switch (sel) {
 	case 0: return multiplier ? pLodFrac : pCombined.a;
@@ -341,7 +405,17 @@ int ext9(int v) {
 
 int sign9(int v) {
 	v &= 0x1FF;
-	return (v & 0x100) != 0 ? v - 0x200 : v;
+	return v - ((v & 0x100) << 1);
+}
+
+ivec3 ext9v(ivec3 v) {
+	v &= 0x1FF;
+	return v - ivec3(equal(v & 0x180, ivec3(0x180))) * 0x200;
+}
+
+ivec3 sign9v(ivec3 v) {
+	v &= 0x1FF;
+	return v - ((v & 0x100) << 1);
 }
 
 int clamp9(int v) {
@@ -359,16 +433,12 @@ ivec4 combine(int cycle) {
 	int aMul = cycle != 0 ? int(lo >> 18) & 7 : int(hi >> 9) & 7;
 	int aB = cycle != 0 ? int(lo >> 3) & 7 : int(lo >> 12) & 7;
 	int aAdd = cycle != 0 ? int(lo) & 7 : int(lo >> 9) & 7;
-	ivec4 o;
-	for (int ch = 0; ch < 3; ++ch) {
-		int a = ext9(rgbIn(subA, 0, ch)), b = ext9(rgbIn(subB, 1, ch));
-		int m = sign9(rgbIn(mul, 2, ch)), d = ext9(rgbIn(add, 3, ch));
-		o[ch] = (((a - b) * m + (d << 8) + 0x80) & 0x1FFFF) >> 8;
-	}
-	int a = ext9(alphaIn(aA, false)), b = ext9(alphaIn(aB, false));
-	int m = sign9(alphaIn(aMul, true)), d = ext9(alphaIn(aAdd, false));
-	o.a = (((a - b) * m + (d << 8) + 0x80) >> 8) & 0x1FF;
-	return o;
+	ivec3 a = ext9v(rgbIn(subA, 0)), b = ext9v(rgbIn(subB, 1));
+	ivec3 m = sign9v(rgbIn(mul, 2)), d = ext9v(rgbIn(add, 3));
+	ivec3 rgb = (((a - b) * m + (d << 8) + 0x80) & 0x1FFFF) >> 8;
+	int aa = ext9(alphaIn(aA, false)), ab = ext9(alphaIn(aB, false));
+	int am = sign9(alphaIn(aMul, true)), ad = ext9(alphaIn(aAdd, false));
+	return ivec4(rgb, (((aa - ab) * am + (ad << 8) + 0x80) >> 8) & 0x1FF);
 }
 
 int blendSel(int cycle, int i) {
@@ -402,18 +472,19 @@ void shadePixel(int x, int y) {
 	bool zCompare = ((omLo >> 4) & 1u) != 0u, zUpdate = ((omLo >> 5) & 1u) != 0u;
 	bool zbuf = data[gS + S_ZADDR] != 0;
 	if (zbuf && zCompare) {
-		int old = zDecompress(rhalf(zAddress(x, y)));
+		int old = zDecompress(fbZ);
 		int zMode = int(omLo >> 10) & 3;
 		bool pass = zMode == 3 ? z <= old + 0x10 && z >= old - 0x10 : z <= old;
 		if (!pass) {
 			return;
 		}
 	}
+	// One-cycle mode runs the combiner's second-cycle equation.
 	pCombined = lastCombined;
-	ivec4 c = combine(cycleType == 1 ? 0 : 1);
-	if (cycleType == 1) {
+	ivec4 c = ivec4(0);
+	for (int cycle = cycleType == 1 ? 0 : 1; cycle < 2; ++cycle) {
+		c = combine(cycle);
 		pCombined = c;
-		c = combine(1);
 	}
 	lastCombined = c;
 	shaded = true;
@@ -426,16 +497,15 @@ void shadePixel(int x, int y) {
 	}
 	ivec4 memory = readPixel(x, y);
 	bool force = ((omLo >> 14) & 1u) != 0u;
-	ivec4 o;
-	if (cycleType == 1) {
-		ivec4 first = blendColor(c, memory, 0);
-		o = force ? blendColor(first, memory, 1) : blendInput(first, memory, 1);
-	} else {
-		o = force ? blendColor(c, memory, 0) : blendInput(c, memory, 0);
+	// In 2-cycle mode the first cycle always blends; the last blends only with force blend.
+	int cycles = cycleType == 1 ? 2 : 1;
+	for (int cycle = 0; cycle < cycles; ++cycle) {
+		c = cycle < cycles - 1 || force ? blendColor(c, memory, cycle) : blendInput(c, memory, cycle);
 	}
-	writePixel(x, y, o);
+	writePixel(x, y, c);
 	if (zbuf && zUpdate) {
-		whalf(zAddress(x, y), zCompress(z));
+		fbZ = zCompress(z);
+		zDirty = true;
 	}
 }
 
@@ -454,23 +524,32 @@ int perspDivide(uvec2 s, int w) {
 		n = neg64(n);
 	}
 	uint d = uint(w);
-	uint r = n.y % d;
+	uint r = n.y - (n.y / d) * d;
 	uint t1 = (r << 16) | (n.x >> 16);
-	uint q1 = t1 / d, r1 = t1 % d;
+	uint q1 = t1 / d, r1 = t1 - q1 * d;
 	uint t2 = (r1 << 16) | (n.x & 0xFFFFu);
 	uint q = (q1 << 16) + t2 / d;
 	return int(negative ? 0u - q : q);
 }
 
 ivec2 texCoords(uvec2 sS, uvec2 sT, uvec2 sW, bool persp) {
-	if (persp) {
-		int wv = int(sW.x >> 16) & 0x7FFF;
-		if (wv == 0) {
-			wv = 1;
-		}
-		return ivec2(perspDivide(sS, wv), perspDivide(sT, wv));
+	if (!persp) {
+		return ivec2(bits64(sS, 16), bits64(sT, 16));
 	}
-	return ivec2(bits64(sS, 16), bits64(sT, 16));
+	int wv = int(sW.x >> 16) & 0x7FFF;
+	if (wv == 0) {
+		wv = 1;
+	}
+	ivec2 o = ivec2(0);
+	for (int k = 0; k < 2; ++k) {
+		int v = perspDivide(k == 0 ? sS : sT, wv);
+		if (k == 0) {
+			o.x = v;
+		} else {
+			o.y = v;
+		}
+	}
+	return o;
 }
 
 bool lodFracUsed() {
@@ -553,97 +632,132 @@ void clearPixel() {
 	pLodFrac = 0;
 }
 
-void triangle(int p, int x, int y) {
-	int row = data[p + P_ROWS] + (y - data[p + P_FIRST]) * ROW_SIZE;
-	int x0 = data[row], x1 = data[row + 1];
-	if (x < x0 || x > x1) {
-		return;
+void fillPixel(int x, int y) {
+	uint fill = uint(data[gS + S_FILL]);
+	int size = u[8];
+	colorDirty = true;
+	if (size == 1) {
+		fbColor = (fill >> ((3u - (colorAt & 3u)) * 8u)) & 255u;
+	} else if (size == 3) {
+		fbColor = fill;
+	} else {
+		fbColor = (x & 1) != 0 ? fill & 0xFFFFu : fill >> 16;
 	}
-	int k = x - x0;
-	int flags = data[p + P_FLAGS];
-	clearPixel();
-	if ((flags & 4) != 0) {
-		for (int i = 0; i < 4; ++i) {
-			uvec2 v = add64(load64(row + 2 + i * 2), mul64(k, data[p + P_SDX + i]));
-			pShade[i] = clamp(bits64(v, 16), 0, 255);
-		}
-	}
-	if ((flags & 1) != 0) {
-		pZ = bits64(add64(load64(row + 16), mul64(k, data[p + P_ZDX])), 13);
-	}
-	if ((flags & 2) != 0) {
-		int cycleType = int(omHi >> 20) & 3;
-		bool persp = ((omHi >> 19) & 1u) != 0u;
-		int tile = data[p + P_TILE];
-		uvec2 sS = add64(load64(row + 10), mul64(k, data[p + P_TDX]));
-		uvec2 sT = add64(load64(row + 12), mul64(k, data[p + P_TDX + 1]));
-		uvec2 sW = add64(load64(row + 14), mul64(k, data[p + P_TDX + 2]));
-		ivec2 st = texCoords(sS, sT, sW, persp);
-		int t1 = tile, t2 = tile + 1;
-		if (((omHi >> 16) & 1u) != 0u || lodFracUsed()) {
-			ivec2 x1c = texCoords(add64(sS, ext64(data[p + P_TDX])), add64(sT, ext64(data[p + P_TDX + 1])),
-			                      add64(sW, ext64(data[p + P_TDX + 2])), persp);
-			ivec2 y1c = texCoords(add64(sS, ext64(data[p + P_TDY])), add64(sT, ext64(data[p + P_TDY + 1])),
-			                      add64(sW, ext64(data[p + P_TDY + 2])), persp);
-			pLodFrac = levelOfDetail(tile, st.x, st.y, x1c.x, x1c.y, y1c.x, y1c.y, t1, t2);
-		}
-		pTex0 = sampleTile(t1, st.x, st.y);
-		pTex1 = cycleType == 1 ? sampleTile(t2, st.x, st.y) : pTex0;
-	}
-	shadePixel(x, y);
 }
 
-void textureRect(int p, int x, int y) {
-	int tile = data[p + P_TILE];
-	int s0 = data[p + P_S0], t0 = data[p + P_T0], dsdx = data[p + P_DSDX], dtdy = data[p + P_DTDY];
-	bool flip = data[p + P_FLIP] != 0;
-	int cycleType = int(omHi >> 20) & 3;
-	int dx = x - data[p + P_CX0], dy = y - data[p + P_CY0];
-	int s = ((s0 << 5) + (flip ? dy * dsdx : dx * dsdx)) >> 5;
-	int t = ((t0 << 5) + (flip ? dx * dtdy : dy * dtdy)) >> 5;
+int shadeAt(int start, int step, int k) {
+	return bits64(add64(load64(start), mul64(k, data[step])), 16);
+}
+
+// One primitive at the pixel: the attributes by kind, then one path for texturing, the level of
+// detail, and shading.
+void drawPrim(int p, int x, int y) {
+	int kind = data[p + P_KIND];
 	clearPixel();
-	int t1 = tile, t2 = tile + 1;
-	if (cycleType < 2 && (((omHi >> 16) & 1u) != 0u || lodFracUsed())) {
-		int sx = s + (flip ? 0 : dsdx >> 5), tx = t + (flip ? dtdy >> 5 : 0);
-		int sy = s + (flip ? dsdx >> 5 : 0), ty = t + (flip ? 0 : dtdy >> 5);
-		pLodFrac = levelOfDetail(tile, s, t, sx, tx, sy, ty, t1, t2);
+	int cycleType = int(omHi >> 20) & 3;
+	int tile = data[p + P_TILE];
+	bool tex = false, lod = false, copy = false;
+	ivec2 st = ivec2(0), sx = ivec2(0), sy = ivec2(0);
+	if (kind == KIND_FILL) {
+		fillPixel(x, y);
+		return;
 	}
-	pTex0 = sampleTile(t1, s, t);
-	pTex1 = cycleType == 1 ? sampleTile(t2, s, t) : pTex0;
-	if (cycleType == 2) {
+	if (kind == KIND_TRIANGLE) {
+		int row = data[p + P_ROWS] + (y - data[p + P_FIRST]) * ROW_SIZE;
+		int x0 = data[row], x1 = data[row + 1];
+		if (x < x0 || x > x1) {
+			return;
+		}
+		int k = x - x0;
+		int flags = data[p + P_FLAGS];
+		if ((flags & 4) != 0) {
+			pShade = clamp(ivec4(shadeAt(row + 2, p + P_SDX, k), shadeAt(row + 4, p + P_SDX + 1, k), shadeAt(row + 6, p + P_SDX + 2, k),
+			                     shadeAt(row + 8, p + P_SDX + 3, k)), 0, 255);
+		}
+		if ((flags & 1) != 0) {
+			pZ = bits64(add64(load64(row + 16), mul64(k, data[p + P_ZDX])), 13);
+		}
+		if ((flags & 2) != 0) {
+			tex = true;
+			lod = ((omHi >> 16) & 1u) != 0u || lodFracUsed();
+			bool persp = ((omHi >> 19) & 1u) != 0u;
+			uvec2 sS = add64(load64(row + 10), mul64(k, data[p + P_TDX]));
+			uvec2 sT = add64(load64(row + 12), mul64(k, data[p + P_TDX + 1]));
+			uvec2 sW = add64(load64(row + 14), mul64(k, data[p + P_TDX + 2]));
+			int count = lod ? 3 : 1;
+			for (int j = 0; j < count; ++j) {
+				uvec2 a = sS, b = sT, c = sW;
+				if (j > 0) {
+					int d = j == 1 ? P_TDX : P_TDY;
+					a = add64(a, ext64(data[p + d]));
+					b = add64(b, ext64(data[p + d + 1]));
+					c = add64(c, ext64(data[p + d + 2]));
+				}
+				ivec2 v = texCoords(a, b, c, persp);
+				if (j == 0) {
+					st = v;
+				} else if (j == 1) {
+					sx = v;
+				} else {
+					sy = v;
+				}
+			}
+		}
+	} else if (kind == KIND_TEXRECT) {
+		int s0 = data[p + P_S0], t0 = data[p + P_T0], dsdx = data[p + P_DSDX], dtdy = data[p + P_DTDY];
+		bool flip = data[p + P_FLIP] != 0;
+		int dx = x - data[p + P_CX0], dy = y - data[p + P_CY0];
+		int s = ((s0 << 5) + (flip ? dy * dsdx : dx * dsdx)) >> 5;
+		int t = ((t0 << 5) + (flip ? dx * dtdy : dy * dtdy)) >> 5;
+		st = ivec2(s, t);
+		tex = true;
+		lod = cycleType < 2 && (((omHi >> 16) & 1u) != 0u || lodFracUsed());
+		sx = ivec2(s + (flip ? 0 : dsdx >> 5), t + (flip ? dtdy >> 5 : 0));
+		sy = ivec2(s + (flip ? dsdx >> 5 : 0), t + (flip ? 0 : dtdy >> 5));
+		copy = cycleType == 2;
+		pZ = data[gS + S_PRIMZ];
+	} else {
+		pZ = data[gS + S_PRIMZ];
+	}
+	if (tex) {
+		int t1 = tile, t2 = tile + 1;
+		if (lod) {
+			pLodFrac = levelOfDetail(tile, st.x, st.y, sx.x, sx.y, sy.x, sy.y, t1, t2);
+		}
+		int samples = cycleType == 1 ? 2 : 1;
+		for (int i = 0; i < samples; ++i) {
+			ivec4 c = sampleTile(i == 0 ? t1 : t2, st.x, st.y);
+			if (i == 0) {
+				pTex0 = c;
+			} else {
+				pTex1 = c;
+			}
+		}
+		if (samples == 1) {
+			pTex1 = pTex0;
+		}
+	}
+	if (copy) {
 		if ((omLo & 1u) != 0u && pTex0.a == 0) {
 			return;
 		}
 		int ti = tile & 7;
 		if (data[gS + S_CSIZE] == 1 && tileField(ti, T_SIZE) == 1) {
+			// Copying into an 8-bit image moves the texel bytes themselves (palette indices).
+			bool flip = data[p + P_FLIP] != 0;
+			int dx = x - data[p + P_CX0], dy = y - data[p + P_CY0];
 			int f;
-			int ss = wrapS(ti, s, f);
-			int tt = wrapT(ti, ((t0 << 5) + (flip ? dx : dy) * dtdy) >> 5, f);
+			int ss = wrapS(ti, st.x, f);
+			int tt = wrapT(ti, ((data[p + P_T0] << 5) + (flip ? dx : dy) * data[p + P_DTDY]) >> 5, f);
 			int a = (tileField(ti, T_TMEM) * 8 + tt * tileField(ti, T_LINE) * 8 + ss) ^ ((tt & 1) != 0 ? 4 : 0);
-			wbyte(uint(data[gS + S_CADDR]) + uint(y * data[gS + S_CWIDTH] + x), tmemByte(a));
+			fbColor = tmemByte(a);
+			colorDirty = true;
 			return;
 		}
 		writePixel(x, y, pTex0);
 		return;
 	}
-	pZ = data[gS + S_PRIMZ];
 	shadePixel(x, y);
-}
-
-void fillPixel(int x, int y) {
-	uint i = uint(y * data[gS + S_CWIDTH] + x);
-	uint addr = uint(data[gS + S_CADDR]);
-	uint fill = uint(data[gS + S_FILL]);
-	int size = data[gS + S_CSIZE];
-	if (size == 1) {
-		uint a = (addr + i) & RDRAM_MASK;
-		wbyte(a, fill >> ((3u - (a & 3u)) * 8u));
-	} else if (size == 3) {
-		uint a = (addr + i * 4u) & (RDRAM_MASK & ~3u);
-		rdram[a >> 2] = (fill >> 24) | ((fill >> 8) & 0xFF00u) | ((fill << 8) & 0xFF0000u) | (fill << 24);
-	} else {
-		whalf((addr + i * 2u) & (RDRAM_MASK & ~1u), (x & 1) != 0 ? fill & 0xFFFFu : fill >> 16);
-	}
 }
 
 shared uint bestKey;
@@ -656,6 +770,9 @@ void main() {
 	int first = data[bin], count = data[bin + 1];
 	uint key = 0u;
 	ivec4 keyColor = ivec4(0);
+	if (count > 0) {
+		loadPixel(x, y);
+	}
 	for (int i = 0; i < count; ++i) {
 		int index = data[u[1] + first + i];
 		int p = index * PRIM_SIZE;
@@ -664,22 +781,14 @@ void main() {
 		}
 		loadState(p);
 		shaded = false;
-		int kind = data[p + P_KIND];
-		if (kind == KIND_TRIANGLE) {
-			triangle(p, x, y);
-		} else if (kind == KIND_TEXRECT) {
-			textureRect(p, x, y);
-		} else if (kind == KIND_FILL) {
-			fillPixel(x, y);
-		} else {
-			clearPixel();
-			pZ = data[gS + S_PRIMZ];
-			shadePixel(x, y);
-		}
+		drawPrim(p, x, y);
 		if (shaded) {
 			key = uint(index + 1) << 20 | uint(y) << 10 | uint(x);
 			keyColor = lastCombined;
 		}
+	}
+	if (count > 0) {
+		storePixel();
 	}
 	// The last pixel through the combiner, in drawing order, for the CPU's next lastCombined.
 	if (gl_LocalInvocationIndex == 0u) {
