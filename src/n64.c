@@ -245,95 +245,113 @@ void n64RunField(struct N64* n) {
 	++n->fields;
 }
 
-// One framebuffer pixel for the VI: 8-bit channels and its coverage (from the hidden bits for
-// 16-bit pixels, the top alpha bits for 32-bit ones).
-struct ViPixel {
-	int r, g, b, cvg;
+// One framebuffer row for the VI from column -3 (index 0): 8-bit channels, their 5-bit values
+// for the dither filter, and coverage (from the hidden bits for 16-bit pixels, the top alpha bits
+// for 32-bit ones).
+struct ViRow {
+	uint8_t c[3][646], q[3][646], cvg[646];
 };
 
-static struct ViPixel viRead(struct N64* n, bool wide, uint32_t origin, int64_t i) {
+static void viStore(struct ViRow* row, int k, int r, int g, int b, int cvg) {
+	row->c[0][k] = (uint8_t) r, row->c[1][k] = (uint8_t) g, row->c[2][k] = (uint8_t) b;
+	row->q[0][k] = (uint8_t) (r >> 3), row->q[1][k] = (uint8_t) (g >> 3), row->q[2][k] = (uint8_t) (b >> 3);
+	row->cvg[k] = (uint8_t) cvg;
+}
+
+static void viDecodePixel(struct N64* n, bool wide, uint32_t a, struct ViRow* row, int k) {
+	const uint8_t* m = &n->rdram[a];
 	if (wide) {
-		const uint8_t* p = &n->rdram[(origin + (uint32_t) i * 4) & (RDRAM_SIZE - 4)];
-		return (struct ViPixel) { p[0], p[1], p[2], (p[3] >> 5) & 7 };
+		viStore(row, k, m[0], m[1], m[2], (m[3] >> 5) & 7);
+		return;
 	}
-	uint32_t a = (origin + (uint32_t) i * 2) & (RDRAM_SIZE - 2);
-	uint16_t px = (uint16_t) (n->rdram[a] << 8 | n->rdram[a + 1]);
+	int px = m[0] << 8 | m[1];
 	int r = (px >> 11) & 31, g = (px >> 6) & 31, b = (px >> 1) & 31;
-	return (struct ViPixel) { r << 3 | r >> 2, g << 3 | g >> 2, b << 3 | b >> 2, (px & 1) << 2 | n->hidden[a >> 1] };
+	viStore(row, k, r << 3 | r >> 2, g << 3 | g >> 2, b << 3 | b >> 2, (px & 1) << 2 | n->hidden[a >> 1]);
 }
 
-// The second largest and second smallest of a few values (the largest and smallest when they
-// repeat), as the VI's edge filter finds them.
-static void penumbra(const int* v, int count, int* low, int* high) {
-	int posMax = 0, posMin = 0, penMax = v[0], penMin = v[0];
-	for (int i = 1; i < count; ++i) {
-		if (v[i] > v[posMax]) {
-			penMax = v[posMax];
-			posMax = i;
-		} else if (v[i] < v[posMin]) {
-			penMin = v[posMin];
-			posMin = i;
+// Decodes count pixels from index start; rows that don't wrap around RDRAM take the straight loops.
+static void viDecodeRow(struct N64* n, bool wide, uint32_t origin, int64_t start, int count, struct ViRow* restrict row) {
+	uint32_t size = wide ? 4 : 2;
+	uint32_t a0 = (origin + (uint32_t) start * size) & (RDRAM_SIZE - size);
+	if (a0 + (uint32_t) count * size > RDRAM_SIZE) {
+		for (int k = 0; k < count; ++k) {
+			viDecodePixel(n, wide, (origin + (uint32_t) (start + k) * size) & (RDRAM_SIZE - size), row, k);
 		}
+		return;
 	}
-	if (penMax != v[posMax]) {
-		for (int i = posMax + 1; i < count; ++i) {
-			penMax = v[i] > penMax ? v[i] : penMax;
+	const uint8_t* restrict m = &n->rdram[a0];
+	if (wide) {
+		for (int k = 0; k < count; ++k) {
+			int r = m[k * 4], g = m[k * 4 + 1], b = m[k * 4 + 2];
+			row->c[0][k] = (uint8_t) r, row->c[1][k] = (uint8_t) g, row->c[2][k] = (uint8_t) b;
+			row->q[0][k] = (uint8_t) (r >> 3), row->q[1][k] = (uint8_t) (g >> 3), row->q[2][k] = (uint8_t) (b >> 3);
+			row->cvg[k] = (m[k * 4 + 3] >> 5) & 7;
 		}
+		return;
 	}
-	if (penMin != v[posMin]) {
-		for (int i = posMin + 1; i < count; ++i) {
-			penMin = v[i] < penMin ? v[i] : penMin;
-		}
+	const uint8_t* restrict hidden = &n->hidden[a0 >> 1];
+	for (int k = 0; k < count; ++k) {
+		int px = m[k * 2] << 8 | m[k * 2 + 1];
+		int r = (px >> 11) & 31, g = (px >> 6) & 31, b = (px >> 1) & 31;
+		row->c[0][k] = (uint8_t) (r << 3 | r >> 2), row->c[1][k] = (uint8_t) (g << 3 | g >> 2), row->c[2][k] = (uint8_t) (b << 3 | b >> 2);
+		row->q[0][k] = (uint8_t) r, row->q[1][k] = (uint8_t) g, row->q[2][k] = (uint8_t) b;
+		row->cvg[k] = (uint8_t) ((px & 1) << 2 | hidden[k]);
 	}
-	*low = penMin;
-	*high = penMax;
 }
 
-// The VI's fetch of a pixel: with antialiasing, a partly covered pixel moves toward the colour the
-// fully covered pixels around it agree on, by the coverage it lacks; with the dither filter, a fully
-// covered one moves a step toward each of its eight neighbours.
-static struct ViPixel viFetch(struct N64* n, bool wide, uint32_t origin, int64_t i, int64_t stride, bool aa, bool dither) {
-	struct ViPixel c = viRead(n, wide, origin, i);
-	if (!aa) {
-		c.cvg = 7;
-	}
-	int* ch[3] = { &c.r, &c.g, &c.b };
-	if (c.cvg == 7) {
-		if (dither) {
-			static const int8_t dx[8] = { -1, 0, 1, -1, 0, 1, -1, 1 }, dy[8] = { -1, -1, -1, 1, 1, 1, 0, 0 };
-			int base[3] = { c.r >> 3, c.g >> 3, c.b >> 3 };
-			for (int k = 0; k < 8; ++k) {
-				struct ViPixel o = viRead(n, wide, origin, i + dy[k] * stride + dx[k]);
-				int nb[3] = { o.r >> 3, o.g >> 3, o.b >> 3 };
-				for (int j = 0; j < 3; ++j) {
-					*ch[j] += (base[j] < nb[j]) - (base[j] > nb[j]);
-				}
-			}
-		}
-		return c;
-	}
-	int values[3][7] = { { c.r }, { c.g }, { c.b } }, count = 1;
-	const int64_t around[6] = { -stride - 1, -stride + 1, -2, 2, stride - 1, stride + 1 };
-	for (int k = 0; k < 6; ++k) {
-		struct ViPixel o = viRead(n, wide, origin, i + around[k]);
-		if (o.cvg == 7) {
-			values[0][count] = o.r, values[1][count] = o.g, values[2][count] = o.b;
-			++count;
-		}
-	}
-	for (int j = 0; j < 3; ++j) {
-		int low, high;
-		penumbra(values[j], count, &low, &high);
-		int col = low + high - (*ch[j] << 1);
-		*ch[j] = ((((col * (7 - c.cvg)) + 4) >> 3) + *ch[j]) & 255;
-	}
-	return c;
+static inline int viMax(int a, int b) {
+	return a > b ? a : b;
 }
 
-// The divot filter: each channel the median of a pixel and its neighbours, unless all three are
-// fully covered.
-static int median3(int a, int b, int c) {
-	return a > b ? (b > c ? b : a > c ? c : a) : (a > c ? a : b > c ? c : b);
+static inline int viMin(int a, int b) {
+	return a < b ? a : b;
+}
+
+// The dither filter for one channel of a row: a fully covered pixel moves a step toward each of
+// its eight neighbours (5-bit values compared).
+static void viDitherRow(int16_t* restrict out, const uint8_t* restrict c, const uint8_t* restrict at, const uint8_t* restrict up,
+                        const uint8_t* restrict down, int count) {
+	for (int x = 0; x < count; ++x) {
+		int b = at[x], s = 0;
+		s += (b < up[x - 1]) - (b > up[x - 1]);
+		s += (b < up[x]) - (b > up[x]);
+		s += (b < up[x + 1]) - (b > up[x + 1]);
+		s += (b < at[x - 1]) - (b > at[x - 1]);
+		s += (b < at[x + 1]) - (b > at[x + 1]);
+		s += (b < down[x - 1]) - (b > down[x - 1]);
+		s += (b < down[x]) - (b > down[x]);
+		s += (b < down[x + 1]) - (b > down[x + 1]);
+		out[x] = (int16_t) (c[x] + s);
+	}
+}
+
+// Antialiasing for one channel of a row: a partly covered pixel moves toward the colour the fully
+// covered pixels around it agree on, by the coverage it lacks. That colour comes from the
+// penumbra of the pixel and those neighbours: the largest if the pixel has it, else the second
+// largest (repeats count), and the same for the smallest.
+static void viRestoreRow(int16_t* restrict out, const uint8_t* restrict at, const uint8_t* restrict atCvg, const uint8_t* restrict up,
+                         const uint8_t* restrict upCvg, const uint8_t* restrict down, const uint8_t* restrict downCvg, int count) {
+	for (int x = 0; x < count; ++x) {
+		int c = at[x], hi1 = c, hi2 = -1, lo1 = c, lo2 = 256;
+		// A neighbour that isn't fully covered counts as -1 for the largest and 256 or more for the
+		// smallest, which changes neither.
+#define VI_NEIGHBOUR(v, cvg) do { \
+			int vh_ = (v) | -((cvg) != 7), vl_ = (v) | ((cvg) != 7) << 8; \
+			hi2 = viMax(hi2, viMin(hi1, vh_)), hi1 = viMax(hi1, vh_); \
+			lo2 = viMin(lo2, viMax(lo1, vl_)), lo1 = viMin(lo1, vl_); \
+		} while (0)
+		VI_NEIGHBOUR(up[x - 1], upCvg[x - 1]);
+		VI_NEIGHBOUR(up[x + 1], upCvg[x + 1]);
+		VI_NEIGHBOUR(at[x - 2], atCvg[x - 2]);
+		VI_NEIGHBOUR(at[x + 2], atCvg[x + 2]);
+		VI_NEIGHBOUR(down[x - 1], downCvg[x - 1]);
+		VI_NEIGHBOUR(down[x + 1], downCvg[x + 1]);
+#undef VI_NEIGHBOUR
+		int isHi = -(c == hi1), isLo = -(c == lo1);
+		int high = (hi1 & isHi) | (hi2 & ~isHi), low = (lo1 & isLo) | (lo2 & ~isLo);
+		int col = low + high - (c << 1);
+		out[x] = (int16_t) (((((col * (7 - atCvg[x])) + 4) >> 3) + c) & 255);
+	}
 }
 
 // The picture the VI scans out, scaled by its X and Y scale registers, as 0x00RRGGBB.
@@ -366,34 +384,87 @@ int n64Picture(struct N64* n, uint32_t* out, int* width, int* height) {
 		h = 480;
 	}
 	// With gamma on, the VI outputs the square root of each channel (scaled to 8 bits).
-	uint8_t gamma[256];
-	for (int i = 0; i < 256; ++i) {
-		int s = 0;
-		while ((s + 1) * (s + 1) <= i * 256) {
-			++s;
+	static uint8_t gamma[256];
+	if (!gamma[255]) {
+		for (int i = 0; i < 256; ++i) {
+			int s = 0;
+			while ((s + 1) * (s + 1) <= i * 256) {
+				++s;
+			}
+			gamma[i] = (uint8_t) (s > 255 ? 255 : s);
 		}
-		gamma[i] = (uint8_t) (s > 255 ? 255 : s);
 	}
 	bool gammaOn = v[0] & 8, divot = v[0] & 16, dither = v[0] & 0x10000, aa = ((v[0] >> 8) & 3) <= 1, wide = type == 3;
-	struct ViPixel line[642];
+	// Rows y-1, y and y+1 (a ring of three), decoded from column -3 to w+2.
+	static struct ViRow rows[3];
+	static int16_t full[3][642], restored[3][642], line[3][642], divoted[3][640];
+	static uint8_t lineCvg[642];
+	for (int k = 0; k < 3; ++k) {
+		viDecodeRow(n, wide, origin, (int64_t) (k - 1) * stride - 3, w + 6, &rows[k]);
+	}
 	for (int y = 0; y < h; ++y) {
-		int64_t row = (int64_t) y * stride;
-		for (int x = -1; x <= w; ++x) {
-			line[x + 1] = viFetch(n, wide, origin, row + x, stride, aa, dither);
+		if (y > 0) {
+			viDecodeRow(n, wide, origin, (int64_t) (y + 1) * stride - 3, w + 6, &rows[(y + 2) % 3]);
 		}
-		for (int x = 0; x < w; ++x) {
-			struct ViPixel c = line[x + 1];
-			if (divot) {
-				const struct ViPixel* l = &line[x], * r = &line[x + 2];
-				if ((c.cvg & l->cvg & r->cvg) != 7) {
-					c.r = median3(l->r, c.r, r->r), c.g = median3(l->g, c.g, r->g), c.b = median3(l->b, c.b, r->b);
+		const struct ViRow* up = &rows[y % 3], * at = &rows[(y + 1) % 3], * down = &rows[(y + 2) % 3];
+		// Columns -1 to w (index 0 to w+1; rows from index 2).
+		int count = w + 2;
+		bool partial = false;
+		if (aa) {
+			uint8_t all = 7;
+			for (int x = 0; x < count; ++x) {
+				all &= at->cvg[x + 2];
+			}
+			partial = all != 7;
+		}
+		for (int j = 0; j < 3; ++j) {
+			if (dither) {
+				viDitherRow(full[j], at->c[j] + 2, at->q[j] + 2, up->q[j] + 2, down->q[j] + 2, count);
+			} else {
+				for (int x = 0; x < count; ++x) {
+					full[j][x] = at->c[j][x + 2];
 				}
 			}
-			uint32_t px = (uint32_t) c.r << 16 | (uint32_t) c.g << 8 | (uint32_t) c.b;
-			if (gammaOn) {
-				px = (uint32_t) gamma[c.r] << 16 | (uint32_t) gamma[c.g] << 8 | gamma[c.b];
+			if (partial) {
+				viRestoreRow(restored[j], at->c[j] + 2, at->cvg + 2, up->c[j] + 2, up->cvg + 2, down->c[j] + 2, down->cvg + 2, count);
 			}
-			out[y * w + x] = px;
+		}
+		for (int x = 0; x < count; ++x) {
+			lineCvg[x] = aa ? at->cvg[x + 2] : 7;
+		}
+		for (int j = 0; j < 3; ++j) {
+			if (partial) {
+				for (int x = 0; x < count; ++x) {
+					line[j][x] = lineCvg[x] == 7 ? full[j][x] : restored[j][x];
+				}
+			} else {
+				memcpy(line[j], full[j], sizeof(line[j][0]) * (size_t) count);
+			}
+		}
+		// The divot filter: each channel the median of a pixel and its neighbours, unless all three
+		// are fully covered.
+		if (divot) {
+			for (int j = 0; j < 3; ++j) {
+				for (int x = 0; x < w; ++x) {
+					int a = line[j][x], b = line[j][x + 1], c = line[j][x + 2];
+					int median = viMax(viMin(a, b), viMin(viMax(a, b), c));
+					divoted[j][x] = (int16_t) ((lineCvg[x] & lineCvg[x + 1] & lineCvg[x + 2]) != 7 ? median : b);
+				}
+			}
+		} else {
+			for (int j = 0; j < 3; ++j) {
+				memcpy(divoted[j], line[j] + 1, sizeof(line[j][0]) * (size_t) w);
+			}
+		}
+		uint32_t* o = &out[y * w];
+		if (gammaOn) {
+			for (int x = 0; x < w; ++x) {
+				o[x] = (uint32_t) gamma[divoted[0][x]] << 16 | (uint32_t) gamma[divoted[1][x]] << 8 | gamma[divoted[2][x]];
+			}
+		} else {
+			for (int x = 0; x < w; ++x) {
+				o[x] = (uint32_t) divoted[0][x] << 16 | (uint32_t) divoted[1][x] << 8 | (uint32_t) divoted[2][x];
+			}
 		}
 	}
 	*width = w;
