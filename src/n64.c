@@ -21,6 +21,15 @@ struct N64* n64Create(void) {
 		free(n);
 		return NULL;
 	}
+	// RDRAM holds noise at power-on, not zeros, and the boot code clears only what it uses. Wayne
+	// Gretzky's 3D Hockey '98 (EU) sends its first audio list empty and gets by on that noise.
+	uint32_t x = 0x2545F491u;
+	for (uint32_t i = 0; i < RDRAM_SIZE; i += 4) {
+		x ^= x << 13;
+		x ^= x >> 17;
+		x ^= x << 5;
+		put32(&n->rdram[i], x);
+	}
 	n->pageFlags[RDRAM_SIZE >> 12] = 0xFF;
 	n->vpageFillCount = VPAGE_FILLED + 1;
 	cpuTlbChanged(n);
