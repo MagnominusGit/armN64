@@ -1690,6 +1690,8 @@ static void submit(struct N64* n, struct RDP* r, const uint64_t* w, int op, int 
 enum {
 	GPU_PRIM_SIZE = 24, GPU_ROW_SIZE = 18, GPU_TILE_FIELDS = 15, GPU_STATE_SIZE = 19 + 8 * GPU_TILE_FIELDS + 4,
 	GPU_TILES = 64, GPU_PRIMS_MAX = 4000, GPU_LAST_SIZE = 1 << 20, GPU_BATCHES_MAX = 4096,
+	// Tiles times primitives in one dispatch: a long dispatch trips the kernel's GPU hang check.
+	GPU_ENTRIES_MAX = 1024,
 	GPU_KIND_TRIANGLE = 0, GPU_KIND_TEXRECT = 1, GPU_KIND_FILL = 2, GPU_KIND_RECT = 3,
 	GPU_PAGE_BATCH = 1, GPU_PAGE_OWNED = 2, GPU_PAGE_MARKED = 4,
 };
@@ -1698,6 +1700,7 @@ struct Gpu {
 	struct Gles* gl;
 	int32_t prims[GPU_PRIMS_MAX * GPU_PRIM_SIZE];
 	int primCount;
+	int entries;
 	int32_t* states;
 	int stateCount, stateCap;
 	int32_t* rows;
@@ -2040,6 +2043,7 @@ static void gpuSubmit(struct N64* n, struct RDP* r) {
 	g->batchTiles[g->batchCount++] = across * down;
 	g->lastUsed += across * down * 3;
 	g->primCount = 0;
+	g->entries = 0;
 	g->stateCount = 0;
 	g->rowCount = 0;
 	g->tmemCount = 0;
@@ -2127,6 +2131,11 @@ static void gpuCommand(struct N64* n, struct RDP* r, const uint64_t* w, int op) 
 		--r->seq;
 		return;
 	}
+	// At most the scissor's width times the rows it may draw.
+	int across = ((r->scissorX1 >> 2) >> 4) - ((r->scissorX0 >> 2) >> 4) + 1;
+	if (g->primCount && g->entries + across * ((y1 >> 4) - (y0 >> 4) + 1) > GPU_ENTRIES_MAX) {
+		gpuSubmit(n, r);
+	}
 	int32_t* p = g->prims + g->primCount * GPU_PRIM_SIZE;
 	memset(p, 0, GPU_PRIM_SIZE * sizeof(int32_t));
 	if (op >= 0x08 && op <= 0x0F) {
@@ -2159,6 +2168,7 @@ static void gpuCommand(struct N64* n, struct RDP* r, const uint64_t* w, int op) 
 		p[0] = r->cycleType == 3 ? GPU_KIND_FILL : GPU_KIND_RECT;
 		p[2] = x0, p[3] = y0, p[4] = x1, p[5] = y1;
 	}
+	g->entries += ((p[4] >> 4) - (p[2] >> 4) + 1) * ((p[5] >> 4) - (p[3] >> 4) + 1);
 	p[1] = gpuState(g, r);
 	gpuMark(n, g, color, colorLen);
 	if (depth) {
