@@ -25,13 +25,14 @@ const int P_S0 = 8, P_T0 = 9, P_DSDX = 10, P_DTDY = 11, P_CX0 = 12, P_CY0 = 13, 
 const int PRIM_SIZE = 24, ROW_SIZE = 18;
 const int S_OM_LO = 0, S_OM_HI = 1, S_CB_LO = 2, S_CB_HI = 3, S_CADDR = 4, S_CWIDTH = 5, S_CSIZE = 6, S_ZADDR = 7;
 const int S_FOG = 8, S_BLEND = 9, S_PRIM = 10, S_ENV = 11, S_PRIMLOD = 12, S_PRIMZ = 13, S_MINLEVEL = 14;
-const int S_K4 = 15, S_K5 = 16, S_FILL = 17, S_TMEM = 18, S_TILES = 19, TILE_SIZE = 15;
+const int S_K4 = 15, S_K5 = 16, S_FILL = 17, S_TMEM = 18, S_TILES = 19, TILE_SIZE = 15, S_KCONV = 19 + 8 * 15;
 
 // ---- The primitive being drawn
 int gS;
 uint omLo, omHi, cbLo, cbHi;
 ivec4 gFog, gBlend, gPrim, gEnv;
 int gPrimLod, gK4, gK5, gTmem, gMaxLevel, gMinLevel;
+ivec4 gKConv;
 
 // ---- The pixel
 ivec4 pShade, pTex0, pTex1, pCombined;
@@ -251,6 +252,12 @@ ivec4 texel(int t, int s, int tt) {
 		return ivec4(v, v, v, v);
 	}
 	if (size == 2) {
+		if (format == 1) {
+			int a = (base & 0x7FF) + s;
+			int y = int(tmemByte((a ^ swap) | 0x800));
+			int u = int(tmemByte(((a & ~1) ^ swap) & 0x7FF)), v = int(tmemByte(((a | 1) ^ swap) & 0x7FF));
+			return ivec4(u - 128, v - 128, y, y);
+		}
 		int a = (base + s * 2) ^ swap;
 		int v = int(tmemByte(a) << 8 | tmemByte(a + 1));
 		if (format == 3) {
@@ -308,12 +315,12 @@ ivec4 div32(ivec4 v) {
 }
 
 // The texels go through one texel() call (a loop the compiler leaves alone): the shader stays small.
-ivec4 sampleTile(int t, int s, int tt) {
+ivec4 sampleTile(int t, int s, int tt, bool filter) {
 	t &= 7;
 	int fs, ft, f;
 	int s0 = wrapS(t, s, fs);
 	int t0 = wrapT(t, tt, ft);
-	bool bilinear = ((omHi >> 13) & 1u) != 0u && ((omHi >> 20) & 3u) < 2u;
+	bool bilinear = filter && ((omHi >> 13) & 1u) != 0u && ((omHi >> 20) & 3u) < 2u;
 	int s1 = s0, t1 = t0;
 	if (bilinear) {
 		int shiftS = tileField(t, T_SHIFTS), shiftT = tileField(t, T_SHIFTT);
@@ -416,6 +423,14 @@ ivec3 ext9v(ivec3 v) {
 ivec3 sign9v(ivec3 v) {
 	v &= 0x1FF;
 	return v - ((v & 0x100) << 1);
+}
+
+// The texture convert unit (rdp.c convert): U, V, Y in red, green, blue to RGB.
+ivec4 convertYuv(ivec4 c) {
+	int red = c.b + ((gKConv.x * c.g + 0x80) >> 8);
+	int green = c.b + ((gKConv.y * c.r + gKConv.z * c.g + 0x80) >> 8);
+	int blue = c.b + ((gKConv.w * c.r + 0x80) >> 8);
+	return ivec4(ext9(red), ext9(green), ext9(blue), ext9(c.b));
 }
 
 int clamp9(int v) {
@@ -623,6 +638,7 @@ void loadState(int p) {
 	gMinLevel = data[gS + S_MINLEVEL];
 	gK4 = data[gS + S_K4];
 	gK5 = data[gS + S_K5];
+	gKConv = ivec4(data[gS + S_KCONV], data[gS + S_KCONV + 1], data[gS + S_KCONV + 2], data[gS + S_KCONV + 3]);
 	gTmem = data[gS + S_TMEM];
 	gMaxLevel = data[p + P_MAXLEVEL];
 }
@@ -728,9 +744,28 @@ void drawPrim(int p, int x, int y) {
 		if (lod) {
 			pLodFrac = levelOfDetail(tile, st.x, st.y, sx.x, sx.y, sy.x, sy.y, t1, t2);
 		}
+		// Each cycle filters or converts from YUV; convert-one converts the first cycle's texel.
+		bool filter0 = cycleType >= 2 || ((omHi >> 11) & 1u) != 0u, filter1 = ((omHi >> 10) & 1u) != 0u;
+		bool convertOne = ((omHi >> 9) & 1u) != 0u;
 		int samples = cycleType == 1 ? 2 : 1;
+		ivec4 first = ivec4(0);
 		for (int i = 0; i < samples; ++i) {
-			ivec4 c = sampleTile(i == 0 ? t1 : t2, st.x, st.y);
+			ivec4 c;
+			bool conv;
+			if (i == 1 && convertOne) {
+				c = first;
+				conv = true;
+			} else {
+				bool f = i == 0 ? filter0 : filter1;
+				c = sampleTile(i == 0 ? t1 : t2, st.x, st.y, f);
+				conv = !f;
+				if (i == 0) {
+					first = c;
+				}
+			}
+			if (conv) {
+				c = convertYuv(c);
+			}
 			if (i == 0) {
 				pTex0 = c;
 			} else {

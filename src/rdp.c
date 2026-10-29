@@ -76,6 +76,8 @@ struct RDP {
 	// The combiner's last output: what "combined" reads in one-cycle mode and in the first cycle.
 	struct Color lastCombined;
 	int k4, k5;
+	// The texture convert unit's YUV factors as it uses them (2K + 1).
+	int k0, k1, k2, k3;
 	// RDP clocks spent on the commands so far.
 	uint64_t clocks;
 	// The pixel being drawn, and where the combiner's inputs come from for the current combine mode.
@@ -84,7 +86,7 @@ struct RDP {
 	// otherModes taken apart (setupModes): the cycle type, depth and alpha tests, and the blender's
 	// P, A, M and B inputs for each cycle.
 	int cycleType, zMode;
-	bool zCompare, zUpdate, zPrim, alphaCompare, cvgAlpha, cvgTimesAlpha, forceBlend;
+	bool zCompare, zUpdate, zPrim, alphaCompare, cvgAlpha, cvgTimesAlpha, forceBlend, texConvert;
 	uint8_t blendSel[2][4];
 	// The rows this renderer draws: y % rowCount == rowIndex (rowCount 0: none).
 	int rowIndex, rowCount;
@@ -247,6 +249,14 @@ static inline __attribute__((always_inline)) struct Color texel(struct RDP* r, s
 		return (struct Color) { v, v, v, v };
 	}
 	case 2: {
+		// YUV: Y in the upper half of TMEM, U and V for each pair of texels in the lower half; U and V
+		// come out signed (9 bits).
+		if (t->format == 1) {
+			uint32_t a = ((t->tmem * 8 + tt * t->line * 8) & 0x7FF) + s;
+			int y = tmemByte(r, (a ^ swap) | 0x800);
+			int u = tmemByte(r, ((a & ~1u) ^ swap) & 0x7FF), v = tmemByte(r, ((a | 1) ^ swap) & 0x7FF);
+			return (struct Color) { u - 128, v - 128, y, y };
+		}
 		uint32_t a = (base + s * 2) ^ swap;
 		uint16_t v = (uint16_t) (tmemByte(r, a) << 8 | tmemByte(r, a + 1));
 		if (t->format == 3) {
@@ -294,12 +304,12 @@ static inline __attribute__((always_inline)) int wrapCoord(int c, int shift, int
 	return i;
 }
 
-static struct Color sample(struct RDP* r, int tileIndex, int s, int t) {
+static struct Color sample(struct RDP* r, int tileIndex, int s, int t, bool filter) {
 	struct Tile* tile = &r->tile[tileIndex & 7];
 	int fs, ft;
 	int s0 = wrapCoord(s, tile->shiftS, tile->sl, tile->sh, tile->cmS, tile->maskS, &fs);
 	int t0 = wrapCoord(t, tile->shiftT, tile->tl, tile->th, tile->cmT, tile->maskT, &ft);
-	bool bilinear = ((r->otherModes >> 45) & 1) && ((r->otherModes >> 52) & 3) < 2;
+	bool bilinear = filter && ((r->otherModes >> 45) & 1) && ((r->otherModes >> 52) & 3) < 2;
 	if (!bilinear) {
 		return texel(r, tile, s0, t0);
 	}
@@ -315,6 +325,39 @@ static struct Color sample(struct RDP* r, int tileIndex, int s, int t) {
 	}
 	i4 c3 = lanes(texel(r, tile, s1, t1));
 	return color(c3 + ((c2 - c3) * (32 - fs) + (c1 - c3) * (32 - ft)) / 32);
+}
+
+static int ext9(int v);
+
+// The texture convert unit: YUV (U, V, Y in red, green, blue) to RGB with K0-K3.
+static struct Color convert(const struct RDP* r, struct Color c) {
+	int red = c.b + ((r->k0 * c.g + 0x80) >> 8);
+	int green = c.b + ((r->k1 * c.r + r->k2 * c.g + 0x80) >> 8);
+	int blue = c.b + ((r->k3 * c.r + 0x80) >> 8);
+	return (struct Color) { ext9(red), ext9(green), ext9(blue), ext9(c.b) };
+}
+
+// Both texels of a pixel: each cycle filters (bilinear when the sample type says so) or converts
+// from YUV; with convert-one the second cycle converts the first's texel.
+static void textures(struct RDP* r, struct Pixel* p, int t1, int t2, int s, int t) {
+	uint64_t m = r->otherModes;
+	int cycleType = (m >> 52) & 3;
+	bool filter0 = cycleType >= 2 || ((m >> 43) & 1), filter1 = (m >> 42) & 1, convertOne = (m >> 41) & 1;
+	p->tex0 = sample(r, t1, s, t, filter0);
+	struct Color first = p->tex0;
+	if (!filter0) {
+		p->tex0 = convert(r, p->tex0);
+	}
+	if (cycleType != 1) {
+		p->tex1 = p->tex0;
+	} else if (convertOne) {
+		p->tex1 = convert(r, first);
+	} else {
+		p->tex1 = sample(r, t2, s, t, filter1);
+		if (!filter1) {
+			p->tex1 = convert(r, p->tex1);
+		}
+	}
 }
 
 // ---- Combiner and blender
@@ -556,6 +599,7 @@ static void setupModes(struct RDP* r) {
 	r->alphaCompare = m & 1;
 	r->cvgAlpha = (m >> 13) & 1;
 	r->cvgTimesAlpha = (m >> 12) & 1;
+	r->texConvert = r->cycleType < 2 && (!((m >> 43) & 1) || (r->cycleType == 1 && (!((m >> 42) & 1) || ((m >> 41) & 1))));
 	r->forceBlend = (m >> 14) & 1;
 	for (int cycle = 0; cycle < 2; ++cycle) {
 		for (int i = 0; i < 4; ++i) {
@@ -583,10 +627,10 @@ static i4 ext9x4(i4 v) {
 
 // combine() through the inputs setupCombiner found, for modes without noise; color and alpha
 // keep the same 9 bits ((x & 0x1FFFF) >> 8 is (x >> 8) & 0x1FF).
-static struct Color combineInputs(const struct Stage* s) {
+static struct Color combineInputs(const struct Stage* s, bool raw) {
 	i4 a = input4(&s->a, s->alpha[0]), b = input4(&s->b, s->alpha[1]);
 	i4 m = input4(&s->m, s->alpha[2]), d = input4(&s->d, s->alpha[3]);
-	if (!s->raw) {
+	if (!raw) {
 		a = ext9x4(a), b = ext9x4(b), d = ext9x4(d);
 		m = (m << 23) >> 23;
 	}
@@ -594,7 +638,8 @@ static struct Color combineInputs(const struct Stage* s) {
 }
 
 static struct Color combineCycle(struct RDP* r, struct Pixel* p, int cycle) {
-	return r->stage[cycle].noise ? combine(r, p, cycle) : combineInputs(&r->stage[cycle]);
+	// Converted texels can be outside 0-255: then the 9-bit rules apply.
+	return r->stage[cycle].noise ? combine(r, p, cycle) : combineInputs(&r->stage[cycle], r->stage[cycle].raw && !r->texConvert);
 }
 
 static struct Color blendColor(struct RDP* r, struct Color pixel, struct Color memory, struct Pixel* p, int cycle) {
@@ -851,8 +896,7 @@ static void textureRect(struct N64* n, struct RDP* r, uint64_t w0, uint64_t w1, 
 				int sy = s + (flip ? dsdx >> 5 : 0), ty = t + (flip ? 0 : dtdy >> 5);
 				p->lodFrac = levelOfDetail(r, tile, s, t, sx, tx, sy, ty, &t1, &t2);
 			}
-			p->tex0 = sample(r, t1, s, t);
-			p->tex1 = cycleType == 1 ? sample(r, t2, s, t) : p->tex0;
+			textures(r, p, t1, t2, s, t);
 			if (cycleType == 2) {
 				if ((r->otherModes & 1) && p->tex0.a == 0) {
 					continue;
@@ -964,7 +1008,6 @@ static void triangle(struct N64* n, struct RDP* r, const uint64_t* w, int op) {
 		zdx = fix(w[idx], 0);
 		zde = fix(w[idx + 1], 32);
 	}
-	int cycleType = (r->otherModes >> 52) & 3;
 	bool persp = (r->otherModes >> 51) & 1;
 	int first, end;
 	triangleRows(r, &e, &first, &end);
@@ -1016,8 +1059,7 @@ static void triangle(struct N64* n, struct RDP* r, const uint64_t* w, int op) {
 					texCoords(sS + tdy[0], sT + tdy[1], sW + tdy[2], persp, &sy, &ty);
 					p->lodFrac = levelOfDetail(r, tile, s, t, sx, tx, sy, ty, &t1, &t2);
 				}
-				p->tex0 = sample(r, t1, s, t);
-				p->tex1 = cycleType == 1 ? sample(r, t2, s, t) : p->tex0;
+				textures(r, p, t1, t2, s, t);
 			}
 			shadePixel(n, r, x, y, p);
 		}
@@ -1043,7 +1085,11 @@ static void loadTile(struct N64* n, struct RDP* r, uint64_t w, bool block) {
 			bool odd = (lineT >> 11) & 1;
 			for (int b = 0; b < 8; ++b) {
 				uint32_t dst = (t->tmem * 8 + i + b) ^ (odd ? 4 : 0);
-				if (r->texSize == 3) {
+				if (r->texSize == 2 && t->format == 1) {
+					uint32_t texel = (i + b) / 2, part = (i + b) & 3;
+					uint32_t d = (t->tmem * 8 + (texel & ~1u) + (part >= 2 ? 1 : 0)) ^ (odd ? 4 : 0);
+					r->tmem[(d & 0x7FF) | (part & 1 ? 0x800 : 0)] = n->rdram[(src + i + b) & (RDRAM_SIZE - 1)];
+				} else if (r->texSize == 3) {
 					uint32_t texelIndex = (i + b) / 4, part = (i + b) & 3;
 					uint32_t d = (t->tmem * 8 + texelIndex * 2 + (part & 1)) ^ (odd ? 4 : 0);
 					r->tmem[(d + (part >= 2 ? 0x800 : 0)) & 0xFFF] = n->rdram[(src + i + b) & (RDRAM_SIZE - 1)];
@@ -1076,6 +1122,14 @@ static void loadTile(struct N64* n, struct RDP* r, uint64_t w, bool block) {
 				r->tmem[(d + 1) & 0x7FF] = src[1];
 				r->tmem[0x800 | (d & 0x7FF)] = src[2];
 				r->tmem[0x800 | ((d + 1) & 0x7FF)] = src[3];
+			}
+		} else if (r->texSize == 2 && t->format == 1) {
+			// YUV: U Y0 V Y1 in RDRAM; Y to the upper half, U and V to the lower.
+			for (int s = s0; s <= s1; ++s) {
+				uint32_t d = (line + (s - s0)) ^ swap;
+				const uint8_t* src = &n->rdram[(row + (s & ~1) * 2) & (RDRAM_SIZE - 4)];
+				r->tmem[d & 0x7FF] = src[s & 1 ? 2 : 0];
+				r->tmem[0x800 | (d & 0x7FF)] = src[s & 1 ? 3 : 1];
 			}
 		} else {
 			for (int s = s0; s <= s1; ++s) {
@@ -1173,6 +1227,10 @@ static void execute(struct N64* n, struct RDP* r, const uint64_t* w, int op) {
 	case 0x2C:
 		r->k4 = (c >> 9) & 0x1FF;
 		r->k5 = c & 0x1FF;
+		r->k0 = (int) (((int64_t) (c << 10) >> 55) * 2 + 1);
+		r->k1 = (int) (((int64_t) (c << 19) >> 55) * 2 + 1);
+		r->k2 = (int) (((int64_t) (c << 28) >> 55) * 2 + 1);
+		r->k3 = (int) (((int64_t) (c << 37) >> 55) * 2 + 1);
 		break;
 	case 0x2D:
 		r->scissorX0 = (c >> 44) & 0xFFF;
@@ -1630,7 +1688,7 @@ static void submit(struct N64* n, struct RDP* r, const uint64_t* w, int op, int 
 #include "rdp_gpu_glsl.h"
 
 enum {
-	GPU_PRIM_SIZE = 24, GPU_ROW_SIZE = 18, GPU_TILE_FIELDS = 15, GPU_STATE_SIZE = 19 + 8 * GPU_TILE_FIELDS,
+	GPU_PRIM_SIZE = 24, GPU_ROW_SIZE = 18, GPU_TILE_FIELDS = 15, GPU_STATE_SIZE = 19 + 8 * GPU_TILE_FIELDS + 4,
 	GPU_TILES = 64, GPU_PRIMS_MAX = 4000, GPU_LAST_SIZE = 1 << 20, GPU_BATCHES_MAX = 4096,
 	GPU_KIND_TRIANGLE = 0, GPU_KIND_TEXRECT = 1, GPU_KIND_FILL = 2, GPU_KIND_RECT = 3,
 	GPU_PAGE_BATCH = 1, GPU_PAGE_OWNED = 2, GPU_PAGE_MARKED = 4,
@@ -1748,6 +1806,8 @@ static int gpuState(struct Gpu* g, struct RDP* r) {
 			f[5] = t->cmS, f[6] = t->cmT, f[7] = t->maskS, f[8] = t->maskT, f[9] = t->shiftS, f[10] = t->shiftT;
 			f[11] = t->sl, f[12] = t->tl, f[13] = t->sh, f[14] = t->th;
 		}
+		int32_t* k = s + 19 + 8 * GPU_TILE_FIELDS;
+		k[0] = r->k0, k[1] = r->k1, k[2] = r->k2, k[3] = r->k3;
 		++g->stateCount;
 		g->stateDirty = false;
 	}
