@@ -21,6 +21,8 @@ static const struct {
 } cics[] = {
 	{ 0x6170A4A1, 6101, 0x3F }, { 0x90BB6CB5, 6102, 0x3F }, { 0x0B050EE0, 6103, 0x78 },
 	{ 0x98BC2C86, 6105, 0x91 }, { 0xACC8580A, 6106, 0x85 }, { 0x009E9EA3, 7102, 0x3F },
+	// A 6102-style boot code that wants the 64DD's seed (Zoinkity's translation patches).
+	{ 0x0E018159, 8303, 0xDD },
 };
 
 // Leaves the machine as the PIF boot ROM does when it hands over to the cartridge's boot code.
@@ -46,7 +48,9 @@ void pifBoot(struct N64* n) {
 	if (!boot) {
 		return;
 	}
-	n->bootChecksumReads = !disk && cartBootChecksum(n->rom, n->romSize, n->cic, n->bootChecksum) ? 3 : 0;
+	// Only for the standard boot codes: others check what they load their own way.
+	bool standard = n->cic >= 6101 && n->cic <= 7102 && n->cic != 8303;
+	n->bootChecksumReads = !disk && standard && cartBootChecksum(n->rom, n->romSize, n->cic, seed, n->bootChecksum) ? 3 : 0;
 	memcpy(n->sp.mem + 0x40, boot + 0x40, 0xFC0);
 	// The PIF leaves a short routine in IMEM, which the 6105 boot code relies on.
 	static const uint32_t imem[8] = {

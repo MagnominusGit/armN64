@@ -73,11 +73,11 @@ bool cartEeprom16k(const uint8_t* rom) {
 
 // The boot code's checksum over the first megabyte after the header (as the boot code works it out
 // for each lockout chip). False if the header has it already.
-bool cartBootChecksum(const uint8_t* rom, size_t size, int cic, uint32_t out[2]) {
+bool cartBootChecksum(const uint8_t* rom, size_t size, int cic, uint8_t seedByte, uint32_t out[2]) {
 	if (size < 0x101000) {
 		return false;
 	}
-	uint32_t seed = cic == 6103 ? 0xA3886759u : cic == 6105 ? 0xDF26F436u : cic == 6106 ? 0x1FEA617Au : 0xF8CA4DDCu;
+	uint32_t seed = cic == 6103 ? 0xA3886759u : cic == 6105 ? 0xDF26F436u : cic == 6106 ? 0x1FEA617Au : seedByte * 0x5D588B65u + 1;
 	uint32_t t1 = seed, t2 = seed, t3 = seed, t4 = seed, t5 = seed, t6 = seed;
 	for (uint32_t i = 0x1000; i < 0x101000; i += 4) {
 		uint32_t d = be32(rom + i);

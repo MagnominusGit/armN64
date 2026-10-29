@@ -406,7 +406,7 @@ void rdpDestroy(struct N64*);
 
 // carts.c
 bool cartEeprom16k(const uint8_t* rom);
-bool cartBootChecksum(const uint8_t* rom, size_t size, int cic, uint32_t out[2]);
+bool cartBootChecksum(const uint8_t* rom, size_t size, int cic, uint8_t seedByte, uint32_t out[2]);
 
 // pif.c
 void pifBoot(struct N64*);
