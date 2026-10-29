@@ -22,7 +22,7 @@ const int KIND_TRIANGLE = 0, KIND_TEXRECT = 1, KIND_FILL = 2, KIND_RECT = 3;
 const int P_KIND = 0, P_STATE = 1, P_X0 = 2, P_Y0 = 3, P_X1 = 4, P_Y1 = 5, P_TILE = 6, P_MAXLEVEL = 7;
 const int P_ROWS = 8, P_FIRST = 9, P_FLAGS = 10, P_SDX = 11, P_TDX = 15, P_TDY = 18, P_ZDX = 21;
 const int P_S0 = 8, P_T0 = 9, P_DSDX = 10, P_DTDY = 11, P_CX0 = 12, P_CY0 = 13, P_FLIP = 14;
-const int PRIM_SIZE = 24, ROW_SIZE = 18;
+const int PRIM_SIZE = 24, ROW_SIZE = 26;
 const int S_OM_LO = 0, S_OM_HI = 1, S_CB_LO = 2, S_CB_HI = 3, S_CADDR = 4, S_CWIDTH = 5, S_CSIZE = 6, S_ZADDR = 7;
 const int S_FOG = 8, S_BLEND = 9, S_PRIM = 10, S_ENV = 11, S_PRIMLOD = 12, S_PRIMZ = 13, S_MINLEVEL = 14;
 const int S_K4 = 15, S_K5 = 16, S_FILL = 17, S_TMEM = 18, S_TILES = 19, TILE_SIZE = 15, S_KCONV = 19 + 8 * 15;
@@ -36,7 +36,9 @@ ivec4 gKConv;
 
 // ---- The pixel
 ivec4 pShade, pTex0, pTex1, pCombined;
-int pZ, pLodFrac;
+int pZ, pLodFrac, pCvg, pDz, pPrimDz;
+bool pCvbit;
+int blShiftA, blShiftB;
 ivec4 lastCombined;
 bool shaded;
 
@@ -128,9 +130,32 @@ int zDecompress(uint v) {
 // each invocation keeps its pixel's color and depth (big-endian values) and writes them back at the
 // end.
 
-uint fbColor, fbZ;
+uint fbColor, fbZ, fbHidden, fbZHidden;
 bool colorDirty, zDirty;
 uint colorAt, zAt;
+
+// RDRAM's hidden bits follow it in the buffer, a byte for each halfword.
+uint hiddenAt() {
+	return RDRAM_MASK + 1u + (colorAt >> 1);
+}
+
+uint rhiddenAt(uint a) {
+	return (rdram[a >> 2] >> ((a & 3u) * 8u)) & 3u;
+}
+
+void whiddenAt(uint a, uint v) {
+	uint s = (a & 3u) * 8u;
+	atomicAnd(rdram[a >> 2], ~(255u << s));
+	atomicOr(rdram[a >> 2], (v & 3u) << s);
+}
+
+uint rhidden() {
+	return rhiddenAt(hiddenAt());
+}
+
+void whidden(uint v) {
+	whiddenAt(hiddenAt(), v);
+}
 
 uint rword(uint a) {
 	return rbyte(a) << 24 | rbyte(a + 1u) << 16 | rbyte(a + 2u) << 8 | rbyte(a + 3u);
@@ -149,9 +174,11 @@ void loadPixel(int x, int y) {
 	} else {
 		colorAt = (addr + i * 2u) & (RDRAM_MASK & ~1u);
 		fbColor = rhalf(colorAt);
+		fbHidden = rhidden();
 	}
 	zAt = (uint(u[9]) + i * 2u) & (RDRAM_MASK & ~1u);
 	fbZ = u[9] != 0 ? rhalf(zAt) : 0u;
+	fbZHidden = u[9] != 0 ? rhiddenAt(RDRAM_MASK + 1u + (zAt >> 1)) : 0u;
 	colorDirty = zDirty = false;
 }
 
@@ -165,10 +192,12 @@ void storePixel() {
 			rdram[colorAt >> 2] = (v >> 24) | ((v >> 8) & 0xFF00u) | ((v << 8) & 0xFF0000u) | (v << 24);
 		} else {
 			whalf(colorAt, fbColor);
+			whidden(fbHidden);
 		}
 	}
 	if (zDirty) {
 		whalf(zAt, fbZ);
+		whiddenAt(RDRAM_MASK + 1u + (zAt >> 1), fbZHidden);
 	}
 }
 
@@ -185,7 +214,7 @@ ivec4 readPixel(int x, int y) {
 	}
 	uint p = fbColor;
 	int cr = int(p >> 11) & 31, cg = int(p >> 6) & 31, cb = int(p >> 1) & 31;
-	return ivec4(cr << 3 | cr >> 2, cg << 3 | cg >> 2, cb << 3 | cb >> 2, (p & 1u) != 0u ? 0xE0 : 0);
+	return ivec4(cr << 3 | cr >> 2, cg << 3 | cg >> 2, cb << 3 | cb >> 2, int((p & 1u) << 2 | fbHidden) << 5);
 }
 
 void writePixel(int x, int y, ivec4 c) {
@@ -197,6 +226,7 @@ void writePixel(int x, int y, ivec4 c) {
 		fbColor = uint(c.r & 255) << 24 | uint(c.g & 255) << 16 | uint(c.b & 255) << 8 | uint(c.a & 255);
 	} else {
 		fbColor = uint((c.r >> 3) << 11 | (c.g >> 3) << 6 | (c.b >> 3) << 1 | (c.a >= 128 ? 1 : 0));
+		fbHidden = uint(c.a >> 5) & 3u;
 	}
 }
 
@@ -462,14 +492,41 @@ int blendSel(int cycle, int i) {
 	return int(omLo >> uint(30 - cycle * 2 - i * 4)) & 3;
 }
 
-ivec4 blendColor(ivec4 pixel, ivec4 memory, int cycle) {
+// The blender's divider: the hardware's bit-serial division of a sum of products by the sum of its
+// 4-bit factors.
+int blendDivide(int i) {
+	int d = (i >> 11) & 15, n = i & 0x7FF, inv = ~d & 15, res = 0;
+	int partial = (inv + (n >> 8) + 1) & 7;
+	for (int k = 0; k < 8; ++k) {
+		int bit = (n >> (7 - k)) & 1;
+		int t = (res & (0x100 >> k)) != 0 ? inv + (partial << 1) + bit + 1 : d + (partial << 1) + bit;
+		partial = t & 7;
+		if ((t & 0x10) != 0) {
+			res |= 1 << (7 - k);
+		}
+	}
+	return res;
+}
+
+ivec4 blendColor(ivec4 pixel, ivec4 memory, int cycle, bool divide) {
 	int sp = blendSel(cycle, 0), sa = blendSel(cycle, 1), sm = blendSel(cycle, 2), sb = blendSel(cycle, 3);
 	ivec4 P = sp == 0 ? pixel : sp == 1 ? memory : sp == 2 ? gBlend : gFog;
 	ivec4 M = sm == 0 ? pixel : sm == 1 ? memory : sm == 2 ? gBlend : gFog;
 	int a = sa == 0 ? pixel.a : sa == 1 ? gFog.a : sa == 2 ? pShade.a : 0;
 	int b = sb == 0 ? 255 - a : sb == 1 ? memory.a : sb == 2 ? 255 : 0;
-	int fa = a >> 3, fb = (b >> 3) + 1;
-	ivec4 o = ((P * fa + M * fb) >> 5) & 255;
+	int fa = a >> 3, fb = b >> 3;
+	if (sb == 1) {
+		fa = (fa >> blShiftA) & 0x3C;
+		fb = (fb >> blShiftB) | 3;
+	}
+	ivec4 sum = P * fa + M * (fb + 1);
+	ivec4 o;
+	if (divide) {
+		int d = ((fa & ~3) + (fb & ~3) + 4) << 9;
+		o = ivec4(blendDivide(d | ((sum.r >> 2) & 0x7FF)), blendDivide(d | ((sum.g >> 2) & 0x7FF)), blendDivide(d | ((sum.b >> 2) & 0x7FF)), 0);
+	} else {
+		o = (sum >> 5) & 255;
+	}
 	o.a = pixel.a;
 	return o;
 }
@@ -481,6 +538,14 @@ ivec4 blendInput(ivec4 pixel, ivec4 memory, int cycle) {
 	return o;
 }
 
+int normalizeHighest(int v) {
+	return v != 0 ? 1 << findMSB(v) : 0;
+}
+
+int dzEncode(int v) {
+	return ((v & 0xFF00) != 0 ? 8 : 0) | ((v & 0xF0F0) != 0 ? 4 : 0) | ((v & 0xCCCC) != 0 ? 2 : 0) | ((v & 0xAAAA) != 0 ? 1 : 0);
+}
+
 void shadePixel(int x, int y) {
 	int cycleType = int(omHi >> 20) & 3;
 	bool zPrim = ((omLo >> 2) & 1u) != 0u;
@@ -488,14 +553,6 @@ void shadePixel(int x, int y) {
 	z = clamp(z, 0, 0x3FFFF);
 	bool zCompare = ((omLo >> 4) & 1u) != 0u, zUpdate = ((omLo >> 5) & 1u) != 0u;
 	bool zbuf = data[gS + S_ZADDR] != 0;
-	if (zbuf && zCompare) {
-		int old = zDecompress(fbZ);
-		int zMode = int(omLo >> 10) & 3;
-		bool pass = zMode == 3 ? z <= old + 0x10 && z >= old - 0x10 : z <= old;
-		if (!pass) {
-			return;
-		}
-	}
 	// One-cycle mode runs the combiner's second-cycle equation.
 	pCombined = lastCombined;
 	ivec4 c = ivec4(0);
@@ -507,31 +564,93 @@ void shadePixel(int x, int y) {
 	shaded = true;
 	c = ivec4(clamp9(c.r), clamp9(c.g), clamp9(c.b), clamp9(c.a));
 	bool antialias = ((omLo >> 3) & 1u) != 0u, cvgTimesAlpha = ((omLo >> 12) & 1u) != 0u;
-	int cvg = cvgTimesAlpha ? c.a >> 5 : 8;
+	bool imageRead = ((omLo >> 6) & 1u) != 0u, colorOnCvg = ((omLo >> 7) & 1u) != 0u, force = ((omLo >> 14) & 1u) != 0u;
+	int cvg = cvgTimesAlpha ? (((c.a * pCvg + 4) >> 3) >> 5) & 15 : pCvg;
 	if (((omLo >> 13) & 1u) != 0u) {
-		c.a = cvgTimesAlpha ? cvg << 5 : 255;
+		c.a = min(cvg << 5, 255);
 	}
-	if (antialias && cvg == 0) {
-		return;
+	ivec4 memory = readPixel(x, y);
+	int memCvg = imageRead ? memory.a >> 5 : 7;
+	if (!imageRead) {
+		memory.a = 0xE0;
+	}
+	int dzpix = zPrim ? pPrimDz : pDz;
+	int dzEnc = dzEncode(dzpix);
+	bool overflow = ((cvg + memCvg) & 8) != 0;
+	bool blend;
+	if (zbuf && zCompare) {
+		int oz = zDecompress(fbZ);
+		int rawDzMem = int((fbZ & 3u) << 2 | fbZHidden);
+		int dzMem = 1 << rawDzMem;
+		blShiftA = clamp(dzEnc - rawDzMem, 0, 4);
+		blShiftB = clamp(rawDzMem - dzEnc, 0, 4);
+		bool coplanar = false;
+		int zPrecision = int(fbZ >> 13) & 15;
+		if (zPrecision < 3) {
+			if (dzMem != 0x8000) {
+				dzMem = max(dzMem << 1, 16 >> zPrecision);
+			} else {
+				coplanar = true;
+				dzMem = 0xFFFF;
+			}
+		}
+		int dzNew = normalizeHighest((dzpix | dzMem) & 0xFFFF);
+		int dzShifted = dzNew << 3;
+		bool farther = coplanar || z + dzShifted >= oz;
+		bool infront = z < oz, nearer = coplanar || z - dzShifted <= oz, isMax = oz == 0x3FFFF;
+		blend = force || (!overflow && antialias && farther);
+		int zMode = int(omLo >> 10) & 3;
+		bool pass;
+		if (zMode == 0) {
+			pass = isMax || (overflow ? infront : nearer);
+		} else if (zMode == 1) {
+			if (!infront || !farther || !overflow) {
+				pass = isMax || (overflow ? infront : nearer);
+			} else {
+				int enc = dzEncode(dzNew & 0xFFFF);
+				cvg = ((((oz >> enc) - (z >> enc)) & 15) * cvg >> 3) & 15;
+				pass = true;
+			}
+		} else if (zMode == 2) {
+			pass = infront || isMax;
+		} else {
+			pass = farther && nearer && !isMax;
+		}
+		if (!pass) {
+			return;
+		}
+	} else {
+		blShiftA = 0;
+		blShiftB = dzEnc < 11 ? 4 : 15 - dzEnc;
+		blend = force || (!overflow && antialias);
 	}
 	if ((omLo & 1u) != 0u && c.a < gBlend.a) {
 		return;
 	}
-	ivec4 memory = readPixel(x, y);
-	int memCvg = memory.a >> 5;
-	bool blend = ((omLo >> 14) & 1u) != 0u || (antialias && ((cvg + memCvg) & 8) == 0);
-	// In 2-cycle mode the first cycle always blends; the last blends only with force blend or
-	// antialiasing without coverage overflow.
-	int cycles = cycleType == 1 ? 2 : 1;
-	for (int cycle = 0; cycle < cycles; ++cycle) {
-		c = cycle < cycles - 1 || blend ? blendColor(c, memory, cycle) : blendInput(c, memory, cycle);
+	if (antialias ? cvg == 0 : !pCvbit) {
+		return;
+	}
+	int last = cycleType == 1 ? 1 : 0;
+	bool partialReject = blendSel(last, 1) == 0 && blendSel(last, 3) == 0 && c.a >= 255;
+	ivec4 inColor = c;
+	if (cycleType == 1) {
+		inColor = blendColor(c, memory, 0, false);
+	}
+	if (colorOnCvg && !overflow) {
+		int sm = blendSel(last, 2);
+		c = sm == 0 ? inColor : sm == 1 ? memory : sm == 2 ? gBlend : gFog;
+	} else if (!blend || partialReject) {
+		c = blendInput(inColor, memory, last);
+	} else {
+		c = blendColor(inColor, memory, last, !force);
 	}
 	int cvgDest = int(omLo >> 8) & 3;
 	int kept = cvgDest == 0 ? (blend ? cvg + memCvg : cvg - 1) : cvgDest == 1 ? (cvg + memCvg) & 7 : cvgDest == 2 ? 7 : memCvg;
 	c.a = ((kept & 8) != 0 ? 7 : kept & 7) << 5;
 	writePixel(x, y, c);
 	if (zbuf && zUpdate) {
-		fbZ = zCompress(z);
+		fbZ = zCompress(z) | uint(dzEnc >> 2);
+		fbZHidden = uint(dzEnc & 3);
 		zDirty = true;
 	}
 }
@@ -658,6 +777,8 @@ void clearPixel() {
 	pCombined = ivec4(0);
 	pZ = 0;
 	pLodFrac = 0;
+	pCvg = 8;
+	pCvbit = true;
 }
 
 void fillPixel(int x, int y) {
@@ -670,6 +791,7 @@ void fillPixel(int x, int y) {
 		fbColor = fill;
 	} else {
 		fbColor = (x & 1) != 0 ? fill & 0xFFFFu : fill >> 16;
+		fbHidden = (fbColor & 1u) != 0u ? 3u : 0u;
 	}
 }
 
@@ -682,6 +804,8 @@ int shadeAt(int start, int step, int k) {
 void drawPrim(int p, int x, int y) {
 	int kind = data[p + P_KIND];
 	clearPixel();
+	pDz = data[p + 22];
+	pPrimDz = data[p + 23];
 	int cycleType = int(omHi >> 20) & 3;
 	int tile = data[p + P_TILE];
 	bool tex = false, lod = false, copy = false;
@@ -694,6 +818,22 @@ void drawPrim(int p, int x, int y) {
 		int row = data[p + P_ROWS] + (y - data[p + P_FIRST]) * ROW_SIZE;
 		int x0 = data[row], x1 = data[row + 1];
 		if (x < x0 || x > x1) {
+			return;
+		}
+		// A pixel is drawn when any sample is covered with antialiasing, else when the first is.
+		int mask = 0;
+		for (int k = 0; k < 4; ++k) {
+			for (int j = 0; j < 2; ++j) {
+				int quarter = (k & 1) + j * 2;
+				int e = x * 8 + quarter * 2;
+				if (e >= data[row + 18 + k] && e < data[row + 22 + k]) {
+					mask |= 1 << ((k < 2 ? 4 : 0) + 3 - quarter);
+				}
+			}
+		}
+		pCvg = bitCount(mask);
+		pCvbit = (mask & 0x80) != 0;
+		if (((omLo >> 3) & 1u) != 0u ? mask == 0 : !pCvbit) {
 			return;
 		}
 		int k = x - x0;

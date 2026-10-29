@@ -177,6 +177,8 @@ struct DD {
 
 struct N64 {
 	uint8_t* rdram;
+	// RDRAM's hidden ninth bits, as the RDP keeps them: two coverage bits for each halfword.
+	uint8_t* hidden;
 	uint8_t* rom;
 	size_t romSize;
 	uint8_t pifRam[64];

@@ -14,9 +14,11 @@ struct N64* n64Create(void) {
 		return NULL;
 	}
 	n->rdram = calloc(1, RDRAM_SIZE);
+	n->hidden = calloc(1, RDRAM_SIZE / 2);
 	n->vpages = malloc(2 * VPAGES * sizeof(*n->vpages));
-	if (!n->rdram || !n->vpages) {
+	if (!n->rdram || !n->hidden || !n->vpages) {
 		free(n->rdram);
+		free(n->hidden);
 		free(n->vpages);
 		free(n);
 		return NULL;
@@ -44,6 +46,7 @@ void n64Destroy(struct N64* n) {
 		rdpDestroy(n);
 		free(n->hle);
 		free(n->rdram);
+		free(n->hidden);
 		free(n->vpages);
 		ddFree(n);
 		free(n->rom);

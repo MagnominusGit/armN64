@@ -21,6 +21,9 @@ struct Pixel {
 	struct Color shade, tex0, tex1, combined;
 	int z;
 	int lodFrac;
+	// Samples of the pixel's 8 the primitive covers, and whether the first is one of them.
+	int cvg;
+	bool cvbit;
 };
 
 // Colors as four lanes: red, green, blue and alpha.
@@ -72,6 +75,9 @@ struct RDP {
 	uint32_t fillColor;
 	struct Color fog, blend, prim, env;
 	int primLod, primZ, primDz;
+	// The last triangle's depth slope (dzpix), and the blender's shifts for memory alpha from the
+	// depth test.
+	int dzpix, blShiftA, blShiftB;
 	int minLevel, maxLevel;
 	// The combiner's last output: what "combined" reads in one-cycle mode and in the first cycle.
 	struct Color lastCombined;
@@ -86,7 +92,7 @@ struct RDP {
 	// otherModes taken apart (setupModes): the cycle type, depth and alpha tests, and the blender's
 	// P, A, M and B inputs for each cycle.
 	int cycleType, zMode, cvgDest;
-	bool antialias, zCompare, zUpdate, zPrim, alphaCompare, cvgAlpha, cvgTimesAlpha, forceBlend, texConvert;
+	bool antialias, imageRead, colorOnCvg, zCompare, zUpdate, zPrim, alphaCompare, cvgAlpha, cvgTimesAlpha, forceBlend, texConvert;
 	uint8_t blendSel[2][4];
 	// The rows this renderer draws: y % rowCount == rowIndex (rowCount 0: none).
 	int rowIndex, rowCount;
@@ -105,10 +111,12 @@ static bool ownsRow(const struct RDP* r, int y) {
 static void setupCombiner(struct RDP* r);
 static void setupModes(struct RDP* r);
 static void gpuSync(struct N64* n, struct RDP* r);
+static void buildBlendDivide(void);
 
 static struct RDP* state(struct N64* n) {
 	if (!n->rdp) {
 		n->rdp = calloc(1, sizeof(struct RDP));
+		buildBlendDivide();
 		if (n->rdp) {
 			n->rdp->rowCount = 1;
 			setupCombiner(n->rdp);
@@ -168,7 +176,8 @@ static struct Color readPixel(struct N64* n, struct RDP* r, int x, int y) {
 	uint32_t a = (r->colorAddr + i * 2) & (RDRAM_SIZE - 2);
 	uint16_t p = (uint16_t) (n->rdram[a] << 8 | n->rdram[a + 1]);
 	int cr = (p >> 11) & 31, cg = (p >> 6) & 31, cb = (p >> 1) & 31;
-	return (struct Color) { cr << 3 | cr >> 2, cg << 3 | cg >> 2, cb << 3 | cb >> 2, p & 1 ? 0xE0 : 0 };
+	// The coverage: the colour's low bit over the two hidden bits.
+	return (struct Color) { cr << 3 | cr >> 2, cg << 3 | cg >> 2, cb << 3 | cb >> 2, ((p & 1) << 2 | n->hidden[a >> 1]) << 5 };
 }
 
 static void writePixel(struct N64* n, struct RDP* r, int x, int y, struct Color c) {
@@ -187,6 +196,7 @@ static void writePixel(struct N64* n, struct RDP* r, int x, int y, struct Color 
 	uint16_t p = (uint16_t) ((c.r >> 3) << 11 | (c.g >> 3) << 6 | (c.b >> 3) << 1 | (c.a >= 128 ? 1 : 0));
 	n->rdram[a] = p >> 8;
 	n->rdram[a + 1] = (uint8_t) p;
+	n->hidden[a >> 1] = (c.a >> 5) & 3;
 }
 
 static uint16_t* zPointer(struct N64* n, struct RDP* r, int x, int y, uint8_t* tmp) {
@@ -200,10 +210,69 @@ static uint16_t zRead(struct N64* n, struct RDP* r, int x, int y) {
 	return (uint16_t) (p[0] << 8 | p[1]);
 }
 
-static void zWrite(struct N64* n, struct RDP* r, int x, int y, uint16_t v) {
+// The depth slope's low two bits are in the hidden bits.
+static int zHidden(struct N64* n, struct RDP* r, int x, int y) {
+	return n->hidden[((r->zAddr + (y * r->colorWidth + x) * 2) & (RDRAM_SIZE - 2)) >> 1];
+}
+
+static void zWrite(struct N64* n, struct RDP* r, int x, int y, uint16_t v, int hidden) {
 	uint8_t* p = (uint8_t*) zPointer(n, r, x, y, NULL);
 	p[0] = v >> 8;
 	p[1] = (uint8_t) v;
+	n->hidden[((r->zAddr + (y * r->colorWidth + x) * 2) & (RDRAM_SIZE - 2)) >> 1] = (uint8_t) hidden;
+}
+
+// A depth slope (|dz/dx| + |dz/dy| in whole steps) as the power of two above it, and that power's
+// exponent (dz_compress).
+static int normalizeDz(int sum) {
+	if (sum & 0xC000) {
+		return 0x8000;
+	}
+	if (!(sum & 0xFFFF)) {
+		return 1;
+	}
+	if (sum == 1) {
+		return 3;
+	}
+	for (int bit = 0x2000; bit > 0; bit >>= 1) {
+		if (sum & bit) {
+			return bit << 1;
+		}
+	}
+	return 0;
+}
+
+static int dzEncode(int v) {
+	return (v & 0xFF00 ? 8 : 0) | (v & 0xF0F0 ? 4 : 0) | (v & 0xCCCC ? 2 : 0) | (v & 0xAAAA ? 1 : 0);
+}
+
+static int highestBit(int v) {
+	return v ? 1 << (31 - __builtin_clz((unsigned) v)) : 0;
+}
+
+// The blender's divider (for antialiased blends): the hardware's bit-serial division of a sum of
+// products by the sum of its 4-bit factors.
+static uint8_t blendDivide[0x8000];
+
+static void buildBlendDivide(void) {
+	static bool built;
+	if (built) {
+		return;
+	}
+	built = true;
+	for (int i = 0; i < 0x8000; ++i) {
+		int d = (i >> 11) & 15, n = i & 0x7FF, inv = ~d & 15, res = 0;
+		int partial = (inv + (n >> 8) + 1) & 7;
+		for (int k = 0; k < 8; ++k) {
+			int bit = (n >> (7 - k)) & 1;
+			int t = res & (0x100 >> k) ? inv + (partial << 1) + bit + 1 : d + (partial << 1) + bit;
+			partial = t & 7;
+			if (t & 0x10) {
+				res |= 1 << (7 - k);
+			}
+		}
+		blendDivide[i] = (uint8_t) res;
+	}
 }
 
 // ---- Textures
@@ -600,6 +669,8 @@ static void setupModes(struct RDP* r) {
 	r->zMode = (m >> 10) & 3;
 	r->alphaCompare = m & 1;
 	r->antialias = (m >> 3) & 1;
+	r->imageRead = (m >> 6) & 1;
+	r->colorOnCvg = (m >> 7) & 1;
 	r->cvgDest = (m >> 8) & 3;
 	r->cvgAlpha = (m >> 13) & 1;
 	r->cvgTimesAlpha = (m >> 12) & 1;
@@ -646,17 +717,31 @@ static struct Color combineCycle(struct RDP* r, struct Pixel* p, int cycle) {
 	return r->stage[cycle].noise ? combine(r, p, cycle) : combineInputs(&r->stage[cycle], r->stage[cycle].raw && !r->texConvert);
 }
 
-static struct Color blendColor(struct RDP* r, struct Color pixel, struct Color memory, struct Pixel* p, int cycle) {
+static struct Color blendColor(struct RDP* r, struct Color pixel, struct Color memory, struct Pixel* p, int cycle, bool divide) {
 	const uint8_t* sel = r->blendSel[cycle];
 	int sp = sel[0], sa = sel[1], sm = sel[2], sb = sel[3];
 	const struct Color* choices[4] = { &pixel, &memory, &r->blend, &r->fog };
 	struct Color P = *choices[sp], M = *choices[sm];
 	int a = sa == 0 ? pixel.a : sa == 1 ? r->fog.a : sa == 2 ? p->shade.a : 0;
 	int b = sb == 0 ? 255 - a : sb == 1 ? memory.a : sb == 2 ? 255 : 0;
-	// The blender works with 5-bit factors and doesn't normalise: (P * a + M * (b + 1)) / 32, wrapping
-	// at 8 bits, so "one" for b adds.
-	int fa = a >> 3, fb = (b >> 3) + 1;
-	i4 out = ((lanes(P) * fa + lanes(M) * fb) >> 5) & 255;
+	// 5-bit factors: (P * a + M * (b + 1)), over 32 (wrapping at 8 bits) with force blend or in the
+	// first of two cycles, else through the divider by the factors' sum. With memory alpha the
+	// factors are shifted by the depth slopes' difference.
+	int fa = a >> 3, fb = b >> 3;
+	if (sb == 1) {
+		fa = (fa >> r->blShiftA) & 0x3C;
+		fb = (fb >> r->blShiftB) | 3;
+	}
+	i4 sum = lanes(P) * fa + lanes(M) * (fb + 1);
+	i4 out;
+	if (divide) {
+		int d = ((fa & ~3) + (fb & ~3) + 4) << 9;
+		for (int i = 0; i < 3; ++i) {
+			out[i] = blendDivide[d | ((sum[i] >> 2) & 0x7FF)];
+		}
+	} else {
+		out = (sum >> 5) & 255;
+	}
 	out[3] = pixel.a;
 	return color(out);
 }
@@ -669,21 +754,12 @@ static struct Color blendInput(struct RDP* r, struct Color pixel, struct Color m
 	return out;
 }
 
+// The depth test (with the stored depth slope: coplanar and decal tests, and whether an
+// antialiased edge blends), then the blender, and the coverage and depth written.
 static void shadePixel(struct N64* n, struct RDP* r, int x, int y, struct Pixel* p) {
 	int cycleType = r->cycleType;
 	int z = r->zPrim ? r->primZ : p->z;
-	if (z < 0) {
-		z = 0;
-	} else if (z > 0x3FFFF) {
-		z = 0x3FFFF;
-	}
-	if (r->zAddr && r->zCompare) {
-		int old = zDecompress(zRead(n, r, x, y));
-		bool pass = r->zMode == 3 ? z <= old + 0x10 && z >= old - 0x10 : z <= old;
-		if (!pass) {
-			return;
-		}
-	}
+	z = z < 0 ? 0 : z > 0x3FFFF ? 0x3FFFF : z;
 	// One-cycle mode runs the combiner's second-cycle equation.
 	p->combined = r->lastCombined;
 	struct Color c = combineCycle(r, p, cycleType == 1 ? 0 : 1);
@@ -694,38 +770,104 @@ static void shadePixel(struct N64* n, struct RDP* r, int x, int y, struct Pixel*
 	r->lastCombined = c;
 	r->lastPos = r->seq << 24 | (uint64_t) y << 12 | (uint32_t) x;
 	c = (struct Color) { clamp9(c.r), clamp9(c.g), clamp9(c.b), clamp9(c.a) };
-	// Coverage is full (8) as partial edges aren't modelled; coverage times alpha scales it, and alpha
-	// as coverage replaces alpha with it.
-	int cvg = r->cvgTimesAlpha ? c.a >> 5 : 8;
+	// Coverage times alpha scales the coverage, and alpha as coverage replaces alpha with it.
+	int cvg = r->cvgTimesAlpha ? (((c.a * p->cvg + 4) >> 3) >> 5) & 15 : p->cvg;
 	if (r->cvgAlpha) {
-		c.a = r->cvgTimesAlpha ? cvg << 5 : 255;
+		c.a = cvg << 5 > 255 ? 255 : cvg << 5;
 	}
-	if (r->antialias && !cvg) {
-		return;
+	struct Color memory = readPixel(n, r, x, y);
+	int memCvg = r->imageRead ? memory.a >> 5 : 7;
+	if (!r->imageRead) {
+		memory.a = 0xE0;
+	}
+	int dzpix = r->zPrim ? r->primDz : r->dzpix;
+	int dzEnc = dzEncode(dzpix);
+	bool overflow = (cvg + memCvg) & 8;
+	bool blend;
+	if (r->zAddr && r->zCompare) {
+		uint16_t stored = zRead(n, r, x, y);
+		int oz = zDecompress(stored);
+		int rawDzMem = (stored & 3) << 2 | zHidden(n, r, x, y);
+		int dzMem = 1 << rawDzMem;
+		r->blShiftA = dzEnc - rawDzMem < 0 ? 0 : dzEnc - rawDzMem > 4 ? 4 : dzEnc - rawDzMem;
+		r->blShiftB = rawDzMem - dzEnc < 0 ? 0 : rawDzMem - dzEnc > 4 ? 4 : rawDzMem - dzEnc;
+		bool coplanar = false;
+		int precision = (stored >> 13) & 15;
+		if (precision < 3) {
+			if (dzMem != 0x8000) {
+				dzMem <<= 1;
+				dzMem = dzMem < (16 >> precision) ? 16 >> precision : dzMem;
+			} else {
+				coplanar = true;
+				dzMem = 0xFFFF;
+			}
+		}
+		int dzNew = highestBit((dzpix | dzMem) & 0xFFFF);
+		int dzShifted = dzNew << 3;
+		bool farther = coplanar || z + dzShifted >= oz;
+		bool infront = z < oz, nearer = coplanar || z - dzShifted <= oz, max = oz == 0x3FFFF;
+		blend = r->forceBlend || (!overflow && r->antialias && farther);
+		bool pass;
+		switch (r->zMode) {
+		case 0:
+			pass = max || (overflow ? infront : nearer);
+			break;
+		case 1:
+			if (!infront || !farther || !overflow) {
+				pass = max || (overflow ? infront : nearer);
+			} else {
+				int enc = dzEncode(dzNew & 0xFFFF);
+				cvg = ((((oz >> enc) - (z >> enc)) & 15) * cvg >> 3) & 15;
+				pass = true;
+			}
+			break;
+		case 2:
+			pass = infront || max;
+			break;
+		default:
+			pass = farther && nearer && !max;
+		}
+		if (!pass) {
+			return;
+		}
+	} else {
+		r->blShiftA = 0;
+		r->blShiftB = dzEnc < 11 ? 4 : 15 - dzEnc;
+		blend = r->forceBlend || (!overflow && r->antialias);
 	}
 	if (r->alphaCompare && c.a < r->blend.a) {
 		return;
 	}
-	struct Color memory = readPixel(n, r, x, y);
-	// The blend formula applies with force blend, or with antialiasing when the coverage doesn't
-	// overflow; otherwise a cycle passes its first input through. In 2-cycle mode the first cycle
-	// always blends (fog), and its result is the second cycle's pixel.
-	int memCvg = memory.a >> 5;
-	bool blend = r->forceBlend || (r->antialias && !((cvg + memCvg) & 8));
-	struct Color out = c;
-	if (cycleType == 1) {
-		struct Color first = blendColor(r, c, memory, p, 0);
-		out = blend ? blendColor(r, first, memory, p, 1) : blendInput(r, first, memory, 1);
-	} else {
-		out = blend ? blendColor(r, c, memory, p, 0) : blendInput(r, c, memory, 0);
+	if (r->antialias ? !cvg : !p->cvbit) {
+		return;
 	}
-	// The image keeps the coverage (the alpha bit of 16-bit pixels, the top 3 alpha bits of 32-bit
-	// ones), as cvg_dest says.
+	// The blend formula applies when blending, unless the pixel is opaque and the mode rejects
+	// partial blends; without it a cycle passes its first input through. With colour on coverage
+	// only a wrap of the coverage writes the colour. In 2-cycle mode the first cycle always blends
+	// (fog), and its result is the second cycle's pixel.
+	int last = cycleType == 1 ? 1 : 0;
+	const uint8_t* sel = r->blendSel[last];
+	bool partialReject = sel[1] == 0 && sel[3] == 0 && c.a >= 255;
+	struct Color in = c;
+	if (cycleType == 1) {
+		in = blendColor(r, c, memory, p, 0, false);
+	}
+	struct Color out;
+	if (r->colorOnCvg && !overflow) {
+		const struct Color* choices[4] = { &in, &memory, &r->blend, &r->fog };
+		out = *choices[sel[2]];
+	} else if (!blend || partialReject) {
+		out = blendInput(r, in, memory, last);
+	} else {
+		out = blendColor(r, in, memory, p, last, !r->forceBlend);
+	}
+	// The image keeps the coverage (the alpha bit of 16-bit pixels with two hidden bits, the top 3
+	// alpha bits of 32-bit ones), as cvg_dest says.
 	int kept = r->cvgDest == 0 ? (blend ? cvg + memCvg : cvg - 1) : r->cvgDest == 1 ? (cvg + memCvg) & 7 : r->cvgDest == 2 ? 7 : memCvg;
 	out.a = (kept & 8 ? 7 : kept & 7) << 5;
 	writePixel(n, r, x, y, out);
 	if (r->zAddr && r->zUpdate) {
-		zWrite(n, r, x, y, zCompress(z));
+		zWrite(n, r, x, y, (uint16_t) (zCompress(z) | dzEnc >> 2), dzEnc & 3);
 	}
 }
 
@@ -750,6 +892,7 @@ static void fillRect(struct N64* n, struct RDP* r, int x0, int y0, int x1, int y
 				uint16_t even = __builtin_bswap16((uint16_t) (r->fillColor >> 16)), odd = __builtin_bswap16((uint16_t) r->fillColor);
 				for (int x = x0; x <= x1; ++x) {
 					memcpy(row + (x - x0) * 2, x & 1 ? &odd : &even, 2);
+					n->hidden[(first >> 1) + (uint32_t) (x - x0)] = (x & 1 ? r->fillColor : r->fillColor >> 16) & 1 ? 3 : 0;
 				}
 			}
 			continue;
@@ -766,6 +909,7 @@ static void fillRect(struct N64* n, struct RDP* r, int x0, int y0, int x1, int y
 				uint16_t v = (uint16_t) (x & 1 ? r->fillColor : r->fillColor >> 16);
 				n->rdram[a] = v >> 8;
 				n->rdram[a + 1] = (uint8_t) v;
+				n->hidden[a >> 1] = v & 1 ? 3 : 0;
 			}
 		}
 	}
@@ -924,6 +1068,8 @@ static void textureRect(struct N64* n, struct RDP* r, uint64_t w0, uint64_t w1, 
 				continue;
 			}
 			p->z = r->primZ;
+			p->cvg = 8;
+			p->cvbit = true;
 			shadePixel(n, r, x, y, p);
 		}
 	}
@@ -951,6 +1097,17 @@ static struct Edges edges(const uint64_t* w) {
 	};
 }
 
+// The depth slope a triangle's pixels carry (dzpix): |dz/dx| + |dz/dy| in whole steps, normalized.
+static int triangleDz(const uint64_t* w, int op) {
+	if (!(op & 1)) {
+		return normalizeDz(0);
+	}
+	int idx = 4 + (op & 4 ? 8 : 0) + (op & 2 ? 8 : 0);
+	int dx = (int) ((fix(w[idx], 0) >> 16) & 0xFFFF), dy = (int) ((fix(w[idx + 1], 0) >> 16) & 0xFFFF);
+	int sum = (dy & 0x8000 ? ~dy & 0x7FFF : dy) + (dx & 0x8000 ? ~dx & 0x7FFF : dx);
+	return normalizeDz(sum & 0xFFFF) & 0xFFFF;
+}
+
 // The first and past-the-last scanline a triangle may cover inside the scissor.
 static void triangleRows(const struct RDP* r, const struct Edges* t, int* first, int* end) {
 	int top = t->yh < r->scissorY0 ? r->scissorY0 : t->yh;
@@ -959,26 +1116,54 @@ static void triangleRows(const struct RDP* r, const struct Edges* t, int* first,
 	*end = (bottom + 3) >> 2;
 }
 
-// The pixels a triangle covers on scanline y (none if x1 < x0); false if it misses the line.
-static bool span(const struct RDP* r, const struct Edges* t, int y, int* x0, int* x1) {
-	// Edges are evaluated at the middle of the scanline, in quarter lines.
-	int64_t q = (int64_t) y * 4 + 2;
-	if (q < t->yh || q >= t->yl) {
-		return false;
+// A triangle on scanline y: each of its four sub-scanlines' edges in eighths of a pixel inside the
+// scissor (left >= right where it has none), and the pixels they reach (none if x1 < x0).
+struct Span {
+	int x0, x1;
+	int32_t left[4], right[4];
+};
+
+static bool span(const struct RDP* r, const struct Edges* t, int y, struct Span* s) {
+	s->x0 = INT32_MAX, s->x1 = INT32_MIN;
+	bool any = false;
+	for (int k = 0; k < 4; ++k) {
+		int64_t q = (int64_t) y * 4 + k;
+		s->left[k] = 0, s->right[k] = 0;
+		if (q < t->yh || q >= t->yl || q < r->scissorY0 || q >= r->scissorY1) {
+			continue;
+		}
+		int64_t dy = q - (t->yh & ~3);
+		int64_t major = t->xh + t->dxh * dy / 4;
+		int64_t minor = q < t->ym ? t->xm + t->dxm * dy / 4 : t->xl + t->dxl * (q - t->ym) / 4;
+		int64_t lo = major < minor ? major : minor, hi = major < minor ? minor : major;
+		int64_t l8 = lo >> 13, r8 = hi >> 13;
+		l8 = l8 < r->scissorX0 * 2 ? r->scissorX0 * 2 : l8;
+		r8 = r8 > r->scissorX1 * 2 ? r->scissorX1 * 2 : r8;
+		if (l8 >= r8) {
+			continue;
+		}
+		s->left[k] = (int32_t) l8, s->right[k] = (int32_t) r8;
+		s->x0 = (int) (l8 >> 3) < s->x0 ? (int) (l8 >> 3) : s->x0;
+		s->x1 = (int) ((r8 - 1) >> 3) > s->x1 ? (int) ((r8 - 1) >> 3) : s->x1;
+		any = true;
 	}
-	int64_t dy = q - (t->yh & ~3);
-	int64_t major = t->xh + t->dxh * dy / 4;
-	int64_t minor = q < t->ym ? t->xm + t->dxm * dy / 4 : t->xl + t->dxl * (q - t->ym) / 4;
-	int64_t left = major < minor ? major : minor, right = major < minor ? minor : major;
-	*x0 = (int) ((left + 0xFFFF) >> 16);
-	*x1 = (int) ((right + 0xFFFF) >> 16) - 1;
-	if (*x0 < r->scissorX0 >> 2) {
-		*x0 = r->scissorX0 >> 2;
+	return any;
+}
+
+// The samples of pixel x a span covers, bit 7 first: two to a sub-scanline, at quarters 0 and 2 of
+// the pixel on even ones and 1 and 3 on odd ones.
+static int coverageMask(const struct Span* s, int x) {
+	int mask = 0;
+	for (int k = 0; k < 4; ++k) {
+		for (int j = 0; j < 2; ++j) {
+			int quarter = (k & 1) + j * 2;
+			int e = x * 8 + quarter * 2;
+			if (e >= s->left[k] && e < s->right[k]) {
+				mask |= 1 << ((k < 2 ? 4 : 0) + 3 - quarter);
+			}
+		}
 	}
-	if (*x1 > (r->scissorX1 >> 2) - 1) {
-		*x1 = (r->scissorX1 >> 2) - 1;
-	}
-	return true;
+	return mask;
 }
 
 static void triangle(struct N64* n, struct RDP* r, const uint64_t* w, int op) {
@@ -1011,6 +1196,7 @@ static void triangle(struct N64* n, struct RDP* r, const uint64_t* w, int op) {
 		idx += 8;
 	}
 	r->maxLevel = (w[0] >> 51) & 7;
+	r->dzpix = triangleDz(w, op);
 	bool doLod = tex && (((r->otherModes >> 48) & 1) || lodFracUsed(r));
 	if (zbuf) {
 		zv = fix(w[idx], 32);
@@ -1021,10 +1207,11 @@ static void triangle(struct N64* n, struct RDP* r, const uint64_t* w, int op) {
 	int first, end;
 	triangleRows(r, &e, &first, &end);
 	for (int y = first; y < end; ++y) {
-		int x0, x1;
-		if (!ownsRow(r, y) || !span(r, &e, y, &x0, &x1)) {
+		struct Span sp;
+		if (!ownsRow(r, y) || !span(r, &e, y, &sp)) {
 			continue;
 		}
+		int x0 = sp.x0, x1 = sp.x1;
 		// Attributes too are evaluated at the middle of the scanline.
 		int64_t dy = (int64_t) y * 4 + 2 - (yh & ~3);
 		int64_t ey = dy / 4;
@@ -1044,6 +1231,11 @@ static void triangle(struct N64* n, struct RDP* r, const uint64_t* w, int op) {
 		for (int x = x0; x <= x1; ++x) {
 			struct Pixel* p = &r->pix;
 			*p = (struct Pixel) { 0 };
+			// A pixel is drawn when any sample is covered with antialiasing, else when the first is.
+			int mask = coverageMask(&sp, x);
+			p->cvg = __builtin_popcount((unsigned) mask);
+			p->cvbit = (mask & 0x80) != 0;
+			bool drawn = r->antialias ? mask != 0 : p->cvbit;
 			if (shade) {
 				p->shade = (struct Color) { clamp8((int) (shadeAt[0] >> 16)), clamp8((int) (shadeAt[1] >> 16)),
 				                            clamp8((int) (shadeAt[2] >> 16)), clamp8((int) (shadeAt[3] >> 16)) };
@@ -1060,6 +1252,9 @@ static void triangle(struct N64* n, struct RDP* r, const uint64_t* w, int op) {
 				for (int i = 0; i < 3; ++i) {
 					texAt[i] += tdx[i];
 				}
+				if (!drawn) {
+					continue;
+				}
 				int s, t, t1 = tile, t2 = tile + 1;
 				texCoords(sS, sT, sW, persp, &s, &t);
 				if (doLod) {
@@ -1070,7 +1265,9 @@ static void triangle(struct N64* n, struct RDP* r, const uint64_t* w, int op) {
 				}
 				textures(r, p, t1, t2, s, t);
 			}
-			shadePixel(n, r, x, y, p);
+			if (drawn) {
+				shadePixel(n, r, x, y, p);
+			}
 		}
 	}
 }
@@ -1187,9 +1384,9 @@ static uint64_t primitiveClocks(struct RDP* r, const uint64_t* w, int op) {
 		int first, end;
 		triangleRows(r, &e, &first, &end);
 		for (int y = first; y < end; ++y) {
-			int x0, x1;
-			if (span(r, &e, y, &x0, &x1) && x1 >= x0) {
-				pixels += (uint64_t) (x1 - x0 + 1);
+			struct Span sp;
+			if (span(r, &e, y, &sp) && sp.x1 >= sp.x0) {
+				pixels += (uint64_t) (sp.x1 - sp.x0 + 1);
 			}
 		}
 		return pixels * perPixel + 20;
@@ -1301,7 +1498,7 @@ static void execute(struct N64* n, struct RDP* r, const uint64_t* w, int op) {
 				}
 				for (int x = x0; x <= x1; ++x) {
 					struct Pixel* p = &r->pix;
-					*p = (struct Pixel) { 0 };
+					*p = (struct Pixel) { .cvg = 8, .cvbit = true };
 					p->z = r->primZ;
 					shadePixel(n, r, x, y, p);
 				}
@@ -1697,7 +1894,7 @@ static void submit(struct N64* n, struct RDP* r, const uint64_t* w, int op, int 
 #include "rdp_gpu_glsl.h"
 
 enum {
-	GPU_PRIM_SIZE = 24, GPU_ROW_SIZE = 18, GPU_TILE_FIELDS = 15, GPU_STATE_SIZE = 19 + 8 * GPU_TILE_FIELDS + 4,
+	GPU_PRIM_SIZE = 24, GPU_ROW_SIZE = 26, GPU_TILE_FIELDS = 15, GPU_STATE_SIZE = 19 + 8 * GPU_TILE_FIELDS + 4,
 	GPU_TILES = 64, GPU_PRIMS_MAX = 4000, GPU_LAST_SIZE = 1 << 20, GPU_BATCHES_MAX = 4096,
 	// Tiles times primitives in one dispatch: a long dispatch trips the kernel's GPU hang check.
 	GPU_ENTRIES_MAX = 1024,
@@ -1757,7 +1954,7 @@ static struct Gpu* gpuCreate(void) {
 		return NULL;
 	}
 	fprintf(stderr, "GPU RDP on %s\n", glesRenderer(g->gl));
-	glesData(g->gl, 0, NULL, RDRAM_SIZE);
+	glesData(g->gl, 0, NULL, RDRAM_SIZE + RDRAM_SIZE / 2);
 	glesData(g->gl, 3, NULL, GPU_LAST_SIZE * 4);
 	g->stateDirty = g->tmemDirty = true;
 	return g;
@@ -1890,14 +2087,19 @@ static bool gpuTriangle(struct Gpu* g, struct RDP* r, const uint64_t* w, int op,
 	for (int y = first; y < end; ++y) {
 		int32_t* row = rows + (y - first) * GPU_ROW_SIZE;
 		memset(row, 0, GPU_ROW_SIZE * sizeof(int32_t));
-		int x0, x1;
-		if (!span(r, &e, y, &x0, &x1) || x1 < x0) {
+		struct Span sp;
+		if (!span(r, &e, y, &sp) || sp.x1 < sp.x0) {
 			row[0] = 1;
 			row[1] = 0;
 			continue;
 		}
+		int x0 = sp.x0, x1 = sp.x1;
 		row[0] = x0;
 		row[1] = x1;
+		for (int k = 0; k < 4; ++k) {
+			row[18 + k] = sp.left[k];
+			row[22 + k] = sp.right[k];
+		}
 		minX = x0 < minX ? x0 : minX;
 		maxX = x1 > maxX ? x1 : maxX;
 		minY = y < minY ? y : minY;
@@ -1980,6 +2182,7 @@ static void gpuSubmit(struct N64* n, struct RDP* r) {
 				++run;
 			}
 			glesSubData(g->gl, 0, (size_t) p << 12, &n->rdram[(size_t) p << 12], (size_t) run << 12);
+			glesSubData(g->gl, 0, RDRAM_SIZE + ((size_t) p << 11), &n->hidden[(size_t) p << 11], (size_t) run << 11);
 			for (int k = 0; k < run; ++k) {
 				g->page[p + k] |= GPU_PAGE_OWNED;
 			}
@@ -2083,6 +2286,16 @@ static void gpuSync(struct N64* n, struct RDP* r) {
 			}
 			glesUnmap(g->gl, 0);
 		}
+		const uint8_t* h = glesMap(g->gl, 0, RDRAM_SIZE + ((size_t) lo << 11), (size_t) (hi - lo + 1) << 11);
+		if (h) {
+			for (int i = 0; i < g->markedPageCount; ++i) {
+				int p = g->markedPages[i];
+				if (g->page[p] & GPU_PAGE_OWNED) {
+					memcpy(&n->hidden[(size_t) p << 11], h + ((size_t) (p - lo) << 11), 0x800);
+				}
+			}
+			glesUnmap(g->gl, 0);
+		}
 	}
 	for (int i = 0; i < g->markedPageCount; ++i) {
 		int p = g->markedPages[i];
@@ -2117,6 +2330,9 @@ static void gpuCommand(struct N64* n, struct RDP* r, const uint64_t* w, int op) 
 		return;
 	}
 	++r->seq;
+	if (op >= 0x08 && op <= 0x0F) {
+		r->dzpix = triangleDz(w, op);
+	}
 	int y0, y1;
 	primitiveRows(r, w, op, &y0, &y1);
 	if (y1 < y0) {
@@ -2147,6 +2363,8 @@ static void gpuCommand(struct N64* n, struct RDP* r, const uint64_t* w, int op) 
 	}
 	int32_t* p = g->prims + g->primCount * GPU_PRIM_SIZE;
 	memset(p, 0, GPU_PRIM_SIZE * sizeof(int32_t));
+	p[22] = r->dzpix;
+	p[23] = r->primDz;
 	if (op >= 0x08 && op <= 0x0F) {
 		if (!gpuTriangle(g, r, w, op, p)) {
 			return;
