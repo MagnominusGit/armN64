@@ -91,6 +91,7 @@ void pifBoot(struct N64* n) {
 	c->cop0[CP0_EPC] = 0xFFFFFFFFFFFFFFFFull;
 	c->cop0[CP0_ERROREPC] = 0xFFFFFFFFFFFFFFFFull;
 	c->cop0[CP0_LLADDR] = 0xFFFFFFFF;
+	n->coldBoot = true;
 	n->riReg[0] = 0x0E;
 	n->riReg[1] = 0x40;
 	n->riReg[3] = 0x14;

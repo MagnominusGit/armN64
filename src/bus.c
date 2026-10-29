@@ -244,6 +244,8 @@ static uint32_t viCurrent(struct N64* n) {
 }
 
 // SP memory and registers, DP and MI registers: what the RSP (and the RDP it drives) can change or see.
+enum { RDRAM_INIT_CYCLES = 2000000 };
+
 static inline bool rspShared(uint32_t addr) {
 	return addr >= 0x04000000 && addr < 0x04400000;
 }
@@ -360,6 +362,15 @@ uint32_t busRead32(struct N64* n, uint32_t addr) {
 		}
 	case 0x047: {
 		uint32_t* r = reg(n->riReg, addr, 8);
+		// The RI comes up initialised (pifBoot), so the boot code skips the RDRAM set-up it does
+		// after a power-on: device numbering and current calibration of each chip. That takes
+		// about 20 ms (estimated from the 6102 boot code); it's spent here, at the boot code's first
+		// look at RI_SELECT. Games time their start from the Count the boot code zeroes just before
+		// (BattleTanx needs the time).
+		if ((addr & 0x1F) == 0x0C && n->coldBoot) {
+			n->coldBoot = false;
+			n->cpu.stall += RDRAM_INIT_CYCLES;
+		}
 		return r ? *r : 0;
 	}
 	case 0x048:

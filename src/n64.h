@@ -189,6 +189,8 @@ struct N64 {
 	struct SI si;
 	uint32_t miMode, miIntr, miMask;
 	uint32_t riReg[8];
+	// The boot code hasn't read RI_SELECT yet (see busRead32).
+	bool coldBoot;
 
 	uint64_t cycles;
 	// The earliest pending event (AI, PI, SI, DP sync): the CPU runs no further before it is handled.
