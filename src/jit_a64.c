@@ -8,13 +8,27 @@
 // RDRAM loads and stores inline, the rest through cpuJitStep, stopping after any instruction that
 // takes the cycle count to the limit.
 //
-// Registers: x19 = n, x20 = &n->cpu, x21 = n->cycles, x22 = the limit, x23 = RDRAM, x24 = jitTable,
-// x25 = tlbCache, x26 = pageFlags, x27 = cpu.dcacheTag, x28 = cpu.dcacheDirty. Each block starts with
-// a branch to the way out, for the conditional branches that can't reach it.
+// Registers: x19 = n, x20 = &n->cpu, x21 = n->cycles, x22 = the limit, x23 = RDRAM,
+// x27 = cpu.dcacheTag, x28 = cpu.dcacheDirty; x24-x26 and x9-x15 hold guest registers within a
+// block (each written through to memory at once, so memory is always up to date); x0-x8, x16 and
+// x17 are scratch. Each block starts with a branch to the way out, for the conditional branches that
+// can't reach it.
 
 enum { ARENA_SIZE = 32 << 20, BLOCK_CODE_MAX = 32 << 10, SHARED_SIZE = 256 };
 
-enum { N = 19, CPU = 20, CYCLES = 21, LIMIT = 22, RAM = 23, TABLE = 24, TLB = 25, CODE = 26, DTAG = 27, DIRTY = 28, IP = 16 };
+enum { N = 19, CPU = 20, CYCLES = 21, LIMIT = 22, RAM = 23, DTAG = 27, DIRTY = 28, IP = 16, IP1 = 17 };
+
+// The host registers that hold guest registers; the last seven don't survive calls.
+enum { POOL = 10, POOL_SAVED = 3 };
+static const uint8_t pool[POOL] = { 24, 25, 26, 9, 10, 11, 12, 13, 14, 15 };
+
+// Which guest register each pool register holds, and when it was last used.
+struct Cache {
+	int8_t guest[POOL];
+	int8_t host[32];
+	uint32_t used[POOL];
+	uint32_t clock;
+};
 
 #define CPU_OFF(f) ((unsigned) offsetof(struct CPU, f))
 #define N64_OFF(f) ((unsigned) offsetof(struct N64, f))
@@ -67,35 +81,20 @@ static void movConst(struct Emitter* e, int rd, uint64_t v) {
 }
 
 static void storeConst(struct Emitter* e, unsigned cpuOff, uint64_t v) {
-	movConst(e, 9, v);
-	aStrX(e, 9, CPU, cpuOff);
+	movConst(e, IP1, v);
+	aStrX(e, IP1, CPU, cpuOff);
 }
 
 static void storeByte(struct Emitter* e, unsigned cpuOff, unsigned v) {
 	if (v) {
-		aMovImm(e, 9, v);
+		aMovImm(e, IP1, v);
 	}
-	aStrb(e, v ? 9 : ZR, CPU, cpuOff);
+	aStrb(e, v ? IP1 : ZR, CPU, cpuOff);
 }
 
-static void loadGpr(struct Emitter* e, int rt, int i) {
-	aLdrX(e, rt, CPU, gprOff(i));
-}
-
-static void loadGpr32(struct Emitter* e, int rt, int i) {
-	aLdr(e, rt, CPU, gprOff(i));
-}
-
-static void storeGpr(struct Emitter* e, int i, int rt) {
-	if (i) {
-		aStrX(e, rt, CPU, gprOff(i));
-	}
-}
-
-static void storeGprConst(struct Emitter* e, int i, uint64_t v) {
-	if (i) {
-		storeConst(e, gprOff(i), v);
-	}
+// A 64-bit register copy that also takes the zero register.
+static void movReg(struct Emitter* e, int rd, int rm) {
+	aDp(e, A_ORR | W64, rd, ZR, rm, S_LSL, 0);
 }
 
 enum Kind { PLAIN, BRANCH, LIKELY };
@@ -116,6 +115,8 @@ struct Slow {
 	uint32_t op, paddr;
 	uint64_t pc;
 	bool delay, lineStart, last;
+	// The guest registers held where the fast path resumes, to load again after the interpreter.
+	struct Cache cache;
 };
 
 struct Miss {
@@ -139,29 +140,123 @@ struct Jit {
 	int missCount;
 	uint8_t* leave;
 	bool rdpThreads;
+	struct Cache cache;
 };
+
+static void cacheClear(struct Cache* c) {
+	for (int i = 0; i < POOL; ++i) {
+		c->guest[i] = -1;
+	}
+	for (int g = 0; g < 32; ++g) {
+		c->host[g] = -1;
+	}
+}
+
+static void forget(struct Cache* c, int g) {
+	if (c->host[g] >= 0) {
+		c->guest[c->host[g]] = -1;
+		c->host[g] = -1;
+	}
+}
+
+// Calls clobber the pool registers that aren't callee-saved.
+static void forgetCallerSaved(struct Cache* c) {
+	for (int i = POOL_SAVED; i < POOL; ++i) {
+		if (c->guest[i] >= 0) {
+			forget(c, c->guest[i]);
+		}
+	}
+}
+
+// A pool register for guest g: its own, a free one, or the one least recently used.
+static int claim(struct Jit* j, int g) {
+	struct Cache* c = &j->cache;
+	int i = c->host[g];
+	if (i < 0) {
+		i = 0;
+		for (int k = 0; k < POOL; ++k) {
+			if (c->guest[k] < 0) {
+				i = k;
+				break;
+			}
+			if (c->used[k] < c->used[i]) {
+				i = k;
+			}
+		}
+		if (c->guest[i] >= 0) {
+			c->host[c->guest[i]] = -1;
+		}
+		c->guest[i] = (int8_t) g;
+		c->host[g] = (int8_t) i;
+	}
+	c->used[i] = ++c->clock;
+	return i;
+}
+
+// The host register holding guest g, loaded if need be (the zero register for r0).
+static int readReg(struct Jit* j, int g) {
+	if (!g) {
+		return ZR;
+	}
+	bool held = j->cache.host[g] >= 0;
+	int host = pool[claim(j, g)];
+	if (!held) {
+		aLdrX(&j->e, host, CPU, gprOff(g));
+	}
+	return host;
+}
+
+// The host register to compute guest g's new value in (scratch x8 for r0, which keeps 0); commit()
+// then writes it through.
+static int writeReg(struct Jit* j, int g) {
+	return g ? pool[claim(j, g)] : 8;
+}
+
+static void commit(struct Jit* j, int g, int host) {
+	if (g) {
+		aStrX(&j->e, host, CPU, gprOff(g));
+	}
+}
+
+// Guest g = v, through the cache.
+static void setConst(struct Jit* j, int g, uint64_t v) {
+	if (g) {
+		int d = writeReg(j, g);
+		movConst(&j->e, d, v);
+		commit(j, g, d);
+	}
+}
+
+// Guest g = host register r (a scratch one).
+static void setReg(struct Jit* j, int g, int r) {
+	if (g) {
+		int d = writeReg(j, g);
+		movReg(&j->e, d, r);
+		commit(j, g, d);
+	}
+}
 
 static void exitAt(struct Jit* j, uint8_t* site, uint64_t pc, enum Kind kind, bool delay, bool skip) {
 	j->exits[j->exitCount++] = (struct Exit) { site, pc, kind, delay, skip, false };
 }
 
 // Sets the flags for a branch condition and returns the condition under which it is taken.
-static int branchCondition(struct Emitter* e, uint32_t op, int rs, int rt) {
-	loadGpr(e, 0, rs);
+static int branchCondition(struct Jit* j, uint32_t op, int rs, int rt) {
+	struct Emitter* e = &j->e;
+	int s = readReg(j, rs);
 	switch (op >> 26) {
 	case 0x04: case 0x14:
 	case 0x05: case 0x15:
-		loadGpr(e, 1, rt);
-		aDp(e, A_SUBS | W64, ZR, 0, 1, S_LSL, 0);
+		aDp(e, A_SUBS | W64, ZR, s, readReg(j, rt), S_LSL, 0);
 		return (op >> 26) & 1 ? C_NE : C_EQ;
 	case 0x06: case 0x16:
-		aDpImm(e, A_SUBS_IMM | W64, ZR, 0, 0);
+		aDp(e, A_SUBS | W64, ZR, s, ZR, S_LSL, 0);
 		return C_LE;
 	case 0x07: case 0x17:
-		aDpImm(e, A_SUBS_IMM | W64, ZR, 0, 0);
+		aDp(e, A_SUBS | W64, ZR, s, ZR, S_LSL, 0);
 		return C_GT;
 	}
-	aDpImm(e, A_SUBS_IMM | W64, ZR, 0, 0);
+	aDp(e, A_SUBS | W64, ZR, s, ZR, S_LSL, 0);
 	return rt & 1 ? C_GE : C_LT;
 }
 
@@ -209,32 +304,33 @@ static bool emitCop0(struct Jit* j, uint32_t op) {
 			return false;
 		}
 		if (rt) {
+			int d = writeReg(j, rt);
 			if (rd == CP0_COUNT) {
 				// Count: half the cycles before this instruction, from countBase.
 				aLsrImmX(e, 0, CYCLES, 1);
 				aLdrX(e, 1, CPU, CPU_OFF(countBase));
 				aDp(e, A_SUB | W64, 0, 0, 1, S_LSL, 0);
 				if (rs == 0x00) {
-					aSxtw(e, 0, 0);
+					aSxtw(e, d, 0);
 				} else {
-					aMov(e, 0, 0);
+					aMov(e, d, 0);
 				}
 			} else {
-				aLdrX(e, 0, CPU, reg);
+				aLdrX(e, d, CPU, reg);
 				if (rs == 0x00) {
-					aSxtw(e, 0, 0);
+					aSxtw(e, d, d);
 				}
 			}
-			storeGpr(e, rt, 0);
+			commit(j, rt, d);
 		}
 		return true;
 	}
 	if (rs != 0x04 && rs != 0x05) {
 		return false;
 	}
+	int t = readReg(j, rt);
 	if (rd == CP0_STATUS) {
-		loadGpr32(e, 0, rt);
-		andConst(e, 0, 0, 0xFFF7FFFF);
+		andConst(e, 0, t, 0xFFF7FFFF);
 		aStrX(e, 0, CPU, reg);
 		// Interrupts on (IE, not EXL or ERL) and one of them pending.
 		aAndBits(e, 1, 0, 0, 3);
@@ -249,11 +345,12 @@ static bool emitCop0(struct Jit* j, uint32_t op) {
 		return true;
 	}
 	if (rd == CP0_EPC || rd == CP0_ERROREPC) {
-		loadGpr(e, 0, rt);
 		if (rs == 0x04) {
-			aSxtw(e, 0, 0);
+			aSxtw(e, 0, t);
+			aStrX(e, 0, CPU, reg);
+		} else {
+			aStrX(e, t, CPU, reg);
 		}
-		aStrX(e, 0, CPU, reg);
 		return true;
 	}
 	return false;
@@ -271,39 +368,35 @@ static bool emitInline(struct Jit* j, uint32_t op, uint64_t pc, enum Kind* kind)
 		switch (f) {
 		case 0x00: case 0x02: case 0x03:
 			if (rd) {
+				int t = readReg(j, rt), d = writeReg(j, rd);
 				if (f == 0x03) {
-					loadGpr(e, 0, rt);
-					aAsrImmX(e, 0, 0, sa);
+					aAsrImmX(e, d, t, sa);
+				} else if (f == 0x02) {
+					aLsrImm(e, d, t, sa);
 				} else {
-					loadGpr32(e, 0, rt);
-					if (sa) {
-						f ? aLsrImm(e, 0, 0, sa) : aLslImm(e, 0, 0, sa);
-					}
+					aLslImm(e, d, t, sa);
 				}
-				aSxtw(e, 0, 0);
-				storeGpr(e, rd, 0);
+				aSxtw(e, d, d);
+				commit(j, rd, d);
 			}
 			return true;
 		case 0x04: case 0x06: case 0x07:
 			if (rd) {
-				loadGpr32(e, 1, rs);
+				int s = readReg(j, rs), t = readReg(j, rt), d = writeReg(j, rd);
 				if (f == 0x07) {
-					aAndBits(e, 1, 1, 0, 5);
-					loadGpr(e, 0, rt);
-					aDp(e, A_ASRV | W64, 0, 0, 1, S_LSL, 0);
+					aAndBits(e, 1, s, 0, 5);
+					aDp(e, A_ASRV | W64, d, t, 1, S_LSL, 0);
 				} else {
-					loadGpr32(e, 0, rt);
-					aDp(e, f == 0x04 ? A_LSLV : A_LSRV, 0, 0, 1, S_LSL, 0);
+					aDp(e, f == 0x04 ? A_LSLV : A_LSRV, d, t, s, S_LSL, 0);
 				}
-				aSxtw(e, 0, 0);
-				storeGpr(e, rd, 0);
+				aSxtw(e, d, d);
+				commit(j, rd, d);
 			}
 			return true;
 		case 0x08: case 0x09:
-			loadGpr(e, 0, rs);
-			aStrX(e, 0, CPU, CPU_OFF(nextPc));
+			aStrX(e, readReg(j, rs), CPU, CPU_OFF(nextPc));
 			if (f == 0x09) {
-				storeGprConst(e, rd, pc + 8);
+				setConst(j, rd, pc + 8);
 			}
 			*kind = BRANCH;
 			return true;
@@ -311,30 +404,28 @@ static bool emitInline(struct Jit* j, uint32_t op, uint64_t pc, enum Kind* kind)
 			return true;
 		case 0x10: case 0x12:
 			if (rd) {
-				aLdrX(e, 0, CPU, f == 0x10 ? CPU_OFF(hi) : CPU_OFF(lo));
-				storeGpr(e, rd, 0);
+				int d = writeReg(j, rd);
+				aLdrX(e, d, CPU, f == 0x10 ? CPU_OFF(hi) : CPU_OFF(lo));
+				commit(j, rd, d);
 			}
 			return true;
 		case 0x11: case 0x13:
-			loadGpr(e, 0, rs);
-			aStrX(e, 0, CPU, f == 0x11 ? CPU_OFF(hi) : CPU_OFF(lo));
+			aStrX(e, readReg(j, rs), CPU, f == 0x11 ? CPU_OFF(hi) : CPU_OFF(lo));
 			return true;
 		case 0x14: case 0x16: case 0x17:
 			if (rd) {
-				loadGpr(e, 1, rs);
-				loadGpr(e, 0, rt);
-				aDp(e, (f == 0x14 ? A_LSLV : f == 0x16 ? A_LSRV : A_ASRV) | W64, 0, 0, 1, S_LSL, 0);
-				storeGpr(e, rd, 0);
+				int s = readReg(j, rs), t = readReg(j, rt), d = writeReg(j, rd);
+				aDp(e, (f == 0x14 ? A_LSLV : f == 0x16 ? A_LSRV : A_ASRV) | W64, d, t, s, S_LSL, 0);
+				commit(j, rd, d);
 			}
 			return true;
-		case 0x18: case 0x19:
+		case 0x18: case 0x19: {
 			// The products' low and high words, sign-extended; the multiplier holds the pipeline.
-			loadGpr32(e, 0, rs);
-			loadGpr32(e, 1, rt);
+			int s = readReg(j, rs), t = readReg(j, rt);
 			if (f == 0x18) {
-				aSmull(e, 0, 0, 1);
+				aSmull(e, 0, s, t);
 			} else {
-				aUmull(e, 0, 0, 1);
+				aUmull(e, 0, s, t);
 			}
 			aSxtw(e, 1, 0);
 			aStrX(e, 1, CPU, CPU_OFF(lo));
@@ -343,64 +434,58 @@ static bool emitInline(struct Jit* j, uint32_t op, uint64_t pc, enum Kind* kind)
 			aStrX(e, 0, CPU, CPU_OFF(hi));
 			j->extraCycles = 3;
 			return true;
+		}
 		case 0x20: case 0x22: case 0x2C: case 0x2E: {
 			// Overflow raises an exception, through the interpreter, before rd changes.
 			uint32_t wide = f >= 0x2C ? W64 : 0;
-			loadGpr(e, 0, rs);
-			loadGpr(e, 1, rt);
-			aDp(e, ((f & 2) ? A_SUBS : A_ADDS) | wide, 0, 0, 1, S_LSL, 0);
+			aDp(e, ((f & 2) ? A_SUBS : A_ADDS) | wide, 0, readReg(j, rs), readReg(j, rt), S_LSL, 0);
 			slowIf(j, C_VS);
 			if (!wide) {
 				aSxtw(e, 0, 0);
 			}
-			storeGpr(e, rd, 0);
+			setReg(j, rd, 0);
 			return true;
 		}
 		case 0x21: case 0x23:
 			if (rd) {
-				loadGpr32(e, 0, rs);
-				loadGpr32(e, 1, rt);
-				aDp(e, f == 0x21 ? A_ADD : A_SUB, 0, 0, 1, S_LSL, 0);
-				aSxtw(e, 0, 0);
-				storeGpr(e, rd, 0);
+				int s = readReg(j, rs), t = readReg(j, rt), d = writeReg(j, rd);
+				aDp(e, f == 0x21 ? A_ADD : A_SUB, d, s, t, S_LSL, 0);
+				aSxtw(e, d, d);
+				commit(j, rd, d);
 			}
 			return true;
 		case 0x24: case 0x25: case 0x26: case 0x27: case 0x2D: case 0x2F: {
 			static const uint32_t alu[] = { A_AND, A_ORR, A_EOR, A_ORR };
 			if (rd) {
-				loadGpr(e, 0, rs);
-				loadGpr(e, 1, rt);
-				aDp(e, (f == 0x2D ? A_ADD : f == 0x2F ? A_SUB : alu[f - 0x24]) | W64, 0, 0, 1, S_LSL, 0);
+				int s = readReg(j, rs), t = readReg(j, rt), d = writeReg(j, rd);
+				aDp(e, (f == 0x2D ? A_ADD : f == 0x2F ? A_SUB : alu[f - 0x24]) | W64, d, s, t, S_LSL, 0);
 				if (f == 0x27) {
-					aDp(e, A_ORN | W64, 0, ZR, 0, S_LSL, 0);
+					aDp(e, A_ORN | W64, d, ZR, d, S_LSL, 0);
 				}
-				storeGpr(e, rd, 0);
+				commit(j, rd, d);
 			}
 			return true;
 		}
 		case 0x2A: case 0x2B:
 			if (rd) {
-				loadGpr(e, 0, rs);
-				loadGpr(e, 1, rt);
-				aDp(e, A_SUBS | W64, ZR, 0, 1, S_LSL, 0);
-				aCset(e, 0, f == 0x2A ? C_LT : C_LO);
-				storeGpr(e, rd, 0);
+				int s = readReg(j, rs), t = readReg(j, rt), d = writeReg(j, rd);
+				aDp(e, A_SUBS | W64, ZR, s, t, S_LSL, 0);
+				aCset(e, d, f == 0x2A ? C_LT : C_LO);
+				commit(j, rd, d);
 			}
 			return true;
 		case 0x38: case 0x3A: case 0x3B: case 0x3C: case 0x3E: case 0x3F:
 			if (rd) {
 				int amount = sa + (f >= 0x3C ? 32 : 0);
-				loadGpr(e, 0, rt);
-				if (amount) {
-					if ((f & 3) == 0) {
-						aLslImmX(e, 0, 0, amount);
-					} else if ((f & 3) == 2) {
-						aLsrImmX(e, 0, 0, amount);
-					} else {
-						aAsrImmX(e, 0, 0, amount);
-					}
+				int t = readReg(j, rt), d = writeReg(j, rd);
+				if ((f & 3) == 0) {
+					aLslImmX(e, d, t, amount);
+				} else if ((f & 3) == 2) {
+					aLsrImmX(e, d, t, amount);
+				} else {
+					aAsrImmX(e, d, t, amount);
 				}
-				storeGpr(e, rd, 0);
+				commit(j, rd, d);
 			}
 			return true;
 		}
@@ -414,7 +499,7 @@ static bool emitInline(struct Jit* j, uint32_t op, uint64_t pc, enum Kind* kind)
 	case 0x02: case 0x03:
 		storeConst(e, CPU_OFF(nextPc), ((pc + 4) & ~0x0FFFFFFFull) | (uint64_t) (op & 0x03FFFFFF) << 2);
 		if (op >> 26 == 0x03) {
-			storeGprConst(e, 31, pc + 8);
+			setConst(j, 31, pc + 8);
 		}
 		*kind = BRANCH;
 		return true;
@@ -423,44 +508,47 @@ static bool emitInline(struct Jit* j, uint32_t op, uint64_t pc, enum Kind* kind)
 		break;
 	case 0x08: case 0x18: {
 		uint32_t wide = op >> 26 == 0x18 ? W64 : 0;
-		loadGpr(e, 0, rs);
+		int s = readReg(j, rs);
 		movConst(e, 1, (uint64_t) (int64_t) imm);
-		aDp(e, A_ADDS | wide, 0, 0, 1, S_LSL, 0);
+		aDp(e, A_ADDS | wide, 0, s, 1, S_LSL, 0);
 		slowIf(j, C_VS);
 		if (!wide) {
 			aSxtw(e, 0, 0);
 		}
-		storeGpr(e, rt, 0);
+		setReg(j, rt, 0);
 		return true;
 	}
-	case 0x09:
+	case 0x09: case 0x19:
 		if (rt) {
-			loadGpr32(e, 0, rs);
-			aAddImm(e, 0, 0, imm, 1);
-			aSxtw(e, 0, 0);
-			storeGpr(e, rt, 0);
+			int s = readReg(j, rs), d = writeReg(j, rt);
+			movConst(e, 1, (uint64_t) (int64_t) imm);
+			aDp(e, A_ADD | (op >> 26 == 0x19 ? W64 : 0), d, s, 1, S_LSL, 0);
+			if (op >> 26 == 0x09) {
+				aSxtw(e, d, d);
+			}
+			commit(j, rt, d);
 		}
 		return true;
 	case 0x0A: case 0x0B:
 		if (rt) {
-			loadGpr(e, 0, rs);
+			int s = readReg(j, rs), d = writeReg(j, rt);
 			movConst(e, 1, (uint64_t) (int64_t) imm);
-			aDp(e, A_SUBS | W64, ZR, 0, 1, S_LSL, 0);
-			aCset(e, 0, op >> 26 == 0x0A ? C_LT : C_LO);
-			storeGpr(e, rt, 0);
+			aDp(e, A_SUBS | W64, ZR, s, 1, S_LSL, 0);
+			aCset(e, d, op >> 26 == 0x0A ? C_LT : C_LO);
+			commit(j, rt, d);
 		}
 		return true;
 	case 0x0C: case 0x0D: case 0x0E:
 		if (rt) {
 			static const uint32_t alu[] = { A_AND, A_ORR, A_EOR };
-			loadGpr(e, 0, rs);
+			int s = readReg(j, rs), d = writeReg(j, rt);
 			aMovImm(e, 1, (uint16_t) op);
-			aDp(e, alu[(op >> 26) - 0x0C] | W64, 0, 0, 1, S_LSL, 0);
-			storeGpr(e, rt, 0);
+			aDp(e, alu[(op >> 26) - 0x0C] | W64, d, s, 1, S_LSL, 0);
+			commit(j, rt, d);
 		}
 		return true;
 	case 0x0F:
-		storeGprConst(e, rt, sext32((uint32_t) (uint16_t) op << 16));
+		setConst(j, rt, sext32((uint32_t) (uint16_t) op << 16));
 		return true;
 	case 0x10:
 		return emitCop0(j, op);
@@ -477,26 +565,22 @@ static bool emitInline(struct Jit* j, uint32_t op, uint64_t pc, enum Kind* kind)
 		aMovImm(e, 1, op);
 		aMovImm64(e, IP, (uint64_t) (uintptr_t) fpuExecute);
 		aBlr(e, IP);
+		forgetCallerSaved(&j->cache);
 		aLdr(e, 0, CPU, CPU_OFF(stall));
 		aDp(e, A_ADD | W64, CYCLES, CYCLES, 0, S_LSL, 0);
 		aStr(e, ZR, CPU, CPU_OFF(stall));
-		// A move to r0 is undone, as the interpreter zeroes r0 after every instruction.
-		if (((op >> 21) & 31) <= 2 && !rt) {
-			aStrX(e, ZR, CPU, gprOff(0));
+		// Moves to a general register: it has a new value; r0 is undone, as the interpreter zeroes it.
+		if (((op >> 21) & 31) <= 2) {
+			forget(&j->cache, rt);
+			if (!rt) {
+				aStrX(e, ZR, CPU, gprOff(0));
+			}
 		}
 		return true;
 	case 0x20: case 0x21: case 0x23: case 0x24: case 0x25: case 0x27: case 0x37:
 	case 0x28: case 0x29: case 0x2B: case 0x3F:
 	case 0x31: case 0x35: case 0x39: case 0x3D:
 		emitMemory(j, j->slow);
-		return true;
-	case 0x19:
-		if (rt) {
-			loadGpr(e, 0, rs);
-			movConst(e, 1, (uint64_t) (int64_t) imm);
-			aDp(e, A_ADD | W64, 0, 0, 1, S_LSL, 0);
-			storeGpr(e, rt, 0);
-		}
 		return true;
 	default:
 		return false;
@@ -513,10 +597,10 @@ static bool emitInline(struct Jit* j, uint32_t op, uint64_t pc, enum Kind* kind)
 		aLogicImm(e, A_ANDS_IMM, ZR, 0, 1u << 23);
 		cc = rt & 1 ? C_NE : C_EQ;
 	} else {
-		cc = branchCondition(e, op, rs, rt);
+		cc = branchCondition(j, op, rs, rt);
 	}
 	if ((op >> 26) == 0x01 && (rt & 0x10)) {
-		storeGprConst(e, 31, pc + 8);
+		setConst(j, 31, pc + 8);
 	}
 	if (likely) {
 		exitAt(j, aBcond(e, cc ^ 1, NULL), pc, LIKELY, false, true);
@@ -678,10 +762,12 @@ static void emitMemory(struct Jit* j, struct Slow* slow) {
 		needCop1(j);
 	}
 
-	loadGpr(e, 0, rs);
+	int base = readReg(j, rs);
 	if ((int16_t) op) {
 		movConst(e, 1, (uint64_t) (int64_t) (int16_t) op);
-		aDp(e, A_ADD | W64, 0, 0, 1, S_LSL, 0);
+		aDp(e, A_ADD | W64, 0, base, 1, S_LSL, 0);
+	} else {
+		movReg(e, 0, base);
 	}
 	aSxtw(e, 1, 0);
 	aDp(e, A_SUBS | W64, ZR, 1, 0, S_LSL, 0);
@@ -700,7 +786,8 @@ static void emitMemory(struct Jit* j, struct Slow* slow) {
 	aLsrImm(e, 1, 0, 12);
 	aAndBits(e, 2, 1, 0, 8);
 	aLogicImm(e, A_ORR_IMM, 1, 1, 0x80000000u);
-	aDp(e, A_ADD | W64, 3, TLB, 2, S_LSL, 3);
+	aAddImmX(e, 3, N, N64_OFF(tlbCache));
+	aDp(e, A_ADD | W64, 3, 3, 2, S_LSL, 3);
 	aLdpW(e, 4, 5, 3, 0);
 	aDp(e, A_SUBS, ZR, 4, 1, S_LSL, 0);
 	slow->site[slow->sites++] = aBcond(e, C_NE, NULL);
@@ -720,7 +807,8 @@ static void emitMemory(struct Jit* j, struct Slow* slow) {
 	// Stores go slow on any flag (code, RDP), loads on pages the RDP may still be drawing to.
 	if (isStore || j->rdpThreads) {
 		aLsrImm(e, 1, 0, 12);
-		aLdst(e, L_LDRB, 1, CODE, 1, L_UXTW);
+		aAddImmX(e, 6, N, N64_OFF(pageFlags));
+		aLdst(e, L_LDRB, 1, 6, 1, L_UXTW);
 		slow->site[slow->sites++] = isStore ? aCbnz(e, 1, NULL) : aTbnz(e, 1, 1, NULL);
 	}
 
@@ -738,51 +826,27 @@ static void emitMemory(struct Jit* j, struct Slow* slow) {
 		aLdst(e, L_STRB, 3, DIRTY, 1, L_UXTW);
 	}
 
+	if (isStore && !fpu) {
+		int t = readReg(j, rt);
+		switch (op >> 26) {
+		case 0x28:
+			aLdst(e, L_STRB, t, RAM, 0, L_UXTW);
+			return;
+		case 0x29:
+			aRev16(e, 4, t);
+			aLdst(e, L_STRH, 4, RAM, 0, L_UXTW);
+			return;
+		case 0x2B:
+			aRev(e, 4, t);
+			aLdst(e, L_STR, 4, RAM, 0, L_UXTW);
+			return;
+		default:
+			aRevX(e, 4, t);
+			aLdst(e, L_STRX, 4, RAM, 0, L_UXTW);
+			return;
+		}
+	}
 	switch (op >> 26) {
-	case 0x20:
-		aLdst(e, L_LDRB, 4, RAM, 0, L_UXTW);
-		aSxtbX(e, 4, 4);
-		break;
-	case 0x24:
-		aLdst(e, L_LDRB, 4, RAM, 0, L_UXTW);
-		break;
-	case 0x21: case 0x25:
-		aLdst(e, L_LDRH, 4, RAM, 0, L_UXTW);
-		aRev16(e, 4, 4);
-		if (op >> 26 == 0x21) {
-			aSxthX(e, 4, 4);
-		}
-		break;
-	case 0x23: case 0x27:
-		aLdst(e, L_LDR, 4, RAM, 0, L_UXTW);
-		aRev(e, 4, 4);
-		if (op >> 26 == 0x23) {
-			aSxtw(e, 4, 4);
-		}
-		break;
-	case 0x37:
-		aLdst(e, L_LDRX, 4, RAM, 0, L_UXTW);
-		aRevX(e, 4, 4);
-		break;
-	case 0x28:
-		loadGpr32(e, 4, rt);
-		aLdst(e, L_STRB, 4, RAM, 0, L_UXTW);
-		break;
-	case 0x29:
-		loadGpr32(e, 4, rt);
-		aRev16(e, 4, 4);
-		aLdst(e, L_STRH, 4, RAM, 0, L_UXTW);
-		break;
-	case 0x2B:
-		loadGpr32(e, 4, rt);
-		aRev(e, 4, 4);
-		aLdst(e, L_STR, 4, RAM, 0, L_UXTW);
-		break;
-	case 0x3F:
-		loadGpr(e, 4, rt);
-		aRevX(e, 4, 4);
-		aLdst(e, L_STRX, 4, RAM, 0, L_UXTW);
-		break;
 	case 0x31: case 0x35:
 		aLdst(e, size == 4 ? L_LDR : L_LDRX, 4, RAM, 0, L_UXTW);
 		if (size == 4) {
@@ -809,9 +873,35 @@ static void emitMemory(struct Jit* j, struct Slow* slow) {
 		aLdst(e, size == 4 ? L_STR : L_STRX, 4, RAM, 0, L_UXTW);
 		return;
 	}
-	if (!isStore) {
-		storeGpr(e, rt, 4);
+	int d = writeReg(j, rt);
+	switch (op >> 26) {
+	case 0x20:
+		aLdst(e, L_LDRB, d, RAM, 0, L_UXTW);
+		aSxtbX(e, d, d);
+		break;
+	case 0x24:
+		aLdst(e, L_LDRB, d, RAM, 0, L_UXTW);
+		break;
+	case 0x21: case 0x25:
+		aLdst(e, L_LDRH, d, RAM, 0, L_UXTW);
+		aRev16(e, d, d);
+		if (op >> 26 == 0x21) {
+			aSxthX(e, d, d);
+		}
+		break;
+	case 0x23: case 0x27:
+		aLdst(e, L_LDR, d, RAM, 0, L_UXTW);
+		aRev(e, d, d);
+		if (op >> 26 == 0x23) {
+			aSxtw(e, d, d);
+		}
+		break;
+	default:
+		aLdst(e, L_LDRX, d, RAM, 0, L_UXTW);
+		aRevX(e, d, d);
+		break;
 	}
+	commit(j, rt, d);
 }
 
 // Goes on to the block at the pc in memory if the jump table has it, or leaves.
@@ -822,7 +912,8 @@ static void chain(struct Jit* j) {
 	aDp(e, A_SUBS | W64, ZR, 1, 0, S_LSL, 0);
 	aBcond(e, C_NE, j->leave);
 	aUbfx(e, 1, 0, 2, 14);
-	aDp(e, A_ADD | W64, 2, TABLE, 1, S_LSL, 4);
+	aAddImmX(e, 2, N, N64_OFF(jitTable));
+	aDp(e, A_ADD | W64, 2, 2, 1, S_LSL, 4);
 	aLdr(e, 3, 2, (unsigned) offsetof(struct JitEntry, vaddr));
 	aDp(e, A_SUBS, ZR, 3, 0, S_LSL, 0);
 	aBcond(e, C_NE, j->leave);
@@ -856,9 +947,6 @@ static uint8_t* arenaGet(struct N64* n) {
 	loadN(&e, CYCLES, N64_OFF(cycles), 8);
 	loadN(&e, LIMIT, N64_OFF(jitLimit), 8);
 	loadN(&e, RAM, N64_OFF(rdram), 8);
-	aAddImmX(&e, TABLE, N, N64_OFF(jitTable));
-	aAddImmX(&e, TLB, N, N64_OFF(tlbCache));
-	aAddImmX(&e, CODE, N, N64_OFF(pageFlags));
 	aAddImmX(&e, DTAG, CPU, CPU_OFF(dcacheTag));
 	aAddImmX(&e, DIRTY, CPU, CPU_OFF(dcacheDirty));
 	aBr(&e, 1);
@@ -913,6 +1001,7 @@ void* jitCompile(struct N64* n, const uint32_t* ops, uint32_t count, uint32_t va
 		skipIdle(e, vaddr, paddr);
 	}
 
+	cacheClear(&j->cache);
 	bool delay = false;
 	for (uint32_t k = 0; k < count; ++k) {
 		uint32_t op = ops[k], p = paddr + k * 4;
@@ -922,6 +1011,7 @@ void* jitCompile(struct N64* n, const uint32_t* ops, uint32_t count, uint32_t va
 		enum Kind kind;
 		uint8_t* mark = e->p;
 		int exits = j->exitCount, misses = j->missCount;
+		struct Cache cache = j->cache;
 		bool branch = isBranchOp(op);
 		struct Slow* slow = &j->slows[j->slowCount];
 		*slow = (struct Slow) { .op = op, .paddr = p, .pc = pc, .delay = delay, .lineStart = lineStart, .last = last };
@@ -951,6 +1041,7 @@ void* jitCompile(struct N64* n, const uint32_t* ops, uint32_t count, uint32_t va
 			}
 			if (slow->sites) {
 				slow->resume = e->p;
+				slow->cache = j->cache;
 				++j->slowCount;
 			}
 			delay = kind != PLAIN;
@@ -959,7 +1050,10 @@ void* jitCompile(struct N64* n, const uint32_t* ops, uint32_t count, uint32_t va
 		e->p = mark;
 		j->exitCount = exits;
 		j->missCount = misses;
+		j->cache = cache;
 		emitHelper(j, op, pc, p, delay, lineStart, last);
+		// The interpreter may have changed any register, and the call the scratch ones.
+		cacheClear(&j->cache);
 		delay = branch;
 	}
 
@@ -983,6 +1077,12 @@ void* jitCompile(struct N64* n, const uint32_t* ops, uint32_t count, uint32_t va
 		}
 		emitHelper(j, sl->op, sl->pc, sl->paddr, sl->delay, sl->lineStart, sl->last);
 		if (!sl->last) {
+			// The registers the fast path holds from here, as the interpreter left them.
+			for (int k = 0; k < POOL; ++k) {
+				if (sl->cache.guest[k] >= 0) {
+					aLdrX(e, pool[k], CPU, gprOff(sl->cache.guest[k]));
+				}
+			}
 			aB(e, sl->resume);
 		}
 	}
