@@ -8,7 +8,8 @@
 // RDRAM loads and stores inline, the rest through cpuJitStep, stopping after any instruction that
 // takes the cycle count to the limit.
 //
-// Registers: x19 = n, x20 = &n->cpu, x21 = n->cycles, x22 = the limit, x23 = RDRAM,
+// Registers: x19 = n, x20 = &n->cpu, x21 = cycles left to the limit (the limit less n->cycles),
+// x22 = the limit, x23 = RDRAM,
 // x27 = cpu.dcacheTag, x28 = cpu.dcacheDirty; x24-x26 and x9-x15 hold guest registers within a
 // block (each written through to memory at once, so memory is always up to date); x0-x8, x16 and
 // x17 are scratch. Each block starts with a branch to the way out, for the conditional branches that
@@ -16,7 +17,7 @@
 
 enum { ARENA_SIZE = 32 << 20, BLOCK_CODE_MAX = 32 << 10, SHARED_SIZE = 256 };
 
-enum { N = 19, CPU = 20, CYCLES = 21, LIMIT = 22, RAM = 23, DTAG = 27, DIRTY = 28, IP = 16, IP1 = 17 };
+enum { N = 19, CPU = 20, LEFT = 21, LIMIT = 22, RAM = 23, DTAG = 27, DIRTY = 28, IP = 16, IP1 = 17 };
 
 // The host registers that hold guest registers; the last seven don't survive calls.
 enum { POOL = 10, POOL_SAVED = 3 };
@@ -307,7 +308,8 @@ static bool emitCop0(struct Jit* j, uint32_t op) {
 			int d = writeReg(j, rt);
 			if (rd == CP0_COUNT) {
 				// Count: half the cycles before this instruction, from countBase.
-				aLsrImmX(e, 0, CYCLES, 1);
+				aDp(e, A_SUB | W64, 0, LIMIT, LEFT, S_LSL, 0);
+				aLsrImmX(e, 0, 0, 1);
 				aLdrX(e, 1, CPU, CPU_OFF(countBase));
 				aDp(e, A_SUB | W64, 0, 0, 1, S_LSL, 0);
 				if (rs == 0x00) {
@@ -567,7 +569,7 @@ static bool emitInline(struct Jit* j, uint32_t op, uint64_t pc, enum Kind* kind)
 		aBlr(e, IP);
 		forgetCallerSaved(&j->cache);
 		aLdr(e, 0, CPU, CPU_OFF(stall));
-		aDp(e, A_ADD | W64, CYCLES, CYCLES, 0, S_LSL, 0);
+		aDp(e, A_SUB | W64, LEFT, LEFT, 0, S_LSL, 0);
 		aStr(e, ZR, CPU, CPU_OFF(stall));
 		// Moves to a general register: it has a new value; r0 is undone, as the interpreter zeroes it.
 		if (((op >> 21) & 31) <= 2) {
@@ -637,7 +639,7 @@ static void icacheCheck(struct Emitter* e, uint32_t vaddr, uint32_t paddr, bool 
 		aDpImm(e, A_ADD_IMM, 0, 0, 48);
 		aStr(e, 0, CPU, CPU_OFF(stall));
 	} else {
-		aDpImm(e, A_ADD_IMM | W64, CYCLES, CYCLES, 48);
+		aDpImm(e, A_SUB_IMM | W64, LEFT, LEFT, 48);
 	}
 	patchHere(e, hit);
 }
@@ -655,12 +657,11 @@ static void skipIdle(struct Emitter* e, uint32_t vaddr, uint32_t paddr) {
 		aDp(e, A_SUBS, ZR, 0, 1, S_LSL, 0);
 		skip[sites++] = aBcond(e, C_NE, NULL);
 	}
-	aDp(e, A_SUBS | W64, 0, LIMIT, CYCLES, S_LSL, 0);
-	aDpImm(e, A_SUBS_IMM | W64, ZR, 0, 1);
+	aDpImm(e, A_SUBS_IMM | W64, ZR, LEFT, 1);
 	skip[sites++] = aBcond(e, C_LE, NULL);
-	aDpImm(e, A_SUB_IMM | W64, 0, 0, 1);
+	aDpImm(e, A_SUB_IMM | W64, 0, LEFT, 1);
 	aLsrImmX(e, 0, 0, 1);
-	aDp(e, A_ADD | W64, CYCLES, CYCLES, 0, S_LSL, 1);
+	aDp(e, A_SUB | W64, LEFT, LEFT, 0, S_LSL, 1);
 	for (int i = 0; i < sites; ++i) {
 		patchHere(e, skip[i]);
 	}
@@ -699,16 +700,18 @@ static void emitHelper(struct Jit* j, uint32_t op, uint64_t pc, uint32_t paddr, 
 	storeConst(e, CPU_OFF(curPc), pc);
 	storeByte(e, CPU_OFF(inDelay), delay);
 	storeByte(e, CPU_OFF(nextInDelay), 0);
-	storeN(e, CYCLES, N64_OFF(cycles), 8);
+	aDp(e, A_SUB | W64, 1, LIMIT, LEFT, S_LSL, 0);
+	storeN(e, 1, N64_OFF(cycles), 8);
 	aMovX(e, 0, N);
 	aMovImm(e, 1, op);
 	aMovImm64(e, IP, (uint64_t) (uintptr_t) cpuJitStep);
 	aBlr(e, IP);
-	loadN(e, CYCLES, N64_OFF(cycles), 8);
+	loadN(e, 1, N64_OFF(cycles), 8);
 	loadN(e, LIMIT, N64_OFF(jitLimit), 8);
+	aDp(e, A_SUB | W64, LEFT, LIMIT, 1, S_LSL, 0);
 	aCbnz(e, 0, j->leave);
-	aDp(e, A_SUBS | W64, ZR, CYCLES, LIMIT, S_LSL, 0);
-	aBcond(e, C_HS, j->leave);
+	aDp(e, A_SUBS | W64, ZR, LEFT, ZR, S_LSL, 0);
+	aBcond(e, C_LE, j->leave);
 	if (last) {
 		aLdrb(e, 0, CPU, CPU_OFF(nextInDelay));
 		aCbnz(e, 0, j->leave);
@@ -944,14 +947,16 @@ static uint8_t* arenaGet(struct N64* n) {
 	aStp(&e, 27, 28, 80);
 	aMovX(&e, N, 0);
 	aAddImmX(&e, CPU, N, N64_OFF(cpu));
-	loadN(&e, CYCLES, N64_OFF(cycles), 8);
+	loadN(&e, 0, N64_OFF(cycles), 8);
 	loadN(&e, LIMIT, N64_OFF(jitLimit), 8);
+	aDp(&e, A_SUB | W64, LEFT, LIMIT, 0, S_LSL, 0);
 	loadN(&e, RAM, N64_OFF(rdram), 8);
 	aAddImmX(&e, DTAG, CPU, CPU_OFF(dcacheTag));
 	aAddImmX(&e, DIRTY, CPU, CPU_OFF(dcacheDirty));
 	aBr(&e, 1);
 	n->jitLeave = e.p;
-	storeN(&e, CYCLES, N64_OFF(cycles), 8);
+	aDp(&e, A_SUB | W64, 0, LIMIT, LEFT, S_LSL, 0);
+	storeN(&e, 0, N64_OFF(cycles), 8);
 	aLdp(&e, 19, 20, 16);
 	aLdp(&e, 21, 22, 32);
 	aLdp(&e, 23, 24, 48);
@@ -1027,7 +1032,7 @@ void* jitCompile(struct N64* n, const uint32_t* ops, uint32_t count, uint32_t va
 			if (lineStart && !branch) {
 				icacheCheck(e, (uint32_t) pc, p, false);
 			}
-			aDpImm(e, A_ADD_IMM | W64, CYCLES, CYCLES, 1 + j->extraCycles);
+			aDpImm(e, A_SUBS_IMM | W64, LEFT, LEFT, 1 + j->extraCycles);
 			if (j->interruptCheck) {
 				// An interrupt now due is taken before the next instruction.
 				exitAt(j, aCbnz(e, 2, NULL), pc, kind, delay, false);
@@ -1036,8 +1041,7 @@ void* jitCompile(struct N64* n, const uint32_t* ops, uint32_t count, uint32_t va
 				exitAt(j, aB(e, NULL), pc, kind, delay, false);
 				j->exits[j->exitCount - 1].last = true;
 			} else {
-				aDp(e, A_SUBS | W64, ZR, CYCLES, LIMIT, S_LSL, 0);
-				exitAt(j, aBcond(e, C_HS, NULL), pc, kind, delay, false);
+				exitAt(j, aBcond(e, C_LE, NULL), pc, kind, delay, false);
 			}
 			if (slow->sites) {
 				slow->resume = e->p;
@@ -1061,10 +1065,10 @@ void* jitCompile(struct N64* n, const uint32_t* ops, uint32_t count, uint32_t va
 	for (int i = 0; i < j->missCount; ++i) {
 		struct Miss* m = &j->misses[i];
 		patchHere(e, m->site);
-		aDpImm(e, A_ADD_IMM | W64, CYCLES, CYCLES, 40);
+		aDpImm(e, A_SUB_IMM | W64, LEFT, LEFT, 40);
 		aLdst(e, L_LDRB, 3, DIRTY, 1, L_UXTW);
 		uint8_t* clean = aCbz(e, 3, NULL);
-		aDpImm(e, A_ADD_IMM | W64, CYCLES, CYCLES, 40);
+		aDpImm(e, A_SUB_IMM | W64, LEFT, LEFT, 40);
 		patchHere(e, clean);
 		aLdst(e, L_STR, 2, DTAG, 1, L_UXTW | 0x1000);
 		aLdst(e, L_STRB, ZR, DIRTY, 1, L_UXTW);
@@ -1095,7 +1099,7 @@ void* jitCompile(struct N64* n, const uint32_t* ops, uint32_t count, uint32_t va
 		storeByte(e, CPU_OFF(inDelay), x->delay);
 		storeByte(e, CPU_OFF(nextInDelay), x->kind != PLAIN && !x->skip);
 		if (x->skip) {
-			aDpImm(e, A_ADD_IMM | W64, CYCLES, CYCLES, 1);
+			aDpImm(e, A_SUB_IMM | W64, LEFT, LEFT, 1);
 			storeConst(e, CPU_OFF(pc), x->pc + 8);
 			storeConst(e, CPU_OFF(nextPc), x->pc + 12);
 		} else if (x->delay) {
@@ -1107,8 +1111,8 @@ void* jitCompile(struct N64* n, const uint32_t* ops, uint32_t count, uint32_t va
 			}
 		}
 		if (x->last && !(x->kind != PLAIN && !x->skip)) {
-			aDp(e, A_SUBS | W64, ZR, CYCLES, LIMIT, S_LSL, 0);
-			aBcond(e, C_HS, j->leave);
+			aDp(e, A_SUBS | W64, ZR, LEFT, ZR, S_LSL, 0);
+			aBcond(e, C_LE, j->leave);
 			chain(j);
 		} else {
 			aB(e, j->leave);
