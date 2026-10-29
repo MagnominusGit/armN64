@@ -10,7 +10,7 @@
 //
 // Registers: x19 = n, x20 = &n->cpu, x21 = cycles left to the limit (the limit less n->cycles),
 // x22 = the limit, x23 = RDRAM,
-// x25 = tlbCache, x26 = pageFlags, x27 = cpu.dcacheTag, x28 = cpu.dcacheDirty; x24 and x9-x15 hold
+// x25 = vpages, x26 = pageFlags, x27 = cpu.dcacheTag, x28 = cpu.dcacheDirty; x24 and x9-x15 hold
 // guest registers within a
 // block (each written through to memory at once, so memory is always up to date); x0-x8, x16 and
 // x17 are scratch. Each block starts with a branch to the way out, for the conditional branches that
@@ -117,6 +117,8 @@ struct Slow {
 	uint32_t op, paddr;
 	uint64_t pc;
 	bool delay, lineStart, last;
+	// Kept even with no site yet: a D-cache miss path may add one.
+	bool keep;
 	// The guest registers held where the fast path resumes, to load again after the interpreter.
 	struct Cache cache;
 };
@@ -124,6 +126,9 @@ struct Slow {
 struct Miss {
 	uint8_t* site;
 	uint8_t* resume;
+	// The access's slow path, for a misaligned address or one past RDRAM, and its size.
+	struct Slow* slow;
+	int size;
 };
 
 struct Jit {
@@ -752,10 +757,11 @@ static void fprAddress(struct Emitter* e, int ft, int size) {
 	aCselX(e, 5, 7, 5, C_EQ);
 }
 
-// A load or store to cached RDRAM, through kseg0 or a page in the TLB cache, with dataTiming's
-// D-cache check; anything else jumps to the slow path before any change. Like the interpreter, it
-// takes the low 32 bits of the address: w0 the virtual address, w6 the physical one, w1 the D-cache
-// line and w2 its tag.
+// A load or store to cached RDRAM, through kseg0 or a page the TLB mapped (vpages), with
+// dataTiming's D-cache check; anything else jumps to the slow path before any change. Like the
+// interpreter, it takes the low 32 bits of the address: w0 the virtual address, w6 the physical
+// one and w1 the D-cache line. A page not looked up, and a misaligned address, fail the tag check
+// and take the slow path from the miss path.
 static void emitMemory(struct Jit* j, struct Slow* slow) {
 	struct Emitter* e = &j->e;
 	uint32_t op = slow->op;
@@ -779,29 +785,15 @@ static void emitMemory(struct Jit* j, struct Slow* slow) {
 		aMovImm(e, 1, (uint32_t) offset);
 		aDp(e, A_ADD, 0, base, 1, S_LSL, 0);
 	}
-	// kseg0 and aligned: then w6 is the physical address.
-	aLogicImm(e, A_EOR_IMM, 6, 0, 0x80000000u);
-	aLogicImm(e, A_ANDS_IMM, ZR, 6, 0xFF800000u | (size - 1));
-	uint8_t* kseg0 = aBcond(e, C_EQ, NULL);
-
-	// Mapped: the physical page from the TLB cache.
-	if (size > 1) {
-		aLogicImm(e, A_ANDS_IMM, ZR, 0, size - 1);
-		slow->site[slow->sites++] = aBcond(e, C_NE, NULL);
-	}
+	// The physical page from vpages: one not looked up lands past RDRAM.
 	aLsrImm(e, 1, 0, 12);
-	aAndBits(e, 2, 1, 0, 8);
-	aDp(e, A_ADD | W64, 3, TLB, 2, S_LSL, 3);
-	aLdpW(e, 4, 5, 3, 0);
-	aDp(e, A_SUBS, ZR, 4, 1, S_LSL, 0);
-	slow->site[slow->sites++] = aBcond(e, C_NE, NULL);
 	if (isStore) {
-		slow->site[slow->sites++] = aTbz(e, 5, 0, NULL);
+		aDpImm(e, A_ADD_IMM | W64, 3, TLB, VPAGES * 4);
+		aLdst(e, L_LDR, 5, 3, 1, L_UXTW | 0x1000);
+	} else {
+		aLdst(e, L_LDR, 5, TLB, 1, L_UXTW | 0x1000);
 	}
-	andConst(e, 5, 5, ~0xFFFu);
 	aDp(e, A_ADD, 6, 0, 5, S_LSL, 0);
-
-	patchHere(e, kseg0);
 	// Stores go slow on any flag (code, RDP), loads on pages the RDP may still be drawing to.
 	if (isStore || j->rdpThreads) {
 		aLsrImm(e, 1, 6, 12);
@@ -809,15 +801,18 @@ static void emitMemory(struct Jit* j, struct Slow* slow) {
 		slow->site[slow->sites++] = isStore ? aCbnz(e, 1, NULL) : aTbnz(e, 1, 1, NULL);
 	}
 
-	// The line index from the virtual address, the tag from the physical one.
+	// The line index from the virtual address; a hit when its tag is this physical line and the
+	// address is aligned.
 	aUbfx(e, 1, 0, 4, 9);
-	aLsrImm(e, 2, 6, 4);
-	aLogicImm(e, A_ORR_IMM, 2, 2, 0x80000000u);
 	aLdst(e, L_LDR, 3, DTAG, 1, L_UXTW | 0x1000);
-	aDp(e, A_SUBS, ZR, 3, 2, S_LSL, 0);
+	aDp(e, A_EOR, 2, 3, 6, S_LSL, 0);
+	aLogicImm(e, A_ANDS_IMM, ZR, 2, 0xFFFFFFF0u | (size - 1));
 	struct Miss* m = &j->misses[j->missCount++];
 	m->site = aBcond(e, C_NE, NULL);
 	m->resume = e->p;
+	m->slow = slow;
+	m->size = size;
+	slow->keep = true;
 	if (isStore) {
 		aMovImm(e, 3, 1);
 		aLdst(e, L_STRB, 3, DIRTY, 1, L_UXTW);
@@ -945,7 +940,7 @@ static uint8_t* arenaGet(struct N64* n) {
 	loadN(&e, LIMIT, N64_OFF(jitLimit), 8);
 	aDp(&e, A_SUB | W64, LEFT, LIMIT, 0, S_LSL, 0);
 	loadN(&e, RAM, N64_OFF(rdram), 8);
-	aAddImmX(&e, TLB, N, N64_OFF(tlbCache));
+	loadN(&e, TLB, N64_OFF(vpages), 8);
 	aAddImmX(&e, PAGES, N, N64_OFF(pageFlags));
 	aAddImmX(&e, DTAG, CPU, CPU_OFF(dcacheTag));
 	aAddImmX(&e, DIRTY, CPU, CPU_OFF(dcacheDirty));
@@ -1039,7 +1034,7 @@ void* jitCompile(struct N64* n, const uint32_t* ops, uint32_t count, uint32_t va
 			} else {
 				exitAt(j, aBcond(e, C_LE, NULL), pc, kind, delay, false);
 			}
-			if (slow->sites) {
+			if (slow->sites || slow->keep) {
 				slow->resume = e->p;
 				slow->cache = j->cache;
 				++j->slowCount;
@@ -1057,10 +1052,18 @@ void* jitCompile(struct N64* n, const uint32_t* ops, uint32_t count, uint32_t va
 		delay = branch;
 	}
 
-	// D-cache line fills, as dataTiming: the fill, the write-back of a dirty line, the new tag.
+	// D-cache line fills, as dataTiming: the fill, the write-back of a dirty line, the new tag. A
+	// misaligned address, or one past RDRAM, takes the slow path instead.
 	for (int i = 0; i < j->missCount; ++i) {
 		struct Miss* m = &j->misses[i];
 		patchHere(e, m->site);
+		if (m->size > 1) {
+			aLogicImm(e, A_ANDS_IMM, ZR, 0, m->size - 1);
+			m->slow->site[m->slow->sites++] = aBcond(e, C_NE, NULL);
+		}
+		aLsrImm(e, 2, 6, 23);
+		m->slow->site[m->slow->sites++] = aCbnz(e, 2, NULL);
+		aLogicImm(e, A_AND_IMM, 2, 6, ~0xFu);
 		aDpImm(e, A_SUB_IMM | W64, LEFT, LEFT, 40);
 		aLdst(e, L_LDRB, 3, DIRTY, 1, L_UXTW);
 		uint8_t* clean = aCbz(e, 3, NULL);

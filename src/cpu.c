@@ -40,7 +40,7 @@ static void dataTiming(struct CPU* c, uint64_t vaddr, uint32_t paddr, bool store
 	if (!cached(vaddr)) {
 		return;
 	}
-	uint32_t i = ((uint32_t) vaddr >> 4) & 511, tag = paddr >> 4 | 0x80000000u;
+	uint32_t i = ((uint32_t) vaddr >> 4) & 511, tag = paddr & ~0xFu;
 	if (c->dcacheTag[i] != tag) {
 		c->stall += DCACHE_FILL + (c->dcacheDirty[i] ? DCACHE_WRITEBACK : 0);
 		c->dcacheTag[i] = tag;
@@ -67,14 +67,15 @@ static void cacheOp(struct CPU* c, uint32_t op, uint64_t vaddr) {
 		c->dcacheDirty[i] = false;
 	}
 	if (action == 0 || action == 4 || action == 5) {
-		c->dcacheTag[i] = 0;
+		c->dcacheTag[i] = DCACHE_NONE;
 	}
 }
 
 void cpuReset(struct N64* n) {
 	struct CPU* c = &n->cpu;
 	memset(c, 0, sizeof(*c));
-	memset(n->tlbCache, 0xFF, sizeof(n->tlbCache));
+	memset(c->dcacheTag, 0xFF, sizeof(c->dcacheTag));
+	cpuTlbChanged(n);
 	c->cop0[CP0_STATUS] = 0x34000000;
 	c->cop0[CP0_CONFIG] = 0x7006E463;
 	c->cop0[CP0_PRID] = 0x00000B22;
@@ -125,6 +126,30 @@ static bool interruptPending(struct N64* n) {
 }
 
 // Virtual to physical. Returns false after raising the exception.
+// A virtual page's entry in vpages when it isn't known: the page past RDRAM.
+static uint32_t vpageUnknown(uint32_t page) {
+	return ((RDRAM_SIZE >> 12) - page) << 12;
+}
+
+void cpuTlbChanged(struct N64* n) {
+	memset(n->tlbCache, 0xFF, sizeof(n->tlbCache));
+	if (n->vpageFillCount > VPAGE_FILLED) {
+		for (uint32_t page = 0; page < VPAGES; ++page) {
+			n->vpages[page] = n->vpages[VPAGES + page] = vpageUnknown(page);
+		}
+		// kseg0's RDRAM, which the TLB doesn't change.
+		for (uint32_t page = 0x80000; page < 0x80000 + (RDRAM_SIZE >> 12); ++page) {
+			n->vpages[page] = n->vpages[VPAGES + page] = 0x80000000u;
+		}
+	} else {
+		for (uint32_t i = 0; i < n->vpageFillCount; ++i) {
+			uint32_t page = n->vpageFilled[i];
+			n->vpages[page] = n->vpages[VPAGES + page] = vpageUnknown(page);
+		}
+	}
+	n->vpageFillCount = 0;
+}
+
 static bool translate(struct N64* n, uint64_t vaddr, bool store, uint32_t* paddr) {
 	struct CPU* c = &n->cpu;
 	uint32_t v = (uint32_t) vaddr;
@@ -158,6 +183,15 @@ static bool translate(struct N64* n, uint64_t vaddr, bool store, uint32_t* paddr
 		if ((*paddr & ~0xFFFu) < RDRAM_SIZE) {
 			uint32_t delta = (*paddr & ~0xFFFu) - (v & ~0xFFFu);
 			n->tlbCache[(v >> 12) & (TLB_CACHE_SIZE - 1)] = (struct TlbCacheEntry) { v >> 12, delta | ((lo >> 2) & 1) };
+			uint32_t page = v >> 12, writes = lo & 4 ? delta : vpageUnknown(page);
+			if (n->vpages[page] != delta || n->vpages[VPAGES + page] != writes) {
+				if (n->vpageFillCount < VPAGE_FILLED) {
+					n->vpageFilled[n->vpageFillCount] = page;
+				}
+				++n->vpageFillCount;
+				n->vpages[page] = delta;
+				n->vpages[VPAGES + page] = writes;
+			}
 		}
 		return true;
 	}
@@ -229,7 +263,7 @@ static void tlbWrite(struct N64* n, int i) {
 	e->entryLo[0] = (c->cop0[CP0_ENTRYLO0] & 0x3FFFFFFE) | g;
 	e->entryLo[1] = (c->cop0[CP0_ENTRYLO1] & 0x3FFFFFFE) | g;
 	++n->blockGen;
-	memset(n->tlbCache, 0xFF, sizeof(n->tlbCache));
+	cpuTlbChanged(n);
 }
 
 static uint32_t randomIndex(struct N64* n) {
@@ -283,7 +317,7 @@ static void cop0Write(struct N64* n, int r, uint64_t v) {
 	case CP0_ENTRYHI:
 		cop0[r] = v & 0xC00000FFFFFFE0FFull;
 		++n->blockGen;
-		memset(n->tlbCache, 0xFF, sizeof(n->tlbCache));
+		cpuTlbChanged(n);
 		return;
 	case CP0_PRID:
 	case CP0_RANDOM:

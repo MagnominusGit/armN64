@@ -51,6 +51,7 @@ struct CPU {
 	uint32_t fcr31;
 	bool exception;
 	// Timing: cache tags (only to cost misses; the data lives in memory) and cycles owed by this step.
+	// D-cache tags are line addresses, DCACHE_NONE for an empty line.
 	uint32_t icacheTag[512], dcacheTag[512];
 	bool dcacheDirty[512];
 	uint32_t stall;
@@ -132,7 +133,8 @@ struct RspBlock;
 // A virtual 4 KB page the TLB maps to a page inside RDRAM: the page number (all ones when empty),
 // and what to add to a virtual address in it for the physical one, with bit 0 set if stores may go
 // there.
-enum { TLB_CACHE_SIZE = 256 };
+enum { TLB_CACHE_SIZE = 256, VPAGES = 1 << 20, VPAGE_FILLED = 1024 };
+#define DCACHE_NONE 0xFFFFFFFFu
 struct TlbCacheEntry {
 	uint32_t tag, delta;
 };
@@ -177,7 +179,8 @@ struct N64 {
 	// Instruction blocks (blocks.c): one table of blocks per 4 KB RDRAM page that has any, and
 	// what each page holds (PAGE_*): a write to compiled code throws it away.
 	struct Block** blockPage[RDRAM_SIZE >> 12];
-	uint8_t pageFlags[RDRAM_SIZE >> 12];
+	// The entry past RDRAM has every flag set: virtual pages not yet looked up point there (vpages).
+	uint8_t pageFlags[(RDRAM_SIZE >> 12) + 1];
 	// One bit per RDRAM word that a block holds: writes elsewhere in a page with code keep its blocks.
 	uint8_t codeWords[RDRAM_SIZE >> 5];
 	uint32_t blockGen;
@@ -193,6 +196,12 @@ struct N64 {
 	struct JitEntry jitTable[JIT_TABLE_SIZE];
 	// Pages the TLB mapped recently, for compiled loads and stores; emptied when the TLB changes.
 	struct TlbCacheEntry tlbCache[TLB_CACHE_SIZE];
+	// What to add to an address in each 4 KB virtual page for the physical one: 1 << 20 entries for
+	// loads, then as many for stores. A page not looked up since the TLB last changed, or not
+	// writable for stores, adds up to the page past RDRAM. The pages filled in since are listed.
+	uint32_t* vpages;
+	uint32_t vpageFilled[VPAGE_FILLED];
+	uint32_t vpageFillCount;
 	// Compiled RSP blocks (rsp_jit_x64.c): every version compiled for each IMEM address, and the
 	// one for IMEM as it is; rspCodeGen changes with every write to IMEM.
 	bool useRspJit;
@@ -228,6 +237,8 @@ int n64Picture(struct N64*, uint32_t* out, int* width, int* height);
 
 // cpu.c
 void cpuReset(struct N64*);
+// The TLB or ASID changed: forgets the pages compiled loads and stores looked up.
+void cpuTlbChanged(struct N64*);
 void cpuStep(struct N64*);
 void cpuStepOp(struct N64*, uint32_t op, uint32_t paddr);
 bool cpuJitReady(struct N64*);

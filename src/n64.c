@@ -14,10 +14,16 @@ struct N64* n64Create(void) {
 		return NULL;
 	}
 	n->rdram = calloc(1, RDRAM_SIZE);
-	if (!n->rdram) {
+	n->vpages = malloc(2 * VPAGES * sizeof(*n->vpages));
+	if (!n->rdram || !n->vpages) {
+		free(n->rdram);
+		free(n->vpages);
 		free(n);
 		return NULL;
 	}
+	n->pageFlags[RDRAM_SIZE >> 12] = 0xFF;
+	n->vpageFillCount = VPAGE_FILLED + 1;
+	cpuTlbChanged(n);
 	return n;
 }
 
@@ -28,6 +34,7 @@ void n64Destroy(struct N64* n) {
 		rspJitFree(n);
 		rdpDestroy(n);
 		free(n->rdram);
+		free(n->vpages);
 		free(n->rom);
 		free(n);
 	}

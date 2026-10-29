@@ -677,8 +677,7 @@ static void emitMemory(struct Jit* j, struct Slow* slow) {
 	xShiftI(e, X_SHR, 4, R(RCX), 4);
 	xAluI(e, X_AND, 4, R(RCX), 511);
 	xMovRR(e, 4, RDX, RAX);
-	xShiftI(e, X_SHR, 4, R(RDX), 4);
-	xAluI(e, X_OR, 4, R(RDX), (int32_t) 0x80000000u);
+	xAluI(e, X_AND, 4, R(RDX), ~0xF);
 	xAluRM(e, X_CMP, 4, RDX, MI(R12, RCX, 4, (int32_t) offsetof(struct CPU, dcacheTag)));
 	struct Miss* m = &j->misses[j->missCount++];
 	m->site = xJcc(e, CC_NE, NULL);
