@@ -157,20 +157,25 @@ void rspCatchUp(struct N64* n) {
 	n->catchingUp = false;
 }
 
-// One video field: the CPU runs until the field ends, with the VI interrupt at the V_INTR line.
+// When the beam reaches the V_INTR line in the field from start (never if the field is shorter).
+static uint64_t viIntrAt(struct N64* n, uint64_t start) {
+	uint32_t lines = (n->vi.reg[6] & 0x3FF) + 1, line = n->vi.reg[3] & 0x3FF;
+	return line < lines ? start + (uint64_t) line * n->fieldCycles / lines : UINT64_MAX;
+}
+
+// One video field: the CPU runs until the field ends, with the VI interrupt when the beam passes
+// the V_INTR line (none in a field that doesn't reach it).
 // With a slice, the CPU runs ahead of the RSP by up to that many cycles (or to the next event),
 // and the RSP catches up then or when the CPU touches what it shares with it. Without one, the
 // two step in lockstep.
 void n64RunField(struct N64* n) {
-	uint64_t start = n->nextVi - n->fieldCycles;
-	uint32_t lines = (n->vi.reg[6] & 0x3FF) + 1;
-	uint64_t intrAt = start + (uint64_t) (n->vi.reg[3] & 0x3FF) * n->fieldCycles / lines;
-	bool raised = false;
+	uint64_t start = n->nextVi - n->fieldCycles, passed = start;
 	while (n->cycles < n->nextVi) {
-		if (!raised && n->cycles >= intrAt) {
+		uint64_t intrAt = viIntrAt(n, start);
+		if (intrAt >= passed && intrAt <= n->cycles) {
 			n64Interrupt(n, MI_VI, true);
-			raised = true;
 		}
+		passed = n->cycles + 1;
 		if (n->ai.queued && n->cycles >= n->ai.endsAt) {
 			aiUpdate(n);
 		}
@@ -197,7 +202,7 @@ void n64RunField(struct N64* n) {
 		uint64_t until = n->nextVi;
 		if (n->slice) {
 			until = n->cycles + n->slice < until ? n->cycles + n->slice : until;
-			if (!raised && intrAt < until) {
+			if (intrAt > n->cycles && intrAt < until) {
 				until = intrAt;
 			}
 			n->eventAt = until;
@@ -218,7 +223,8 @@ void n64RunField(struct N64* n) {
 		} while (n->slice && n->cycles < n->eventAt);
 		rspCatchUp(n);
 	}
-	if (!raised) {
+	uint64_t intrAt = viIntrAt(n, start);
+	if (intrAt >= passed && intrAt < n->nextVi) {
 		n64Interrupt(n, MI_VI, true);
 	}
 	n->nextVi += n->fieldCycles;
