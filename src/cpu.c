@@ -255,13 +255,17 @@ static void branchLikely(struct CPU* c, bool taken, uint64_t target) {
 static void tlbWrite(struct N64* n, int i) {
 	struct CPU* c = &n->cpu;
 	struct TLBEntry* e = &c->tlb[i & 31];
+	struct TLBEntry old = *e;
 	e->pageMask = c->cop0[CP0_PAGEMASK] & 0x01FFE000;
 	e->entryHi = c->cop0[CP0_ENTRYHI] & ~(uint64_t) e->pageMask & ~0x1F00ull;
 	uint64_t g = c->cop0[CP0_ENTRYLO0] & c->cop0[CP0_ENTRYLO1] & 1;
 	e->entryLo[0] = (c->cop0[CP0_ENTRYLO0] & 0x3FFFFFFE) | g;
 	e->entryLo[1] = (c->cop0[CP0_ENTRYLO1] & 0x3FFFFFFE) | g;
-	++n->blockGen;
-	cpuTlbChanged(n);
+	// Writing an entry as it was maps nothing differently.
+	if (old.pageMask != e->pageMask || old.entryHi != e->entryHi || old.entryLo[0] != e->entryLo[0] || old.entryLo[1] != e->entryLo[1]) {
+		++n->blockGen;
+		cpuTlbChanged(n);
+	}
 }
 
 static uint32_t randomIndex(struct N64* n) {
@@ -312,11 +316,16 @@ static void cop0Write(struct N64* n, int r, uint64_t v) {
 	case CP0_PAGEMASK:
 		cop0[r] = v & 0x01FFE000;
 		return;
-	case CP0_ENTRYHI:
+	case CP0_ENTRYHI: {
+		// Only the ASID takes part in translating.
+		uint64_t asid = cop0[r] & 0xFF;
 		cop0[r] = v & 0xC00000FFFFFFE0FFull;
-		++n->blockGen;
-		cpuTlbChanged(n);
+		if ((cop0[r] & 0xFF) != asid) {
+			++n->blockGen;
+			cpuTlbChanged(n);
+		}
 		return;
+	}
 	case CP0_PRID:
 	case CP0_RANDOM:
 	case CP0_BADVADDR:
