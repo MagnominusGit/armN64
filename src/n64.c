@@ -244,6 +244,97 @@ void n64RunField(struct N64* n) {
 	++n->fields;
 }
 
+// One framebuffer pixel for the VI: 8-bit channels and its coverage (from the hidden bits for
+// 16-bit pixels, the top alpha bits for 32-bit ones).
+struct ViPixel {
+	int r, g, b, cvg;
+};
+
+static struct ViPixel viRead(struct N64* n, bool wide, uint32_t origin, int64_t i) {
+	if (wide) {
+		const uint8_t* p = &n->rdram[(origin + (uint32_t) i * 4) & (RDRAM_SIZE - 4)];
+		return (struct ViPixel) { p[0], p[1], p[2], (p[3] >> 5) & 7 };
+	}
+	uint32_t a = (origin + (uint32_t) i * 2) & (RDRAM_SIZE - 2);
+	uint16_t px = (uint16_t) (n->rdram[a] << 8 | n->rdram[a + 1]);
+	int r = (px >> 11) & 31, g = (px >> 6) & 31, b = (px >> 1) & 31;
+	return (struct ViPixel) { r << 3 | r >> 2, g << 3 | g >> 2, b << 3 | b >> 2, (px & 1) << 2 | n->hidden[a >> 1] };
+}
+
+// The second largest and second smallest of a few values (the largest and smallest when they
+// repeat), as the VI's edge filter finds them.
+static void penumbra(const int* v, int count, int* low, int* high) {
+	int posMax = 0, posMin = 0, penMax = v[0], penMin = v[0];
+	for (int i = 1; i < count; ++i) {
+		if (v[i] > v[posMax]) {
+			penMax = v[posMax];
+			posMax = i;
+		} else if (v[i] < v[posMin]) {
+			penMin = v[posMin];
+			posMin = i;
+		}
+	}
+	if (penMax != v[posMax]) {
+		for (int i = posMax + 1; i < count; ++i) {
+			penMax = v[i] > penMax ? v[i] : penMax;
+		}
+	}
+	if (penMin != v[posMin]) {
+		for (int i = posMin + 1; i < count; ++i) {
+			penMin = v[i] < penMin ? v[i] : penMin;
+		}
+	}
+	*low = penMin;
+	*high = penMax;
+}
+
+// The VI's fetch of a pixel: with antialiasing, a partly covered pixel moves toward the colour the
+// fully covered pixels around it agree on, by the coverage it lacks; with the dither filter, a fully
+// covered one moves a step toward each of its eight neighbours.
+static struct ViPixel viFetch(struct N64* n, bool wide, uint32_t origin, int64_t i, int64_t stride, bool aa, bool dither) {
+	struct ViPixel c = viRead(n, wide, origin, i);
+	if (!aa) {
+		c.cvg = 7;
+	}
+	int* ch[3] = { &c.r, &c.g, &c.b };
+	if (c.cvg == 7) {
+		if (dither) {
+			static const int8_t dx[8] = { -1, 0, 1, -1, 0, 1, -1, 1 }, dy[8] = { -1, -1, -1, 1, 1, 1, 0, 0 };
+			int base[3] = { c.r >> 3, c.g >> 3, c.b >> 3 };
+			for (int k = 0; k < 8; ++k) {
+				struct ViPixel o = viRead(n, wide, origin, i + dy[k] * stride + dx[k]);
+				int nb[3] = { o.r >> 3, o.g >> 3, o.b >> 3 };
+				for (int j = 0; j < 3; ++j) {
+					*ch[j] += (base[j] < nb[j]) - (base[j] > nb[j]);
+				}
+			}
+		}
+		return c;
+	}
+	int values[3][7] = { { c.r }, { c.g }, { c.b } }, count = 1;
+	const int64_t around[6] = { -stride - 1, -stride + 1, -2, 2, stride - 1, stride + 1 };
+	for (int k = 0; k < 6; ++k) {
+		struct ViPixel o = viRead(n, wide, origin, i + around[k]);
+		if (o.cvg == 7) {
+			values[0][count] = o.r, values[1][count] = o.g, values[2][count] = o.b;
+			++count;
+		}
+	}
+	for (int j = 0; j < 3; ++j) {
+		int low, high;
+		penumbra(values[j], count, &low, &high);
+		int col = low + high - (*ch[j] << 1);
+		*ch[j] = ((((col * (7 - c.cvg)) + 4) >> 3) + *ch[j]) & 255;
+	}
+	return c;
+}
+
+// The divot filter: each channel the median of a pixel and its neighbours, unless all three are
+// fully covered.
+static int median3(int a, int b, int c) {
+	return a > b ? (b > c ? b : a > c ? c : a) : (a > c ? a : b > c ? c : b);
+}
+
 // The picture the VI scans out, scaled by its X and Y scale registers, as 0x00RRGGBB.
 int n64Picture(struct N64* n, uint32_t* out, int* width, int* height) {
 	rdpWait(n);
@@ -282,24 +373,26 @@ int n64Picture(struct N64* n, uint32_t* out, int* width, int* height) {
 		}
 		gamma[i] = (uint8_t) (s > 255 ? 255 : s);
 	}
-	bool gammaOn = v[0] & 8;
+	bool gammaOn = v[0] & 8, divot = v[0] & 16, dither = v[0] & 0x10000, aa = ((v[0] >> 8) & 3) <= 1, wide = type == 3;
+	struct ViPixel line[642];
 	for (int y = 0; y < h; ++y) {
-		uint32_t row = origin + (uint32_t) y * stride * (type == 3 ? 4 : 2);
+		int64_t row = (int64_t) y * stride;
+		for (int x = -1; x <= w; ++x) {
+			line[x + 1] = viFetch(n, wide, origin, row + x, stride, aa, dither);
+		}
 		for (int x = 0; x < w; ++x) {
-			uint32_t c;
-			if (type == 3) {
-				const uint8_t* p = &n->rdram[(row + x * 4) & (RDRAM_SIZE - 4)];
-				c = (uint32_t) p[0] << 16 | (uint32_t) p[1] << 8 | p[2];
-			} else {
-				const uint8_t* p = &n->rdram[(row + x * 2) & (RDRAM_SIZE - 2)];
-				uint16_t px = (uint16_t) (p[0] << 8 | p[1]);
-				uint32_t r = (px >> 11) & 31, g = (px >> 6) & 31, b = (px >> 1) & 31;
-				c = (r << 3 | r >> 2) << 16 | (g << 3 | g >> 2) << 8 | (b << 3 | b >> 2);
+			struct ViPixel c = line[x + 1];
+			if (divot) {
+				const struct ViPixel* l = &line[x], * r = &line[x + 2];
+				if ((c.cvg & l->cvg & r->cvg) != 7) {
+					c.r = median3(l->r, c.r, r->r), c.g = median3(l->g, c.g, r->g), c.b = median3(l->b, c.b, r->b);
+				}
 			}
+			uint32_t px = (uint32_t) c.r << 16 | (uint32_t) c.g << 8 | (uint32_t) c.b;
 			if (gammaOn) {
-				c = (uint32_t) gamma[c >> 16] << 16 | (uint32_t) gamma[(c >> 8) & 255] << 8 | gamma[c & 255];
+				px = (uint32_t) gamma[c.r] << 16 | (uint32_t) gamma[c.g] << 8 | gamma[c.b];
 			}
-			out[y * w + x] = c;
+			out[y * w + x] = px;
 		}
 	}
 	*width = w;
