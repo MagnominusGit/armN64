@@ -16,7 +16,7 @@ static void spDma(struct N64* n, uint32_t lenReg, bool toRdram) {
 	uint32_t skip = lenReg >> 20;
 	uint32_t mem = n->sp.memAddr & 0x1FF8;
 	uint32_t base = mem & 0x1000;
-	uint32_t dram = n->sp.dramAddr & 0xFFFFF8;
+	uint32_t dram = n->sp.dramAddr & (n->compat ? 0xFFFFFF : 0xFFFFF8);
 	for (uint32_t row = 0; row < count; ++row) {
 		if (toRdram) {
 			n64RdramWrite(n, dram, len);
@@ -453,7 +453,7 @@ void busWrite32(struct N64* n, uint32_t addr, uint32_t v) {
 			n->sp.memAddr = v & 0x1FF8;
 			break;
 		case 0x04:
-			n->sp.dramAddr = v & 0xFFFFF8;
+			n->sp.dramAddr = v & (n->compat ? 0xFFFFFF : 0xFFFFF8);
 			break;
 		case 0x08:
 			spDma(n, v, false);

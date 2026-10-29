@@ -215,7 +215,8 @@ struct N64 {
 	// N64_ACCURACY: lle-accurate (the default) is the hardware. lle-compatible is for hacks made on
 	// emulators: RDRAM starts zeroed, misaligned CPU accesses align down instead of raising address
 	// errors, unmapped null-pointer accesses read zero, PI DMA copies between the exact addresses
-	// and takes a quarter cycle a byte, and a blanked VI window still shows the picture. hle adds
+	// and takes a quarter cycle a byte, SP DMA keeps the RDRAM address's low bits, and a blanked VI
+	// window still shows the picture. hle adds
 	// high-level graphics (hle.c) to that. compat is true for both.
 	int accuracy;
 	bool compat;
