@@ -100,6 +100,18 @@ uint32_t blockPollPass(const uint32_t* ops, uint32_t count, uint32_t vaddr) {
 	return load && !((readFirst & written) & ~1ull) ? count : 0;
 }
 
+// Clears table entries: all, those for mapped code, or those for one RDRAM page.
+void jitTableClear(struct N64* n, bool mappedOnly, int page) {
+	for (int i = 0; i < JIT_TABLE_SIZE; ++i) {
+		struct JitEntry* je = &n->jitTable[i];
+		if ((mappedOnly && je->genAt == &n->steadyGen) || (page >= 0 && je->page != (uint32_t) page)) {
+			continue;
+		}
+		// No pc matches an odd address.
+		je->vaddr = 1;
+	}
+}
+
 void blocksInvalidatePage(struct N64* n, uint32_t page) {
 	struct Block** t = n->blockPage[page];
 	if (t) {
@@ -111,6 +123,7 @@ void blocksInvalidatePage(struct N64* n, uint32_t page) {
 	}
 	n->pageFlags[page] &= ~PAGE_CODE;
 	memset(&n->codeWords[page << 7], 0, 128);
+	jitTableClear(n, false, (int) page);
 	++n->blockGen;
 }
 
@@ -121,6 +134,7 @@ void blocksFree(struct N64* n) {
 		}
 	}
 	jitReset(n);
+	jitTableClear(n, false, -1);
 }
 
 // From paddr to a branch's delay slot, the end of the page or BLOCK_MAX instructions.
@@ -167,7 +181,7 @@ void blocksRun(struct N64* n) {
 	do {
 		uint32_t v = (uint32_t) c->pc;
 		struct JitEntry* je = &n->jitTable[(v >> 2) & (JIT_TABLE_SIZE - 1)];
-		if (je->vaddr == v && je->gen == n->blockGen && c->pc == (uint64_t) (int64_t) (int32_t) v && !c->nextInDelay) {
+		if (je->vaddr == v && *je->genAt == je->gen && c->pc == (uint64_t) (int64_t) (int32_t) v && !c->nextInDelay) {
 			jitRun(n, je->code);
 			continue;
 		}
@@ -210,7 +224,8 @@ void blocksRun(struct N64* n) {
 			}
 		}
 		if (b->code) {
-			*je = (struct JitEntry) { v, n->blockGen, b->code };
+			const uint32_t* genAt = mapped ? &n->vpageGen[v >> 12] : &n->steadyGen;
+			*je = (struct JitEntry) { v, *genAt, genAt, b->code, page, 0 };
 			jitRun(n, b->code);
 			continue;
 		}

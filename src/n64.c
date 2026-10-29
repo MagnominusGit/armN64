@@ -19,10 +19,12 @@ struct N64* n64Create(void) {
 	n->rdram = calloc(1, RDRAM_SIZE);
 	n->hidden = calloc(1, RDRAM_SIZE / 2);
 	n->vpages = malloc(2 * VPAGES * sizeof(*n->vpages));
-	if (!n->rdram || !n->hidden || !n->vpages) {
+	n->vpageGen = calloc(VPAGES, sizeof(*n->vpageGen));
+	if (!n->rdram || !n->hidden || !n->vpages || !n->vpageGen) {
 		free(n->rdram);
 		free(n->hidden);
 		free(n->vpages);
+		free(n->vpageGen);
 		free(n);
 		return NULL;
 	}
@@ -36,6 +38,7 @@ struct N64* n64Create(void) {
 		put32(&n->rdram[i], x);
 	}
 	n->pageFlags[RDRAM_SIZE >> 12] = 0xFF;
+	jitTableClear(n, false, -1);
 	n->vpageFillCount = VPAGE_FILLED + 1;
 	cpuTlbChanged(n);
 	return n;
@@ -52,6 +55,7 @@ void n64Destroy(struct N64* n) {
 		free(n->rdram);
 		free(n->hidden);
 		free(n->vpages);
+		free(n->vpageGen);
 		ddFree(n);
 		free(n->rom);
 		free(n);
