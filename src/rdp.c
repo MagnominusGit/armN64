@@ -84,7 +84,7 @@ struct RDP {
 	// otherModes taken apart (setupModes): the cycle type, depth and alpha tests, and the blender's
 	// P, A, M and B inputs for each cycle.
 	int cycleType, zMode;
-	bool zCompare, zUpdate, zPrim, alphaCompare, cvgAlpha, forceBlend;
+	bool zCompare, zUpdate, zPrim, alphaCompare, cvgAlpha, cvgTimesAlpha, forceBlend;
 	uint8_t blendSel[2][4];
 	// The rows this renderer draws: y % rowCount == rowIndex (rowCount 0: none).
 	int rowIndex, rowCount;
@@ -555,6 +555,7 @@ static void setupModes(struct RDP* r) {
 	r->zMode = (m >> 10) & 3;
 	r->alphaCompare = m & 1;
 	r->cvgAlpha = (m >> 13) & 1;
+	r->cvgTimesAlpha = (m >> 12) & 1;
 	r->forceBlend = (m >> 14) & 1;
 	for (int cycle = 0; cycle < 2; ++cycle) {
 		for (int i = 0; i < 4; ++i) {
@@ -644,11 +645,16 @@ static void shadePixel(struct N64* n, struct RDP* r, int x, int y, struct Pixel*
 	r->lastCombined = c;
 	r->lastPos = r->seq << 24 | (uint64_t) y << 12 | (uint32_t) x;
 	c = (struct Color) { clamp9(c.r), clamp9(c.g), clamp9(c.b), clamp9(c.a) };
-	if (r->alphaCompare && c.a < r->blend.a) {
-		return;
+	// With alpha as coverage, alpha becomes the coverage (full: partial edges aren't modelled), or
+	// with coverage times alpha the 3-bit coverage it leaves; a pixel with none isn't written.
+	if (r->cvgAlpha) {
+		if (!r->cvgTimesAlpha) {
+			c.a = 255;
+		} else if (c.a < 32) {
+			return;
+		}
 	}
-	// With alpha as coverage, alpha becomes the 3-bit coverage; a pixel with none isn't written.
-	if (r->cvgAlpha && c.a < 32) {
+	if (r->alphaCompare && c.a < r->blend.a) {
 		return;
 	}
 	struct Color memory = readPixel(n, r, x, y);

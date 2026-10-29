@@ -489,10 +489,14 @@ void shadePixel(int x, int y) {
 	lastCombined = c;
 	shaded = true;
 	c = ivec4(clamp9(c.r), clamp9(c.g), clamp9(c.b), clamp9(c.a));
-	if ((omLo & 1u) != 0u && c.a < gBlend.a) {
-		return;
+	if (((omLo >> 13) & 1u) != 0u) {
+		if (((omLo >> 12) & 1u) == 0u) {
+			c.a = 255;
+		} else if (c.a < 32) {
+			return;
+		}
 	}
-	if (((omLo >> 13) & 1u) != 0u && c.a < 32) {
+	if ((omLo & 1u) != 0u && c.a < gBlend.a) {
 		return;
 	}
 	ivec4 memory = readPixel(x, y);
