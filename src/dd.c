@@ -548,10 +548,11 @@ bool ddPresent(const struct N64* n) {
 // as the CPU and the PI see them. The registers are 16 bits, in a word's upper half.
 uint32_t ddRead32(struct N64* n, uint32_t addr) {
 	struct DD* d = &n->dd;
-	if (!d->ipl) {
-		return 0;
-	}
 	addr &= ~3u;
+	// No drive: open bus, the address's low half in both halves.
+	if (!d->ipl) {
+		return (addr & 0xFFFF) * 0x10001u;
+	}
 	if (addr >= 0x06000000) {
 		return addr < 0x06400000 ? be32(&d->ipl[addr - 0x06000000]) : 0;
 	}
