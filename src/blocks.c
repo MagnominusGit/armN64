@@ -1,6 +1,7 @@
 #include "n64.h"
 
 #include <stdlib.h>
+#include <string.h>
 
 // Blocks of instructions fetched once from cached RDRAM code, run by the interpreter's own step
 // (cpuStepOp) without fetching each instruction again. A write to a page throws away its blocks.
@@ -48,6 +49,7 @@ void blocksInvalidatePage(struct N64* n, uint32_t page) {
 		n->blockPage[page] = NULL;
 	}
 	n->pageFlags[page] &= ~PAGE_CODE;
+	memset(&n->codeWords[page << 7], 0, 128);
 	++n->blockGen;
 }
 
@@ -142,6 +144,9 @@ void blocksRun(struct N64* n) {
 			}
 			t[(paddr >> 2) & (PAGE_WORDS - 1)] = b;
 			n->pageFlags[page] |= PAGE_CODE;
+			for (uint32_t w = paddr >> 2; w < (paddr >> 2) + b->count; ++w) {
+				n->codeWords[w >> 3] |= (uint8_t) (1 << (w & 7));
+			}
 		}
 		if (b->code) {
 			*je = (struct JitEntry) { v, n->blockGen, b->code };

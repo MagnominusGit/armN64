@@ -177,6 +177,8 @@ struct N64 {
 	// what each page holds (PAGE_*): a write to compiled code throws it away.
 	struct Block** blockPage[RDRAM_SIZE >> 12];
 	uint8_t pageFlags[RDRAM_SIZE >> 12];
+	// One bit per RDRAM word that a block holds: writes elsewhere in a page with code keep its blocks.
+	uint8_t codeWords[RDRAM_SIZE >> 5];
 	uint32_t blockGen;
 	bool useBlocks;
 	// Compiled blocks (jit_x64.c): the code arena, how far compiled code may run, and the code
@@ -265,7 +267,21 @@ void jitFree(struct N64*);
 // rdp.c: waits for RDP commands still being drawn by other threads.
 void rdpWait(struct N64*);
 
-// RDRAM [addr, addr + len) is about to be written: throws away code there, and waits for RDP
+// Whether any word of RDRAM [addr, addr + len) inside page p is part of a block.
+static inline bool n64HoldsCode(struct N64* n, uint32_t p, uint32_t addr, uint32_t len) {
+	uint32_t first = addr & (RDRAM_SIZE - 1), last = (addr + len - 1) & (RDRAM_SIZE - 1);
+	uint32_t from = p << 10, to = from + 1023;
+	uint32_t w0 = first >> 2 > from && first >> 2 <= to ? first >> 2 : from;
+	uint32_t w1 = last >> 2 >= from && last >> 2 < to ? last >> 2 : to;
+	for (uint32_t w = w0; w <= w1; ++w) {
+		if (n->codeWords[w >> 3] & (1 << (w & 7))) {
+			return true;
+		}
+	}
+	return false;
+}
+
+// RDRAM [addr, addr + len) is about to be written: throws away blocks there, and waits for RDP
 // commands that draw there or read it.
 static inline void n64RdramWrite(struct N64* n, uint32_t addr, uint32_t len) {
 	uint32_t first = (addr & (RDRAM_SIZE - 1)) >> 12, last = ((addr + len - 1) & (RDRAM_SIZE - 1)) >> 12;
@@ -273,7 +289,7 @@ static inline void n64RdramWrite(struct N64* n, uint32_t addr, uint32_t len) {
 		if (n->pageFlags[p] & PAGE_RDP) {
 			rdpWait(n);
 		}
-		if (n->pageFlags[p] & PAGE_CODE) {
+		if ((n->pageFlags[p] & PAGE_CODE) && n64HoldsCode(n, p, addr, len)) {
 			blocksInvalidatePage(n, p);
 		}
 		if (p == last) {
