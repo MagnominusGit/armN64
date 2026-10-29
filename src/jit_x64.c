@@ -624,13 +624,11 @@ static void emitMemory(struct Jit* j, struct Slow* slow) {
 		needCop1(j);
 	}
 
-	xLoad(e, 8, RAX, gpr(rs));
+	// Like the interpreter, the low 32 bits of the address.
+	xLoad(e, 4, RAX, gpr(rs));
 	if ((int16_t) op) {
-		xAluI(e, X_ADD, 8, R(RAX), (int16_t) op);
+		xAluI(e, X_ADD, 4, R(RAX), (int16_t) op);
 	}
-	xMovsxd(e, RCX, R(RAX));
-	xAluRR(e, X_CMP, 8, R(RCX), RAX);
-	slow->site[slow->sites++] = xJcc(e, CC_NE, NULL);
 	xMovRR(e, 4, R8, RAX);
 	xMovRR(e, 4, RCX, RAX);
 	xAluI(e, X_AND, 4, R(RCX), (int32_t) (0xFF800000u | (size - 1)));

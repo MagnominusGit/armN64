@@ -746,15 +746,16 @@ static void fprAddress(struct Emitter* e, int ft, int size) {
 	if (!(ft & 1)) {
 		return;
 	}
-	aAddImmX(e, 6, CPU, CPU_OFF(fpr) + 8 * (ft & ~1) + (size == 4 ? 4 : 0));
-	aLdr(e, 7, CPU, CPU_OFF(cop0) + 8 * CP0_STATUS);
-	aLogicImm(e, A_ANDS_IMM, ZR, 7, 1u << 26);
-	aCselX(e, 5, 6, 5, C_EQ);
+	aAddImmX(e, 7, CPU, CPU_OFF(fpr) + 8 * (ft & ~1) + (size == 4 ? 4 : 0));
+	aLdr(e, IP, CPU, CPU_OFF(cop0) + 8 * CP0_STATUS);
+	aLogicImm(e, A_ANDS_IMM, ZR, IP, 1u << 26);
+	aCselX(e, 5, 7, 5, C_EQ);
 }
 
 // A load or store to cached RDRAM, through kseg0 or a page in the TLB cache, with dataTiming's
-// D-cache check; anything else jumps to the slow path before any change. w0 ends up the physical
-// address, w8 the virtual one, w1 the D-cache line and w2 its tag.
+// D-cache check; anything else jumps to the slow path before any change. Like the interpreter, it
+// takes the low 32 bits of the address: w0 the virtual address, w6 the physical one, w1 the D-cache
+// line and w2 its tag.
 static void emitMemory(struct Jit* j, struct Slow* slow) {
 	struct Emitter* e = &j->e;
 	uint32_t op = slow->op;
@@ -762,24 +763,25 @@ static void emitMemory(struct Jit* j, struct Slow* slow) {
 	int code = op >> 26;
 	bool fpu = code == 0x31 || code == 0x35 || code == 0x39 || code == 0x3D;
 	bool isStore = code >= 0x28 && code != 0x37 && code != 0x31 && code != 0x35;
+	int32_t offset = (int16_t) op;
 	if (fpu) {
 		needCop1(j);
 	}
 
 	int base = readReg(j, rs);
-	if ((int16_t) op) {
-		movConst(e, 1, (uint64_t) (int64_t) (int16_t) op);
-		aDp(e, A_ADD | W64, 0, base, 1, S_LSL, 0);
+	if (base == ZR) {
+		aMovImm(e, 0, (uint32_t) offset);
+	} else if (offset >= 0 && offset < 4096) {
+		aDpImm(e, A_ADD_IMM, 0, base, (unsigned) offset);
+	} else if (offset < 0 && offset > -4096) {
+		aDpImm(e, A_SUB_IMM, 0, base, (unsigned) -offset);
 	} else {
-		movReg(e, 0, base);
+		aMovImm(e, 1, (uint32_t) offset);
+		aDp(e, A_ADD, 0, base, 1, S_LSL, 0);
 	}
-	aSxtw(e, 1, 0);
-	aDp(e, A_SUBS | W64, ZR, 1, 0, S_LSL, 0);
-	slow->site[slow->sites++] = aBcond(e, C_NE, NULL);
-	aMov(e, 8, 0);
-	// kseg0 and aligned: then w1 is the physical address.
-	aLogicImm(e, A_EOR_IMM, 1, 0, 0x80000000u);
-	aLogicImm(e, A_ANDS_IMM, ZR, 1, 0xFF800000u | (size - 1));
+	// kseg0 and aligned: then w6 is the physical address.
+	aLogicImm(e, A_EOR_IMM, 6, 0, 0x80000000u);
+	aLogicImm(e, A_ANDS_IMM, ZR, 6, 0xFF800000u | (size - 1));
 	uint8_t* kseg0 = aBcond(e, C_EQ, NULL);
 
 	// Mapped: the physical page from the TLB cache.
@@ -797,22 +799,19 @@ static void emitMemory(struct Jit* j, struct Slow* slow) {
 		slow->site[slow->sites++] = aTbz(e, 5, 0, NULL);
 	}
 	andConst(e, 5, 5, ~0xFFFu);
-	aDp(e, A_ADD, 0, 0, 5, S_LSL, 0);
-	uint8_t* mapped = aB(e, NULL);
+	aDp(e, A_ADD, 6, 0, 5, S_LSL, 0);
 
 	patchHere(e, kseg0);
-	aMov(e, 0, 1);
-	patchHere(e, mapped);
 	// Stores go slow on any flag (code, RDP), loads on pages the RDP may still be drawing to.
 	if (isStore || j->rdpThreads) {
-		aLsrImm(e, 1, 0, 12);
+		aLsrImm(e, 1, 6, 12);
 		aLdst(e, L_LDRB, 1, PAGES, 1, L_UXTW);
 		slow->site[slow->sites++] = isStore ? aCbnz(e, 1, NULL) : aTbnz(e, 1, 1, NULL);
 	}
 
 	// The line index from the virtual address, the tag from the physical one.
-	aUbfx(e, 1, 8, 4, 9);
-	aLsrImm(e, 2, 0, 4);
+	aUbfx(e, 1, 0, 4, 9);
+	aLsrImm(e, 2, 6, 4);
 	aLogicImm(e, A_ORR_IMM, 2, 2, 0x80000000u);
 	aLdst(e, L_LDR, 3, DTAG, 1, L_UXTW | 0x1000);
 	aDp(e, A_SUBS, ZR, 3, 2, S_LSL, 0);
@@ -828,25 +827,25 @@ static void emitMemory(struct Jit* j, struct Slow* slow) {
 		int t = readReg(j, rt);
 		switch (op >> 26) {
 		case 0x28:
-			aLdst(e, L_STRB, t, RAM, 0, L_UXTW);
+			aLdst(e, L_STRB, t, RAM, 6, L_UXTW);
 			return;
 		case 0x29:
 			aRev16(e, 4, t);
-			aLdst(e, L_STRH, 4, RAM, 0, L_UXTW);
+			aLdst(e, L_STRH, 4, RAM, 6, L_UXTW);
 			return;
 		case 0x2B:
 			aRev(e, 4, t);
-			aLdst(e, L_STR, 4, RAM, 0, L_UXTW);
+			aLdst(e, L_STR, 4, RAM, 6, L_UXTW);
 			return;
 		default:
 			aRevX(e, 4, t);
-			aLdst(e, L_STRX, 4, RAM, 0, L_UXTW);
+			aLdst(e, L_STRX, 4, RAM, 6, L_UXTW);
 			return;
 		}
 	}
 	switch (op >> 26) {
 	case 0x31: case 0x35:
-		aLdst(e, size == 4 ? L_LDR : L_LDRX, 4, RAM, 0, L_UXTW);
+		aLdst(e, size == 4 ? L_LDR : L_LDRX, 4, RAM, 6, L_UXTW);
 		if (size == 4) {
 			aRev(e, 4, 4);
 		} else {
@@ -868,34 +867,34 @@ static void emitMemory(struct Jit* j, struct Slow* slow) {
 			aLdrX(e, 4, 5, 0);
 			aRevX(e, 4, 4);
 		}
-		aLdst(e, size == 4 ? L_STR : L_STRX, 4, RAM, 0, L_UXTW);
+		aLdst(e, size == 4 ? L_STR : L_STRX, 4, RAM, 6, L_UXTW);
 		return;
 	}
 	int d = writeReg(j, rt);
 	switch (op >> 26) {
 	case 0x20:
-		aLdst(e, L_LDRB, d, RAM, 0, L_UXTW);
+		aLdst(e, L_LDRB, d, RAM, 6, L_UXTW);
 		aSxtbX(e, d, d);
 		break;
 	case 0x24:
-		aLdst(e, L_LDRB, d, RAM, 0, L_UXTW);
+		aLdst(e, L_LDRB, d, RAM, 6, L_UXTW);
 		break;
 	case 0x21: case 0x25:
-		aLdst(e, L_LDRH, d, RAM, 0, L_UXTW);
+		aLdst(e, L_LDRH, d, RAM, 6, L_UXTW);
 		aRev16(e, d, d);
 		if (op >> 26 == 0x21) {
 			aSxthX(e, d, d);
 		}
 		break;
 	case 0x23: case 0x27:
-		aLdst(e, L_LDR, d, RAM, 0, L_UXTW);
+		aLdst(e, L_LDR, d, RAM, 6, L_UXTW);
 		aRev(e, d, d);
 		if (op >> 26 == 0x23) {
 			aSxtw(e, d, d);
 		}
 		break;
 	default:
-		aLdst(e, L_LDRX, d, RAM, 0, L_UXTW);
+		aLdst(e, L_LDRX, d, RAM, 6, L_UXTW);
 		aRevX(e, d, d);
 		break;
 	}
