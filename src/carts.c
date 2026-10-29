@@ -1,6 +1,10 @@
 // Cartridges whose save chip is a 16 Kbit EEPROM, by the two CRCs at 0x10 in the header (every other
-// cartridge answers as a 4 Kbit EEPROM). The list is from mupen64plus's ROM database (GPLv2).
+// cartridge answers as a 4 Kbit EEPROM). The list is from mupen64plus's ROM database (GPLv2); the
+// game IDs (header 0x3B) are those of the listed dumps, so revisions, betas and kiosk/LodgeNet
+// versions of the same games answer the same.
 #include "n64.h"
+
+#include <string.h>
 
 static const uint64_t eeprom16k[] = {
 	0x975B7845A2505C18ull, // 77a Special Edition by Count0 (PD)
@@ -47,7 +51,17 @@ static const uint64_t eeprom16k[] = {
 	0xD3F97D496924135Bull, // Yoshi's Story (E) (M3) [!]
 };
 
+static const char gameIds16k[][4] = {
+	"N3D", "N8M", "NB7", "NCW", "ND2", "NDO", "NDP", "NEP", "NEV", "NFU", "NM8",
+	"NMV", "NMX", "NNB", "NNX", "NPD", "NRZ", "NUB", "NYS",
+};
+
 bool cartEeprom16k(const uint8_t* rom) {
+	for (size_t i = 0; i < sizeof(gameIds16k) / sizeof(*gameIds16k); ++i) {
+		if (!memcmp(rom + 0x3B, gameIds16k[i], 3)) {
+			return true;
+		}
+	}
 	uint64_t id = (uint64_t) be32(rom + 0x10) << 32 | be32(rom + 0x14);
 	for (size_t i = 0; i < sizeof(eeprom16k) / sizeof(*eeprom16k); ++i) {
 		if (eeprom16k[i] == id) {
