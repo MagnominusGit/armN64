@@ -281,60 +281,79 @@ static uint8_t tmemByte(struct RDP* r, uint32_t addr) {
 	return r->tmem[addr & 0xFFF];
 }
 
-static inline __attribute__((always_inline)) struct Color tlutColor(struct RDP* r, int index) {
+static inline __attribute__((always_inline)) struct Color tlutColor(struct RDP* r, int index, bool ia) {
 	uint32_t a = 0x800 + index * 8;
 	uint16_t v = (uint16_t) (tmemByte(r, a) << 8 | tmemByte(r, a + 1));
-	if ((r->otherModes >> 46) & 1) {
+	if (ia) {
 		return (struct Color) { v >> 8, v >> 8, v >> 8, v & 255 };
 	}
 	int cr = (v >> 11) & 31, cg = (v >> 6) & 31, cb = (v >> 1) & 31;
 	return (struct Color) { cr << 3 | cr >> 2, cg << 3 | cg >> 2, cb << 3 | cb >> 2, v & 1 ? 255 : 0 };
 }
 
-static inline __attribute__((always_inline)) struct Color texel(struct RDP* r, struct Tile* t, int s, int tt) {
+// What a tile's texels are, from its size and format and the TLUT modes: each kind has its own
+// sampler, so the fetches inside one don't test them again.
+enum TexelKind {
+	TK_I4, TK_IA4, TK_CI4, TK_CI4_IA, TK_I8, TK_IA8, TK_CI8, TK_CI8_IA,
+	TK_YUV16, TK_IA16, TK_CI16, TK_CI16_IA, TK_RGBA16, TK_RGBA32,
+};
+
+static enum TexelKind texelKind(const struct RDP* r, const struct Tile* t) {
+	bool tlut = (r->otherModes >> 47) & 1, ia = (r->otherModes >> 46) & 1;
+	switch (t->size) {
+	case 0:
+		return t->format == 2 || tlut ? (ia ? TK_CI4_IA : TK_CI4) : t->format == 3 ? TK_IA4 : TK_I4;
+	case 1:
+		return t->format == 2 || tlut ? (ia ? TK_CI8_IA : TK_CI8) : t->format == 3 ? TK_IA8 : TK_I8;
+	case 2:
+		return t->format == 1 ? TK_YUV16 : t->format == 3 ? TK_IA16 : tlut ? (ia ? TK_CI16_IA : TK_CI16) : TK_RGBA16;
+	}
+	return TK_RGBA32;
+}
+
+static inline __attribute__((always_inline)) struct Color texel(struct RDP* r, const struct Tile* t, int s, int tt, enum TexelKind kind) {
 	uint32_t base = t->tmem * 8 + tt * t->line * 8;
 	uint32_t swap = tt & 1 ? 4 : 0;
-	bool tlut = (r->otherModes >> 47) & 1;
-	switch (t->size) {
-	case 0: {
+	switch (kind) {
+	case TK_I4: case TK_IA4: case TK_CI4: case TK_CI4_IA: {
 		uint32_t a = (base + (s >> 1)) ^ swap;
 		int v = s & 1 ? tmemByte(r, a) & 15 : tmemByte(r, a) >> 4;
-		if (t->format == 2 || tlut) {
-			return tlutColor(r, t->palette << 4 | v);
+		if (kind == TK_CI4 || kind == TK_CI4_IA) {
+			return tlutColor(r, t->palette << 4 | v, kind == TK_CI4_IA);
 		}
-		if (t->format == 3) {
+		if (kind == TK_IA4) {
 			int i = (v >> 1) * 255 / 7;
 			return (struct Color) { i, i, i, v & 1 ? 255 : 0 };
 		}
 		int i = v * 17;
 		return (struct Color) { i, i, i, i };
 	}
-	case 1: {
+	case TK_I8: case TK_IA8: case TK_CI8: case TK_CI8_IA: {
 		int v = tmemByte(r, (base + s) ^ swap);
-		if (t->format == 2 || tlut) {
-			return tlutColor(r, v);
+		if (kind == TK_CI8 || kind == TK_CI8_IA) {
+			return tlutColor(r, v, kind == TK_CI8_IA);
 		}
-		if (t->format == 3) {
+		if (kind == TK_IA8) {
 			return (struct Color) { (v >> 4) * 17, (v >> 4) * 17, (v >> 4) * 17, (v & 15) * 17 };
 		}
 		return (struct Color) { v, v, v, v };
 	}
-	case 2: {
-		// YUV: Y in the upper half of TMEM, U and V for each pair of texels in the lower half; U and V
+	case TK_YUV16: {
+		// Y in the upper half of TMEM, U and V for each pair of texels in the lower half; U and V
 		// come out signed (9 bits).
-		if (t->format == 1) {
-			uint32_t a = ((t->tmem * 8 + tt * t->line * 8) & 0x7FF) + s;
-			int y = tmemByte(r, (a ^ swap) | 0x800);
-			int u = tmemByte(r, ((a & ~1u) ^ swap) & 0x7FF), v = tmemByte(r, ((a | 1) ^ swap) & 0x7FF);
-			return (struct Color) { u - 128, v - 128, y, y };
-		}
+		uint32_t a = ((t->tmem * 8 + tt * t->line * 8) & 0x7FF) + s;
+		int y = tmemByte(r, (a ^ swap) | 0x800);
+		int u = tmemByte(r, ((a & ~1u) ^ swap) & 0x7FF), v = tmemByte(r, ((a | 1) ^ swap) & 0x7FF);
+		return (struct Color) { u - 128, v - 128, y, y };
+	}
+	case TK_IA16: case TK_CI16: case TK_CI16_IA: case TK_RGBA16: {
 		uint32_t a = (base + s * 2) ^ swap;
 		uint16_t v = (uint16_t) (tmemByte(r, a) << 8 | tmemByte(r, a + 1));
-		if (t->format == 3) {
+		if (kind == TK_IA16) {
 			return (struct Color) { v >> 8, v >> 8, v >> 8, v & 255 };
 		}
-		if (tlut) {
-			return tlutColor(r, v >> 8);
+		if (kind != TK_RGBA16) {
+			return tlutColor(r, v >> 8, kind == TK_CI16_IA);
 		}
 		int cr = (v >> 11) & 31, cg = (v >> 6) & 31, cb = (v >> 1) & 31;
 		return (struct Color) { cr << 3 | cr >> 2, cg << 3 | cg >> 2, cb << 3 | cb >> 2, v & 1 ? 255 : 0 };
@@ -375,27 +394,40 @@ static inline __attribute__((always_inline)) int wrapCoord(int c, int shift, int
 	return i;
 }
 
-static struct Color sample(struct RDP* r, int tileIndex, int s, int t, bool filter) {
-	struct Tile* tile = &r->tile[tileIndex & 7];
+static inline __attribute__((always_inline)) struct Color sampleAs(struct RDP* r, const struct Tile* tile, int s, int t, bool bilinear,
+                                                                    enum TexelKind kind) {
 	int fs, ft;
 	int s0 = wrapCoord(s, tile->shiftS, tile->sl, tile->sh, tile->cmS, tile->maskS, &fs);
 	int t0 = wrapCoord(t, tile->shiftT, tile->tl, tile->th, tile->cmT, tile->maskT, &ft);
-	bool bilinear = filter && ((r->otherModes >> 45) & 1) && ((r->otherModes >> 52) & 3) < 2;
 	if (!bilinear) {
-		return texel(r, tile, s0, t0);
+		return texel(r, tile, s0, t0, kind);
 	}
 	int f;
 	int s1 = wrapCoord(s + (32 << (tile->shiftS < 11 ? tile->shiftS : 0)), tile->shiftS, tile->sl, tile->sh, tile->cmS,
 	                   tile->maskS, &f);
 	int t1 = wrapCoord(t + (32 << (tile->shiftT < 11 ? tile->shiftT : 0)), tile->shiftT, tile->tl, tile->th, tile->cmT,
 	                   tile->maskT, &f);
-	i4 c0 = lanes(texel(r, tile, s0, t0)), c1 = lanes(texel(r, tile, s1, t0)), c2 = lanes(texel(r, tile, s0, t1));
+	i4 c0 = lanes(texel(r, tile, s0, t0, kind)), c1 = lanes(texel(r, tile, s1, t0, kind)), c2 = lanes(texel(r, tile, s0, t1, kind));
 	// Three-point filtering: the triangle of texels nearest the sample point.
 	if (fs + ft < 32) {
 		return color(c0 + ((c1 - c0) * fs + (c2 - c0) * ft) / 32);
 	}
-	i4 c3 = lanes(texel(r, tile, s1, t1));
+	i4 c3 = lanes(texel(r, tile, s1, t1, kind));
 	return color(c3 + ((c2 - c3) * (32 - fs) + (c1 - c3) * (32 - ft)) / 32);
+}
+
+static struct Color sample(struct RDP* r, int tileIndex, int s, int t, bool filter) {
+	struct Tile* tile = &r->tile[tileIndex & 7];
+	bool bilinear = filter && ((r->otherModes >> 45) & 1) && ((r->otherModes >> 52) & 3) < 2;
+	switch (texelKind(r, tile)) {
+#define SAMPLE_AS(kind) case kind: return sampleAs(r, tile, s, t, bilinear, kind);
+	SAMPLE_AS(TK_I4) SAMPLE_AS(TK_IA4) SAMPLE_AS(TK_CI4) SAMPLE_AS(TK_CI4_IA) SAMPLE_AS(TK_I8) SAMPLE_AS(TK_IA8)
+	SAMPLE_AS(TK_CI8) SAMPLE_AS(TK_CI8_IA) SAMPLE_AS(TK_YUV16) SAMPLE_AS(TK_IA16) SAMPLE_AS(TK_CI16) SAMPLE_AS(TK_CI16_IA)
+	SAMPLE_AS(TK_RGBA16)
+#undef SAMPLE_AS
+	default:
+		return sampleAs(r, tile, s, t, bilinear, TK_RGBA32);
+	}
 }
 
 static int ext9(int v);
