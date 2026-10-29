@@ -1148,11 +1148,31 @@ bool cpuJitReady(struct N64* n) {
 // Returns whether the code must stop: the program left the straight line, a write threw blocks
 // away, an interrupt is due, a write to Count or Compare moved the timer's limit, or a CACHE
 // instruction changed the I-cache the code checks.
+// LW and SW at an aligned uncached address (the RCP's registers, mostly), as loadStore does them,
+// without its decoding; false for anything else.
+static bool uncachedWord(struct N64* n, uint32_t op) {
+	struct CPU* c = &n->cpu;
+	uint64_t vaddr = c->gpr[RS] + IMM;
+	if ((op >> 26 != 0x23 && op >> 26 != 0x2B) || ((uint32_t) vaddr & 0xE0000003) != 0xA0000000) {
+		return false;
+	}
+	uint32_t p = (uint32_t) vaddr & 0x1FFFFFFF;
+	dataTiming(c, vaddr, p, op >> 26 == 0x2B);
+	if (op >> 26 == 0x23) {
+		c->gpr[RT] = sext32(busRead32(n, p));
+	} else {
+		busWrite32(n, p, (uint32_t) c->gpr[RT]);
+	}
+	return true;
+}
+
 bool cpuJitStep(struct N64* n, uint32_t op) {
 	struct CPU* c = &n->cpu;
 	uint64_t pc = c->pc;
 	uint32_t gen = n->blockGen;
-	execute(n, op);
+	if (!uncachedWord(n, op)) {
+		execute(n, op);
+	}
 	c->gpr[0] = 0;
 	n->cycles += 1 + c->stall;
 	c->stall = 0;
