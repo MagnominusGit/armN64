@@ -89,7 +89,7 @@ bool cartBootChecksum(const uint8_t* rom, size_t size, int cic, uint8_t seedByte
 		uint32_t s = d & 31;
 		uint32_t r = s ? d << s | d >> (32 - s) : d;
 		t5 += r;
-		t2 ^= t2 > d ? r : t6 ^ d;
+		t2 ^= t2 >= d ? r : t6 ^ d;
 		t1 += cic == 6105 ? be32(rom + 0x40 + 0x710 + (i & 0xFF)) ^ d : t5 ^ d;
 	}
 	uint32_t crc1, crc2;
