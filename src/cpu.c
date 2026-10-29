@@ -405,8 +405,19 @@ static void cop0Execute(struct N64* n, uint32_t op) {
 	cpuException(n, EXC_RI, 0);
 }
 
+// In compatibility mode, an unmapped access within 64 KiB of address zero (a null pointer) reads
+// zero and writes nothing instead of missing the TLB.
+static bool nullAccess(struct N64* n, uint64_t vaddr) {
+	uint32_t v = (uint32_t) vaddr, p;
+	return n->compat && (v < 0x10000 || v >= 0xFFFF0000u) && !cpuPeekAddress(n, vaddr, &p);
+}
+
 static bool load(struct N64* n, uint64_t vaddr, int size, uint64_t* out) {
 	uint32_t p;
+	if (nullAccess(n, vaddr)) {
+		*out = 0;
+		return true;
+	}
 	if (!address(n, vaddr, size, false, &p)) {
 		return false;
 	}
@@ -429,6 +440,9 @@ static bool load(struct N64* n, uint64_t vaddr, int size, uint64_t* out) {
 
 static bool store(struct N64* n, uint64_t vaddr, int size, uint64_t v) {
 	uint32_t p;
+	if (nullAccess(n, vaddr)) {
+		return true;
+	}
 	if (!address(n, vaddr, size, true, &p)) {
 		return false;
 	}
