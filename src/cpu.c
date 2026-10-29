@@ -132,7 +132,6 @@ static uint32_t vpageUnknown(uint32_t page) {
 }
 
 void cpuTlbChanged(struct N64* n) {
-	memset(n->tlbCache, 0xFF, sizeof(n->tlbCache));
 	if (n->vpageFillCount > VPAGE_FILLED) {
 		for (uint32_t page = 0; page < VPAGES; ++page) {
 			n->vpages[page] = n->vpages[VPAGES + page] = vpageUnknown(page);
@@ -182,7 +181,6 @@ static bool translate(struct N64* n, uint64_t vaddr, bool store, uint32_t* paddr
 		*paddr = ((uint32_t) (lo >> 6) << 12 & ~offsetMask) | (v & offsetMask);
 		if ((*paddr & ~0xFFFu) < RDRAM_SIZE) {
 			uint32_t delta = (*paddr & ~0xFFFu) - (v & ~0xFFFu);
-			n->tlbCache[(v >> 12) & (TLB_CACHE_SIZE - 1)] = (struct TlbCacheEntry) { v >> 12, delta | ((lo >> 2) & 1) };
 			uint32_t page = v >> 12, writes = lo & 4 ? delta : vpageUnknown(page);
 			if (n->vpages[page] != delta || n->vpages[VPAGES + page] != writes) {
 				if (n->vpageFillCount < VPAGE_FILLED) {

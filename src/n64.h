@@ -130,14 +130,9 @@ struct RspJitEntry {
 };
 struct RspBlock;
 
-// A virtual 4 KB page the TLB maps to a page inside RDRAM: the page number (all ones when empty),
-// and what to add to a virtual address in it for the physical one, with bit 0 set if stores may go
-// there.
-enum { TLB_CACHE_SIZE = 256, VPAGES = 1 << 20, VPAGE_FILLED = 1024 };
+// Virtual 4 KB pages (vpages), and how many filled pages are listed for emptying them again.
+enum { VPAGES = 1 << 20, VPAGE_FILLED = 1024 };
 #define DCACHE_NONE 0xFFFFFFFFu
-struct TlbCacheEntry {
-	uint32_t tag, delta;
-};
 
 // Compiled code for a virtual address, good while blockGen is unchanged.
 enum { JIT_TABLE_SIZE = 1 << 14 };
@@ -194,11 +189,10 @@ struct N64 {
 	void (*jitEnter)(struct N64*, void* code);
 	void* jitLeave;
 	struct JitEntry jitTable[JIT_TABLE_SIZE];
-	// Pages the TLB mapped recently, for compiled loads and stores; emptied when the TLB changes.
-	struct TlbCacheEntry tlbCache[TLB_CACHE_SIZE];
-	// What to add to an address in each 4 KB virtual page for the physical one: 1 << 20 entries for
-	// loads, then as many for stores. A page not looked up since the TLB last changed, or not
-	// writable for stores, adds up to the page past RDRAM. The pages filled in since are listed.
+	// Pages for compiled loads and stores: what to add to an address in each 4 KB virtual page for
+	// the physical one, 1 << 20 entries for loads, then as many for stores. A page not looked up
+	// since the TLB last changed, or not writable for stores, adds up to the page past RDRAM. The
+	// pages filled in since are listed.
 	uint32_t* vpages;
 	uint32_t vpageFilled[VPAGE_FILLED];
 	uint32_t vpageFillCount;

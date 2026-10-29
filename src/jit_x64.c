@@ -66,6 +66,7 @@ struct Exit {
 	bool delay;
 	bool skip;
 	bool last;
+	bool jumped;
 };
 
 // A load or store that left its inline path: for the helper, or for a D-cache line fill.
@@ -76,11 +77,16 @@ struct Slow {
 	uint32_t op, paddr;
 	uint64_t pc;
 	bool delay, lineStart, last;
+	// Kept even with no site yet: a D-cache miss path may add one.
+	bool keep;
 };
 
 struct Miss {
 	uint8_t* site;
 	uint8_t* resume;
+	// The access's slow path, for a misaligned address or one past RDRAM, and its size.
+	struct Slow* slow;
+	int size;
 };
 
 struct Jit {
@@ -97,12 +103,17 @@ struct Jit {
 	int slowCount;
 	struct Miss misses[64];
 	int missCount;
+	// Stores to pages with compiled code, which check that they miss its words.
+	struct Miss codeChecks[64];
+	int codeCheckCount;
+	// The instruction set pc and nextPc itself (ERET): the block leaves after it.
+	bool jumped;
 	uint8_t* leave;
 	bool rdpThreads;
 };
 
 static void exitAt(struct Jit* j, uint8_t* site, uint64_t pc, enum Kind kind, bool delay, bool skip) {
-	j->exits[j->exitCount++] = (struct Exit) { site, pc, kind, delay, skip, false };
+	j->exits[j->exitCount++] = (struct Exit) { site, pc, kind, delay, skip, false, false };
 }
 
 // Sets the flags for a branch condition and returns the condition code under which it is taken.
@@ -158,6 +169,26 @@ static bool emitCop0(struct Jit* j, uint32_t op) {
 	struct Emitter* e = &j->e;
 	int rs = (op >> 21) & 31, rt = (op >> 16) & 31, rd = (op >> 11) & 31;
 	struct Opnd reg = M(R12, (int32_t) (offsetof(struct CPU, cop0) + 8 * rd));
+	if (op == 0x42000018 && !j->slow->delay) {
+		// ERET: to ErrorEPC with ERL cleared when it is set, else to EPC with EXL cleared.
+		xLoad(e, 8, RAX, CPU_AT(cop0[CP0_STATUS]));
+		xLoad(e, 8, RCX, CPU_AT(cop0[CP0_EPC]));
+		xLoad(e, 8, RDX, CPU_AT(cop0[CP0_ERROREPC]));
+		xMovI(e, RSI, ~2u);
+		xMovI(e, RDI, ~4u);
+		xTestI(e, 4, R(RAX), 4);
+		xCmov(e, CC_NE, 8, RCX, R(RDX));
+		xCmov(e, CC_NE, 8, RSI, R(RDI));
+		xMovsxd(e, RSI, R(RSI));
+		xAluRR(e, X_AND, 8, R(RAX), RSI);
+		xStore(e, 8, CPU_AT(cop0[CP0_STATUS]), RAX);
+		xStore(e, 8, CPU_AT(pc), RCX);
+		xAluI(e, X_ADD, 8, R(RCX), 4);
+		xStore(e, 8, CPU_AT(nextPc), RCX);
+		xStoreI(e, 1, CPU_AT(llBit), 0);
+		j->jumped = true;
+		return true;
+	}
 	if (rs == 0x00 || rs == 0x01) {
 		if (rd == CP0_RANDOM) {
 			return false;
@@ -609,9 +640,10 @@ static void fprAddress(struct Emitter* e, int ft, int size) {
 	xCmov(e, CC_E, 8, RSI, R(RDI));
 }
 
-// A load or store to cached RDRAM, through kseg0 or a page in the TLB cache, with dataTiming's
-// D-cache check. Anything else (other segments, misalignment, a page the cache doesn't have, a
-// store to a page holding code) jumps to the slow path, before any change.
+// A load or store to cached RDRAM, through kseg0 or a page the TLB mapped (vpages), with
+// dataTiming's D-cache check. Anything else jumps to the slow path before any change: a page not
+// looked up, and a misaligned address, fail the tag check and leave from the miss path. eax is the
+// physical address and r8d the virtual one.
 static void emitMemory(struct Jit* j, struct Slow* slow) {
 	struct Emitter* e = &j->e;
 	uint32_t op = slow->op;
@@ -630,58 +662,44 @@ static void emitMemory(struct Jit* j, struct Slow* slow) {
 		xAluI(e, X_ADD, 4, R(RAX), (int16_t) op);
 	}
 	xMovRR(e, 4, R8, RAX);
-	xMovRR(e, 4, RCX, RAX);
-	xAluI(e, X_AND, 4, R(RCX), (int32_t) (0xFF800000u | (size - 1)));
-	xAluI(e, X_CMP, 4, R(RCX), (int32_t) 0x80000000u);
-	uint8_t* kseg0 = xJcc(e, CC_E, NULL);
-
-	// Mapped: the physical page from the TLB cache.
-	if (size > 1) {
-		xTestI(e, 4, R(RAX), size - 1);
-		slow->site[slow->sites++] = xJcc(e, CC_NE, NULL);
-	}
-	struct Opnd entry = MI(RBX, RDX, 8, (int32_t) offsetof(struct N64, tlbCache));
+	// The physical page from vpages: one not looked up lands past RDRAM.
 	xMovRR(e, 4, RCX, RAX);
 	xShiftI(e, X_SHR, 4, R(RCX), 12);
-	xMovRR(e, 4, RDX, RCX);
-	xAluI(e, X_AND, 4, R(RDX), TLB_CACHE_SIZE - 1);
-	xAluRM(e, X_CMP, 4, RCX, entry);
-	slow->site[slow->sites++] = xJcc(e, CC_NE, NULL);
-	entry.disp += 4;
-	xLoad(e, 4, RCX, entry);
-	if (isStore) {
-		xTestI(e, 1, R(RCX), 1);
-		slow->site[slow->sites++] = xJcc(e, CC_E, NULL);
-	}
-	xAluI(e, X_AND, 4, R(RCX), ~0xFFF);
-	xAluRR(e, X_ADD, 4, R(RAX), RCX);
-	uint8_t* mapped = xJmp(e, NULL);
-
-	patchHere(e, kseg0);
-	xAluI(e, X_AND, 4, R(RAX), RDRAM_SIZE - 1);
-	patchHere(e, mapped);
+	xLoad(e, 8, RDX, N64_AT(vpages));
+	xAluRM(e, X_ADD, 4, RAX, MI(RDX, RCX, 4, isStore ? VPAGES * 4 : 0));
+	// Stores go slow on any flag (code, RDP) unless the page has only code that they miss; loads
+	// on pages the RDP may still be drawing to.
 	if (isStore || j->rdpThreads) {
 		xMovRR(e, 4, RCX, RAX);
 		xShiftI(e, X_SHR, 4, R(RCX), 12);
-		// Stores go slow on any flag (code, RDP), loads on pages the RDP may still be drawing to.
 		if (isStore) {
 			xAluI(e, X_CMP, 1, MI(RBX, RCX, 1, (int32_t) offsetof(struct N64, pageFlags)), 0);
+			struct Miss* k = &j->codeChecks[j->codeCheckCount++];
+			k->site = xJcc(e, CC_NE, NULL);
+			k->resume = e->p;
+			k->slow = slow;
+			k->size = size;
+			slow->keep = true;
 		} else {
 			xTestI(e, 1, MI(RBX, RCX, 1, (int32_t) offsetof(struct N64, pageFlags)), PAGE_RDP_WRITES);
+			slow->site[slow->sites++] = xJcc(e, CC_NE, NULL);
 		}
-		slow->site[slow->sites++] = xJcc(e, CC_NE, NULL);
 	}
 
-	// The line index from the virtual address, the tag from the physical one.
+	// The line index from the virtual address; a hit when its tag is this physical line and the
+	// address is aligned.
 	xMovRR(e, 4, RCX, R8);
 	xShiftI(e, X_SHR, 4, R(RCX), 4);
 	xAluI(e, X_AND, 4, R(RCX), 511);
-	xMovRR(e, 4, RDX, RAX);
-	xAluI(e, X_AND, 4, R(RDX), ~0xF);
-	xAluRM(e, X_CMP, 4, RDX, MI(R12, RCX, 4, (int32_t) offsetof(struct CPU, dcacheTag)));
+	xLoad(e, 4, RDX, MI(R12, RCX, 4, (int32_t) offsetof(struct CPU, dcacheTag)));
+	xAluRR(e, X_XOR, 4, R(RDX), RAX);
+	xTestI(e, 4, R(RDX), 0xFFFFFFF0u | (uint32_t) (size - 1));
 	struct Miss* m = &j->misses[j->missCount++];
 	m->site = xJcc(e, CC_NE, NULL);
 	m->resume = e->p;
+	m->slow = slow;
+	m->size = size;
+	slow->keep = true;
 	if (isStore) {
 		xStoreI(e, 1, MI(R12, RCX, 1, (int32_t) offsetof(struct CPU, dcacheDirty)), 1);
 	}
@@ -828,7 +846,7 @@ void* jitCompile(struct N64* n, const uint32_t* ops, uint32_t count, uint32_t va
 	static struct Jit jit;
 	struct Jit* j = &jit;
 	j->e = (struct Emitter) { arena + n->jitUsed, arena + n->jitUsed, arena + n->jitUsed + BLOCK_CODE_MAX };
-	j->exitCount = j->slowCount = j->missCount = 0;
+	j->exitCount = j->slowCount = j->missCount = j->codeCheckCount = 0;
 	j->leave = n->jitLeave;
 	j->rdpThreads = n->rdpThreads > 0;
 	struct Emitter* e = &j->e;
@@ -845,13 +863,14 @@ void* jitCompile(struct N64* n, const uint32_t* ops, uint32_t count, uint32_t va
 		bool lineStart = k == 0 || !(p & 31);
 		enum Kind kind;
 		uint8_t* mark = e->p;
-		int exits = j->exitCount, misses = j->missCount;
+		int exits = j->exitCount, misses = j->missCount, codeChecks = j->codeCheckCount;
 		bool branch = isBranchOp(op);
 		struct Slow* slow = &j->slows[j->slowCount];
 		*slow = (struct Slow) { .op = op, .paddr = p, .pc = pc, .delay = delay, .lineStart = lineStart, .last = last };
 		j->slow = slow;
 		j->extraCycles = 0;
 		j->interruptCheck = false;
+		j->jumped = false;
 		// A branch's I-cache check comes first (a likely branch not taken leaves inside it); the rest
 		// check after, so slow paths and Count reads see the cycles before this fetch.
 		if (lineStart && branch && !delay) {
@@ -867,14 +886,17 @@ void* jitCompile(struct N64* n, const uint32_t* ops, uint32_t count, uint32_t va
 				xTest(e, 4, R(RCX), RCX);
 				exitAt(j, xJcc(e, CC_NE, NULL), pc, kind, delay, false);
 			}
-			if (last) {
+			if (j->jumped) {
+				exitAt(j, xJmp(e, NULL), pc, kind, delay, false);
+				j->exits[j->exitCount - 1].jumped = true;
+			} else if (last) {
 				exitAt(j, xJmp(e, NULL), pc, kind, delay, false);
 				j->exits[j->exitCount - 1].last = true;
 			} else {
 				xAluRR(e, X_CMP, 8, R(R13), R14);
 				exitAt(j, xJcc(e, CC_AE, NULL), pc, kind, delay, false);
 			}
-			if (slow->sites) {
+			if (slow->sites || slow->keep) {
 				slow->resume = e->p;
 				++j->slowCount;
 			}
@@ -884,14 +906,43 @@ void* jitCompile(struct N64* n, const uint32_t* ops, uint32_t count, uint32_t va
 		e->p = mark;
 		j->exitCount = exits;
 		j->missCount = misses;
+		j->codeCheckCount = codeChecks;
 		emitHelper(j, op, pc, p, delay, lineStart, last);
 		delay = branch;
 	}
 
-	// D-cache line fills, as dataTiming: the fill, the write-back of a dirty line, the new tag.
+	// Stores to a page with code only: on unless they hit a word a block holds (n64HoldsCode), its
+	// bit in codeWords. An aligned store touches one word, or two for SD.
+	for (int i = 0; i < j->codeCheckCount; ++i) {
+		struct Miss* k = &j->codeChecks[i];
+		patchHere(e, k->site);
+		xAluI(e, X_CMP, 1, MI(RBX, RCX, 1, (int32_t) offsetof(struct N64, pageFlags)), PAGE_CODE);
+		k->slow->site[k->slow->sites++] = xJcc(e, CC_NE, NULL);
+		xMovRR(e, 4, RDX, RAX);
+		xShiftI(e, X_SHR, 4, R(RDX), 5);
+		xMovzx(e, RDX, 1, MI(RBX, RDX, 1, (int32_t) offsetof(struct N64, codeWords)));
+		xMovRR(e, 4, RCX, RAX);
+		xShiftI(e, X_SHR, 4, R(RCX), 2);
+		xAluI(e, X_AND, 4, R(RCX), 7);
+		xShiftCl(e, X_SHR, 4, R(RDX));
+		xTestI(e, 4, R(RDX), k->size == 8 ? 3 : 1);
+		k->slow->site[k->slow->sites++] = xJcc(e, CC_NE, NULL);
+		xJmp(e, k->resume);
+	}
+
+	// D-cache line fills, as dataTiming: the fill, the write-back of a dirty line, the new tag. A
+	// misaligned address, or one past RDRAM, takes the slow path instead.
 	for (int i = 0; i < j->missCount; ++i) {
 		struct Miss* m = &j->misses[i];
 		patchHere(e, m->site);
+		if (m->size > 1) {
+			xTestI(e, 4, R(R8), (uint32_t) (m->size - 1));
+			m->slow->site[m->slow->sites++] = xJcc(e, CC_NE, NULL);
+		}
+		xTestI(e, 4, R(RAX), ~(uint32_t) (RDRAM_SIZE - 1));
+		m->slow->site[m->slow->sites++] = xJcc(e, CC_NE, NULL);
+		xMovRR(e, 4, RDX, RAX);
+		xAluI(e, X_AND, 4, R(RDX), ~0xF);
 		struct Opnd dirty = MI(R12, RCX, 1, (int32_t) offsetof(struct CPU, dcacheDirty));
 		xAluI(e, X_ADD, 8, R(R13), 40);
 		xAluI(e, X_CMP, 1, dirty, 0);
@@ -920,6 +971,10 @@ void* jitCompile(struct N64* n, const uint32_t* ops, uint32_t count, uint32_t va
 		storeConst(e, CPU_AT(curPc), x->pc);
 		xStoreI(e, 1, CPU_AT(inDelay), x->delay);
 		xStoreI(e, 1, CPU_AT(nextInDelay), x->kind != PLAIN && !x->skip);
+		if (x->jumped) {
+			xJmp(e, j->leave);
+			continue;
+		}
 		if (x->skip) {
 			xAluI(e, X_ADD, 8, R(R13), 1);
 			storeConst(e, CPU_AT(pc), x->pc + 8);
