@@ -87,6 +87,8 @@ bool n64LoadRom(struct N64* n, const uint8_t* data, size_t size) {
 static void start(struct N64* n) {
 	const char* compat = getenv("N64_COMPAT");
 	n->compat = compat && *compat == '1';
+	const char* mouse = getenv("N64_MOUSE");
+	n->mousePort = mouse && *mouse >= '1' && *mouse <= '4' ? *mouse - '0' : 0;
 	if (n->compat) {
 		memset(n->rdram, 0, RDRAM_SIZE);
 	}

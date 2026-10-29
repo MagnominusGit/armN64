@@ -127,22 +127,23 @@ void pifBoot(struct N64* n) {
 	}
 }
 
-static void controller(struct N64* n, const uint8_t* cmd, uint8_t* resp, int rx) {
+// A controller, or an N64 Mouse (type 0x0002), which reads the same way.
+static void controller(const uint8_t* cmd, uint8_t* resp, int rx, bool mouse, uint32_t state) {
 	switch (cmd[0]) {
 	case 0x00:
 	case 0xFF:
 		if (rx >= 3) {
-			resp[0] = 0x05;
-			resp[1] = 0x00;
-			resp[2] = 0x02;
+			resp[0] = mouse ? 0x00 : 0x05;
+			resp[1] = mouse ? 0x02 : 0x00;
+			resp[2] = mouse ? 0x00 : 0x02;
 		}
 		return;
 	case 0x01:
 		if (rx >= 4) {
-			resp[0] = n->buttons >> 24;
-			resp[1] = n->buttons >> 16;
-			resp[2] = n->buttons >> 8;
-			resp[3] = n->buttons;
+			resp[0] = state >> 24;
+			resp[1] = state >> 16;
+			resp[2] = state >> 8;
+			resp[3] = state;
 		}
 		return;
 	}
@@ -236,8 +237,10 @@ void pifRun(struct N64* n) {
 		}
 		uint8_t* cmd = &ram[i + 2];
 		uint8_t* resp = cmd + send;
-		if (channel == 0) {
-			controller(n, cmd, resp, receive);
+		if (n->mousePort && channel == n->mousePort - 1) {
+			controller(cmd, resp, receive, true, n->mouse);
+		} else if (channel == 0) {
+			controller(cmd, resp, receive, false, n->buttons);
 		} else if (channel == 4) {
 			eeprom(n, cmd, resp, send, receive);
 		} else {
