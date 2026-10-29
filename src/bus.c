@@ -268,8 +268,8 @@ uint32_t busRead32(struct N64* n, uint32_t addr) {
 	if (addr >= 0x10000000 && addr < 0x1FC00000) {
 		// The PI's address counter moves past the word the CPU reads.
 		n->pi.cartAddr = (addr & ~3u) + 4;
-		// A write to cartridge space stays on the bus, and the next read returns it.
-		if (n->pi.romLatched) {
+		// A write to cartridge space stays on the bus while the PI writes it: a read then returns it.
+		if (n->pi.romLatched && n->cycles < n->pi.romLatchUntil) {
 			n->pi.romLatched = false;
 			return n->pi.romLatch;
 		}
@@ -581,6 +581,9 @@ void busWrite32(struct N64* n, uint32_t addr, uint32_t v) {
 	} else if (addr >= 0x10000000 && addr < 0x1FC00000) {
 		n->pi.romLatch = v;
 		n->pi.romLatched = true;
+		// Domain 1 timing for one word: latency, then two halfwords of pulse and release.
+		const uint32_t* t = n->pi.timing;
+		n->pi.romLatchUntil = n->cycles + ((t[0] + 1) + 2 * ((t[1] + 1) + (t[3] + 1))) * 3 / 2;
 	}
 }
 

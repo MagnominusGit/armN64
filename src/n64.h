@@ -111,6 +111,8 @@ struct PI {
 	uint32_t timing[8];
 	uint32_t romLatch;
 	bool romLatched;
+	// When the write the latch holds is done on the bus.
+	uint64_t romLatchUntil;
 };
 
 struct SI {
