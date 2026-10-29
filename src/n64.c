@@ -97,6 +97,11 @@ static void start(struct N64* n) {
 	n->useBlocks = n->useJit || (n->slice && blocks && blocks[0] == '1');
 	const char* rdpThreads = getenv("N64_RDP_THREADS");
 	n->rdpThreads = rdpThreads ? atoi(rdpThreads) : 0;
+	const char* rdpGpu = getenv("N64_RDP_GPU");
+	n->rdpGpu = rdpGpu && rdpGpu[0] == '1';
+	if (n->rdpGpu && !n->rdpThreads) {
+		n->rdpThreads = 1;
+	}
 	rspJitFree(n);
 	++n->rspCodeGen;
 }

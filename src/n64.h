@@ -229,6 +229,9 @@ struct N64 {
 	struct RspBlock* rspVariants[1024];
 	// RDP threads (N64_RDP_THREADS), and whether they have commands not yet drawn.
 	int rdpThreads;
+	// N64_RDP_GPU: the RDP's pixels drawn by a GLES 3.1 compute shader (rdp.c), falling back to the
+	// renderer threads where that can't start.
+	bool rdpGpu;
 	bool rdpPending;
 	// CPU cycles per video field: 60 fields a second for NTSC and MPAL, 50 for PAL.
 	uint64_t fieldCycles;

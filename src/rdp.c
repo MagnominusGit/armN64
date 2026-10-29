@@ -1,6 +1,8 @@
 #include "n64.h"
+#include "gles.h"
 
 #include <pthread.h>
+#include <stdio.h>
 #include <stdatomic.h>
 #include <stdlib.h>
 #include <string.h>
@@ -89,8 +91,9 @@ struct RDP {
 	// Primitives drawn so far, and the primitive, y and x of the pixel that left lastCombined, for
 	// finding the latest across renderers.
 	uint64_t seq, lastPos;
-	// Other threads drawing the commands (the main thread's state only).
+	// Other threads drawing the commands, or the GPU (the main thread's state only).
 	struct Renderers* renderers;
+	struct Gpu* gpu;
 };
 
 static bool ownsRow(const struct RDP* r, int y) {
@@ -99,6 +102,7 @@ static bool ownsRow(const struct RDP* r, int y) {
 
 static void setupCombiner(struct RDP* r);
 static void setupModes(struct RDP* r);
+static void gpuSync(struct N64* n, struct RDP* r);
 
 static struct RDP* state(struct N64* n) {
 	if (!n->rdp) {
@@ -1453,6 +1457,10 @@ void rdpWait(struct N64* n) {
 	if (!n->rdpPending) {
 		return;
 	}
+	if (n->rdp->gpu) {
+		gpuSync(n, n->rdp);
+		return;
+	}
 	struct Renderers* all = n->rdp->renderers;
 	waitFor(all, atomic_load_explicit(&all->written, memory_order_relaxed));
 	for (int i = 0; i < all->markedCount; ++i) {
@@ -1603,6 +1611,497 @@ static void submit(struct N64* n, struct RDP* r, const uint64_t* w, int op, int 
 	put(all, header, w, words);
 }
 
+// ---- Drawing on the GPU
+//
+// With N64_RDP_GPU, a compute shader (rdp_gpu.glsl) draws the primitives. The main thread runs the
+// other commands itself (texture loads included, into TMEM snapshots) and records each primitive
+// with the state it draws with; triangles come with their spans and each row's starting attributes.
+// A batch goes to the GPU at a full sync, before the color or depth image changes, or when
+// full; each 16x16 tile of the picture draws its primitives in order. The pages the batch draws to
+// are flagged like the renderer threads' (rdpWait brings them back). Primitives that need the pixel
+// drawn before them are drawn here after everything before them is back.
+
+#include "rdp_gpu_glsl.h"
+
+enum {
+	GPU_PRIM_SIZE = 24, GPU_ROW_SIZE = 18, GPU_TILE_FIELDS = 15, GPU_STATE_SIZE = 19 + 8 * GPU_TILE_FIELDS,
+	GPU_TILES = 64, GPU_PRIMS_MAX = 4000, GPU_LAST_SIZE = 1 << 20, GPU_BATCHES_MAX = 4096,
+	GPU_KIND_TRIANGLE = 0, GPU_KIND_TEXRECT = 1, GPU_KIND_FILL = 2, GPU_KIND_RECT = 3,
+	GPU_PAGE_BATCH = 1, GPU_PAGE_OWNED = 2, GPU_PAGE_MARKED = 4,
+};
+
+struct Gpu {
+	struct Gles* gl;
+	int32_t prims[GPU_PRIMS_MAX * GPU_PRIM_SIZE];
+	int primCount;
+	int32_t* states;
+	int stateCount, stateCap;
+	int32_t* rows;
+	size_t rowCount, rowCap;
+	uint8_t* tmem;
+	int tmemCount, tmemCap;
+	bool stateDirty, tmemDirty;
+	int32_t* upload;
+	size_t uploadCap;
+	uint8_t page[RDRAM_SIZE >> 12];
+	uint16_t batchPages[RDRAM_SIZE >> 12], markedPages[RDRAM_SIZE >> 12];
+	int batchPageCount, markedPageCount;
+	// Each batch's part of the last-pixel buffer (3 words a tile), since the last collection.
+	uint32_t lastUsed;
+	uint32_t batchBase[GPU_BATCHES_MAX], batchTiles[GPU_BATCHES_MAX];
+	int batchCount;
+};
+
+static void* grow(void* p, size_t* cap, size_t need, size_t size) {
+	if (need <= *cap) {
+		return p;
+	}
+	size_t c = *cap ? *cap : 1024;
+	while (c < need) {
+		c *= 2;
+	}
+	void* q = realloc(p, c * size);
+	if (!q) {
+		abort();
+	}
+	*cap = c;
+	return q;
+}
+
+static struct Gpu* gpuCreate(void) {
+	struct Gpu* g = calloc(1, sizeof(*g));
+	if (!g) {
+		return NULL;
+	}
+	char error[2048] = "";
+	g->gl = glesCreate(rdpGpuSource, error, sizeof(error));
+	if (!g->gl) {
+		fprintf(stderr, "GPU RDP unavailable (%s), drawing on the CPU\n", error);
+		free(g);
+		return NULL;
+	}
+	fprintf(stderr, "GPU RDP on %s\n", glesRenderer(g->gl));
+	glesData(g->gl, 0, NULL, RDRAM_SIZE);
+	glesData(g->gl, 3, NULL, GPU_LAST_SIZE * 4);
+	g->stateDirty = g->tmemDirty = true;
+	return g;
+}
+
+static void gpuDestroy(struct Gpu* g) {
+	glesDestroy(g->gl);
+	free(g->states);
+	free(g->rows);
+	free(g->tmem);
+	free(g->upload);
+	free(g);
+}
+
+static int32_t packColor(struct Color c) {
+	return (int32_t) ((uint32_t) c.r << 24 | (uint32_t) c.g << 16 | (uint32_t) c.b << 8 | (uint32_t) c.a);
+}
+
+// The state a primitive draws with: a new record when anything changed since the last one.
+static int gpuState(struct Gpu* g, struct RDP* r) {
+	if (g->tmemDirty) {
+		size_t cap = (size_t) g->tmemCap;
+		g->tmem = grow(g->tmem, &cap, (size_t) (g->tmemCount + 1) * 0x1000, 1);
+		g->tmemCap = (int) cap;
+		memcpy(g->tmem + (size_t) g->tmemCount * 0x1000, r->tmem, 0x1000);
+		++g->tmemCount;
+		g->tmemDirty = false;
+		g->stateDirty = true;
+	}
+	if (g->stateDirty) {
+		size_t cap = (size_t) g->stateCap;
+		g->states = grow(g->states, &cap, (size_t) (g->stateCount + 1) * GPU_STATE_SIZE, sizeof(int32_t));
+		g->stateCap = (int) cap;
+		int32_t* s = g->states + (size_t) g->stateCount * GPU_STATE_SIZE;
+		s[0] = (int32_t) (uint32_t) r->otherModes;
+		s[1] = (int32_t) (uint32_t) (r->otherModes >> 32);
+		s[2] = (int32_t) (uint32_t) r->combine;
+		s[3] = (int32_t) (uint32_t) (r->combine >> 32);
+		s[4] = (int32_t) r->colorAddr;
+		s[5] = (int32_t) r->colorWidth;
+		s[6] = r->colorSize;
+		s[7] = (int32_t) r->zAddr;
+		s[8] = packColor(r->fog);
+		s[9] = packColor(r->blend);
+		s[10] = packColor(r->prim);
+		s[11] = packColor(r->env);
+		s[12] = r->primLod;
+		s[13] = r->primZ;
+		s[14] = r->minLevel;
+		s[15] = r->k4;
+		s[16] = r->k5;
+		s[17] = (int32_t) r->fillColor;
+		s[18] = g->tmemCount - 1;
+		for (int i = 0; i < 8; ++i) {
+			const struct Tile* t = &r->tile[i];
+			int32_t* f = s + 19 + i * GPU_TILE_FIELDS;
+			f[0] = t->format, f[1] = t->size, f[2] = t->line, f[3] = t->tmem, f[4] = t->palette;
+			f[5] = t->cmS, f[6] = t->cmT, f[7] = t->maskS, f[8] = t->maskT, f[9] = t->shiftS, f[10] = t->shiftT;
+			f[11] = t->sl, f[12] = t->tl, f[13] = t->sh, f[14] = t->th;
+		}
+		++g->stateCount;
+		g->stateDirty = false;
+	}
+	return (g->stateCount - 1) * GPU_STATE_SIZE;
+}
+
+static void gpuMark(struct N64* n, struct Gpu* g, uint32_t addr, uint32_t len) {
+	FOR_PAGES(addr, len, p) {
+		if (!(g->page[p] & GPU_PAGE_MARKED)) {
+			g->markedPages[g->markedPageCount++] = (uint16_t) p;
+			g->page[p] |= GPU_PAGE_MARKED;
+		}
+		if (!(g->page[p] & GPU_PAGE_BATCH)) {
+			g->batchPages[g->batchPageCount++] = (uint16_t) p;
+			g->page[p] |= GPU_PAGE_BATCH;
+		}
+		n->pageFlags[p] |= PAGE_RDP_WRITES;
+	}
+	n->rdpPending = true;
+}
+
+static void put64(int32_t* to, int64_t v) {
+	to[0] = (int32_t) (uint32_t) v;
+	to[1] = (int32_t) (uint32_t) ((uint64_t) v >> 32);
+}
+
+// triangle()'s setup: the spans and each row's attributes at its first pixel. False if it draws
+// nothing.
+static bool gpuTriangle(struct Gpu* g, struct RDP* r, const uint64_t* w, int op, int32_t* p) {
+	bool shade = op & 4, tex = op & 2, zbuf = op & 1;
+	struct Edges e = edges(w);
+	int idx = 4;
+	int64_t sv[4] = { 0 }, sdx[4] = { 0 }, sde[4] = { 0 };
+	int64_t tv[3] = { 0 }, tdx[3] = { 0 }, tde[3] = { 0 }, tdy[3] = { 0 };
+	int64_t zv = 0, zdx = 0, zde = 0;
+	if (shade) {
+		for (int i = 0; i < 4; ++i) {
+			int sh = 48 - i * 16;
+			sv[i] = (int64_t) ((int32_t) ((uint32_t) ((w[idx] >> sh) & 0xFFFF) << 16 | (uint32_t) ((w[idx + 2] >> sh) & 0xFFFF)));
+			sdx[i] = (int32_t) ((uint32_t) ((w[idx + 1] >> sh) & 0xFFFF) << 16 | (uint32_t) ((w[idx + 3] >> sh) & 0xFFFF));
+			sde[i] = (int32_t) ((uint32_t) ((w[idx + 4] >> sh) & 0xFFFF) << 16 | (uint32_t) ((w[idx + 6] >> sh) & 0xFFFF));
+		}
+		idx += 8;
+	}
+	if (tex) {
+		for (int i = 0; i < 3; ++i) {
+			int sh = 48 - i * 16;
+			tv[i] = (int32_t) ((uint32_t) ((w[idx] >> sh) & 0xFFFF) << 16 | (uint32_t) ((w[idx + 2] >> sh) & 0xFFFF));
+			tdx[i] = (int32_t) ((uint32_t) ((w[idx + 1] >> sh) & 0xFFFF) << 16 | (uint32_t) ((w[idx + 3] >> sh) & 0xFFFF));
+			tde[i] = (int32_t) ((uint32_t) ((w[idx + 4] >> sh) & 0xFFFF) << 16 | (uint32_t) ((w[idx + 6] >> sh) & 0xFFFF));
+			tdy[i] = (int32_t) ((uint32_t) ((w[idx + 5] >> sh) & 0xFFFF) << 16 | (uint32_t) ((w[idx + 7] >> sh) & 0xFFFF));
+		}
+		idx += 8;
+	}
+	if (zbuf) {
+		zv = fix(w[idx], 32);
+		zdx = fix(w[idx], 0);
+		zde = fix(w[idx + 1], 32);
+	}
+	int first, end;
+	triangleRows(r, &e, &first, &end);
+	if (end <= first) {
+		return false;
+	}
+	g->rows = grow(g->rows, &g->rowCap, (g->rowCount + (size_t) (end - first)) * GPU_ROW_SIZE, sizeof(int32_t));
+	int32_t* rows = g->rows + g->rowCount * GPU_ROW_SIZE;
+	int minX = INT32_MAX, maxX = INT32_MIN, minY = INT32_MAX, maxY = INT32_MIN;
+	for (int y = first; y < end; ++y) {
+		int32_t* row = rows + (y - first) * GPU_ROW_SIZE;
+		memset(row, 0, GPU_ROW_SIZE * sizeof(int32_t));
+		int x0, x1;
+		if (!span(r, &e, y, &x0, &x1) || x1 < x0) {
+			row[0] = 1;
+			row[1] = 0;
+			continue;
+		}
+		row[0] = x0;
+		row[1] = x1;
+		minX = x0 < minX ? x0 : minX;
+		maxX = x1 > maxX ? x1 : maxX;
+		minY = y < minY ? y : minY;
+		maxY = y;
+		int64_t dy = (int64_t) y * 4 + 2 - (e.yh & ~3);
+		int64_t ey = dy / 4;
+		int64_t dx0 = (int64_t) x0 * 65536 + 32768 - e.xh - e.dxh * dy / 4;
+		for (int i = 0; i < 4; ++i) {
+			put64(row + 2 + i * 2, sv[i] + sde[i] * ey + (sdx[i] * dx0 >> 16));
+		}
+		for (int i = 0; i < 3; ++i) {
+			put64(row + 10 + i * 2, tv[i] + tde[i] * ey + (tdx[i] * dx0 >> 16));
+		}
+		if (zbuf) {
+			put64(row + 16, zv + zde * ey + (zdx * dx0 >> 16));
+		}
+	}
+	if (maxY < minY) {
+		return false;
+	}
+	p[0] = GPU_KIND_TRIANGLE;
+	p[2] = minX, p[3] = minY, p[4] = maxX, p[5] = maxY;
+	p[6] = (w[0] >> 48) & 7;
+	p[7] = (w[0] >> 51) & 7;
+	p[8] = (int32_t) (g->rowCount * GPU_ROW_SIZE);
+	p[9] = first;
+	p[10] = op & 7;
+	for (int i = 0; i < 4; ++i) {
+		p[11 + i] = (int32_t) sdx[i];
+	}
+	for (int i = 0; i < 3; ++i) {
+		p[15 + i] = (int32_t) tdx[i];
+		p[18 + i] = (int32_t) tdy[i];
+	}
+	p[21] = (int32_t) zdx;
+	g->rowCount += (size_t) (end - first);
+	return true;
+}
+
+static void gpuCollectLast(struct Gpu* g, struct RDP* r) {
+	if (!g->lastUsed) {
+		return;
+	}
+	const uint32_t* last = glesMap(g->gl, 3, 0, g->lastUsed * 4);
+	if (last) {
+		for (int b = 0; b < g->batchCount; ++b) {
+			uint32_t best = 0, at = 0;
+			for (uint32_t t = 0; t < g->batchTiles[b]; ++t) {
+				uint32_t i = g->batchBase[b] + t * 3;
+				if (last[i] > best) {
+					best = last[i];
+					at = i;
+				}
+			}
+			if (best) {
+				uint32_t c = last[at + 1];
+				r->lastCombined = (struct Color) { c & 0x1FF, (c >> 9) & 0x1FF, (c >> 18) & 0x1FF, last[at + 2] & 0x1FF };
+			}
+		}
+		glesUnmap(g->gl, 3);
+	}
+	g->lastUsed = 0;
+	g->batchCount = 0;
+}
+
+// Sends the batch to the GPU.
+static void gpuSubmit(struct N64* n, struct RDP* r) {
+	struct Gpu* g = r->gpu;
+	if (!g->primCount) {
+		return;
+	}
+	// The pages it draws to, unless the GPU's copy is already the newest.
+	for (int i = 0; i < g->batchPageCount; ++i) {
+		int p = g->batchPages[i];
+		g->page[p] &= ~GPU_PAGE_BATCH;
+		if (!(g->page[p] & GPU_PAGE_OWNED)) {
+			int run = 1;
+			while (i + run < g->batchPageCount && g->batchPages[i + run] == p + run && !(g->page[p + run] & GPU_PAGE_OWNED)) {
+				g->page[p + run] &= ~GPU_PAGE_BATCH;
+				++run;
+			}
+			glesSubData(g->gl, 0, (size_t) p << 12, &n->rdram[(size_t) p << 12], (size_t) run << 12);
+			for (int k = 0; k < run; ++k) {
+				g->page[p + k] |= GPU_PAGE_OWNED;
+			}
+			i += run - 1;
+		}
+	}
+	g->batchPageCount = 0;
+	// The tiles each primitive's box covers, and the lists of primitives for each.
+	int tx0 = GPU_TILES, ty0 = GPU_TILES, tx1 = -1, ty1 = -1;
+	static int32_t counts[GPU_TILES * GPU_TILES];
+	memset(counts, 0, sizeof(counts));
+	size_t entries = 0;
+	for (int i = 0; i < g->primCount; ++i) {
+		const int32_t* p = g->prims + i * GPU_PRIM_SIZE;
+		int ax = p[2] >> 4, ay = p[3] >> 4, bx = p[4] >> 4, by = p[5] >> 4;
+		tx0 = ax < tx0 ? ax : tx0, ty0 = ay < ty0 ? ay : ty0;
+		tx1 = bx > tx1 ? bx : tx1, ty1 = by > ty1 ? by : ty1;
+		for (int ty = ay; ty <= by; ++ty) {
+			for (int tx = ax; tx <= bx; ++tx) {
+				++counts[ty * GPU_TILES + tx];
+			}
+		}
+		entries += (size_t) (bx - ax + 1) * (size_t) (by - ay + 1);
+	}
+	size_t statesAt = (size_t) g->primCount * GPU_PRIM_SIZE;
+	size_t rowsAt = statesAt + (size_t) g->stateCount * GPU_STATE_SIZE;
+	size_t binsAt = rowsAt + g->rowCount * GPU_ROW_SIZE;
+	size_t listsAt = binsAt + GPU_TILES * GPU_TILES * 2;
+	size_t total = listsAt + entries;
+	g->upload = grow(g->upload, &g->uploadCap, total, sizeof(int32_t));
+	int32_t* d = g->upload;
+	memcpy(d, g->prims, statesAt * sizeof(int32_t));
+	for (int i = 0; i < g->primCount; ++i) {
+		int32_t* p = d + i * GPU_PRIM_SIZE;
+		p[1] += (int32_t) statesAt;
+		if (p[0] == GPU_KIND_TRIANGLE) {
+			p[8] += (int32_t) rowsAt;
+		}
+	}
+	memcpy(d + statesAt, g->states, (size_t) g->stateCount * GPU_STATE_SIZE * sizeof(int32_t));
+	memcpy(d + rowsAt, g->rows, g->rowCount * GPU_ROW_SIZE * sizeof(int32_t));
+	int32_t* bins = d + binsAt;
+	int32_t offset = 0;
+	for (int t = 0; t < GPU_TILES * GPU_TILES; ++t) {
+		bins[t * 2] = offset;
+		bins[t * 2 + 1] = 0;
+		offset += counts[t];
+	}
+	int32_t* lists = d + listsAt;
+	for (int i = 0; i < g->primCount; ++i) {
+		const int32_t* p = g->prims + i * GPU_PRIM_SIZE;
+		for (int ty = p[3] >> 4; ty <= p[5] >> 4; ++ty) {
+			for (int tx = p[2] >> 4; tx <= p[4] >> 4; ++tx) {
+				int32_t* bin = bins + (ty * GPU_TILES + tx) * 2;
+				lists[bin[0] + bin[1]++] = i;
+			}
+		}
+	}
+	unsigned across = (unsigned) (tx1 - tx0 + 1), down = (unsigned) (ty1 - ty0 + 1);
+	if (g->lastUsed + across * down * 3 > GPU_LAST_SIZE || g->batchCount == GPU_BATCHES_MAX) {
+		gpuCollectLast(g, r);
+	}
+	glesData(g->gl, 2, d, total * sizeof(int32_t));
+	glesData(g->gl, 1, g->tmem, (size_t) g->tmemCount * 0x1000);
+	int u[8] = { (int) binsAt, (int) listsAt, tx0, ty0, (int) across, (int) g->lastUsed, 0, 0 };
+	glesUniforms(g->gl, u, 8);
+	glesDispatch(g->gl, across, down);
+	g->batchBase[g->batchCount] = g->lastUsed;
+	g->batchTiles[g->batchCount++] = across * down;
+	g->lastUsed += across * down * 3;
+	g->primCount = 0;
+	g->stateCount = 0;
+	g->rowCount = 0;
+	g->tmemCount = 0;
+	g->stateDirty = g->tmemDirty = true;
+}
+
+// Brings back everything the GPU drew.
+static void gpuSync(struct N64* n, struct RDP* r) {
+	struct Gpu* g = r->gpu;
+	gpuSubmit(n, r);
+	gpuCollectLast(g, r);
+	int lo = RDRAM_SIZE >> 12, hi = -1;
+	for (int i = 0; i < g->markedPageCount; ++i) {
+		int p = g->markedPages[i];
+		if (g->page[p] & GPU_PAGE_OWNED) {
+			lo = p < lo ? p : lo;
+			hi = p > hi ? p : hi;
+		}
+	}
+	if (hi >= lo) {
+		const uint8_t* m = glesMap(g->gl, 0, (size_t) lo << 12, (size_t) (hi - lo + 1) << 12);
+		if (m) {
+			for (int i = 0; i < g->markedPageCount; ++i) {
+				int p = g->markedPages[i];
+				if (g->page[p] & GPU_PAGE_OWNED) {
+					memcpy(&n->rdram[(size_t) p << 12], m + ((size_t) (p - lo) << 12), 0x1000);
+				}
+			}
+			glesUnmap(g->gl, 0);
+		}
+	}
+	for (int i = 0; i < g->markedPageCount; ++i) {
+		int p = g->markedPages[i];
+		g->page[p] = 0;
+		n->pageFlags[p] &= ~PAGE_RDP;
+	}
+	g->markedPageCount = 0;
+	n->rdpPending = false;
+}
+
+// A command, with the GPU drawing.
+static void gpuCommand(struct N64* n, struct RDP* r, const uint64_t* w, int op) {
+	struct Gpu* g = r->gpu;
+	bool draws = (op >= 0x08 && op <= 0x0F) || op == 0x24 || op == 0x25 || op == 0x36;
+	if (!draws) {
+		if (op == 0x30 || op == 0x33 || op == 0x34) {
+			uint32_t addr, len;
+			loadSource(r, w, op, &addr, &len);
+			bool drawn = false;
+			FOR_PAGES(addr, len, p) {
+				drawn |= (n->pageFlags[p] & PAGE_RDP_WRITES) != 0;
+			}
+			if (drawn) {
+				gpuSync(n, r);
+			}
+			g->tmemDirty = true;
+		} else if ((op == 0x3E || op == 0x3F) && g->primCount) {
+			gpuSubmit(n, r);
+		}
+		execute(n, r, w, op);
+		g->stateDirty = true;
+		return;
+	}
+	++r->seq;
+	int y0, y1;
+	primitiveRows(r, w, op, &y0, &y1);
+	if (y1 < y0) {
+		return;
+	}
+	uint32_t bpp = r->colorSize == 1 ? 1 : r->colorSize == 3 ? 4 : 2;
+	uint32_t right = (uint32_t) ((r->scissorX1 >> 2) + 1);
+	bool depth = r->zAddr && (r->zCompare || r->zUpdate);
+	uint32_t color = r->colorAddr + (uint32_t) y0 * r->colorWidth * bpp;
+	uint32_t colorLen = (uint32_t) (y1 - y0) * r->colorWidth * bpp + right * bpp;
+	uint32_t z = r->zAddr + (uint32_t) y0 * r->colorWidth * 2;
+	uint32_t zLen = (uint32_t) (y1 - y0) * r->colorWidth * 2 + right * 2;
+	bool overlap = depth && r->zAddr != r->colorAddr && z < color + colorLen && color < z + zLen;
+	bool shades = !(op == 0x36 && r->cycleType == 3) && !((op == 0x24 || op == 0x25) && r->cycleType == 2);
+	const struct Stage* firstStage = &r->stage[r->cycleType == 1 ? 0 : 1];
+	bool alone = right - 1 > r->colorWidth || overlap ||
+	             (shades && (firstStage->readsCombined || firstStage->noise || (r->cycleType == 1 && r->stage[1].noise)));
+	if (alone || y1 >= GPU_TILES * 16) {
+		gpuSync(n, r);
+		execute(n, r, w, op);
+		--r->seq;
+		return;
+	}
+	int32_t* p = g->prims + g->primCount * GPU_PRIM_SIZE;
+	memset(p, 0, GPU_PRIM_SIZE * sizeof(int32_t));
+	if (op >= 0x08 && op <= 0x0F) {
+		if (!gpuTriangle(g, r, w, op, p)) {
+			return;
+		}
+	} else if (op == 0x24 || op == 0x25) {
+		int cx0, cy0, x0, x1;
+		textureRectBounds(r, w[0], &cx0, &cy0, &x0, &y0, &x1, &y1);
+		if (x1 < x0 || y1 < y0) {
+			return;
+		}
+		int dsdx = (int16_t) (w[1] >> 16);
+		p[0] = GPU_KIND_TEXRECT;
+		p[2] = x0, p[3] = y0, p[4] = x1, p[5] = y1;
+		p[6] = (w[0] >> 24) & 7;
+		p[8] = (int16_t) (w[1] >> 48);
+		p[9] = (int16_t) (w[1] >> 32);
+		p[10] = r->cycleType == 2 ? dsdx / 4 : dsdx;
+		p[11] = (int16_t) w[1];
+		p[12] = cx0, p[13] = cy0;
+		p[14] = op == 0x25;
+	} else {
+		int x1 = ((w[0] >> 44) & 0xFFF) >> 2, x0 = ((w[0] >> 12) & 0xFFF) >> 2;
+		y1 = ((w[0] >> 32) & 0xFFF) >> 2, y0 = (w[0] & 0xFFF) >> 2;
+		clipRect(r, &x0, &y0, &x1, &y1);
+		if (x1 < x0 || y1 < y0) {
+			return;
+		}
+		p[0] = r->cycleType == 3 ? GPU_KIND_FILL : GPU_KIND_RECT;
+		p[2] = x0, p[3] = y0, p[4] = x1, p[5] = y1;
+	}
+	p[1] = gpuState(g, r);
+	gpuMark(n, g, color, colorLen);
+	if (depth) {
+		gpuMark(n, g, z, zLen);
+	}
+	if (++g->primCount == GPU_PRIMS_MAX) {
+		gpuSubmit(n, r);
+	}
+}
+
 // Runs the commands from DP_CURRENT to DP_END, keeping the RDP's time: a full sync interrupts the CPU
 // once the commands before it would be done.
 void rdpRun(struct N64* n) {
@@ -1610,7 +2109,11 @@ void rdpRun(struct N64* n) {
 		return;
 	}
 	struct RDP* r = state(n);
-	if (n->rdpThreads && !r->renderers) {
+	if (n->rdpGpu && !r->gpu) {
+		r->gpu = gpuCreate();
+		n->rdpGpu = r->gpu != NULL;
+	}
+	if (n->rdpThreads && !r->renderers && !r->gpu) {
 		r->renderers = startRenderers(n, r);
 	}
 	uint64_t begin = n->dp.busyUntil > n->cycles ? n->dp.busyUntil : n->cycles;
@@ -1628,6 +2131,9 @@ void rdpRun(struct N64* n) {
 		}
 		n->dp.current += words * 8;
 		if (op == 0x29) {
+			if (r->gpu) {
+				gpuSubmit(n, r);
+			}
 			++n->stats.dpSyncs;
 			if (n->dp.syncAt) {
 				n64Interrupt(n, MI_DP, true);
@@ -1638,6 +2144,10 @@ void rdpRun(struct N64* n) {
 		}
 		uint64_t clocks = primitiveClocks(r, w, op);
 		r->clocks += clocks;
+		if (r->gpu) {
+			gpuCommand(n, r, w, op);
+			continue;
+		}
 		if (!r->renderers) {
 			execute(n, r, w, op);
 			continue;
@@ -1660,6 +2170,10 @@ void rdpDestroy(struct N64* n) {
 	if (n->rdp && n->rdp->renderers) {
 		rdpWait(n);
 		stopRenderers(n->rdp->renderers);
+	}
+	if (n->rdp && n->rdp->gpu) {
+		rdpWait(n);
+		gpuDestroy(n->rdp->gpu);
 	}
 	free(n->rdp);
 	n->rdp = NULL;
