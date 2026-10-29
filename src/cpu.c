@@ -405,7 +405,7 @@ static void cop0Execute(struct N64* n, uint32_t op) {
 	cpuException(n, EXC_RI, 0);
 }
 
-// In compatibility mode, an unmapped access within 64 KiB of address zero (a null pointer) reads
+// In lle-compatible accuracy, an unmapped access within 64 KiB of address zero (a null pointer) reads
 // zero and writes nothing instead of missing the TLB.
 static bool nullAccess(struct N64* n, uint64_t vaddr) {
 	uint32_t v = (uint32_t) vaddr, p;

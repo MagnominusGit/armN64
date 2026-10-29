@@ -85,8 +85,9 @@ bool n64LoadRom(struct N64* n, const uint8_t* data, size_t size) {
 
 // From power-on: the PIF's boot from the cartridge, or from the 64DD's IPL without one.
 static void start(struct N64* n) {
-	const char* compat = getenv("N64_COMPAT");
-	n->compat = compat && *compat == '1';
+	const char* accuracy = getenv("N64_ACCURACY");
+	n->accuracy = accuracy && !strcmp(accuracy, "lle-compatible") ? ACCURACY_LLE_COMPATIBLE : ACCURACY_LLE_ACCURATE;
+	n->compat = n->accuracy >= ACCURACY_LLE_COMPATIBLE;
 	const char* mouse = getenv("N64_MOUSE");
 	n->mousePort = mouse && *mouse >= '1' && *mouse <= '4' ? *mouse - '0' : 0;
 	if (n->compat) {
@@ -248,7 +249,7 @@ int n64Picture(struct N64* n, uint32_t* out, int* width, int* height) {
 	int hStart = (v[9] >> 16) & 0x3FF, hEnd = v[9] & 0x3FF;
 	int vStart = (v[10] >> 16) & 0x3FF, vEnd = v[10] & 0x3FF;
 	uint32_t xScale = v[12] & 0xFFF, yScale = v[13] & 0xFFF;
-	// In compatibility mode, an empty window (osViBlack) shows the picture anyway in the TV type's
+	// In lle-compatible accuracy, an empty window (osViBlack) shows the picture anyway in the TV type's
 	// usual one, as emulators that draw the RDP's image directly do.
 	if (n->compat && (hEnd <= hStart || vEnd <= vStart)) {
 		bool pal = n->fieldCycles == CPU_HZ / 50;

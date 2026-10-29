@@ -221,7 +221,8 @@ static void piDma(struct N64* n, uint32_t len, bool toRdram) {
 	uint32_t* t = n->pi.timing;
 	uint32_t page = 1u << ((t[2] & 15) + 2);
 	uint64_t rcp = (uint64_t) ((len + page - 1) / page) * (t[0] + 1) + (uint64_t) ((len + 1) / 2) * ((t[1] + 1) + (t[3] + 1));
-	n->pi.busyUntil = n->cycles + rcp * 3 / 2;
+	// Emulators that hacks were made on finish a DMA at once (lle-compatible accuracy).
+	n->pi.busyUntil = n->cycles + (n->compat ? 1 : rcp * 3 / 2);
 	n64Event(n, n->pi.busyUntil);
 	n->pi.status |= 1;
 }

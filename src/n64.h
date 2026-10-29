@@ -126,11 +126,14 @@ struct SI {
 
 struct RDP;
 
-// Per 4 KB page of RDRAM: it holds compiled code, or RDP commands not yet drawn write or read it.
+// The N64_ACCURACY levels.
+enum { ACCURACY_LLE_ACCURATE, ACCURACY_LLE_COMPATIBLE };
+
 // CPU cycles for cache line fills and the write-back of a dirty data line (cpu.c and both code
 // generators).
 enum { ICACHE_FILL = 48, DCACHE_FILL = 40, DCACHE_WRITEBACK = 40 };
 
+// Per 4 KB page of RDRAM: it holds compiled code, or RDP commands not yet drawn write or read it.
 enum { PAGE_CODE = 1, PAGE_RDP_WRITES = 2, PAGE_RDP_READS = 4, PAGE_RDP = 6 };
 
 // Compiled RSP code for an IMEM address, good while rspCodeGen is unchanged.
@@ -206,9 +209,11 @@ struct N64 {
 	uint64_t eventAt;
 	// CPU cycles the CPU may run ahead of the RSP before it catches up.
 	uint64_t slice;
-	// Compatibility mode (N64_COMPAT=1), for hacks made on emulators: RDRAM starts zeroed, misaligned
-	// CPU accesses align down instead of raising address errors, unmapped null-pointer accesses read
-	// zero, PI DMA copies between the exact addresses, and a blanked VI window still shows the picture.
+	// N64_ACCURACY: lle-accurate (the default) is the hardware. lle-compatible is for hacks made on
+	// emulators: RDRAM starts zeroed, misaligned CPU accesses align down instead of raising address
+	// errors, unmapped null-pointer accesses read zero, PI DMA copies between the exact addresses
+	// and finishes at once, and a blanked VI window still shows the picture. compat is true for it.
+	int accuracy;
 	bool compat;
 	// The RSP is being caught up: its own accesses to the shared registers must not catch it up again.
 	bool catchingUp;
