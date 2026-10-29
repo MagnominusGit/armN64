@@ -39,6 +39,67 @@ bool blockIsIdleLoop(const uint32_t* ops, uint32_t count, uint32_t vaddr) {
 	return count == 2 && (ops[0] == 0x1000FFFF || ops[0] == jumpSelf) && ops[1] == 0;
 }
 
+// The registers an instruction of a poll loop reads and writes (bit 32 for none), or false for one
+// a poll loop can't have: anything but loads, ALU instructions that can't trap, and NOP.
+static bool pollOp(uint32_t op, uint64_t* reads, uint64_t* writes) {
+	int rs = (op >> 21) & 31, rt = (op >> 16) & 31, rd = (op >> 11) & 31;
+	switch (op >> 26) {
+	case 0x00:
+		switch (op & 0x3F) {
+		case 0x00: case 0x02: case 0x03: case 0x38: case 0x3A: case 0x3B: case 0x3C: case 0x3E: case 0x3F:
+			*reads = 1ull << rt;
+			*writes = 1ull << rd;
+			return true;
+		case 0x04: case 0x06: case 0x07: case 0x14: case 0x16: case 0x17:
+		case 0x21: case 0x23: case 0x24: case 0x25: case 0x26: case 0x27: case 0x2A: case 0x2B: case 0x2D: case 0x2F:
+			*reads = 1ull << rs | 1ull << rt;
+			*writes = 1ull << rd;
+			return true;
+		}
+		return false;
+	case 0x09: case 0x0A: case 0x0B: case 0x0C: case 0x0D: case 0x0E: case 0x19:
+	case 0x20: case 0x21: case 0x23: case 0x24: case 0x25: case 0x27: case 0x37:
+		*reads = 1ull << rs;
+		*writes = 1ull << rt;
+		return true;
+	case 0x0F:
+		*reads = 0;
+		*writes = 1ull << rt;
+		return true;
+	}
+	return false;
+}
+
+uint32_t blockPollPass(const uint32_t* ops, uint32_t count, uint32_t vaddr) {
+	if (count < 3 || count > 16) {
+		return 0;
+	}
+	// A conditional branch back to the start, then its delay slot.
+	uint32_t branch = ops[count - 2];
+	int code = branch >> 26;
+	bool conditional = (code >= 0x04 && code <= 0x07) || (code == 0x01 && !(((branch >> 16) & 31) & ~1u));
+	if (!conditional || vaddr + 4 * (count - 1) + ((uint32_t) (int16_t) branch << 2) != vaddr) {
+		return 0;
+	}
+	uint64_t written = 0, readFirst = 0;
+	bool load = false;
+	for (uint32_t k = 0; k < count; ++k) {
+		uint32_t op = ops[k];
+		uint64_t reads, writes;
+		if (k == count - 2) {
+			reads = 1ull << ((op >> 21) & 31) | (code == 0x04 || code == 0x05 ? 1ull << ((op >> 16) & 31) : 0);
+			writes = 0;
+		} else if (!pollOp(op, &reads, &writes)) {
+			return 0;
+		}
+		load |= op >> 26 >= 0x20;
+		readFirst |= reads & ~written;
+		written |= writes;
+	}
+	// Each pass reads only what no pass changes, so all of them do the same.
+	return load && !((readFirst & written) & ~1ull) ? count : 0;
+}
+
 void blocksInvalidatePage(struct N64* n, uint32_t page) {
 	struct Block** t = n->blockPage[page];
 	if (t) {

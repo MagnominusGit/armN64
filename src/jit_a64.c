@@ -931,6 +931,60 @@ static void emitMemory(struct Jit* j, struct Slow* slow) {
 }
 
 // Goes on to the block at the pc in memory if the jump table has it, or leaves.
+// A poll loop (blockPollPass) about to go round again, pc back at its start, skips the whole passes
+// of pass cycles that fit before the limit when all its I-cache and D-cache lines are in: every pass
+// then reads the same memory, takes the same branch and costs the same.
+static void pollSkip(struct Jit* j, const uint32_t* ops, uint32_t count, uint32_t vaddr, uint32_t paddr, uint32_t pass) {
+	struct Emitter* e = &j->e;
+	uint8_t* out[64];
+	int sites = 0;
+	aLdrX(e, 0, CPU, CPU_OFF(pc));
+	movConst(e, 1, sext32(vaddr));
+	aDp(e, A_SUBS | W64, ZR, 0, 1, S_LSL, 0);
+	out[sites++] = aBcond(e, C_NE, NULL);
+	for (uint32_t p = paddr & ~31u; p < paddr + 4 * count; p += 32) {
+		uint32_t v = vaddr + (p - paddr);
+		aLdr(e, 0, CPU, CPU_OFF(icacheTag) + 4 * ((v >> 5) & 511));
+		aMovImm(e, 1, p >> 5 | 0x80000000u);
+		aDp(e, A_SUBS, ZR, 0, 1, S_LSL, 0);
+		out[sites++] = aBcond(e, C_NE, NULL);
+	}
+	for (uint32_t k = 0; k < count; ++k) {
+		uint32_t op = ops[k];
+		if (op >> 26 < 0x20) {
+			continue;
+		}
+		int rs = (op >> 21) & 31, size = memSize(op);
+		if (rs) {
+			aLdr(e, 0, CPU, gprOff(rs));
+			aAddImm(e, 0, 0, (int16_t) op, 1);
+		} else {
+			aMovImm(e, 0, (uint32_t) (int32_t) (int16_t) op);
+		}
+		aLsrImm(e, 1, 0, 12);
+		aLdst(e, L_LDR, 5, TLB, 1, L_UXTW | 0x1000);
+		aDp(e, A_ADD, 6, 0, 5, S_LSL, 0);
+		if (j->rdpThreads) {
+			aLsrImm(e, 1, 6, 12);
+			aLdst(e, L_LDRB, 1, PAGES, 1, L_UXTW);
+			out[sites++] = aTbnz(e, 1, 1, NULL);
+		}
+		aUbfx(e, 1, 0, 4, 9);
+		aLdst(e, L_LDR, 3, DTAG, 1, L_UXTW | 0x1000);
+		aDp(e, A_EOR, 2, 3, 6, S_LSL, 0);
+		aLogicImm(e, A_ANDS_IMM, ZR, 2, 0xFFFFFFF0u | (size - 1));
+		out[sites++] = aBcond(e, C_NE, NULL);
+	}
+	aDpImm(e, A_SUB_IMM, 0, LEFT, 1);
+	aMovImm(e, 1, pass);
+	aUdiv(e, 0, 0, 1);
+	aMadd(e, 0, 0, 1, ZR);
+	aDp(e, A_SUB | W64, LEFT, LEFT, 0, S_LSL, 0);
+	for (int i = 0; i < sites; ++i) {
+		patchHere(e, out[i]);
+	}
+}
+
 static void chain(struct Jit* j) {
 	struct Emitter* e = &j->e;
 	aLdrX(e, 0, CPU, CPU_OFF(pc));
@@ -1030,6 +1084,7 @@ void* jitCompile(struct N64* n, const uint32_t* ops, uint32_t count, uint32_t va
 	if (blockIsIdleLoop(ops, count, vaddr)) {
 		skipIdle(e, vaddr, paddr);
 	}
+	uint32_t pollPass = blockPollPass(ops, count, vaddr);
 
 	cacheClear(&j->cache);
 	bool delay = false;
@@ -1172,6 +1227,9 @@ void* jitCompile(struct N64* n, const uint32_t* ops, uint32_t count, uint32_t va
 		if (x->last && !(x->kind != PLAIN && !x->skip)) {
 			aDp(e, A_SUBS | W64, ZR, LEFT, ZR, S_LSL, 0);
 			aBcond(e, C_LE, j->leave);
+			if (pollPass) {
+				pollSkip(j, ops, count, vaddr, paddr, pollPass);
+			}
 			chain(j);
 		} else {
 			aB(e, j->leave);

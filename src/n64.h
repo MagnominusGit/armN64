@@ -271,6 +271,9 @@ void blocksRun(struct N64*);
 void blocksFree(struct N64*);
 void blocksInvalidatePage(struct N64*, uint32_t page);
 bool blockIsIdleLoop(const uint32_t* ops, uint32_t count, uint32_t vaddr);
+// The cycles one pass of a poll loop takes with its cache lines in, or 0 if the block isn't one: a
+// loop back to its start through loads and ALU instructions whose every pass reads the same.
+uint32_t blockPollPass(const uint32_t* ops, uint32_t count, uint32_t vaddr);
 // jit_x64.c
 void* jitCompile(struct N64*, const uint32_t* ops, uint32_t count, uint32_t vaddr, uint32_t paddr);
 void jitReset(struct N64*);

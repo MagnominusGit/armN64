@@ -769,6 +769,63 @@ static void emitMemory(struct Jit* j, struct Slow* slow) {
 }
 
 // Goes on to the block at the pc in memory if the jump table has it, or leaves.
+// A poll loop (blockPollPass) about to go round again, pc back at its start, skips the whole passes
+// of pass cycles that fit before the limit when all its I-cache and D-cache lines are in: every pass
+// then reads the same memory, takes the same branch and costs the same.
+static void pollSkip(struct Jit* j, const uint32_t* ops, uint32_t count, uint32_t vaddr, uint32_t paddr, uint32_t pass) {
+	struct Emitter* e = &j->e;
+	uint8_t* out[64];
+	int sites = 0;
+	xLoad(e, 8, RAX, CPU_AT(pc));
+	movConst(e, RCX, sext32(vaddr));
+	xAluRR(e, X_CMP, 8, R(RAX), RCX);
+	out[sites++] = xJcc(e, CC_NE, NULL);
+	for (uint32_t p = paddr & ~31u; p < paddr + 4 * count; p += 32) {
+		uint32_t v = vaddr + (p - paddr);
+		struct Opnd tag = M(R12, (int32_t) (offsetof(struct CPU, icacheTag) + 4 * ((v >> 5) & 511)));
+		xAluI(e, X_CMP, 4, tag, (int32_t) (p >> 5 | 0x80000000u));
+		out[sites++] = xJcc(e, CC_NE, NULL);
+	}
+	for (uint32_t k = 0; k < count; ++k) {
+		uint32_t op = ops[k];
+		if (op >> 26 < 0x20) {
+			continue;
+		}
+		int size = memSize(op);
+		xLoad(e, 4, RAX, gpr((op >> 21) & 31));
+		xAluI(e, X_ADD, 4, R(RAX), (int16_t) op);
+		xMovRR(e, 4, R8, RAX);
+		xMovRR(e, 4, RCX, RAX);
+		xShiftI(e, X_SHR, 4, R(RCX), 12);
+		xLoad(e, 8, RDX, N64_AT(vpages));
+		xAluRM(e, X_ADD, 4, RAX, MI(RDX, RCX, 4, 0));
+		if (j->rdpThreads) {
+			xMovRR(e, 4, RCX, RAX);
+			xShiftI(e, X_SHR, 4, R(RCX), 12);
+			xTestI(e, 1, MI(RBX, RCX, 1, (int32_t) offsetof(struct N64, pageFlags)), PAGE_RDP_WRITES);
+			out[sites++] = xJcc(e, CC_NE, NULL);
+		}
+		xMovRR(e, 4, RCX, R8);
+		xShiftI(e, X_SHR, 4, R(RCX), 4);
+		xAluI(e, X_AND, 4, R(RCX), 511);
+		xLoad(e, 4, RDX, MI(R12, RCX, 4, (int32_t) offsetof(struct CPU, dcacheTag)));
+		xAluRR(e, X_XOR, 4, R(RDX), RAX);
+		xTestI(e, 4, R(RDX), 0xFFFFFFF0u | (uint32_t) (size - 1));
+		out[sites++] = xJcc(e, CC_NE, NULL);
+	}
+	xMovRR(e, 8, RAX, R14);
+	xAluRR(e, X_SUB, 8, R(RAX), R13);
+	xAluI(e, X_SUB, 4, R(RAX), 1);
+	xAluRR(e, X_XOR, 4, R(RDX), RDX);
+	xMovI(e, RCX, pass);
+	xDiv(e, 4, R(RCX));
+	xImul(e, 4, RAX, R(RCX));
+	xAluRR(e, X_ADD, 8, R(R13), RAX);
+	for (int i = 0; i < sites; ++i) {
+		patchHere(e, out[i]);
+	}
+}
+
 static void chain(struct Jit* j) {
 	struct Emitter* e = &j->e;
 	xLoad(e, 8, RAX, CPU_AT(pc));
@@ -854,6 +911,7 @@ void* jitCompile(struct N64* n, const uint32_t* ops, uint32_t count, uint32_t va
 	if (blockIsIdleLoop(ops, count, vaddr)) {
 		skipIdle(e, vaddr, paddr);
 	}
+	uint32_t pollPass = blockPollPass(ops, count, vaddr);
 
 	bool delay = false;
 	for (uint32_t k = 0; k < count; ++k) {
@@ -990,6 +1048,9 @@ void* jitCompile(struct N64* n, const uint32_t* ops, uint32_t count, uint32_t va
 		if (x->last && !(x->kind != PLAIN && !x->skip)) {
 			xAluRR(e, X_CMP, 8, R(R13), R14);
 			xJcc(e, CC_AE, j->leave);
+			if (pollPass) {
+				pollSkip(j, ops, count, vaddr, paddr, pollPass);
+			}
 			chain(j);
 		} else {
 			xJmp(e, j->leave);
