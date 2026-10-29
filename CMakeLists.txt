@@ -19,7 +19,7 @@ else()
 	set(JIT_SOURCES src/jit_none.c)
 endif()
 
-add_library(n64 STATIC src/n64.c src/blocks.c ${JIT_SOURCES} src/cpu.c src/fpu.c src/bus.c src/pif.c src/rsp.c src/rsp_vu.c src/rdp.c src/gles.c src/carts.c src/dd.c)
+add_library(n64 STATIC src/n64.c src/blocks.c ${JIT_SOURCES} src/cpu.c src/fpu.c src/bus.c src/pif.c src/rsp.c src/rsp_vu.c src/rdp.c src/hle.c src/gles.c src/carts.c src/dd.c)
 # The GPU RDP's shader, as a C string.
 set(RDP_GPU_GLSL ${CMAKE_SOURCE_DIR}/src/rdp_gpu.glsl)
 set_property(DIRECTORY APPEND PROPERTY CMAKE_CONFIGURE_DEPENDS ${RDP_GPU_GLSL})

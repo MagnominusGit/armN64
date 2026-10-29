@@ -2188,12 +2188,8 @@ static void gpuCommand(struct N64* n, struct RDP* r, const uint64_t* w, int op) 
 	}
 }
 
-// Runs the commands from DP_CURRENT to DP_END, keeping the RDP's time: a full sync interrupts the CPU
-// once the commands before it would be done.
-void rdpRun(struct N64* n) {
-	if (n->dp.status & 2) {
-		return;
-	}
+// Starts a run of commands: the renderers or the GPU on first use, and when the RDP can take them.
+static struct RDP* beginCommands(struct N64* n, uint64_t* begin) {
 	struct RDP* r = state(n);
 	if (n->rdpGpu && !r->gpu) {
 		r->gpu = gpuCreate();
@@ -2202,8 +2198,63 @@ void rdpRun(struct N64* n) {
 	if (n->rdpThreads && !r->renderers && !r->gpu) {
 		r->renderers = startRenderers(n, r);
 	}
-	uint64_t begin = n->dp.busyUntil > n->cycles ? n->dp.busyUntil : n->cycles;
+	*begin = n->dp.busyUntil > n->cycles ? n->dp.busyUntil : n->cycles;
 	r->clocks = 0;
+	return r;
+}
+
+// One command: a full sync interrupts the CPU once the commands before it would be done.
+static void command(struct N64* n, struct RDP* r, const uint64_t* w, int op, int words, uint64_t begin) {
+	if (op == 0x29) {
+		if (r->gpu) {
+			gpuSubmit(n, r);
+		}
+		++n->stats.dpSyncs;
+		if (n->dp.syncAt) {
+			n64Interrupt(n, MI_DP, true);
+		}
+		n->dp.syncAt = begin + r->clocks * 3 / 2;
+		n64Event(n, n->dp.syncAt);
+		return;
+	}
+	uint64_t clocks = primitiveClocks(r, w, op);
+	r->clocks += clocks;
+	n->dp.bufBusy += (uint32_t) clocks;
+	n->dp.pipeBusy += (uint32_t) clocks;
+	if (op == 0x30 || op == 0x33 || op == 0x34) {
+		n->dp.tmemBusy += (uint32_t) clocks;
+	}
+	if (r->gpu) {
+		gpuCommand(n, r, w, op);
+		return;
+	}
+	if (!r->renderers) {
+		execute(n, r, w, op);
+		return;
+	}
+	submit(n, r, w, op, words);
+	r->renderers->unannounced += clocks;
+	// The main thread keeps the state the cost model and the flags need; it draws nothing.
+	bool draws = (op >= 0x08 && op <= 0x0F) || op == 0x24 || op == 0x25 || op == 0x36;
+	if (!draws && op != 0x30 && op != 0x33 && op != 0x34) {
+		execute(n, r, w, op);
+	}
+}
+
+static void endCommands(struct N64* n, struct RDP* r, uint64_t begin) {
+	if (r->renderers && r->renderers->unannounced >= WAKE_CLOCKS) {
+		wake(r->renderers);
+	}
+	n->dp.busyUntil = begin + r->clocks * 3 / 2;
+}
+
+// Runs the commands from DP_CURRENT to DP_END, keeping the RDP's time.
+void rdpRun(struct N64* n) {
+	if (n->dp.status & 2) {
+		return;
+	}
+	uint64_t begin;
+	struct RDP* r = beginCommands(n, &begin);
 	while (n->dp.current < n->dp.end) {
 		uint64_t w[22];
 		w[0] = word(n, n->dp.current);
@@ -2216,45 +2267,25 @@ void rdpRun(struct N64* n) {
 			w[i] = word(n, n->dp.current + i * 8);
 		}
 		n->dp.current += words * 8;
-		if (op == 0x29) {
-			if (r->gpu) {
-				gpuSubmit(n, r);
-			}
-			++n->stats.dpSyncs;
-			if (n->dp.syncAt) {
-				n64Interrupt(n, MI_DP, true);
-			}
-			n->dp.syncAt = begin + r->clocks * 3 / 2;
-			n64Event(n, n->dp.syncAt);
-			continue;
-		}
-		uint64_t clocks = primitiveClocks(r, w, op);
-		r->clocks += clocks;
-		n->dp.bufBusy += (uint32_t) clocks;
-		n->dp.pipeBusy += (uint32_t) clocks;
-		if (op == 0x30 || op == 0x33 || op == 0x34) {
-			n->dp.tmemBusy += (uint32_t) clocks;
-		}
-		if (r->gpu) {
-			gpuCommand(n, r, w, op);
-			continue;
-		}
-		if (!r->renderers) {
-			execute(n, r, w, op);
-			continue;
-		}
-		submit(n, r, w, op, words);
-		r->renderers->unannounced += clocks;
-		// The main thread keeps the state the cost model and the flags need; it draws nothing.
-		bool draws = (op >= 0x08 && op <= 0x0F) || op == 0x24 || op == 0x25 || op == 0x36;
-		if (!draws && op != 0x30 && op != 0x33 && op != 0x34) {
-			execute(n, r, w, op);
-		}
+		command(n, r, w, op, words, begin);
 	}
-	if (r->renderers && r->renderers->unannounced >= WAKE_CLOCKS) {
-		wake(r->renderers);
+	endCommands(n, r, begin);
+}
+
+// Runs a list of commands made outside RDRAM (hle.c).
+void rdpCommands(struct N64* n, const uint64_t* list, size_t count) {
+	uint64_t begin;
+	struct RDP* r = beginCommands(n, &begin);
+	for (size_t i = 0; i < count;) {
+		int op = (list[i] >> 56) & 0x3F;
+		int words = commandWords(op);
+		if (i + words > count) {
+			break;
+		}
+		command(n, r, &list[i], op, words, begin);
+		i += words;
 	}
-	n->dp.busyUntil = begin + r->clocks * 3 / 2;
+	endCommands(n, r, begin);
 }
 
 void rdpDestroy(struct N64* n) {

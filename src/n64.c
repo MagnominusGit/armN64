@@ -42,6 +42,7 @@ void n64Destroy(struct N64* n) {
 		jitFree(n);
 		rspJitFree(n);
 		rdpDestroy(n);
+		free(n->hle);
 		free(n->rdram);
 		free(n->vpages);
 		ddFree(n);
@@ -86,7 +87,8 @@ bool n64LoadRom(struct N64* n, const uint8_t* data, size_t size) {
 // From power-on: the PIF's boot from the cartridge, or from the 64DD's IPL without one.
 static void start(struct N64* n) {
 	const char* accuracy = getenv("N64_ACCURACY");
-	n->accuracy = accuracy && !strcmp(accuracy, "lle-compatible") ? ACCURACY_LLE_COMPATIBLE : ACCURACY_LLE_ACCURATE;
+	n->accuracy = !accuracy ? ACCURACY_LLE_ACCURATE : !strcmp(accuracy, "lle-compatible") ? ACCURACY_LLE_COMPATIBLE :
+	              !strcmp(accuracy, "hle") ? ACCURACY_HLE : ACCURACY_LLE_ACCURATE;
 	n->compat = n->accuracy >= ACCURACY_LLE_COMPATIBLE;
 	const char* mouse = getenv("N64_MOUSE");
 	n->mousePort = mouse && *mouse >= '1' && *mouse <= '4' ? *mouse - '0' : 0;

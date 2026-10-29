@@ -127,7 +127,7 @@ struct SI {
 struct RDP;
 
 // The N64_ACCURACY levels.
-enum { ACCURACY_LLE_ACCURATE, ACCURACY_LLE_COMPATIBLE };
+enum { ACCURACY_LLE_ACCURATE, ACCURACY_LLE_COMPATIBLE, ACCURACY_HLE };
 
 // CPU cycles for cache line fills and the write-back of a dirty data line (cpu.c and both code
 // generators).
@@ -190,6 +190,7 @@ struct N64 {
 	struct RSP rsp;
 	struct DP dp;
 	struct RDP* rdp;
+	struct Hle* hle;
 	struct VI vi;
 	struct AI ai;
 	struct PI pi;
@@ -212,7 +213,8 @@ struct N64 {
 	// N64_ACCURACY: lle-accurate (the default) is the hardware. lle-compatible is for hacks made on
 	// emulators: RDRAM starts zeroed, misaligned CPU accesses align down instead of raising address
 	// errors, unmapped null-pointer accesses read zero, PI DMA copies between the exact addresses
-	// and finishes at once, and a blanked VI window still shows the picture. compat is true for it.
+	// and finishes at once, and a blanked VI window still shows the picture. hle adds high-level
+	// graphics (hle.c) to that. compat is true for both.
 	int accuracy;
 	bool compat;
 	// The RSP is being caught up: its own accesses to the shared registers must not catch it up again.
@@ -420,6 +422,10 @@ void busWrite64(struct N64*, uint32_t addr, uint64_t value);
 
 // rdp.c
 void rdpRun(struct N64*);
+void rdpCommands(struct N64*, const uint64_t* list, size_t count);
+
+// hle.c
+bool hleGraphics(struct N64*);
 void rdpDestroy(struct N64*);
 
 // carts.c
