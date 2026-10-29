@@ -315,12 +315,12 @@ ivec4 div32(ivec4 v) {
 }
 
 // The texels go through one texel() call (a loop the compiler leaves alone): the shader stays small.
-ivec4 sampleTile(int t, int s, int tt, bool filter) {
+ivec4 sampleTile(int t, int s, int tt, bool bilerp) {
 	t &= 7;
 	int fs, ft, f;
 	int s0 = wrapS(t, s, fs);
 	int t0 = wrapT(t, tt, ft);
-	bool bilinear = filter && ((omHi >> 13) & 1u) != 0u && ((omHi >> 20) & 3u) < 2u;
+	bool bilinear = bilerp && ((omHi >> 13) & 1u) != 0u && ((omHi >> 20) & 3u) < 2u;
 	int s1 = s0, t1 = t0;
 	if (bilinear) {
 		int shiftS = tileField(t, T_SHIFTS), shiftT = tileField(t, T_SHIFTT);
