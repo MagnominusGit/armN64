@@ -373,13 +373,19 @@ uint32_t busRead32(struct N64* n, uint32_t addr) {
 		case 0x0C:
 			return n->dp.status | 0x80;
 		case 0x10:
-			return (uint32_t) ((n->cycles - n->dp.clockBase) * 2 / 3) & 0xFFFFFF;
+		{
+			// The RSP reads it at its own time (OoT's boot microcode uses it after the clear). It
+			// stops at its largest value (Majora's Mask's boot microcode, read every task, never
+			// sees a low 7 bits of zero).
+			uint64_t t = (n->catchingUp ? n->rsp.clock : n->cycles * 2 / 3) - n->dp.clockBase;
+			return t > 0xFFFFFF ? 0xFFFFFF : (uint32_t) t;
+		}
 		case 0x14:
-			return n->dp.bufBusy & 0xFFFFFF;
+			return n->dp.bufBusy > 0xFFFFFF ? 0xFFFFFF : n->dp.bufBusy;
 		case 0x18:
-			return n->dp.pipeBusy & 0xFFFFFF;
+			return n->dp.pipeBusy > 0xFFFFFF ? 0xFFFFFF : n->dp.pipeBusy;
 		case 0x1C:
-			return n->dp.tmemBusy & 0xFFFFFF;
+			return n->dp.tmemBusy > 0xFFFFFF ? 0xFFFFFF : n->dp.tmemBusy;
 		}
 		return 0;
 	case 0x043:
@@ -539,7 +545,7 @@ void busWrite32(struct N64* n, uint32_t addr, uint32_t v) {
 				n->dp.bufBusy = 0;
 			}
 			if (v & 0x200) {
-				n->dp.clockBase = n->cycles;
+				n->dp.clockBase = n->catchingUp ? n->rsp.clock : n->cycles * 2 / 3;
 			}
 			break;
 		}

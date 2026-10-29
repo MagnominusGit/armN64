@@ -90,7 +90,7 @@ struct DP {
 	uint32_t start, end, current, status;
 	// When the RDP finishes the commands it has, and when its pending full-sync interrupt is due.
 	uint64_t busyUntil, syncAt;
-	// The 24-bit counters: RCP cycles since the clock counter was cleared (from clockBase in CPU
+	// The 24-bit counters: RCP cycles since the clock counter was cleared (at clockBase, in RCP
 	// cycles), and RDP clocks with the command buffer busy, the pipeline busy and TMEM loading.
 	uint64_t clockBase;
 	uint32_t bufBusy, pipeBusy, tmemBusy;
