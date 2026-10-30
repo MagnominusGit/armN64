@@ -250,21 +250,31 @@ static bool idleRun(struct N64* n) {
 	struct CPU* c = &n->cpu;
 	enum { PASS_LIMIT = 256 };
 	if (d->on) {
-		// One pass more, making the same loads with the same values as the traced one.
-		d->tracing = true, d->fatal = false, d->loads = d->passLoads;
-		bool back = idleStepTo(n, d->pc, PASS_LIMIT);
-		d->tracing = false;
-		bool same = back && d->loads == 2 * d->passLoads;
+		// The pass goes the same while no interrupt is due and its loads read what they did: on to
+		// the slice's end or the timer's interrupt, whichever comes first.
+		if ((uint32_t) c->pc != d->pc || c->nextInDelay) {
+			// Back round to where the loop was traced (a slice ran the loop as it is).
+			d->tracing = true, d->fatal = false, d->loads = d->passLoads;
+			bool back = idleStepTo(n, d->pc, PASS_LIMIT);
+			d->tracing = false;
+			if (!back) {
+				d->on = false;
+				return false;
+			}
+		}
+		// An interrupt raised and unmasked stops it too, enabled or not here (the pass may enable
+		// interrupts on its way round).
+		bool same = cpuJitReady(n) && n->jitLimit > n->cycles && !(c->cop0[CP0_CAUSE] & c->cop0[CP0_STATUS] & 0xFF00);
 		for (int i = 0; same && i < d->passLoads; ++i) {
-			same = !memcmp(&d->load[i], &d->load[d->passLoads + i], sizeof(d->load[i]));
+			same = rdramValue(n, d->load[i].addr, d->load[i].size) == d->load[i].value;
 		}
 		if (!same) {
 			d->on = false;
 			return false;
 		}
 		++n->stats.idleSlices;
-		n->stats.idleCycles += n->eventAt > n->cycles ? n->eventAt - n->cycles : 0;
-		n->cycles = n->eventAt;
+		n->stats.idleCycles += n->jitLimit - n->cycles;
+		n->cycles = n->jitLimit;
 		return true;
 	}
 	if (d->near < 4 || c->nextInDelay) {
@@ -288,8 +298,7 @@ static bool idleRun(struct N64* n) {
 	d->passLoads = d->loads;
 	d->on = true;
 	d->pc = pc;
-	n->cycles = n->cycles > n->eventAt ? n->cycles : n->eventAt;
-	return true;
+	return false;
 }
 
 // At the end of a slice: where the CPU is, to see it staying in a small loop (with a call, two
