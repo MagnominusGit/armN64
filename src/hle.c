@@ -647,6 +647,28 @@ static void spriteDraw(struct N64* n, struct Hle* h, int x, int y) {
 	}
 }
 
+// The task's microcode left to the RSP, this task (from the start) and later ones.
+static void reject(struct Hle* h) {
+	if (h->rejectedCount < 8) {
+		h->rejected[h->rejectedCount++] = h->ucode;
+	}
+	h->rejectedNow = true;
+}
+
+static int family(struct N64* n, uint32_t data, uint32_t size);
+
+// G_LOAD_UCODE: the list goes on in another microcode (its data named by G_RDPHALF_1); one of no
+// family here leaves the task to the RSP.
+static bool loadMicrocode(struct N64* n, struct Hle* h, uint32_t dataSize) {
+	int f = family(n, address(h, h->half1), dataSize);
+	if (f == FAMILY_NONE) {
+		reject(h);
+		return false;
+	}
+	h->family = f;
+	return true;
+}
+
 static void runList(struct N64* n, struct Hle* h, uint32_t pc) {
 	uint32_t* stack = h->stack;
 	int sp = h->sp;
@@ -749,6 +771,12 @@ static void runList(struct N64* n, struct Hle* h, uint32_t pc) {
 			case 0xE1:
 				h->half1 = w1;
 				break;
+			case 0xDD:
+				if (!loadMicrocode(n, h, (w0 & 0xFFFF) + 1)) {
+					return;
+				}
+				f3dex2 = h->family == FAMILY_F3DEX2, f3dex = h->family == FAMILY_F3DEX;
+				break;
 			case 0xE2:
 			case 0xE3: {
 				int len = (w0 & 0xFF) + 1, shift = 32 - ((w0 >> 8) & 0xFF) - len;
@@ -821,6 +849,12 @@ static void runList(struct N64* n, struct Hle* h, uint32_t pc) {
 			case 0xB4:
 				h->half1 = w1;
 				break;
+			case 0xAF:
+				if (!loadMicrocode(n, h, (w0 & 0xFFFF) + 1)) {
+					return;
+				}
+				f3dex2 = h->family == FAMILY_F3DEX2, f3dex = h->family == FAMILY_F3DEX;
+				break;
 			case 0xB5:
 				if (f3dex) {
 					int v0 = ((w1 >> 24) & 0xFF) / 2, v1 = ((w1 >> 16) & 0xFF) / 2, v2 = ((w1 >> 8) & 0xFF) / 2, v3 = (w1 & 0xFF) / 2;
@@ -878,10 +912,7 @@ static void runList(struct N64* n, struct Hle* h, uint32_t pc) {
 			case 0xBF:
 				// Fast3D's indices are vertex numbers times 10: other ones are another microcode's.
 				if (!f3dex && (((w1 >> 16) & 0xFF) % 10 || ((w1 >> 8) & 0xFF) % 10 || (w1 & 0xFF) % 10)) {
-					if (h->rejectedCount < 8) {
-						h->rejected[h->rejectedCount++] = h->ucode;
-					}
-					h->rejectedNow = true;
+					reject(h);
 					return;
 				}
 				drawTriangle(n, h, ((w1 >> 16) & 0xFF) / scale, ((w1 >> 8) & 0xFF) / scale, (w1 & 0xFF) / scale);
