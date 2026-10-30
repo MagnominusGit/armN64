@@ -1030,6 +1030,12 @@ void glrDraw(struct N64* n, struct RDP* r, const uint64_t* w, int op) {
 			rdpDrawSoftware(n, r, w, op);
 			return;
 		}
+		if (r->cycleType == 3 && (y1 >> 2) >= TARGET_ROWS) {
+			// A fill taller than a target (several images at once): in RDRAM.
+			glrSync(n);
+			rdpDrawSoftware(n, r, w, op);
+			return;
+		}
 		if (r->cycleType == 3) {
 			// Fill: the color image filled.
 			int rows = (y1 >> 2) + 1;
