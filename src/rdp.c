@@ -37,6 +37,7 @@ static void gpuSync(struct N64* n, struct RDP* r);
 static bool gpuDrew(struct Gpu* g, uint32_t addr, uint32_t len);
 static bool gpuReadNeeds(struct Gpu* g, uint32_t addr, uint32_t len);
 static bool gpuWrite(struct N64* n, struct RDP* r, uint32_t addr, uint32_t len);
+static void gpuSyncRead(struct N64* n, struct RDP* r, uint32_t addr, uint32_t len);
 static void gpuUpdate(struct N64* n, struct Gpu* g);
 static void buildBlendDivide(void);
 
@@ -1865,7 +1866,7 @@ void rdpWaitFor(struct N64* n, uint32_t addr, uint32_t len) {
 void rdpWaitRead(struct N64* n, uint32_t addr, uint32_t len) {
 	if (n->rdp && n->rdp->gpu && !n->glr) {
 		if (n->rdpPending && gpuReadNeeds(n->rdp->gpu, addr, len)) {
-			gpuSync(n, n->rdp);
+			gpuSyncRead(n, n->rdp, addr, len);
 		}
 		return;
 	}
@@ -2589,6 +2590,58 @@ static void gpuSync(struct N64* n, struct RDP* r) {
 	n->rdpPending = false;
 }
 
+// For a read of [addr, addr + len): what the GPU drew on those pages, back in RDRAM and off the drawn
+// list (the rest stays on the GPU until wanted, or the next full sync).
+static void gpuSyncRead(struct N64* n, struct RDP* r, uint32_t addr, uint32_t len) {
+	struct Gpu* g = r->gpu;
+	uint32_t from = addr & (RDRAM_SIZE - 1) & ~0xFFFu, to = ((addr & (RDRAM_SIZE - 1)) + len + 0xFFF) & ~0xFFFu;
+	if (g->drawnAll || to > RDRAM_SIZE) {
+		gpuSync(n, r);
+		return;
+	}
+	++n->stats.glSyncs;
+	gpuSubmit(n, r);
+	gpuUpdate(n, g);
+	static int bindings[GPU_RANGES * 2];
+	static size_t offsets[GPU_RANGES * 2], sizes[GPU_RANGES * 2];
+	uint32_t pieceFrom[GPU_RANGES], pieceTo[GPU_RANGES];
+	int pieces = 0, count = 0;
+	for (int i = 0; i < g->drawnCount; ++i) {
+		uint32_t a = (g->drawnFrom[i] > from ? g->drawnFrom[i] : from) & ~1u, b = g->drawnTo[i] < to ? g->drawnTo[i] : to;
+		b = (b + 1) & ~1u;
+		if (a >= b) {
+			continue;
+		}
+		pieceFrom[pieces] = a, pieceTo[pieces++] = b;
+		bindings[count] = 0, offsets[count] = a, sizes[count++] = b - a;
+		bindings[count] = 0, offsets[count] = RDRAM_SIZE + (a >> 1), sizes[count++] = (b - a) >> 1;
+	}
+	const uint8_t* m = count ? glesMapRanges(g->gl, bindings, offsets, sizes, count) : NULL;
+	if (!m) {
+		return;
+	}
+	for (int i = 0; i < pieces; ++i) {
+		uint32_t a = pieceFrom[i], b = pieceTo[i];
+		memcpy(&n->rdram[a], m, b - a);
+		m += b - a;
+		memcpy(&n->hidden[a >> 1], m, (b - a) >> 1);
+		m += (b - a) >> 1;
+	}
+	glesUnmap(g->gl, 0);
+	// Drawn ranges lose the part read back; one with it in its middle keeps it (back again later).
+	for (int i = 0; i < g->drawnCount; ++i) {
+		uint32_t a = g->drawnFrom[i], b = g->drawnTo[i];
+		if (a >= from && b <= to) {
+			g->drawnFrom[i] = g->drawnFrom[--g->drawnCount], g->drawnTo[i] = g->drawnTo[g->drawnCount];
+			--i;
+		} else if (a >= from && a < to) {
+			g->drawnFrom[i] = to;
+		} else if (b > from && b <= to) {
+			g->drawnTo[i] = from;
+		}
+	}
+}
+
 // The GPU RDP's context, with its copy of RDRAM [addr, addr + len) and those bytes' hidden bits
 // as new as RDRAM's, for work on the GPU that reads them after what it drew (the VI); NULL without
 // the GPU RDP. Nothing waits: the GPU takes the work in order.
@@ -2620,7 +2673,7 @@ static void gpuCommand(struct N64* n, struct RDP* r, const uint64_t* w, int op) 
 			uint32_t addr, len;
 			loadSource(r, w, op, &addr, &len);
 			if (n->rdpPending && gpuReadNeeds(g, addr, len)) {
-				gpuSync(n, r);
+				gpuSyncRead(n, r, addr, len);
 			}
 			g->tmemDirty = true;
 		} else if ((op == 0x3E || op == 0x3F) && g->primCount) {
