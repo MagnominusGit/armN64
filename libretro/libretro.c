@@ -83,8 +83,8 @@ static struct retro_core_option_v2_definition optionDefinitions[] = {
 	{ "armn64_rdp_threads", "Renderer Threads (Restart)", NULL, "Threads beside the emulation that draw the RDP's pictures. Auto takes the cores there are, up to 3.",
 	  NULL, "system", { { "auto", "Auto" }, { "0", "None" }, { "1", "1" }, { "2", "2" }, { "3", "3" }, { NULL, NULL } }, "auto" },
 	{ "armn64_renderer", "Renderer (Restart)", NULL,
-	  "GPU draws with OpenGL ES 3.1: High Level graphics with the GL renderer, Compatible and Accurate with the RDP in compute shaders. CPU draws with the renderer threads.",
-	  NULL, "system", { { "gpu", "GPU" }, { "cpu", "CPU" }, { NULL, NULL } }, "gpu" },
+	  "GPU draws with OpenGL ES 3.1: High Level graphics with the GL renderer, Compatible and Accurate with the RDP in compute shaders (exact, but slower than the renderer threads on most handhelds). CPU draws with the renderer threads. Auto takes the GPU for High Level and the CPU otherwise.",
+	  NULL, "system", { { "auto", "Auto" }, { "gpu", "GPU" }, { "cpu", "CPU" }, { NULL, NULL } }, "auto" },
 	{ "armn64_frameskip", "Frame Skip (Restart)", NULL, "Leaves out the drawing of frames that are never shown, as many games make more than the screen can show.",
 	  NULL, "system", { { "disabled", "Off" }, { "enabled", "On" }, { NULL, NULL } }, "disabled" },
 	{ NULL, NULL, NULL, NULL, NULL, NULL, { { NULL, NULL } }, NULL },
@@ -330,7 +330,8 @@ bool retro_load_game(const struct retro_game_info* info) {
 	}
 	// The GPU renderers, in the frontend's GL context if it has one, else in the core's own (beside a
 	// Vulkan frontend, say).
-	hwWanted = !optionIs(environment, "armn64_renderer", "cpu");
+	hwWanted = optionIs(environment, "armn64_renderer", "gpu") ||
+	           (!optionIs(environment, "armn64_renderer", "cpu") && optionIs(environment, "armn64_accuracy", "hle"));
 	if (hwWanted && !askHardwareContext()) {
 		unsigned preferred = RETRO_HW_CONTEXT_NONE;
 		environment(RETRO_ENVIRONMENT_GET_PREFERRED_HW_RENDER, &preferred);
