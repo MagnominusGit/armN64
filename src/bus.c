@@ -729,11 +729,11 @@ uint64_t busRead64(struct N64* n, uint32_t addr) {
 	return (uint64_t) busRead32(n, addr) << 32 | busRead32(n, addr + 4);
 }
 
-static uint8_t* writable(struct N64* n, uint32_t addr) {
+static uint8_t* writable(struct N64* n, uint32_t addr, uint32_t len) {
 	addr &= 0x1FFFFFFF;
 	if (addr < RDRAM_SIZE) {
 		if (n->pageFlags[addr >> 12]) {
-			n64RdramWrite(n, addr, 1);
+			n64RdramWrite(n, addr, len);
 		}
 		return &n->rdram[addr];
 	}
@@ -749,7 +749,7 @@ static uint8_t* writable(struct N64* n, uint32_t addr) {
 }
 
 void busWrite8(struct N64* n, uint32_t addr, uint8_t v) {
-	uint8_t* p = writable(n, addr);
+	uint8_t* p = writable(n, addr, 1);
 	if (p) {
 		*p = v;
 	} else {
@@ -758,7 +758,7 @@ void busWrite8(struct N64* n, uint32_t addr, uint8_t v) {
 }
 
 void busWrite16(struct N64* n, uint32_t addr, uint16_t v) {
-	uint8_t* p = writable(n, addr & ~1u);
+	uint8_t* p = writable(n, addr & ~1u, 2);
 	if (p) {
 		p[0] = v >> 8;
 		p[1] = v;
