@@ -689,8 +689,8 @@ static void reject(struct Hle* h) {
 
 static int family(struct N64* n, uint32_t data, uint32_t size);
 
-// G_LOAD_UCODE: the list goes on in another microcode (its data named by G_RDPHALF_1); one of no
-// family here leaves the task to the RSP.
+// G_LOAD_UCODE: the list goes on in another microcode (its data named by G_RDPHALF_1), its data's
+// other modes with it; one of no family here leaves the task to the RSP.
 static bool loadMicrocode(struct N64* n, struct Hle* h, uint32_t dataSize) {
 	int f = family(n, address(h, h->half1), dataSize);
 	if (f == FAMILY_NONE) {
@@ -698,6 +698,7 @@ static bool loadMicrocode(struct N64* n, struct Hle* h, uint32_t dataSize) {
 		return false;
 	}
 	h->family = f;
+	h->modeH = 0x080CFF, h->modeL = 0;
 	return true;
 }
 
