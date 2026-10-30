@@ -203,17 +203,10 @@ static void cicChallenge(uint8_t* ram) {
 	ram[63] = 0;
 }
 
-// Runs the Joybus commands in PIF RAM: per channel, a send length, a receive length, the command
-// and room for the reply. Controller 1 is plugged in and the cartridge's EEPROM answers on channel 4.
-void pifRun(struct N64* n) {
+// The Joybus commands in PIF RAM: per channel, a send length, a receive length, the command and room
+// for the reply. Controller 1 is plugged in and the cartridge's EEPROM answers on channel 4.
+static void joybus(struct N64* n, bool controllersOnly) {
 	uint8_t* ram = n->pifRam;
-	if (ram[63] == 2) {
-		cicChallenge(ram);
-		return;
-	}
-	if (!(ram[63] & 1)) {
-		return;
-	}
 	int channel = 0;
 	int i = 0;
 	while (i < 62 && channel < 5) {
@@ -242,12 +235,37 @@ void pifRun(struct N64* n) {
 		} else if (channel == 0) {
 			controller(cmd, resp, receive, false, n->buttons);
 		} else if (channel == 4) {
-			eeprom(n, cmd, resp, send, receive);
+			if (!controllersOnly) {
+				eeprom(n, cmd, resp, send, receive);
+			}
 		} else {
 			ram[i + 1] |= 0x80;
 		}
 		i += 2 + send + receive;
 		++channel;
 	}
+}
+
+// A block written to PIF RAM: the CIC challenge, or Joybus commands to run.
+void pifRun(struct N64* n) {
+	uint8_t* ram = n->pifRam;
+	n->pifJoybus = false;
+	if (ram[63] == 2) {
+		cicChallenge(ram);
+		return;
+	}
+	if (!(ram[63] & 1)) {
+		return;
+	}
+	joybus(n, false);
+	n->pifJoybus = true;
 	ram[63] &= ~1;
+}
+
+// PIF RAM read back: the controllers answer the commands left there again, so a game that wrote its
+// read commands once gets the buttons as they are now (as libultra's osContStartReadData expects).
+void pifRead(struct N64* n) {
+	if (n->pifJoybus) {
+		joybus(n, true);
+	}
 }

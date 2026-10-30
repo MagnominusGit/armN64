@@ -209,6 +209,8 @@ struct N64 {
 	uint8_t* rom;
 	size_t romSize;
 	uint8_t pifRam[64];
+	// PIF RAM holds Joybus commands (not a CIC challenge), which run again when it is read.
+	bool pifJoybus;
 	uint8_t save[0x20000];
 	uint8_t eeprom[2048];
 	bool eeprom16k;
@@ -522,6 +524,7 @@ bool cartBootChecksum(const uint8_t* rom, size_t size, int cic, uint8_t seedByte
 // pif.c
 void pifBoot(struct N64*);
 void pifRun(struct N64*);
+void pifRead(struct N64*);
 
 static inline uint32_t be32(const uint8_t* p) {
 	return (uint32_t) p[0] << 24 | (uint32_t) p[1] << 16 | (uint32_t) p[2] << 8 | p[3];

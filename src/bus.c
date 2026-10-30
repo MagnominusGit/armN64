@@ -283,6 +283,7 @@ static void siDma(struct N64* n, bool toPif) {
 		memcpy(n->pifRam, &n->rdram[dram], 64);
 		pifRun(n);
 	} else {
+		pifRead(n);
 		n64RdramWrite(n, dram, 64);
 		memcpy(&n->rdram[dram], n->pifRam, 64);
 	}
