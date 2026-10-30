@@ -898,6 +898,12 @@ static void runList(struct N64* n, struct Hle* h, uint32_t pc) {
 			case 0xB4:
 				h->half1 = w1;
 				break;
+			case 0xB2:
+				// F3DEX's G_MODIFYVTX (Fast3D's 0xB2 is the third texture rectangle word).
+				if (f3dex) {
+					modifyVertex(h, (int) (w0 & 0xFFFF) / 2, (w0 >> 16) & 0xFF, w1);
+				}
+				break;
 			case 0xAF:
 				if (!loadMicrocode(n, h, (w0 & 0xFFFF) + 1)) {
 					return;
