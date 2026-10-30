@@ -54,6 +54,11 @@ struct Hle {
 	float fogMul, fogOffset;
 	uint32_t modeH, modeL;
 	uint32_t half1;
+	// Fast3D's Sprite2D: the sprite its base command named; the scale-flip and draw commands
+	// that follow it.
+	uint32_t sprite;
+	bool spriteMode, spriteFlipS, spriteFlipT;
+	float spriteScaleX, spriteScaleY;
 	// Counting the commands instead of drawing them (N64HLECHECK).
 	bool dry;
 	uint64_t list[LIST_MAX];
@@ -578,6 +583,53 @@ static void cullOrEnd(struct Hle* h, int first, int last, bool* end) {
 	}
 }
 
+// A Sprite2D sprite (uSprite: image, palette, stride, width, height, format, size, first S and T)
+// at x, y (10.2): its rows loaded in bands TMEM holds, each drawn as a texture rectangle.
+static void spriteDraw(struct N64* n, struct Hle* h, int x, int y) {
+	uint32_t a = h->sprite, w8 = rd32(n, a + 8), w12 = rd32(n, a + 12), w16 = rd32(n, a + 16);
+	uint32_t image = address(h, rd32(n, a)), tlut = rd32(n, a + 4) ? address(h, rd32(n, a + 4)) : 0;
+	int stride = (int16_t) (w8 >> 16), width = (int16_t) w8, height = (int16_t) (w12 >> 16);
+	int format = (w12 >> 8) & 0xFF, size = w12 & 0xFF, s0 = (int16_t) (w16 >> 16), t0 = (int16_t) w16;
+	if (width <= 0 || height <= 0 || stride <= 0 || format > 4 || size > 3 || x < 0 || y < 0) {
+		return;
+	}
+	// 4-bit texels load as 8-bit pairs; 32-bit ones fill both halves of TMEM.
+	int loadSize = size ? size : 1, loadStride = size ? stride : stride / 2;
+	int loadS0 = size ? s0 : s0 / 2, loadS1 = size ? s0 + width - 1 : (s0 + width - 1) / 2;
+	uint32_t line = (uint32_t) ((loadS1 - loadS0 + 1) * (size == 3 ? 2 : 1 << (loadSize - 1)) + 7) / 8;
+	uint32_t room = format == 2 || size == 3 ? 256 : 512;
+	int band = (int) (room / line);
+	if (band < 1) {
+		return;
+	}
+	// The palette lookup the sprite needs (RGBA16 colors for color-indexed ones, none otherwise).
+	otherMode(n, h, true, 14, 2, format == 2 ? 2u << 14 : 0);
+	if (format == 2 && tlut) {
+		emit(n, h, (uint64_t) 0x3D << 56 | (uint64_t) 2 << 51 | tlut);
+		emit(n, h, (uint64_t) 0x35 << 56 | (uint64_t) 0x100 << 32 | (uint64_t) 7 << 24);
+		emit(n, h, (uint64_t) 0x30 << 56 | (uint64_t) 7 << 24 | (uint64_t) ((size ? 255 : 15) << 2) << 12);
+	}
+	bool copy = ((h->modeH >> 20) & 3) == 2;
+	int dsdx = copy ? 4 << 10 : (int) (1024 / h->spriteScaleX), dtdy = copy ? 1 << 10 : (int) (1024 / h->spriteScaleY);
+	float stepX = copy ? 1 : h->spriteScaleX, stepY = copy ? 1 : h->spriteScaleY;
+	for (int t = 0; t < height; t += band) {
+		int rows = height - t < band ? height - t : band;
+		emit(n, h, (uint64_t) 0x3D << 56 | (uint64_t) format << 53 | (uint64_t) loadSize << 51 | (uint64_t) (loadStride - 1) << 32 | image);
+		emit(n, h, (uint64_t) 0x35 << 56 | (uint64_t) format << 53 | (uint64_t) loadSize << 51 | (uint64_t) line << 41 | (uint64_t) 7 << 24);
+		emit(n, h, (uint64_t) 0x34 << 56 | (uint64_t) (loadS0 << 2) << 44 | (uint64_t) ((t0 + t) << 2) << 32 | (uint64_t) 7 << 24 |
+		           (uint64_t) (loadS1 << 2) << 12 | (uint64_t) ((t0 + t + rows - 1) << 2));
+		emit(n, h, (uint64_t) 0x35 << 56 | (uint64_t) format << 53 | (uint64_t) size << 51 | (uint64_t) line << 41);
+		emit(n, h, (uint64_t) 0x32 << 56 | (uint64_t) (s0 << 2) << 44 | (uint64_t) ((t0 + t) << 2) << 32 | (uint64_t) ((s0 + width - 1) << 2) << 12 |
+		           (uint64_t) ((t0 + t + rows - 1) << 2));
+		int yh = y + (int) (t * stepY * 4), yl = y + (int) ((t + rows) * stepY * 4) - (copy ? 4 : 0);
+		int xh = x, xl = x + (int) (width * stepX * 4) - (copy ? 4 : 0);
+		int s = (h->spriteFlipS ? s0 + width - 1 : s0) << 5, tt = (h->spriteFlipT ? t0 + t + rows - 1 : t0 + t) << 5;
+		int ds = h->spriteFlipS ? -dsdx : dsdx, dt = h->spriteFlipT ? -dtdy : dtdy;
+		emit(n, h, (uint64_t) 0x24 << 56 | (uint64_t) (xl & 0xFFF) << 44 | (uint64_t) (yl & 0xFFF) << 32 | (uint64_t) (xh & 0xFFF) << 12 | (uint64_t) (yh & 0xFFF));
+		emit(n, h, (uint64_t) (s & 0xFFFF) << 48 | (uint64_t) (tt & 0xFFFF) << 32 | (uint64_t) (ds & 0xFFFF) << 16 | (uint64_t) (dt & 0xFFFF));
+	}
+}
+
 static void runList(struct N64* n, struct Hle* h, uint32_t start) {
 	uint32_t stack[DL_DEPTH];
 	int sp = 0;
@@ -718,6 +770,14 @@ static void runList(struct N64* n, struct Hle* h, uint32_t start) {
 					loadVertices(n, h, w1, (w0 >> 16) & 0xF, ((w0 >> 20) & 0xF) + 1);
 				}
 				break;
+			case 0x09:
+				if (h->family == FAMILY_F3D) {
+					h->sprite = address(h, w1);
+					h->spriteMode = true;
+					h->spriteScaleX = h->spriteScaleY = 1;
+					h->spriteFlipS = h->spriteFlipT = false;
+				}
+				break;
 			case 0x06:
 				if (!((w0 >> 16) & 0xFF) && sp < DL_DEPTH) {
 					stack[sp++] = next;
@@ -777,10 +837,20 @@ static void runList(struct N64* n, struct Hle* h, uint32_t start) {
 				break;
 			}
 			case 0xBD:
-				popMatrix(h, 1);
+				if (h->spriteMode) {
+					spriteDraw(n, h, (int16_t) (w1 >> 16), (int16_t) w1);
+					h->spriteMode = false;
+				} else {
+					popMatrix(h, 1);
+				}
 				break;
 			case 0xBE:
-				cullOrEnd(h, (w0 & 0xFFFF) / (f3dex ? 2 : 40), (w1 & 0xFFFF) / (f3dex ? 2 : 40), &end);
+				if (h->spriteMode) {
+					h->spriteScaleX = (w1 >> 16) ? (w1 >> 16) / 1024.0f : 1, h->spriteScaleY = (w1 & 0xFFFF) ? (w1 & 0xFFFF) / 1024.0f : 1;
+					h->spriteFlipS = (w0 >> 8) & 0xFF, h->spriteFlipT = w0 & 0xFF;
+				} else {
+					cullOrEnd(h, (w0 & 0xFFFF) / (f3dex ? 2 : 40), (w1 & 0xFFFF) / (f3dex ? 2 : 40), &end);
+				}
 				break;
 			case 0xBF:
 				drawTriangle(n, h, ((w1 >> 16) & 0xFF) / scale, ((w1 >> 8) & 0xFF) / scale, (w1 & 0xFF) / scale);
@@ -885,6 +955,7 @@ bool hleGraphics(struct N64* n, bool dry) {
 	memcpy(h->lookat, lookat, sizeof(lookat));
 	// So do the other modes (the data's set-other-modes command).
 	h->modeH = 0x080CFF, h->modeL = 0;
+	h->spriteMode = false;
 	h->count = 0;
 	uint32_t fifoStart = be32(task + 0x28) & 0xFFFFFF, fifoEnd = be32(task + 0x2C) & 0xFFFFFF;
 	bool fifo = fifoStart && !(fifoStart & 7) && fifoEnd > fifoStart && fifoEnd <= RDRAM_SIZE;
