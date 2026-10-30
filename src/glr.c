@@ -375,8 +375,13 @@ static struct Program* program(struct Glr* g, struct ProgramKey key) {
 		strcat(source, cycleType == 2 ? "	if (combined.a == 0.0) discard;\n" : "	if (combined.a < uBlend.a) discard;\n");
 	}
 	int first = (key.modes >> 8) & 0xFF, last = (key.modes >> 16) & 0xFF;
-	if (cycleType == 1) {
-		// The first of two cycles always blends (fog, mostly).
+	// The first of two cycles always blends (fog, mostly). With memory as its M (and 1 - A as B), the
+	// image's share carries to the last cycle's blend with it: P * a1 * a2 + memory * (1 - a1 * a2).
+	strcat(source, "	float memoryKeep = 1.0;\n");
+	if (cycleType == 1 && ((first >> 4) & 3) == 1 && !((first >> 6) & 3)) {
+		snprintf(line, sizeof(line), "	memoryKeep = %s;\n	combined.rgb = %s;\n", blendAlphaInput(first >> 2), blendColorInput(first));
+		strcat(source, line);
+	} else if (cycleType == 1) {
 		blendFormula(line, sizeof(line), first);
 		strcat(source, line);
 	}
@@ -388,7 +393,7 @@ static struct Program* program(struct Glr* g, struct ProgramKey key) {
 			strcat(source, line);
 			snprintf(line, sizeof(line), "	oColor = vec4(combined.rgb, %s);\n", blendAlphaInput(last >> 2));
 		} else {
-			snprintf(line, sizeof(line), "	oColor = vec4(%s, %s);\n", blendColorInput(last), blendAlphaInput(last >> 2));
+			snprintf(line, sizeof(line), "	oColor = vec4(%s, %s * memoryKeep);\n", blendColorInput(last), blendAlphaInput(last >> 2));
 		}
 		strcat(source, line);
 	} else {
