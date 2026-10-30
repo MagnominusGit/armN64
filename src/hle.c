@@ -463,7 +463,13 @@ static void drawTriangle(struct N64* n, struct Hle* h, int i0, int i1, int i2) {
 	int cur = 0;
 	// Planes as (x, y, z, w) weights: near, then x and y within four screens.
 	static const float planes[5][4] = { { 0, 0, 1, 1 }, { 1, 0, 0, 4 }, { -1, 0, 0, 4 }, { 0, 1, 0, 4 }, { 0, -1, 0, 4 } };
-	for (int p = 0; p < 5 && count >= 3; ++p) {
+	// Corners inside every plane leave nothing to clip.
+	bool inside = true;
+	for (int k = 0; k < 3 && inside; ++k) {
+		const struct Vertex* v = &poly[0][k];
+		inside = isfinite(v->z) && v->z + v->w + 1e-4f * fabsf(v->w) >= 0 && fabsf(v->x) <= 4 * v->w && fabsf(v->y) <= 4 * v->w;
+	}
+	for (int p = inside ? 5 : 0; p < 5 && count >= 3; ++p) {
 		const float* pl = planes[p];
 		int out = 0;
 		for (int i = 0; i < count; ++i) {
