@@ -632,7 +632,7 @@ static void cullOrEnd(struct Hle* h, int first, int last, bool* end) {
 
 // A Sprite2D sprite (image, palette, stride, width, height, format, size) from its first S and T,
 // at x, y (10.2): its rows loaded in bands TMEM holds, each drawn as a texture rectangle.
-static void spriteDraw(struct N64* n, struct Hle* h, int s0, int t0, int x, int y) {
+static void spriteDraw(struct N64* n, struct Hle* h, int s0, int t0, int x, int y, bool older) {
 	uint32_t a = h->sprite, w8 = rd32(n, a + 8), w12 = rd32(n, a + 12);
 	uint32_t image = address(h, rd32(n, a)), tlut = rd32(n, a + 4) ? address(h, rd32(n, a + 4)) : 0;
 	int stride = (int16_t) (w8 >> 16), width = (int16_t) w8, height = (int16_t) (w12 >> 16);
@@ -650,14 +650,14 @@ static void spriteDraw(struct N64* n, struct Hle* h, int s0, int t0, int x, int 
 		return;
 	}
 	// A color-indexed sprite's palette, then RGBA16 colors looked up in it; other sprites without the
-	// lookup (each changed only when it differs, after the palette load, as the microcode does).
+	// lookup (the older sprite command sets that only when it differs), as the microcode does.
 	if (format == 2 && tlut) {
 		emit(n, h, (uint64_t) 0x3D << 56 | (uint64_t) 2 << 51 | tlut);
 		emit(n, h, (uint64_t) 0x35 << 56 | (uint64_t) 0x100 << 32 | (uint64_t) 7 << 24);
 		emit(n, h, (uint64_t) 0x30 << 56 | (uint64_t) 7 << 24 | (uint64_t) ((size ? 255 : 15) << 2) << 12);
 	}
 	uint32_t lookup = format == 2 ? 2u << 14 : 0;
-	if ((h->modeH & (3u << 14)) != lookup) {
+	if (format == 2 || !older || (h->modeH & (3u << 14)) != lookup) {
 		otherMode(n, h, true, 14, 2, lookup);
 	}
 	bool copy = ((h->modeH >> 20) & 3) == 2;
@@ -873,7 +873,7 @@ static void runList(struct N64* n, struct Hle* h, uint32_t pc) {
 					if ((w0 & 0xFFFF) == 0x20) {
 						uint32_t a = h->sprite, w16 = rd32(n, a + 16), w20 = rd32(n, a + 20), w24 = rd32(n, a + 24), w28 = rd32(n, a + 28);
 						h->spriteScaleX = (w16 >> 16) ? (w16 >> 16) / 1024.0f : 1, h->spriteScaleY = (w16 & 0xFFFF) ? (w16 & 0xFFFF) / 1024.0f : 1;
-						spriteDraw(n, h, (int16_t) w20, (int16_t) (w24 >> 16), (int16_t) w24, (int16_t) (w28 >> 16));
+						spriteDraw(n, h, (int16_t) w20, (int16_t) (w24 >> 16), (int16_t) w24, (int16_t) (w28 >> 16), true);
 						h->spriteMode = false;
 					}
 				}
@@ -954,7 +954,7 @@ static void runList(struct N64* n, struct Hle* h, uint32_t pc) {
 			case 0xBD:
 				if (h->spriteMode) {
 					uint32_t w16 = rd32(n, h->sprite + 16);
-					spriteDraw(n, h, (int16_t) (w16 >> 16), (int16_t) w16, (int16_t) (w1 >> 16), (int16_t) w1);
+					spriteDraw(n, h, (int16_t) (w16 >> 16), (int16_t) w16, (int16_t) (w1 >> 16), (int16_t) w1, false);
 					h->spriteMode = false;
 				} else {
 					popMatrix(h, 1);
