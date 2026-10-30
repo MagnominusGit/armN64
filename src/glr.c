@@ -36,7 +36,7 @@ enum {
 	GL_PACK_ALIGNMENT = 0x0D05, GL_UNPACK_ALIGNMENT = 0x0CF5,
 };
 
-enum { TARGETS = 8, TARGET_ROWS = 480, PROGRAMS = 256, TEXTURES = 1024, BATCH_VERTICES = 1 << 16, VERTEX_FLOATS = 10,
+enum { TARGETS = 8, TARGET_ROWS = 480, PROGRAMS = 256, TEXTURES = 1024, TEXTURE_BUCKETS = 2048, BATCH_VERTICES = 1 << 16, VERTEX_FLOATS = 10,
        VERTEX_BUFFER_BYTES = BATCH_VERTICES * VERTEX_FLOATS * 4 * 2 };
 
 struct Gl {
@@ -147,6 +147,8 @@ struct Texture {
 	GLuint texture;
 	int width, height;
 	uint64_t used;
+	// The next texture in its hash bucket (index + 1, 0 for none).
+	int next;
 };
 
 // Everything a batch of primitives is drawn with; a change draws the batch first.
@@ -172,6 +174,7 @@ struct Glr {
 	struct Program programs[PROGRAMS];
 	int programCount;
 	struct Texture textures[TEXTURES];
+	int textureBucket[TEXTURE_BUCKETS];
 	uint64_t clock;
 	struct DrawState state;
 	bool stateSet;
@@ -654,15 +657,25 @@ static uint64_t hashBytes(uint64_t h, const uint8_t* p, size_t len) {
 	return h;
 }
 
-// TMEM from byte from, len bytes (wrapping), eight at a time.
+static uint64_t mix(uint64_t h, const uint8_t* tmem, uint32_t at) {
+	uint64_t v;
+	memcpy(&v, &tmem[at & 0xFF8], 8);
+	h = (h ^ v) * 0x100000001B3ull;
+	return h ^ (h >> 29);
+}
+
+// TMEM from byte from, len bytes (wrapping), eight at a time in four lanes.
 static uint64_t hashTmem(uint64_t h, const uint8_t* tmem, uint32_t from, uint32_t len) {
-	for (uint32_t i = 0; i < len; i += 8) {
-		uint64_t v;
-		memcpy(&v, &tmem[(from + i) & 0xFF8], 8);
-		h = (h ^ v) * 0x100000001B3ull;
-		h ^= h >> 29;
+	uint64_t a = h, b = h ^ 1, c = h ^ 2, d = h ^ 3;
+	uint32_t i = 0;
+	for (; i + 32 <= len; i += 32) {
+		a = mix(a, tmem, from + i), b = mix(b, tmem, from + i + 8);
+		c = mix(c, tmem, from + i + 16), d = mix(d, tmem, from + i + 24);
 	}
-	return h;
+	for (; i < len; i += 8) {
+		a = mix(a, tmem, from + i);
+	}
+	return ((((a * 0x100000001B3ull) ^ b) * 0x100000001B3ull ^ c) * 0x100000001B3ull ^ d) * 0x100000001B3ull;
 }
 
 // The texture for a tile: its texels (as many as its mask or clamp reaches) decoded from TMEM,
@@ -701,16 +714,33 @@ static struct Texture* texture(struct N64* n, struct Glr* g, struct RDP* r, int 
 		key = t->size == 0 ? hashTmem(key, r->tmem, 0x800 + (uint32_t) t->palette * 128, 128) : hashTmem(key, r->tmem, 0x800, 0x800);
 	}
 	*width = w, *height = h;
-	struct Texture* slot = &g->textures[0];
-	for (int i = 0; i < TEXTURES; ++i) {
-		struct Texture* x = &g->textures[i];
-		if (x->texture && x->hash == key) {
+	int* bucket = &g->textureBucket[key & (TEXTURE_BUCKETS - 1)];
+	for (int i = *bucket; i; i = g->textures[i - 1].next) {
+		struct Texture* x = &g->textures[i - 1];
+		if (x->hash == key) {
 			x->used = ++g->clock;
 			g->tileTexture[index & 7] = x, g->tileGen[index & 7] = r->tmemGen, g->tileTlut[index & 7] = tlutMode;
 			return x;
 		}
+	}
+	// A new texture: in an unused slot or the one used longest ago, taken out of its bucket.
+	struct Texture* slot = &g->textures[0];
+	for (int i = 0; i < TEXTURES; ++i) {
+		struct Texture* x = &g->textures[i];
 		if (!x->texture || x->used < slot->used) {
 			slot = x;
+			if (!x->texture) {
+				break;
+			}
+		}
+	}
+	if (slot->texture) {
+		int self = (int) (slot - g->textures) + 1;
+		for (int* link = &g->textureBucket[slot->hash & (TEXTURE_BUCKETS - 1)]; *link; link = &g->textures[*link - 1].next) {
+			if (*link == self) {
+				*link = slot->next;
+				break;
+			}
 		}
 	}
 	struct Gl* gl = &g->gl;
@@ -741,6 +771,7 @@ static struct Texture* texture(struct N64* n, struct Glr* g, struct RDP* r, int 
 	}
 	free(pixels);
 	slot->hash = key, slot->width = w, slot->height = h, slot->used = ++g->clock;
+	slot->next = *bucket, *bucket = (int) (slot - g->textures) + 1;
 	g->tileTexture[index & 7] = slot, g->tileGen[index & 7] = r->tmemGen, g->tileTlut[index & 7] = tlutMode;
 	return slot;
 }
