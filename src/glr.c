@@ -812,6 +812,41 @@ static float halfFloat(uint64_t w, bool high) {
 	return f;
 }
 
+// A GL triangle's RDP time: its pixels inside the scissor box (the polygon clipped to it), as
+// primitiveClocks counts a triangle's.
+uint64_t glrTriangleClocks(const struct RDP* r, const uint64_t* w) {
+	float poly[2][16][2];
+	int count = 3;
+	for (int k = 0; k < 3; ++k) {
+		poly[0][k][0] = halfFloat(w[1 + k * 5], true);
+		poly[0][k][1] = halfFloat(w[1 + k * 5], false);
+	}
+	const float bounds[4] = { r->scissorX0 / 4.0f, r->scissorY0 / 4.0f, r->scissorX1 / 4.0f, r->scissorY1 / 4.0f };
+	int from = 0;
+	for (int edge = 0; edge < 4 && count; ++edge) {
+		int axis = edge & 1, out = 0;
+		float limit = bounds[edge], sign = edge < 2 ? 1.0f : -1.0f;
+		for (int i = 0; i < count; ++i) {
+			const float* a = poly[from][i], * b = poly[from][(i + 1) % count];
+			float da = (a[axis] - limit) * sign, db = (b[axis] - limit) * sign;
+			if (da >= 0) {
+				poly[!from][out][0] = a[0], poly[!from][out][1] = a[1], ++out;
+			}
+			if ((da >= 0) != (db >= 0) && out < 15) {
+				float t = da / (da - db);
+				poly[!from][out][0] = a[0] + (b[0] - a[0]) * t, poly[!from][out][1] = a[1] + (b[1] - a[1]) * t, ++out;
+			}
+		}
+		count = out, from = !from;
+	}
+	float area = 0;
+	for (int i = 0; i < count; ++i) {
+		const float* a = poly[from][i], * b = poly[from][(i + 1) % count];
+		area += a[0] * b[1] - b[0] * a[1];
+	}
+	return (uint64_t) (fabsf(area) / 2) * (r->cycleType == 1 ? 2 : 1) + 20;
+}
+
 void glrDraw(struct N64* n, struct RDP* r, const uint64_t* w, int op) {
 	struct Glr* g = n->glr;
 	glesUse(g->gles);
