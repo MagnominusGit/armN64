@@ -2204,12 +2204,15 @@ static int gpuState(struct Gpu* g, struct RDP* r) {
 	return (g->stateCount - 1) * GPU_STATE_SIZE;
 }
 
-// Adds [addr, addr + len) to a list of ranges, merged with one it touches; false when the list is
-// full or the range wraps around RDRAM.
+// Adds [addr, addr + len) to a list of ranges, merged with one it touches (in two pieces when it
+// wraps around RDRAM); false when the list is full.
 static bool addRange(uint32_t* fromList, uint32_t* toList, int* count, uint32_t addr, uint32_t len) {
 	uint32_t from = addr & (RDRAM_SIZE - 1), to = from + len;
-	if (to > RDRAM_SIZE) {
+	if (len >= RDRAM_SIZE) {
 		return false;
+	}
+	if (to > RDRAM_SIZE) {
+		return addRange(fromList, toList, count, from, RDRAM_SIZE - from) && addRange(fromList, toList, count, 0, to - RDRAM_SIZE);
 	}
 	for (int i = 0; i < *count; ++i) {
 		if (from <= toList[i] && to >= fromList[i]) {
@@ -2228,8 +2231,11 @@ static bool addRange(uint32_t* fromList, uint32_t* toList, int* count, uint32_t 
 
 static bool inRanges(const uint32_t* fromList, const uint32_t* toList, int count, uint32_t addr, uint32_t len) {
 	uint32_t from = addr & (RDRAM_SIZE - 1), to = from + len;
-	if (to > RDRAM_SIZE) {
+	if (len >= RDRAM_SIZE) {
 		return true;
+	}
+	if (to > RDRAM_SIZE) {
+		return inRanges(fromList, toList, count, from, RDRAM_SIZE - from) || inRanges(fromList, toList, count, 0, to - RDRAM_SIZE);
 	}
 	for (int i = 0; i < count; ++i) {
 		if (from < toList[i] && to > fromList[i]) {
