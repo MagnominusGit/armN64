@@ -662,7 +662,7 @@ static uint64_t hashTmem(uint64_t h, const uint8_t* tmem, uint32_t from, uint32_
 
 // The texture for a tile: its texels (as many as its mask or clamp reaches) decoded from TMEM,
 // found again by what they were made from.
-static struct Texture* texture(struct Glr* g, struct RDP* r, int index, bool convert, int* width, int* height) {
+static struct Texture* texture(struct N64* n, struct Glr* g, struct RDP* r, int index, bool convert, int* width, int* height) {
 	const struct Tile* t = &r->tile[index & 7];
 	uint32_t tlutMode = (uint32_t) (r->otherModes >> 46) & 3;
 	struct Texture* known = g->tileTexture[index & 7];
@@ -709,6 +709,11 @@ static struct Texture* texture(struct Glr* g, struct RDP* r, int index, bool con
 		}
 	}
 	struct Gl* gl = &g->gl;
+	// The slot may be in the batch waiting to be drawn.
+	if (g->batchCount && (g->state.texture[0] == slot || g->state.texture[1] == slot)) {
+		flushBatch(n, g);
+	}
+	bool same = slot->texture && slot->width == w && slot->height == h;
 	if (!slot->texture) {
 		gl->GenTextures(1, &slot->texture);
 	}
@@ -718,11 +723,16 @@ static struct Texture* texture(struct Glr* g, struct RDP* r, int index, bool con
 	}
 	rdpTileImage(r, index, w, h, convert, pixels);
 	uploadTexture(g, slot->texture);
-	gl->TexImage2D(GL_TEXTURE_2D, 0, GL_RGBA8, w, h, 0, GL_RGBA, GL_UNSIGNED_BYTE, pixels);
-	gl->TexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_NEAREST);
-	gl->TexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_NEAREST);
-	gl->TexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE);
-	gl->TexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE);
+	if (same) {
+		// The same size: the texels replaced in place (no new storage).
+		gl->TexSubImage2D(GL_TEXTURE_2D, 0, 0, 0, w, h, GL_RGBA, GL_UNSIGNED_BYTE, pixels);
+	} else {
+		gl->TexImage2D(GL_TEXTURE_2D, 0, GL_RGBA8, w, h, 0, GL_RGBA, GL_UNSIGNED_BYTE, pixels);
+		gl->TexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_NEAREST);
+		gl->TexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_NEAREST);
+		gl->TexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE);
+		gl->TexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE);
+	}
 	free(pixels);
 	slot->hash = key, slot->width = w, slot->height = h, slot->used = ++g->clock;
 	g->tileTexture[index & 7] = slot, g->tileGen[index & 7] = r->tmemGen, g->tileTlut[index & 7] = tlutMode;
@@ -877,7 +887,7 @@ static bool drawState(struct N64* n, struct Glr* g, struct RDP* r, bool textured
 			// Without filtering a cycle converts its texels from YUV.
 			int index = (tile + k) & 7, w, h;
 			bool filter = k == 0 ? cycleType >= 2 || ((r->otherModes >> 43) & 1) : (r->otherModes >> 42) & 1;
-			s.texture[k] = texture(g, r, index, !filter, &w, &h);
+			s.texture[k] = texture(n, g, r, index, !filter, &w, &h);
 			const struct Tile* t = &r->tile[index];
 			bool bilinear = filter && ((r->otherModes >> 45) & 1) && cycleType < 2;
 			int params[12] = { t->shiftS, t->shiftT, t->sl, t->tl, t->sh, t->th, t->cmS, t->cmT, t->maskS, t->maskT, bilinear, 0 };
