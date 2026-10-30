@@ -719,7 +719,14 @@ static void runList(struct N64* n, struct Hle* h, uint32_t pc) {
 	int sp = h->sp;
 	h->waiting = false;
 	bool f3dex2 = h->family == FAMILY_F3DEX2, f3dex = h->family == FAMILY_F3DEX;
+	// F3DEX2's 0xD5: so many commands from an address, then back.
+	int counted = -1;
+	uint32_t countedReturn = 0;
 	for (int guard = 0; guard < 1 << 22; ++guard) {
+		if (counted == 0) {
+			pc = countedReturn;
+		}
+		counted -= counted >= 0;
 		uint32_t w0 = rd32(n, pc), w1 = rd32(n, pc + 4);
 		int op = w0 >> 24;
 		uint32_t next = pc + 8;
@@ -810,6 +817,13 @@ static void runList(struct N64* n, struct Hle* h, uint32_t pc) {
 				break;
 			case 0x02:
 				modifyVertex(h, (int) (w0 & 0xFFFF) / 2, (w0 >> 16) & 0xFF, w1);
+				break;
+			case 0xD5:
+				if (counted < 0) {
+					counted = w0 & 0xFF;
+					countedReturn = next;
+					next = address(h, w1);
+				}
 				break;
 			case 0xDF:
 				end = true;
