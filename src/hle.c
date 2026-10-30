@@ -273,8 +273,8 @@ static void loadVertices(struct N64* n, struct Hle* h, uint32_t a, int first, in
 }
 
 // G_MODIFYVTX (and F3DEX's G_MOVEWORD to the points): a loaded vertex's colour, texture
-// coordinates (already scaled) or position on screen (s13.2, kept by moving it in clip space at its
-// own w).
+// coordinates (already scaled) or position on screen (x and y s13.2, z 16.16 in the viewport's range,
+// kept by moving it in clip space at its own w).
 static void modifyVertex(struct Hle* h, int index, int where, uint32_t value) {
 	if (index >= VERTICES) {
 		return;
@@ -292,6 +292,11 @@ static void modifyVertex(struct Hle* h, int index, int where, uint32_t value) {
 		if (h->vscale[0] != 0 && h->vscale[1] != 0) {
 			v->x = ((int16_t) (value >> 16) / 4.0f - h->vtrans[0]) / h->vscale[0] * v->w;
 			v->y = -((int16_t) value / 4.0f - h->vtrans[1]) / h->vscale[1] * v->w;
+		}
+		break;
+	case 0x1C:
+		if (h->vscale[2] != 0) {
+			v->z = ((int32_t) value / 65536.0f - h->vtrans[2]) / h->vscale[2] * v->w;
 		}
 		break;
 	}
