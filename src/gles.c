@@ -26,7 +26,7 @@ enum {
 	EGL_NONE = 0x3038, EGL_RENDERABLE_TYPE = 0x3040, EGL_SURFACE_TYPE = 0x3033, EGL_PBUFFER_BIT = 0x0001,
 	EGL_OPENGL_ES3_BIT = 0x0040, EGL_OPENGL_ES_API = 0x30A0, EGL_CONTEXT_MAJOR_VERSION = 0x3098,
 	EGL_CONTEXT_MINOR_VERSION = 0x30FB, EGL_EXTENSIONS = 0x3055, EGL_WIDTH = 0x3057, EGL_HEIGHT = 0x3056,
-	EGL_PLATFORM_SURFACELESS_MESA = 0x31DD,
+	EGL_PLATFORM_SURFACELESS_MESA = 0x31DD, EGL_DRAW = 0x3059, EGL_READ = 0x305A,
 	GL_COMPUTE_SHADER = 0x91B9, GL_COMPILE_STATUS = 0x8B81, GL_LINK_STATUS = 0x8B82, GL_INFO_LOG_LENGTH = 0x8B84,
 	GL_SHADER_STORAGE_BUFFER = 0x90D2, GL_DYNAMIC_DRAW = 0x88E8, GL_MAP_READ_BIT = 0x0001,
 	GL_SHADER_STORAGE_BARRIER_BIT = 0x2000, GL_BUFFER_UPDATE_BARRIER_BIT = 0x0200, GL_RENDERER = 0x1F01,
@@ -38,6 +38,8 @@ struct Gles {
 	EGLDisplay display;
 	EGLContext context;
 	EGLSurface surface;
+	// The frontend's context (glesFrontend), current already: nothing to make or switch.
+	bool external;
 	GLuint program, buffer[4];
 	GLint uniforms;
 	char renderer[128];
@@ -51,6 +53,10 @@ struct Gles {
 	EGLContext (*eglCreateContext)(EGLDisplay, EGLConfig, EGLContext, const EGLint*);
 	EGLSurface (*eglCreatePbufferSurface)(EGLDisplay, EGLConfig, const EGLint*);
 	EGLBoolean (*eglMakeCurrent)(EGLDisplay, EGLSurface, EGLSurface, EGLContext);
+	EGLDisplay (*eglGetCurrentDisplay)(void);
+	EGLSurface (*eglGetCurrentSurface)(EGLint);
+	EGLContext (*eglGetCurrentContext)(void);
+	EGLenum (*eglQueryAPI)(void);
 	EGLBoolean (*eglDestroyContext)(EGLDisplay, EGLContext);
 	EGLBoolean (*eglDestroySurface)(EGLDisplay, EGLSurface);
 	const char* (*eglQueryString)(EGLDisplay, EGLint);
@@ -87,7 +93,18 @@ struct Gles {
 
 
 
+// A frontend's GL context (libretro's shared hardware context), current whenever the machine runs:
+// contexts made from then on are that one, with its functions.
+static void* (*frontendProc)(const char*);
+
+void glesFrontend(void* (*getProc)(const char* name)) {
+	frontendProc = getProc;
+}
+
 static void* lookup(struct Gles* g, const char* name) {
+	if (g->external) {
+		return frontendProc(name);
+	}
 	void* f = g->gles ? dlsym(g->gles, name) : NULL;
 	if (!f) {
 		f = dlsym(g->egl, name);
@@ -103,6 +120,7 @@ static void* lookup(struct Gles* g, const char* name) {
 static bool loadAll(struct Gles* g) {
 	bool ok = LOAD(eglGetDisplay) && LOAD(eglInitialize) && LOAD(eglTerminate) && LOAD(eglBindAPI) &&
 	          LOAD(eglChooseConfig) && LOAD(eglCreateContext) && LOAD(eglCreatePbufferSurface) && LOAD(eglMakeCurrent) &&
+	          LOAD(eglGetCurrentDisplay) && LOAD(eglGetCurrentSurface) && LOAD(eglGetCurrentContext) && LOAD(eglQueryAPI) &&
 	          LOAD(eglDestroyContext) && LOAD(eglDestroySurface) && LOAD(eglQueryString);
 	(void) LOAD(eglGetPlatformDisplayEXT);
 	return ok;
@@ -124,10 +142,57 @@ static _Thread_local struct Gles* current;
 static EGLDisplay sharedDisplay;
 static int displayUsers;
 
+// What was current on this thread before one of these was made current (a frontend's context, or
+// none, and the client API it was bound for: EGL keeps a current context per API), for glesYield to
+// put back; and the context glesResume makes current again.
+static _Thread_local struct {
+	bool saved;
+	EGLenum api;
+	EGLDisplay display;
+	EGLSurface draw, read;
+	EGLContext context;
+} before;
+static _Thread_local struct Gles* yielded;
+
+static void saveBefore(struct Gles* g) {
+	if (!current && !before.saved) {
+		before.saved = true;
+		before.api = g->eglQueryAPI();
+		before.display = g->eglGetCurrentDisplay();
+		before.draw = g->eglGetCurrentSurface(EGL_DRAW);
+		before.read = g->eglGetCurrentSurface(EGL_READ);
+		before.context = g->eglGetCurrentContext();
+	}
+}
+
 static void use(struct Gles* g) {
-	if (current != g) {
+	if (!g->external && current != g) {
+		saveBefore(g);
+		g->eglBindAPI(EGL_OPENGL_ES_API);
 		g->eglMakeCurrent(g->display, g->surface, g->surface, g->context);
 		current = g;
+	}
+}
+
+void glesYield(void) {
+	if (current) {
+		current->eglMakeCurrent(current->display, NULL, NULL, NULL);
+		if (before.saved) {
+			current->eglBindAPI(before.api);
+			if (before.context) {
+				current->eglMakeCurrent(before.display, before.draw, before.read, before.context);
+			}
+		}
+	}
+	before.saved = false;
+	yielded = current;
+	current = NULL;
+}
+
+void glesResume(void) {
+	if (yielded) {
+		use(yielded);
+		yielded = NULL;
 	}
 }
 
@@ -179,6 +244,15 @@ static bool makeContext(struct Gles* g, EGLDisplay display) {
 }
 
 static bool context(struct Gles* g, char* error, size_t errorSize) {
+	if (frontendProc) {
+		g->external = true;
+		if (!loadGl(g)) {
+			return fail(error, errorSize, "incomplete GL from the frontend");
+		}
+		const char* renderer = (const char*) g->glGetString(GL_RENDERER);
+		snprintf(g->renderer, sizeof(g->renderer), "%s", renderer ? renderer : "?");
+		return true;
+	}
 	g->egl = dlopen("libEGL.so.1", RTLD_NOW | RTLD_LOCAL);
 	if (!g->egl) {
 		g->egl = dlopen("libEGL.so", RTLD_NOW | RTLD_LOCAL);
@@ -191,6 +265,7 @@ static bool context(struct Gles* g, char* error, size_t errorSize) {
 	if (!loadAll(g)) {
 		return fail(error, errorSize, "incomplete libEGL");
 	}
+	saveBefore(g);
 	const char* clientExtensions = g->eglQueryString(NULL, EGL_EXTENSIONS);
 	bool surfaceless = g->eglGetPlatformDisplayEXT && clientExtensions && strstr(clientExtensions, "EGL_MESA_platform_surfaceless");
 	// The surfaceless platform first (no window system needed), then the default display.
@@ -286,6 +361,14 @@ void glesDestroy(struct Gles* g) {
 	if (!g) {
 		return;
 	}
+	if (g->external) {
+		if (g->program) {
+			g->glDeleteBuffers(4, g->buffer);
+			g->glDeleteProgram(g->program);
+		}
+		free(g);
+		return;
+	}
 	if (g->context) {
 		use(g);
 		if (g->program) {
@@ -295,6 +378,9 @@ void glesDestroy(struct Gles* g) {
 		g->eglMakeCurrent(g->display, NULL, NULL, NULL);
 		g->eglDestroyContext(g->display, g->context);
 		current = NULL;
+		if (yielded == g) {
+			yielded = NULL;
+		}
 		--displayUsers;
 	}
 	if (g->surface) {

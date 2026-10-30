@@ -519,6 +519,8 @@ void rdpCommands(struct N64*, const uint64_t* list, size_t count);
 // hle.c
 bool hleGraphics(struct N64*, bool dry);
 void glrEnd(struct N64*);
+// The GL state the renderer last set is unknown (the frontend drew in its context).
+void glrForget(struct N64*);
 // A task waiting where its display list branches to itself (the CPU still writing it); a look
 // whether it can go on.
 bool hleWaiting(struct N64*);

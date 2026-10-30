@@ -1,6 +1,8 @@
 // armN64 as a libretro core: a video field each run, the VI's picture, the AI's samples at
-// 44.1 kHz, controller 1, and the cartridge's save memory. The GPU renderers make their own GL
-// context, which would take RetroArch's from under it, so the core draws with the RDP threads.
+// 44.1 kHz, controller 1, and the cartridge's save memory. The GPU renderer draws in a GL context the
+// frontend shares with its own when it draws with GL (the picture is then put in its framebuffer),
+// else in one of the core's own, made current only while the core runs.
+#include "gles.h"
 #include "n64.h"
 
 #include "libretro.h"
@@ -46,6 +48,24 @@ static int16_t played[OUT_FRAMES * 2];
 static double audioPhase;
 static int16_t audioLast[2];
 static uint8_t saveMemory[SAVE_SIZE];
+// The frontend's GL context for the GPU renderer, and what puts the picture in its framebuffer.
+static struct retro_hw_render_callback hw;
+static bool hwWanted, hwReady;
+static struct {
+	void (*GenTextures)(int, unsigned*);
+	void (*DeleteTextures)(int, const unsigned*);
+	void (*BindTexture)(unsigned, unsigned);
+	void (*TexImage2D)(unsigned, int, int, int, int, int, unsigned, unsigned, const void*);
+	void (*TexSubImage2D)(unsigned, int, int, int, int, int, unsigned, unsigned, const void*);
+	void (*GenFramebuffers)(int, unsigned*);
+	void (*DeleteFramebuffers)(int, const unsigned*);
+	void (*BindFramebuffer)(unsigned, unsigned);
+	void (*FramebufferTexture2D)(unsigned, unsigned, unsigned, unsigned, int);
+	void (*BlitFramebuffer)(int, int, int, int, int, int, int, int, unsigned, unsigned);
+	void (*Disable)(unsigned);
+} gl;
+static unsigned presentTexture, presentFramebuffer;
+static uint32_t presentRgba[640 * 480];
 // RetroArch fills saveMemory from the save file after the game loads: it goes to the machine on the
 // first run.
 static bool saveGiven;
@@ -62,6 +82,9 @@ static struct retro_core_option_v2_definition optionDefinitions[] = {
 	  NULL, "system", { { "hle", "High Level" }, { "lle-compatible", "Compatible" }, { "lle-accurate", "Accurate" }, { NULL, NULL } }, "hle" },
 	{ "armn64_rdp_threads", "Renderer Threads (Restart)", NULL, "Threads beside the emulation that draw the RDP's pictures. Auto takes the cores there are, up to 3.",
 	  NULL, "system", { { "auto", "Auto" }, { "0", "None" }, { "1", "1" }, { "2", "2" }, { "3", "3" }, { NULL, NULL } }, "auto" },
+	{ "armn64_renderer", "Renderer (Restart)", NULL,
+	  "GPU draws High Level graphics with OpenGL ES 3.1 and is faster on handhelds; CPU draws them with the renderer threads. Compatible and Accurate always use the CPU.",
+	  NULL, "system", { { "gpu", "GPU" }, { "cpu", "CPU" }, { NULL, NULL } }, "gpu" },
 	{ "armn64_frameskip", "Frame Skip (Restart)", NULL, "Leaves out the drawing of frames that are never shown, as many games make more than the screen can show.",
 	  NULL, "system", { { "disabled", "Off" }, { "enabled", "On" }, { NULL, NULL } }, "disabled" },
 	{ NULL, NULL, NULL, NULL, NULL, NULL, { { NULL, NULL } }, NULL },
@@ -86,6 +109,9 @@ static const char* settings(const char* name) {
 	}
 	if (!strcmp(name, "N64_JIT") || !strcmp(name, "N64_RSPJIT")) {
 		return "1";
+	}
+	if (!strcmp(name, "N64_RDP_GL")) {
+		return hwWanted ? "1" : "0";
 	}
 	if (!strcmp(name, "N64_FRAMESKIP")) {
 		return optionIs(environment, "armn64_frameskip", "enabled") ? "1" : "0";
@@ -186,6 +212,89 @@ static struct N64* startMachine(void) {
 	return n;
 }
 
+enum {
+	GL_TEXTURE_2D = 0x0DE1, GL_RGBA = 0x1908, GL_RGBA8 = 0x8058, GL_UNSIGNED_BYTE = 0x1401, GL_READ_FRAMEBUFFER = 0x8CA8,
+	GL_DRAW_FRAMEBUFFER = 0x8CA9, GL_COLOR_ATTACHMENT0 = 0x8CE0, GL_COLOR_BUFFER_BIT = 0x4000, GL_NEAREST = 0x2600,
+	GL_SCISSOR_TEST = 0x0C11,
+};
+
+static void* hwProc(const char* name) {
+	return (void*) hw.get_proc_address(name);
+}
+
+// The frontend made the context (again): the renderer starts in it, and the picture's texture.
+static void hwReset(void) {
+	glesFrontend(hwProc);
+	void** fns = (void**) &gl;
+	static const char* const names[] = { "glGenTextures", "glDeleteTextures", "glBindTexture", "glTexImage2D", "glTexSubImage2D", "glGenFramebuffers",
+		                                   "glDeleteFramebuffers", "glBindFramebuffer", "glFramebufferTexture2D", "glBlitFramebuffer", "glDisable" };
+	hwReady = true;
+	for (size_t i = 0; i < sizeof(names) / sizeof(*names); ++i) {
+		fns[i] = hwProc(names[i]);
+		hwReady &= fns[i] != NULL;
+	}
+	if (!hwReady) {
+		logMessage(RETRO_LOG_ERROR, "the frontend's GL context lacks functions the core needs");
+		return;
+	}
+	gl.GenTextures(1, &presentTexture);
+	gl.BindTexture(GL_TEXTURE_2D, presentTexture);
+	gl.TexImage2D(GL_TEXTURE_2D, 0, GL_RGBA8, 640, 480, 0, GL_RGBA, GL_UNSIGNED_BYTE, NULL);
+	gl.GenFramebuffers(1, &presentFramebuffer);
+	gl.BindFramebuffer(GL_READ_FRAMEBUFFER, presentFramebuffer);
+	gl.FramebufferTexture2D(GL_READ_FRAMEBUFFER, GL_COLOR_ATTACHMENT0, GL_TEXTURE_2D, presentTexture, 0);
+}
+
+static void hwDestroy(void) {
+	if (hwReady) {
+		gl.DeleteFramebuffers(1, &presentFramebuffer);
+		gl.DeleteTextures(1, &presentTexture);
+	}
+	hwReady = false;
+}
+
+// The GPU renderer in the frontend's context when it draws with GL: a context of the same kind,
+// version 3.1 for GLES and 4.3 for a core profile (both run the renderer's GLSL ES shaders); a
+// compatibility profile is asked for without a version.
+static bool askHardwareContext(void) {
+	unsigned preferred = RETRO_HW_CONTEXT_NONE;
+	if (!environment(RETRO_ENVIRONMENT_GET_PREFERRED_HW_RENDER, &preferred)) {
+		return false;
+	}
+	bool es = preferred == RETRO_HW_CONTEXT_OPENGLES2 || preferred == RETRO_HW_CONTEXT_OPENGLES3 || preferred == RETRO_HW_CONTEXT_OPENGLES_VERSION;
+	if (!es && preferred != RETRO_HW_CONTEXT_OPENGL && preferred != RETRO_HW_CONTEXT_OPENGL_CORE) {
+		return false;
+	}
+	hw = (struct retro_hw_render_callback) { 0 };
+	hw.context_type = es ? RETRO_HW_CONTEXT_OPENGLES_VERSION : preferred;
+	hw.version_major = es ? 3 : preferred == RETRO_HW_CONTEXT_OPENGL_CORE ? 4 : 0;
+	hw.version_minor = es ? 1 : preferred == RETRO_HW_CONTEXT_OPENGL_CORE ? 3 : 0;
+	hw.context_reset = hwReset;
+	hw.context_destroy = hwDestroy;
+	hw.bottom_left_origin = true;
+	if (!environment(RETRO_ENVIRONMENT_SET_HW_RENDER, &hw)) {
+		return false;
+	}
+	environment(RETRO_ENVIRONMENT_SET_HW_SHARED_CONTEXT, NULL);
+	return true;
+}
+
+// The VI's picture into the frontend's framebuffer, upside down as GL keeps it.
+static void present(int width, int height) {
+	for (int i = 0; i < width * height; ++i) {
+		uint32_t p = picture[i];
+		presentRgba[i] = (p >> 16 & 0xFF) | (p & 0xFF00) | (p & 0xFF) << 16 | 0xFF000000u;
+	}
+	gl.Disable(GL_SCISSOR_TEST);
+	gl.BindTexture(GL_TEXTURE_2D, presentTexture);
+	gl.TexSubImage2D(GL_TEXTURE_2D, 0, 0, 0, width, height, GL_RGBA, GL_UNSIGNED_BYTE, presentRgba);
+	gl.BindFramebuffer(GL_READ_FRAMEBUFFER, presentFramebuffer);
+	gl.BindFramebuffer(GL_DRAW_FRAMEBUFFER, (unsigned) hw.get_current_framebuffer());
+	gl.BlitFramebuffer(0, 0, width, height, 0, height, width, 0, GL_COLOR_BUFFER_BIT, GL_NEAREST);
+	glrForget(machine);
+	videoRefresh(RETRO_HW_FRAME_BUFFER_VALID, (unsigned) width, (unsigned) height, 0);
+}
+
 static void describeInput(void) {
 	static const struct retro_input_descriptor descriptors[] = {
 		{ 0, RETRO_DEVICE_JOYPAD, 0, RETRO_DEVICE_ID_JOYPAD_B, "A" },
@@ -218,6 +327,15 @@ bool retro_load_game(const struct retro_game_info* info) {
 	game = malloc(info->size);
 	if (!game) {
 		return false;
+	}
+	// The GPU renderer draws High Level graphics, in the frontend's GL context if it has one, else in
+	// the core's own (beside a Vulkan frontend, say).
+	hwWanted = optionIs(environment, "armn64_accuracy", "hle") && !optionIs(environment, "armn64_renderer", "cpu");
+	if (hwWanted && !askHardwareContext()) {
+		unsigned preferred = RETRO_HW_CONTEXT_NONE;
+		environment(RETRO_ENVIRONMENT_GET_PREFERRED_HW_RENDER, &preferred);
+		hwWanted = preferred == RETRO_HW_CONTEXT_VULKAN || preferred == RETRO_HW_CONTEXT_NONE;
+		hw.context_type = RETRO_HW_CONTEXT_NONE;
 	}
 	memcpy(game, info->data, info->size);
 	gameSize = info->size;
@@ -257,6 +375,7 @@ bool retro_load_game_special(unsigned type, const struct retro_game_info* info, 
 
 void retro_unload_game(void) {
 	n64Destroy(machine);
+	glesYield();
 	machine = NULL;
 	free(game);
 	free(ipl);
@@ -268,6 +387,7 @@ void retro_reset(void) {
 		return;
 	}
 	n64Destroy(machine);
+	glesYield();
 	machine = startMachine();
 	if (machine) {
 		memcpy(machine->eeprom, saveMemory, EEPROM_SIZE);
@@ -353,6 +473,10 @@ void retro_run(void) {
 		memcpy(machine->save, saveMemory + EEPROM_SIZE, CART_SAVE_SIZE);
 		saveGiven = true;
 	}
+	bool shared = hw.context_type != RETRO_HW_CONTEXT_NONE;
+	if (!shared) {
+		glesResume();
+	}
 	inputPoll();
 	machine->buttons = readController();
 	n64RunField(machine);
@@ -363,9 +487,16 @@ void retro_run(void) {
 			struct retro_game_geometry geometry = { (unsigned) width, (unsigned) height, 640, 480, 4.0f / 3.0f };
 			environment(RETRO_ENVIRONMENT_SET_GEOMETRY, &geometry);
 		}
-		videoRefresh(picture, (unsigned) width, (unsigned) height, (size_t) width * 4);
+		if (!shared) {
+			videoRefresh(picture, (unsigned) width, (unsigned) height, (size_t) width * 4);
+		} else if (hwReady) {
+			present(width, height);
+		}
 	} else {
 		videoRefresh(NULL, (unsigned) pictureWidth, (unsigned) pictureHeight, 0);
+	}
+	if (!shared) {
+		glesYield();
 	}
 	playAudio();
 	memcpy(saveMemory, machine->eeprom, EEPROM_SIZE);

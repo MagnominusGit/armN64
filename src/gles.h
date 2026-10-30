@@ -14,6 +14,13 @@ struct Gles* glesCreate(const char* source, char* error, size_t errorSize);
 struct Gles* glesCreateContext(char* error, size_t errorSize);
 void* glesProc(struct Gles*, const char* name);
 void glesUse(struct Gles*);
+// Makes current again what was current on this thread before these contexts (a frontend's own), and
+// glesResume the context that was current then, for code that doesn't make its own current first.
+void glesYield(void);
+void glesResume(void);
+// From now on, contexts are the frontend's own, current already when they are used (libretro's
+// shared hardware context), with GL functions from getProc.
+void glesFrontend(void* (*getProc)(const char* name));
 void glesDestroy(struct Gles*);
 const char* glesRenderer(struct Gles*);
 // Gives a buffer new storage of size bytes (data may be NULL).

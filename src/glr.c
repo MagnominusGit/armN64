@@ -1365,6 +1365,12 @@ struct Glr* glrCreate(struct N64* n) {
 	return g;
 }
 
+void glrForget(struct N64* n) {
+	if (n->glr) {
+		memset(&n->glr->applied, 0xFF, sizeof(n->glr->applied));
+	}
+}
+
 void glrEnd(struct N64* n) {
 	glrSync(n);
 	glrDestroy(n->glr);
