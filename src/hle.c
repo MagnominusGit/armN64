@@ -583,9 +583,10 @@ static bool branchZ(const struct Hle* h, int index, uint32_t limit) {
 	return fixed <= (int64_t) limit;
 }
 
+// The mask's bits cleared, then the data put in as it is (the microcodes don't mask it).
 static void otherModeMask(struct N64* n, struct Hle* h, bool high, uint32_t mask, uint32_t bits) {
 	uint32_t* m = high ? &h->modeH : &h->modeL;
-	*m = (*m & ~mask) | (bits & mask);
+	*m = (*m & ~mask) | bits;
 	emit(n, h, (uint64_t) (0xEF000000u | (h->modeH & 0xFFFFFF)) << 32 | h->modeL);
 }
 
