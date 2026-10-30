@@ -83,7 +83,7 @@ static struct retro_core_option_v2_definition optionDefinitions[] = {
 	{ "armn64_rdp_threads", "Renderer Threads (Restart)", NULL, "Threads beside the emulation that draw the RDP's pictures. Auto takes the cores there are, up to 3.",
 	  NULL, "system", { { "auto", "Auto" }, { "0", "None" }, { "1", "1" }, { "2", "2" }, { "3", "3" }, { NULL, NULL } }, "auto" },
 	{ "armn64_renderer", "Renderer (Restart)", NULL,
-	  "GPU draws High Level graphics with OpenGL ES 3.1 and is faster on handhelds; CPU draws them with the renderer threads. Compatible and Accurate always use the CPU.",
+	  "GPU draws with OpenGL ES 3.1: High Level graphics with the GL renderer, Compatible and Accurate with the RDP in compute shaders. CPU draws with the renderer threads.",
 	  NULL, "system", { { "gpu", "GPU" }, { "cpu", "CPU" }, { NULL, NULL } }, "gpu" },
 	{ "armn64_frameskip", "Frame Skip (Restart)", NULL, "Leaves out the drawing of frames that are never shown, as many games make more than the screen can show.",
 	  NULL, "system", { { "disabled", "Off" }, { "enabled", "On" }, { NULL, NULL } }, "disabled" },
@@ -110,7 +110,7 @@ static const char* settings(const char* name) {
 	if (!strcmp(name, "N64_JIT") || !strcmp(name, "N64_RSPJIT")) {
 		return "1";
 	}
-	if (!strcmp(name, "N64_RDP_GL")) {
+	if (!strcmp(name, "N64_RDP_GL") || !strcmp(name, "N64_RDP_GPU")) {
 		return hwWanted ? "1" : "0";
 	}
 	if (!strcmp(name, "N64_FRAMESKIP")) {
@@ -328,9 +328,9 @@ bool retro_load_game(const struct retro_game_info* info) {
 	if (!game) {
 		return false;
 	}
-	// The GPU renderer draws High Level graphics, in the frontend's GL context if it has one, else in
-	// the core's own (beside a Vulkan frontend, say).
-	hwWanted = optionIs(environment, "armn64_accuracy", "hle") && !optionIs(environment, "armn64_renderer", "cpu");
+	// The GPU renderers, in the frontend's GL context if it has one, else in the core's own (beside a
+	// Vulkan frontend, say).
+	hwWanted = !optionIs(environment, "armn64_renderer", "cpu");
 	if (hwWanted && !askHardwareContext()) {
 		unsigned preferred = RETRO_HW_CONTEXT_NONE;
 		environment(RETRO_ENVIRONMENT_GET_PREFERRED_HW_RENDER, &preferred);
