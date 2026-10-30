@@ -1290,7 +1290,7 @@ void* jitCompile(struct N64* n, const uint32_t* ops, uint32_t count, uint32_t va
 	uint8_t* start = arena + n->jitUsed;
 	j->e = (struct Emitter) { start, start, start + BLOCK_CODE_MAX };
 	j->exitCount = j->slowCount = j->missCount = j->codeCheckCount = 0;
-	j->rdpThreads = n->rdpThreads > 0;
+	j->rdpThreads = n->rdpThreads > 0 || n->rdpGl;
 	struct Emitter* e = &j->e;
 	j->leave = e->p;
 	aB(e, n->jitLeave);

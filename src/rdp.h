@@ -100,4 +100,4 @@ bool glrShows(struct N64*, uint32_t origin);
 void rdpDrawSoftware(struct N64*, struct RDP*, const uint64_t* w, int op);
 
 // The RGBA8 texels (red in the low byte) of a tile's first w x h, as the samplers read TMEM.
-void rdpTileImage(struct RDP*, int tile, int w, int h, uint32_t* out);
+void rdpTileImage(struct RDP*, int tile, int w, int h, bool convert, uint32_t* out);

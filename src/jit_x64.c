@@ -905,7 +905,7 @@ void* jitCompile(struct N64* n, const uint32_t* ops, uint32_t count, uint32_t va
 	j->e = (struct Emitter) { arena + n->jitUsed, arena + n->jitUsed, arena + n->jitUsed + BLOCK_CODE_MAX };
 	j->exitCount = j->slowCount = j->missCount = j->codeCheckCount = 0;
 	j->leave = n->jitLeave;
-	j->rdpThreads = n->rdpThreads > 0;
+	j->rdpThreads = n->rdpThreads > 0 || n->rdpGl;
 	struct Emitter* e = &j->e;
 
 	if (blockIsIdleLoop(ops, count, vaddr)) {

@@ -353,12 +353,17 @@ static struct Color sample(struct RDP* r, int tileIndex, int s, int t, bool filt
 	}
 }
 
-void rdpTileImage(struct RDP* r, int tileIndex, int w, int h, uint32_t* out) {
+static struct Color convert(const struct RDP* r, struct Color c);
+
+void rdpTileImage(struct RDP* r, int tileIndex, int w, int h, bool converted, uint32_t* out) {
 	const struct Tile* t = &r->tile[tileIndex & 7];
 	enum TexelKind kind = texelKind(r, t);
 	for (int y = 0; y < h; ++y) {
 		for (int x = 0; x < w; ++x) {
 			struct Color c = texel(r, t, x, y, kind);
+			if (converted) {
+				c = convert(r, c);
+			}
 			out[y * w + x] = (uint32_t) clamp8(c.r) | (uint32_t) clamp8(c.g) << 8 | (uint32_t) clamp8(c.b) << 16 | (uint32_t) clamp8(c.a) << 24;
 		}
 	}
@@ -2505,6 +2510,18 @@ static void command(struct N64* n, struct RDP* r, const uint64_t* w, int op, int
 		n->dp.syncAt = at;
 		n64Event(n, n->dp.syncAt);
 		return;
+	}
+	// A texture load from a color image the GPU drew waits for its pixels.
+	if (n->glr && n->rdpPending && (op == 0x30 || op == 0x33 || op == 0x34)) {
+		uint32_t addr, len;
+		loadSource(r, w, op, &addr, &len);
+		bool drawn = false;
+		FOR_PAGES(addr, len, p) {
+			drawn |= (n->pageFlags[p] & PAGE_RDP_WRITES) != 0;
+		}
+		if (drawn) {
+			glrSync(n);
+		}
 	}
 	// The GL renderer draws; the RDP keeps the state (texture loads included) and the time.
 	if (n->glr && (op == 0x01 || (op >= 0x08 && op <= 0x0F) || op == 0x24 || op == 0x25 || op == 0x36)) {
