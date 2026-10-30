@@ -101,6 +101,12 @@ static size_t commandWords(uint64_t w) {
 }
 
 static void flush(struct N64* n, struct Hle* h) {
+	// Whole commands only: a full list may end inside one, which waits for the next flush.
+	size_t total = h->count, whole = 0;
+	while (whole < total && whole + commandWords(h->list[whole]) <= total) {
+		whole += commandWords(h->list[whole]);
+	}
+	h->count = whole;
 	size_t capacity = (h->fifoEnd - h->fifoStart) / 8;
 	if (!h->dry && capacity && h->count) {
 		// A FIFO microcode's commands go through its output buffer in RDRAM, the RDP's registers
@@ -140,7 +146,8 @@ static void flush(struct N64* n, struct Hle* h) {
 			i += commandWords(h->list[i]);
 		}
 	}
-	h->count = 0;
+	memmove(h->list, h->list + whole, (total - whole) * sizeof(h->list[0]));
+	h->count = total - whole;
 }
 
 static void emit(struct N64* n, struct Hle* h, uint64_t w) {
