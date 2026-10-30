@@ -35,7 +35,10 @@ static void setupCombiner(struct RDP* r);
 static void setupModes(struct RDP* r);
 static void gpuSync(struct N64* n, struct RDP* r);
 static bool gpuDrew(struct Gpu* g, uint32_t addr, uint32_t len);
+static bool gpuReadNeeds(struct Gpu* g, uint32_t addr, uint32_t len);
 static bool gpuWriteAside(struct Gpu* g, uint32_t addr, uint32_t len);
+static bool gpuWriteOver(struct N64* n, struct RDP* r, uint32_t addr, uint32_t len);
+static void gpuUpdate(struct N64* n, struct Gpu* g);
 static void buildBlendDivide(void);
 
 static struct RDP* state(struct N64* n) {
@@ -1842,7 +1845,8 @@ static void mark(struct N64* n, struct Renderers* all, uint32_t addr, uint32_t l
 // The CPU or a DMA is about to touch RDRAM [addr, addr + len) on a page the RDP draws to: with the
 // GL renderer only the GPU's own rows matter, else everything waits.
 void rdpWaitFor(struct N64* n, uint32_t addr, uint32_t len) {
-	if (n->rdp && n->rdp->gpu && !n->glr && n->rdpPending && gpuWriteAside(n->rdp->gpu, addr, len)) {
+	if (n->rdp && n->rdp->gpu && !n->glr && n->rdpPending &&
+	    (gpuWriteAside(n->rdp->gpu, addr, len) || gpuWriteOver(n, n->rdp, addr, len))) {
 		return;
 	}
 	if (n->glr) {
@@ -1858,7 +1862,7 @@ void rdpWaitFor(struct N64* n, uint32_t addr, uint32_t len) {
 // whole page, which comes back from the GPU as one).
 void rdpWaitRead(struct N64* n, uint32_t addr, uint32_t len) {
 	if (n->rdp && n->rdp->gpu && !n->glr) {
-		if (n->rdpPending && gpuDrew(n->rdp->gpu, addr, len)) {
+		if (n->rdpPending && gpuReadNeeds(n->rdp->gpu, addr, len)) {
 			gpuSync(n, n->rdp);
 		}
 		return;
@@ -2037,6 +2041,14 @@ struct Gpu {
 	// copy of it is stale, so drawing there waits for a sync first.
 	uint32_t wroteFrom[GPU_RANGES], wroteTo[GPU_RANGES];
 	int wroteCount;
+	// Writes over what it drew, after its drawing was submitted: copied to its RDRAM once they are
+	// done (gpuUpdate), before anything later goes to the GPU.
+	uint32_t updateFrom[GPU_RANGES], updateTo[GPU_RANGES];
+	int updateCount;
+	// Drawn bytes written over since the last sync and not drawn again: newest in RDRAM, so reads
+	// of them go ahead.
+	uint32_t overFrom[GPU_RANGES], overTo[GPU_RANGES];
+	int overCount;
 	// The batch's features, and the shader variants built so far (program 0 draws everything).
 	int features;
 	int variantKey[GPU_VARIANTS], variantProgram[GPU_VARIANTS], variantCount;
@@ -2229,6 +2241,9 @@ static bool inRanges(const uint32_t* fromList, const uint32_t* toList, int count
 }
 
 static void gpuMarkRange(struct Gpu* g, uint32_t addr, uint32_t len) {
+	if (g->overCount && inRanges(g->overFrom, g->overTo, g->overCount, addr, len)) {
+		g->overCount = 0;
+	}
 	if (!addRange(g->drawnFrom, g->drawnTo, &g->drawnCount, addr, len)) {
 		g->drawnAll = true;
 	}
@@ -2239,9 +2254,48 @@ static bool gpuDrew(struct Gpu* g, uint32_t addr, uint32_t len) {
 	return g->drawnAll || inRanges(g->drawnFrom, g->drawnTo, g->drawnCount, addr, len);
 }
 
+// Whether a read of [addr, addr + len) needs what the GPU drew: not when all of it was written over
+// since.
+static bool gpuReadNeeds(struct Gpu* g, uint32_t addr, uint32_t len) {
+	uint32_t from = addr & (RDRAM_SIZE - 1), to = from + len;
+	for (int i = 0; i < g->overCount; ++i) {
+		if (from >= g->overFrom[i] && to <= g->overTo[i]) {
+			return false;
+		}
+	}
+	return gpuDrew(g, addr, len);
+}
+
 // A write outside what the GPU drew goes ahead without a sync, remembered; false when it can't.
 static bool gpuWriteAside(struct Gpu* g, uint32_t addr, uint32_t len) {
 	return !gpuDrew(g, addr, len) && addRange(g->wroteFrom, g->wroteTo, &g->wroteCount, addr, len);
+}
+
+static void gpuSubmit(struct N64* n, struct RDP* r);
+
+// A write over what the GPU drew: the drawing goes to the GPU first, the written bytes after it; false
+// when it can't (the list is full).
+static bool gpuWriteOver(struct N64* n, struct RDP* r, uint32_t addr, uint32_t len) {
+	struct Gpu* g = r->gpu;
+	if (g->drawnAll || g->updateCount == GPU_RANGES) {
+		return false;
+	}
+	gpuSubmit(n, r);
+	if (!addRange(g->updateFrom, g->updateTo, &g->updateCount, addr, len)) {
+		return false;
+	}
+	if (!addRange(g->overFrom, g->overTo, &g->overCount, addr, len)) {
+		g->overCount = 0;
+	}
+	return true;
+}
+
+// The writes over drawn bytes since the last call, now done, into the GPU's RDRAM.
+static void gpuUpdate(struct N64* n, struct Gpu* g) {
+	for (int i = 0; i < g->updateCount; ++i) {
+		glesSubData(g->gl, 0, g->updateFrom[i], &n->rdram[g->updateFrom[i]], g->updateTo[i] - g->updateFrom[i]);
+	}
+	g->updateCount = 0;
 }
 
 static void gpuMark(struct N64* n, struct Gpu* g, uint32_t addr, uint32_t len) {
@@ -2392,6 +2446,7 @@ static void gpuSubmit(struct N64* n, struct RDP* r) {
 	if (!g->primCount) {
 		return;
 	}
+	gpuUpdate(n, g);
 	// The pages it draws to, unless the GPU's copy is already the newest.
 	for (int i = 0; i < g->batchPageCount; ++i) {
 		int p = g->batchPages[i];
@@ -2490,6 +2545,7 @@ static void gpuSync(struct N64* n, struct RDP* r) {
 	struct Gpu* g = r->gpu;
 	++n->stats.glSyncs;
 	gpuSubmit(n, r);
+	gpuUpdate(n, g);
 	gpuCollectLast(g, r);
 	// What the GPU drew with its hidden bits, copied out all at once (each read waits for the GPU):
 	// the bytes drawn, else (too many ranges) every page drawn in, run by run.
@@ -2542,18 +2598,51 @@ static void gpuSync(struct N64* n, struct RDP* r) {
 	g->drawnCount = 0;
 	g->drawnAll = false;
 	g->wroteCount = 0;
+	g->overCount = 0;
 	n->rdpPending = false;
+}
+
+// The GPU RDP's context, with its copy of RDRAM [addr, addr + len) and those bytes' hidden bits
+// as new as RDRAM's, for work on the GPU that reads them after what it drew (the VI); NULL without
+// the GPU RDP. Nothing waits: the GPU takes the work in order.
+struct Gles* rdpGpuShare(struct N64* n, uint32_t addr, uint32_t len) {
+	struct RDP* r = n->rdp;
+	if (!r || !r->gpu) {
+		return NULL;
+	}
+	struct Gpu* g = r->gpu;
+	gpuSubmit(n, r);
+	gpuUpdate(n, g);
+	// Pages the GPU doesn't own are newer in RDRAM; on the ones it owns, so are bytes written beside
+	// what it drew.
+	FOR_PAGES(addr, len, p) {
+		if (!(g->page[p] & GPU_PAGE_OWNED)) {
+			glesSubData(g->gl, 0, (size_t) p << 12, &n->rdram[(size_t) p << 12], 0x1000);
+			glesSubData(g->gl, 0, RDRAM_SIZE + ((size_t) p << 11), &n->hidden[(size_t) p << 11], 0x800);
+		}
+	}
+	uint32_t from = addr & (RDRAM_SIZE - 1), to = from + len;
+	for (int i = 0; i < g->wroteCount; ++i) {
+		uint32_t a = (g->wroteFrom[i] > from ? g->wroteFrom[i] : from) & ~1u, b = g->wroteTo[i] < to ? g->wroteTo[i] : to;
+		b = (b + 1) & ~1u;
+		if (a < b && b <= RDRAM_SIZE) {
+			glesSubData(g->gl, 0, a, &n->rdram[a], b - a);
+			glesSubData(g->gl, 0, RDRAM_SIZE + (a >> 1), &n->hidden[a >> 1], (b - a) >> 1);
+		}
+	}
+	return g->gl;
 }
 
 // A command, with the GPU drawing.
 static void gpuCommand(struct N64* n, struct RDP* r, const uint64_t* w, int op) {
 	struct Gpu* g = r->gpu;
+	gpuUpdate(n, g);
 	bool draws = (op >= 0x08 && op <= 0x0F) || op == 0x24 || op == 0x25 || op == 0x36;
 	if (!draws) {
 		if (op == 0x30 || op == 0x33 || op == 0x34) {
 			uint32_t addr, len;
 			loadSource(r, w, op, &addr, &len);
-			if (n->rdpPending && gpuDrew(g, addr, len)) {
+			if (n->rdpPending && gpuReadNeeds(g, addr, len)) {
 				gpuSync(n, r);
 			}
 			g->tmemDirty = true;

@@ -5,9 +5,17 @@
 precision highp int;
 layout(local_size_x = 16, local_size_y = 16) in;
 
+#ifdef VI_SHARED
+// Run in the GPU RDP's context: all of RDRAM from its buffer, the hidden bits after it, and the
+// picture in RGBA bytes for a texture.
+layout(std430, binding = 0) readonly buffer Frame { uint frame[]; };
+#define hidden frame
+layout(std430, binding = 4) writeonly buffer Picture { uint picture[]; };
+#else
 layout(std430, binding = 0) readonly buffer Frame { uint frame[]; };
 layout(std430, binding = 1) readonly buffer Hidden { uint hidden[]; };
 layout(std430, binding = 2) writeonly buffer Picture { uint picture[]; };
+#endif
 
 // 0 origin, 1 stride, 2 32-bit pixels, 3 width, 4 height, 5 the frame buffer's first RDRAM byte,
 // 6 the hidden buffer's first index, 7 filters (1 antialiasing, 2 dither, 4 divot, 8 gamma)
@@ -109,5 +117,9 @@ void main() {
 	if ((u[7] & 8) != 0) {
 		v = ivec3(gamma(v.r), gamma(v.g), gamma(v.b));
 	}
+#ifdef VI_SHARED
+	picture[y * u[3] + x] = uint(v.r) | uint(v.g) << 8 | uint(v.b) << 16 | 0xFF000000u;
+#else
 	picture[y * u[3] + x] = uint(v.r) << 16 | uint(v.g) << 8 | uint(v.b);
+#endif
 }

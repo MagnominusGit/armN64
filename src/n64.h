@@ -305,6 +305,11 @@ struct N64 {
 	// where that can't start.
 	bool viGpu;
 	struct Gles* viGles;
+	// With the GPU RDP, the VI runs in its context on its copy of RDRAM (the program's index + 1, -1
+	// when it doesn't build); where the last GPU picture is (RGBA there, 0x00RRGGBB in viGles).
+	int viSharedProgram;
+	struct Gles* pictureGles;
+	int pictureBinding;
 	// N64_RDP_GL (with hle): the GL renderer draws what the HLE makes (glr.c).
 	bool rdpGl;
 	struct Glr* glr;
@@ -440,6 +445,7 @@ void jitFree(struct N64*);
 void rdpWait(struct N64*);
 void rdpWaitFor(struct N64*, uint32_t addr, uint32_t len);
 void rdpWaitRead(struct N64*, uint32_t addr, uint32_t len);
+struct Gles* rdpGpuShare(struct N64*, uint32_t addr, uint32_t len);
 void rdpWaitDrawn(struct N64*, uint32_t addr, uint32_t len);
 bool frameSkipped(struct N64*, uint32_t origin);
 

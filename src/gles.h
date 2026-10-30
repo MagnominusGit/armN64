@@ -4,9 +4,11 @@
 #include <stddef.h>
 
 // A GLES 3.1 compute context without a window, loaded at run time (libEGL/libGLESv2 through dlopen),
-// with one compute program and storage buffers at bindings 0-3. Several can be used on one thread;
+// with one compute program and storage buffers at bindings 0-4. Several can be used on one thread;
 // each call makes its own context current.
 struct Gles;
+
+enum { GLES_BUFFERS = 5 };
 
 struct Gles* glesCreate(const char* source, char* error, size_t errorSize);
 // A context without a program, for code making its own GL calls: glesProc finds them, glesUse
@@ -36,6 +38,8 @@ const void* glesMapRanges(struct Gles*, const int* bindings, const size_t* offse
 enum { GLES_PROGRAMS = 64 };
 int glesAddProgram(struct Gles*, const char* source, char* error, size_t errorSize);
 void glesSelectProgram(struct Gles*, int index);
+// The GL name of the buffer at a binding (for a frontend sharing the context).
+unsigned glesBuffer(struct Gles*, int binding);
 // The program's "uniform int u[N]".
 void glesUniforms(struct Gles*, const int* values, int count);
 void glesDispatch(struct Gles*, unsigned x, unsigned y);

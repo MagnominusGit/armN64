@@ -41,7 +41,7 @@ struct Gles {
 	EGLSurface surface;
 	// The frontend's context (glesFrontend), current already: nothing to make or switch.
 	bool external;
-	GLuint program, buffer[4];
+	GLuint program, buffer[GLES_BUFFERS];
 	// Programs added with glesAddProgram (the first is glesCreate's), and their uniforms.
 	GLuint programs[GLES_PROGRAMS];
 	GLint programUniforms[GLES_PROGRAMS];
@@ -337,8 +337,8 @@ static bool program(struct Gles* g, const char* source, char* error, size_t erro
 	if (!compileProgram(g, source, error, errorSize)) {
 		return false;
 	}
-	g->glGenBuffers(4, g->buffer);
-	for (int i = 0; i < 4; ++i) {
+	g->glGenBuffers(GLES_BUFFERS, g->buffer);
+	for (int i = 0; i < GLES_BUFFERS; ++i) {
 		g->glBindBuffer(GL_SHADER_STORAGE_BUFFER, g->buffer[i]);
 		g->glBufferData(GL_SHADER_STORAGE_BUFFER, 16, NULL, GL_DYNAMIC_DRAW);
 		g->glBindBufferBase(GL_SHADER_STORAGE_BUFFER, i, g->buffer[i]);
@@ -384,7 +384,7 @@ void glesDestroy(struct Gles* g) {
 	}
 	if (g->external) {
 		if (g->program) {
-			g->glDeleteBuffers(4, g->buffer);
+			g->glDeleteBuffers(GLES_BUFFERS, g->buffer);
 			g->glDeleteBuffers(1, &g->staging);
 			for (int i = 0; i < g->programCount; ++i) {
 				g->glDeleteProgram(g->programs[i]);
@@ -396,7 +396,7 @@ void glesDestroy(struct Gles* g) {
 	if (g->context) {
 		use(g);
 		if (g->program) {
-			g->glDeleteBuffers(4, g->buffer);
+			g->glDeleteBuffers(GLES_BUFFERS, g->buffer);
 			g->glDeleteBuffers(1, &g->staging);
 			for (int i = 0; i < g->programCount; ++i) {
 				g->glDeleteProgram(g->programs[i]);
@@ -494,6 +494,10 @@ int glesAddProgram(struct Gles* g, const char* source, char* error, size_t error
 		return -1;
 	}
 	return g->programCount - 1;
+}
+
+unsigned glesBuffer(struct Gles* g, int binding) {
+	return g->buffer[binding];
 }
 
 void glesSelectProgram(struct Gles* g, int index) {

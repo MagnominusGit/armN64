@@ -453,6 +453,30 @@ static void viWait(struct N64* n, const struct ViSetup* s) {
 // Starts the filters on the GPU: uploads the rows they read (y-1 to h, columns -3 to w+2) and their
 // hidden bits. False when the GPU can't start or the rows wrap around RDRAM.
 static bool viGpuStart(struct N64* n, const struct ViSetup* s) {
+	uint32_t a0, bytes;
+	struct Gles* shared = viRange(s, &a0, &bytes) && n->viSharedProgram >= 0 ? rdpGpuShare(n, a0, bytes) : NULL;
+	if (shared && !n->viSharedProgram) {
+		static char source[1 << 16];
+		snprintf(source, sizeof(source), "#version 310 es\n#define VI_SHARED 1\n%s", strchr(viGpuSource, '\n') + 1);
+		char error[512] = "";
+		int index = glesAddProgram(shared, source, error, sizeof(error));
+		if (index < 0) {
+			fprintf(stderr, "GPU VI beside the GPU RDP unavailable (%s)\n", error);
+		} else {
+			glesData(shared, 4, NULL, 640 * 480 * 4);
+		}
+		n->viSharedProgram = index < 0 ? -1 : index + 1;
+	}
+	if (shared && n->viSharedProgram > 0) {
+		glesSelectProgram(shared, n->viSharedProgram - 1);
+		int u[8] = { (int) s->origin, (int) s->stride, s->wide, s->w, s->h, 0, -(int) RDRAM_SIZE,
+		             s->aa | s->dither << 1 | s->divot << 2 | s->gammaOn << 3 };
+		glesUniforms(shared, u, 8);
+		glesDispatch(shared, (unsigned) (s->w + 15) / 16, (unsigned) (s->h + 15) / 16);
+		n->pictureGles = shared, n->pictureBinding = 4;
+		return true;
+	}
+	viWait(n, s);
 	if (!n->viGles) {
 		char error[512];
 		n->viGles = glesCreate(viGpuSource, error, sizeof(error));
@@ -464,7 +488,6 @@ static bool viGpuStart(struct N64* n, const struct ViSetup* s) {
 		fprintf(stderr, "GPU VI on %s\n", glesRenderer(n->viGles));
 		glesData(n->viGles, 2, NULL, 640 * 480 * 4);
 	}
-	uint32_t a0, bytes;
 	if (!viRange(s, &a0, &bytes)) {
 		return false;
 	}
@@ -476,6 +499,7 @@ static bool viGpuStart(struct N64* n, const struct ViSetup* s) {
 	             s->aa | s->dither << 1 | s->divot << 2 | s->gammaOn << 3 };
 	glesUniforms(n->viGles, u, 8);
 	glesDispatch(n->viGles, (unsigned) (s->w + 15) / 16, (unsigned) (s->h + 15) / 16);
+	n->pictureGles = n->viGles, n->pictureBinding = 2;
 	return true;
 }
 
@@ -496,7 +520,6 @@ bool n64PictureStart(struct N64* n, int* width, int* height) {
 		*height = n->lastHeight;
 		return true;
 	}
-	viWait(n, &s);
 	n->lastWidth = s.w, n->lastHeight = s.h;
 	if (!viGpuStart(n, &s)) {
 		*width = *height = 0;
@@ -514,18 +537,21 @@ static int viPicture(struct N64* n, uint32_t* out, int* width, int* height) {
 		*width = *height = 0;
 		return 0;
 	}
-	viWait(n, &s);
 	int w = s.w, h = s.h;
 	*width = w;
 	*height = h;
 	if (n->viGpu && viGpuStart(n, &s)) {
-		const uint32_t* picture = glesMap(n->viGles, 2, 0, (size_t) w * h * 4);
+		const uint32_t* picture = glesMap(n->pictureGles, n->pictureBinding, 0, (size_t) w * h * 4);
 		if (picture) {
-			memcpy(out, picture, (size_t) w * h * 4);
-			glesUnmap(n->viGles, 2);
+			for (int i = 0; i < w * h; ++i) {
+				uint32_t p = picture[i];
+				out[i] = n->pictureBinding == 4 ? (p & 0xFF) << 16 | (p & 0xFF00) | (p >> 16 & 0xFF) : p;
+			}
+			glesUnmap(n->pictureGles, n->pictureBinding);
 			return w * h;
 		}
 	}
+	viWait(n, &s);
 	uint32_t origin = s.origin, stride = s.stride;
 	bool gammaOn = s.gammaOn, divot = s.divot, dither = s.dither, aa = s.aa, wide = s.wide;
 	// With gamma on, the VI outputs the square root of each channel (scaled to 8 bits).
