@@ -2755,6 +2755,17 @@ static void gpuCommand(struct N64* n, struct RDP* r, const uint64_t* w, int op) 
 		gpuSync(n, r);
 		execute(n, r, w, op);
 		--r->seq;
+		// Drawn here, so newer than the GPU's copy.
+		FOR_PAGES(color, colorLen, p) {
+			g->page[p] &= ~GPU_PAGE_OWNED;
+			n->pageFlags[p] &= ~PAGE_RDP_READS;
+		}
+		if (depth) {
+			FOR_PAGES(z, zLen, p) {
+				g->page[p] &= ~GPU_PAGE_OWNED;
+				n->pageFlags[p] &= ~PAGE_RDP_READS;
+			}
+		}
 		return;
 	}
 	// At most the scissor's width times the rows it may draw.
