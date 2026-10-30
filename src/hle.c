@@ -222,6 +222,18 @@ static void normalize(float* v) {
 static void loadVertices(struct N64* n, struct Hle* h, uint32_t a, int first, int count) {
 	a = address(h, a);
 	const float* mv = h->modelview[h->depth];
+	// Lighting in model space, as the microcodes light: the lights' and lookat's directions through
+	// the modelview's transpose, against the normal as it is.
+	float dirs[LIGHTS + 2][3];
+	if (h->geometry & (GEOM_LIGHTING | GEOM_TEXTURE_GEN)) {
+		for (int l = 0; l < h->lights + 2; ++l) {
+			const float* d = l < h->lights ? h->lightDir[l] : h->lookat[l - h->lights];
+			for (int k = 0; k < 3; ++k) {
+				dirs[l][k] = mv[k * 4] * d[0] + mv[k * 4 + 1] * d[1] + mv[k * 4 + 2] * d[2];
+			}
+			normalize(dirs[l]);
+		}
+	}
 	for (int i = 0; i < count && first + i < VERTICES; ++i, a += 16) {
 		struct Vertex* v = &h->v[first + i];
 		float x = rd16(n, a), y = rd16(n, a + 2), z = rd16(n, a + 4);
@@ -234,17 +246,12 @@ static void loadVertices(struct N64* n, struct Hle* h, uint32_t a, int first, in
 		uint8_t c[4] = { n->rdram[(a + 12) & (RDRAM_SIZE - 1)], n->rdram[(a + 13) & (RDRAM_SIZE - 1)], n->rdram[(a + 14) & (RDRAM_SIZE - 1)], n->rdram[(a + 15) & (RDRAM_SIZE - 1)] };
 		v->a = c[3] / 255.0f;
 		if (h->geometry & (GEOM_LIGHTING | GEOM_TEXTURE_GEN)) {
-			float nrm[3] = { rd8(n, a + 12), rd8(n, a + 13), rd8(n, a + 14) };
-			float e[3] = {
-				nrm[0] * mv[0] + nrm[1] * mv[4] + nrm[2] * mv[8],
-				nrm[0] * mv[1] + nrm[1] * mv[5] + nrm[2] * mv[9],
-				nrm[0] * mv[2] + nrm[1] * mv[6] + nrm[2] * mv[10],
-			};
+			float e[3] = { rd8(n, a + 12), rd8(n, a + 13), rd8(n, a + 14) };
 			normalize(e);
 			if (h->geometry & GEOM_LIGHTING) {
 				float rgb[3] = { h->lightColor[h->lights][0], h->lightColor[h->lights][1], h->lightColor[h->lights][2] };
 				for (int l = 0; l < h->lights; ++l) {
-					float d = e[0] * h->lightDir[l][0] + e[1] * h->lightDir[l][1] + e[2] * h->lightDir[l][2];
+					float d = e[0] * dirs[l][0] + e[1] * dirs[l][1] + e[2] * dirs[l][2];
 					if (d > 0) {
 						rgb[0] += d * h->lightColor[l][0], rgb[1] += d * h->lightColor[l][1], rgb[2] += d * h->lightColor[l][2];
 					}
@@ -256,8 +263,9 @@ static void loadVertices(struct N64* n, struct Hle* h, uint32_t a, int first, in
 				v->r = c[0] / 255.0f, v->g = c[1] / 255.0f, v->b = c[2] / 255.0f;
 			}
 			if (h->geometry & GEOM_TEXTURE_GEN) {
-				float gx = e[0] * h->lookat[0][0] + e[1] * h->lookat[0][1] + e[2] * h->lookat[0][2];
-				float gy = e[0] * h->lookat[1][0] + e[1] * h->lookat[1][1] + e[2] * h->lookat[1][2];
+				const float* lx = dirs[h->lights], * ly = dirs[h->lights + 1];
+				float gx = e[0] * lx[0] + e[1] * lx[1] + e[2] * lx[2];
+				float gy = e[0] * ly[0] + e[1] * ly[1] + e[2] * ly[2];
 				if (h->geometry & GEOM_TEXTURE_GEN_LINEAR) {
 					s = acosf(gx < -1 ? -1 : gx > 1 ? 1 : gx) * 325.94931f;
 					t = acosf(gy < -1 ? -1 : gy > 1 ? 1 : gy) * 325.94931f;
