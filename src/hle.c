@@ -1031,16 +1031,19 @@ static int family(struct N64* n, uint32_t data, uint32_t size) {
 }
 
 // Runs the graphics task in DMEM at high level when its microcode is one of the known families;
-// A task's list run (or run until it waits): the RSP's time for it, roughly, before the RDP can
-// start on what it made; waiting, it looks again a little later.
+// A task's list run (or run until it waits): the RSP's time for it, roughly. The RDP draws while
+// the RSP makes its commands, so it can't be done before the RSP is; waiting, it looks again a
+// little later.
 static void finishTask(struct N64* n, struct Hle* h) {
 	if (!h->dry && h->waiting) {
 		n->sp.hleDoneAt = n->cycles + 2048;
 	} else if (!h->dry) {
 		n->sp.hleDoneAt = n->cycles + 4096 + 64 * (uint64_t) h->count;
-		n->dp.busyUntil = n->dp.busyUntil > n->sp.hleDoneAt ? n->dp.busyUntil : n->sp.hleDoneAt;
 	}
 	flush(n, h);
+	if (!h->dry && !h->waiting) {
+		n->dp.busyUntil = n->dp.busyUntil > n->sp.hleDoneAt ? n->dp.busyUntil : n->sp.hleDoneAt;
+	}
 }
 
 bool hleWaiting(struct N64* n) {

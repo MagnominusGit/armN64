@@ -2567,6 +2567,9 @@ static void command(struct N64* n, struct RDP* r, const uint64_t* w, int op, int
 		}
 		++n->stats.dpSyncs;
 		uint64_t at = begin + r->clocks * 3 / 2;
+		if (n->accuracy == ACCURACY_HLE && at < n->sp.hleDoneAt) {
+			at = n->sp.hleDoneAt;
+		}
 		if (n->accuracy == ACCURACY_HLE && n->dp.syncAt && n->dp.syncQueued < 8) {
 			n->dp.syncQueue[n->dp.syncQueued++] = at;
 			return;
