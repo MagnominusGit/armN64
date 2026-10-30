@@ -2409,6 +2409,38 @@ static bool gpuTriangle(struct Gpu* g, struct RDP* r, const uint64_t* w, int op,
 	return true;
 }
 
+// The tiles a primitive's box has on tile row ty; for a triangle, only those its edges reach on
+// that row's sub-scanlines (a pixel wider each side).
+static void rowTiles(const struct Gpu* g, const int32_t* p, int ty, int* tx0, int* tx1) {
+	*tx0 = p[2] >> 4, *tx1 = p[4] >> 4;
+	if (p[0] != GPU_KIND_TRIANGLE) {
+		return;
+	}
+	const int32_t* t = g->rows + p[8];
+	struct Edges e = { t[0], t[1], t[2], t[3], t[4], t[5], t[6], t[7], t[8] };
+	int qa = p[3] * 4 > e.yh ? p[3] * 4 : e.yh, qb = p[5] * 4 + 3 < e.yl - 1 ? p[5] * 4 + 3 : e.yl - 1;
+	qa = qa > ty * 64 ? qa : ty * 64;
+	qb = qb < ty * 64 + 63 ? qb : ty * 64 + 63;
+	int64_t lo = INT64_MAX, hi = INT64_MIN;
+	const int qs[4] = { qa, qb, e.ym - 1, e.ym };
+	for (int i = 0; i < 4; ++i) {
+		if (qs[i] < qa || qs[i] > qb) {
+			continue;
+		}
+		for (int major = 0; major < 2; ++major) {
+			int64_t x = edgeX(&e, qs[i], major);
+			lo = x < lo ? x : lo;
+			hi = x > hi ? x : hi;
+		}
+	}
+	if (lo > hi) {
+		return;
+	}
+	int64_t a = ((lo >> 16) - 1) >> 4, b = ((hi >> 16) + 1) >> 4;
+	*tx0 = a > *tx0 ? (int) a : *tx0;
+	*tx1 = b < *tx1 ? (int) b : *tx1;
+}
+
 static void gpuCollectLast(struct Gpu* g, struct RDP* r) {
 	if (!g->lastUsed) {
 		return;
@@ -2472,11 +2504,13 @@ static void gpuSubmit(struct N64* n, struct RDP* r) {
 		tx0 = ax < tx0 ? ax : tx0, ty0 = ay < ty0 ? ay : ty0;
 		tx1 = bx > tx1 ? bx : tx1, ty1 = by > ty1 ? by : ty1;
 		for (int ty = ay; ty <= by; ++ty) {
-			for (int tx = ax; tx <= bx; ++tx) {
+			int rx0, rx1;
+			rowTiles(g, p, ty, &rx0, &rx1);
+			for (int tx = rx0; tx <= rx1; ++tx) {
 				++counts[ty * GPU_TILES + tx];
 			}
+			entries += (size_t) (rx1 >= rx0 ? rx1 - rx0 + 1 : 0);
 		}
-		entries += (size_t) (bx - ax + 1) * (size_t) (by - ay + 1);
 	}
 	size_t statesAt = (size_t) g->primCount * GPU_PRIM_SIZE;
 	size_t rowsAt = statesAt + (size_t) g->stateCount * GPU_STATE_SIZE;
@@ -2506,7 +2540,9 @@ static void gpuSubmit(struct N64* n, struct RDP* r) {
 	for (int i = 0; i < g->primCount; ++i) {
 		const int32_t* p = g->prims + i * GPU_PRIM_SIZE;
 		for (int ty = p[3] >> 4; ty <= p[5] >> 4; ++ty) {
-			for (int tx = p[2] >> 4; tx <= p[4] >> 4; ++tx) {
+			int rx0, rx1;
+			rowTiles(g, p, ty, &rx0, &rx1);
+			for (int tx = rx0; tx <= rx1; ++tx) {
 				int32_t* bin = bins + (ty * GPU_TILES + tx) * 2;
 				lists[bin[0] + bin[1]++] = i;
 			}
