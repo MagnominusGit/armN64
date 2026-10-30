@@ -583,11 +583,14 @@ static bool branchZ(const struct Hle* h, int index, uint32_t limit) {
 	return fixed <= (int64_t) limit;
 }
 
-static void otherMode(struct N64* n, struct Hle* h, bool high, int shift, int len, uint32_t bits) {
-	uint32_t mask = (len >= 32 ? 0xFFFFFFFFu : ((1u << len) - 1)) << shift;
+static void otherModeMask(struct N64* n, struct Hle* h, bool high, uint32_t mask, uint32_t bits) {
 	uint32_t* m = high ? &h->modeH : &h->modeL;
 	*m = (*m & ~mask) | (bits & mask);
 	emit(n, h, (uint64_t) (0xEF000000u | (h->modeH & 0xFFFFFF)) << 32 | h->modeL);
+}
+
+static void otherMode(struct N64* n, struct Hle* h, bool high, int shift, int len, uint32_t bits) {
+	otherModeMask(n, h, high, (len >= 32 ? 0xFFFFFFFFu : ((1u << len) - 1)) << shift, bits);
 }
 
 // The RDP commands a display list passes on as they are, with segmented image addresses resolved;
@@ -806,11 +809,11 @@ static void runList(struct N64* n, struct Hle* h, uint32_t pc) {
 				f3dex2 = h->family == FAMILY_F3DEX2, f3dex = h->family == FAMILY_F3DEX;
 				break;
 			case 0xE2:
-			case 0xE3: {
-				int len = (w0 & 0xFF) + 1, shift = 32 - ((w0 >> 8) & 0xFF) - len;
-				otherMode(n, h, op == 0xE3, shift, len, w1);
+			case 0xE3:
+				// The mask as the microcode makes it: the top bit shifted right by len - 1, with sign,
+				// then by 32 - shift - len (shift and len give no mask past bit 0).
+				otherModeMask(n, h, op == 0xE3, (uint32_t) ((int32_t) 0x80000000 >> (w0 & 31)) >> ((w0 >> 8) & 31), w1);
 				break;
-			}
 			}
 		} else {
 			int scale = f3dex ? 2 : 10;
