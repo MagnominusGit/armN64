@@ -34,6 +34,8 @@ static bool ownsRow(const struct RDP* r, int y) {
 static void setupCombiner(struct RDP* r);
 static void setupModes(struct RDP* r);
 static void gpuSync(struct N64* n, struct RDP* r);
+static bool gpuDrew(struct Gpu* g, uint32_t addr, uint32_t len);
+static bool gpuWriteAside(struct Gpu* g, uint32_t addr, uint32_t len);
 static void buildBlendDivide(void);
 
 static struct RDP* state(struct N64* n) {
@@ -51,7 +53,7 @@ static struct RDP* state(struct N64* n) {
 
 static uint64_t word(struct N64* n, uint32_t addr) {
 	if (!(n->dp.status & 1) && (n->pageFlags[(addr & (RDRAM_SIZE - 8)) >> 12] & PAGE_RDP_WRITES)) {
-		rdpWait(n);
+		rdpWaitRead(n, addr & (RDRAM_SIZE - 8), 8);
 	}
 	const uint8_t* p = n->dp.status & 1 ? &n->sp.mem[addr & 0xFF8] : &n->rdram[addr & (RDRAM_SIZE - 8)];
 	return (uint64_t) be32(p) << 32 | be32(p + 4);
@@ -1840,6 +1842,9 @@ static void mark(struct N64* n, struct Renderers* all, uint32_t addr, uint32_t l
 // The CPU or a DMA is about to touch RDRAM [addr, addr + len) on a page the RDP draws to: with the
 // GL renderer only the GPU's own rows matter, else everything waits.
 void rdpWaitFor(struct N64* n, uint32_t addr, uint32_t len) {
+	if (n->rdp && n->rdp->gpu && !n->glr && n->rdpPending && gpuWriteAside(n->rdp->gpu, addr, len)) {
+		return;
+	}
 	if (n->glr) {
 		if (n->rdpPending && glrDrew(n, addr, len)) {
 			glrSync(n);
@@ -1847,6 +1852,18 @@ void rdpWaitFor(struct N64* n, uint32_t addr, uint32_t len) {
 		return;
 	}
 	rdpWait(n);
+}
+
+// As rdpWaitFor, for a read: with the GPU drawing, only bytes it drew wait (a write waits for the
+// whole page, which comes back from the GPU as one).
+void rdpWaitRead(struct N64* n, uint32_t addr, uint32_t len) {
+	if (n->rdp && n->rdp->gpu && !n->glr) {
+		if (n->rdpPending && gpuDrew(n->rdp->gpu, addr, len)) {
+			gpuSync(n, n->rdp);
+		}
+		return;
+	}
+	rdpWaitFor(n, addr, len);
 }
 
 void rdpWaitDrawn(struct N64* n, uint32_t addr, uint32_t len) {
@@ -1977,7 +1994,7 @@ enum {
 	GPU_ENTRIES_MAX = 1024,
 	GPU_KIND_TRIANGLE = 0, GPU_KIND_TEXRECT = 1, GPU_KIND_FILL = 2, GPU_KIND_RECT = 3,
 	GPU_PAGE_BATCH = 1, GPU_PAGE_OWNED = 2, GPU_PAGE_MARKED = 4,
-	GPU_VARIANTS = 48,
+	GPU_VARIANTS = 48, GPU_RANGES = 64,
 };
 
 // What a batch's primitives use, for the shader variant that leaves out the rest (rdp_gpu.glsl's
@@ -2011,6 +2028,15 @@ struct Gpu {
 	uint32_t lastUsed;
 	uint32_t batchBase[GPU_BATCHES_MAX], batchTiles[GPU_BATCHES_MAX];
 	int batchCount;
+	// The bytes drawn since the last sync, for reads elsewhere on their pages to go ahead without
+	// one; past GPU_RANGES, every read of a drawn page waits.
+	uint32_t drawnFrom[GPU_RANGES], drawnTo[GPU_RANGES];
+	int drawnCount;
+	bool drawnAll;
+	// What the CPU or a DMA wrote since then on those pages but outside what was drawn: the GPU's
+	// copy of it is stale, so drawing there waits for a sync first.
+	uint32_t wroteFrom[GPU_RANGES], wroteTo[GPU_RANGES];
+	int wroteCount;
 	// The batch's features, and the shader variants built so far (program 0 draws everything).
 	int features;
 	int variantKey[GPU_VARIANTS], variantProgram[GPU_VARIANTS], variantCount;
@@ -2167,7 +2193,59 @@ static int gpuState(struct Gpu* g, struct RDP* r) {
 	return (g->stateCount - 1) * GPU_STATE_SIZE;
 }
 
+// Adds [addr, addr + len) to a list of ranges, merged with one it touches; false when the list is
+// full or the range wraps around RDRAM.
+static bool addRange(uint32_t* fromList, uint32_t* toList, int* count, uint32_t addr, uint32_t len) {
+	uint32_t from = addr & (RDRAM_SIZE - 1), to = from + len;
+	if (to > RDRAM_SIZE) {
+		return false;
+	}
+	for (int i = 0; i < *count; ++i) {
+		if (from <= toList[i] && to >= fromList[i]) {
+			fromList[i] = from < fromList[i] ? from : fromList[i];
+			toList[i] = to > toList[i] ? to : toList[i];
+			return true;
+		}
+	}
+	if (*count == GPU_RANGES) {
+		return false;
+	}
+	fromList[*count] = from;
+	toList[(*count)++] = to;
+	return true;
+}
+
+static bool inRanges(const uint32_t* fromList, const uint32_t* toList, int count, uint32_t addr, uint32_t len) {
+	uint32_t from = addr & (RDRAM_SIZE - 1), to = from + len;
+	if (to > RDRAM_SIZE) {
+		return true;
+	}
+	for (int i = 0; i < count; ++i) {
+		if (from < toList[i] && to > fromList[i]) {
+			return true;
+		}
+	}
+	return false;
+}
+
+static void gpuMarkRange(struct Gpu* g, uint32_t addr, uint32_t len) {
+	if (!addRange(g->drawnFrom, g->drawnTo, &g->drawnCount, addr, len)) {
+		g->drawnAll = true;
+	}
+}
+
+// Whether the GPU may have drawn in [addr, addr + len) since the last sync.
+static bool gpuDrew(struct Gpu* g, uint32_t addr, uint32_t len) {
+	return g->drawnAll || inRanges(g->drawnFrom, g->drawnTo, g->drawnCount, addr, len);
+}
+
+// A write outside what the GPU drew goes ahead without a sync, remembered; false when it can't.
+static bool gpuWriteAside(struct Gpu* g, uint32_t addr, uint32_t len) {
+	return !gpuDrew(g, addr, len) && addRange(g->wroteFrom, g->wroteTo, &g->wroteCount, addr, len);
+}
+
 static void gpuMark(struct N64* n, struct Gpu* g, uint32_t addr, uint32_t len) {
+	gpuMarkRange(g, addr, len);
 	FOR_PAGES(addr, len, p) {
 		if (!(g->page[p] & GPU_PAGE_MARKED)) {
 			g->markedPages[g->markedPageCount++] = (uint16_t) p;
@@ -2410,16 +2488,23 @@ static void gpuSubmit(struct N64* n, struct RDP* r) {
 // Brings back everything the GPU drew.
 static void gpuSync(struct N64* n, struct RDP* r) {
 	struct Gpu* g = r->gpu;
+	++n->stats.glSyncs;
 	gpuSubmit(n, r);
 	gpuCollectLast(g, r);
-	// The pages the GPU drew, each run of neighbours with its hidden bits, copied out all at once
-	// (each read waits for the GPU).
+	// What the GPU drew with its hidden bits, copied out all at once (each read waits for the GPU):
+	// the bytes drawn, else (too many ranges) every page drawn in, run by run.
 	const int drawn = GPU_PAGE_OWNED | GPU_PAGE_MARKED;
 	static int bindings[RDRAM_SIZE >> 11];
 	static size_t offsets[RDRAM_SIZE >> 11], sizes[RDRAM_SIZE >> 11];
-	static int firsts[RDRAM_SIZE >> 12], runs[RDRAM_SIZE >> 12];
+	static uint32_t firsts[RDRAM_SIZE >> 12], runs[RDRAM_SIZE >> 12];
 	int count = 0;
-	for (int i = 0; i < g->markedPageCount; ++i) {
+	for (int i = 0; !g->drawnAll && i < g->drawnCount; ++i) {
+		uint32_t from = g->drawnFrom[i] & ~1u, to = (g->drawnTo[i] + 1) & ~1u;
+		firsts[count / 2] = from, runs[count / 2] = to - from;
+		bindings[count] = 0, offsets[count] = from, sizes[count++] = to - from;
+		bindings[count] = 0, offsets[count] = RDRAM_SIZE + (from >> 1), sizes[count++] = (to - from) >> 1;
+	}
+	for (int i = 0; g->drawnAll && i < g->markedPageCount; ++i) {
 		int p = g->markedPages[i];
 		if ((g->page[p] & drawn) != drawn) {
 			continue;
@@ -2434,17 +2519,17 @@ static void gpuSync(struct N64* n, struct RDP* r) {
 		for (int k = 0; k < run; ++k) {
 			g->page[p + k] &= ~GPU_PAGE_OWNED;
 		}
-		firsts[count / 2] = p, runs[count / 2] = run;
+		firsts[count / 2] = (uint32_t) p << 12, runs[count / 2] = (uint32_t) run << 12;
 		bindings[count] = 0, offsets[count] = (size_t) p << 12, sizes[count++] = (size_t) run << 12;
 		bindings[count] = 0, offsets[count] = RDRAM_SIZE + ((size_t) p << 11), sizes[count++] = (size_t) run << 11;
 	}
 	const uint8_t* m = count ? glesMapRanges(g->gl, bindings, offsets, sizes, count) : NULL;
 	if (m) {
 		for (int i = 0; i < count / 2; ++i) {
-			memcpy(&n->rdram[(size_t) firsts[i] << 12], m, (size_t) runs[i] << 12);
-			m += (size_t) runs[i] << 12;
-			memcpy(&n->hidden[(size_t) firsts[i] << 11], m, (size_t) runs[i] << 11);
-			m += (size_t) runs[i] << 11;
+			memcpy(&n->rdram[firsts[i]], m, runs[i]);
+			m += runs[i];
+			memcpy(&n->hidden[firsts[i] >> 1], m, runs[i] >> 1);
+			m += runs[i] >> 1;
 		}
 		glesUnmap(g->gl, 0);
 	}
@@ -2454,6 +2539,9 @@ static void gpuSync(struct N64* n, struct RDP* r) {
 		n->pageFlags[p] &= ~PAGE_RDP;
 	}
 	g->markedPageCount = 0;
+	g->drawnCount = 0;
+	g->drawnAll = false;
+	g->wroteCount = 0;
 	n->rdpPending = false;
 }
 
@@ -2465,11 +2553,7 @@ static void gpuCommand(struct N64* n, struct RDP* r, const uint64_t* w, int op) 
 		if (op == 0x30 || op == 0x33 || op == 0x34) {
 			uint32_t addr, len;
 			loadSource(r, w, op, &addr, &len);
-			bool drawn = false;
-			FOR_PAGES(addr, len, p) {
-				drawn |= (n->pageFlags[p] & PAGE_RDP_WRITES) != 0;
-			}
-			if (drawn) {
+			if (n->rdpPending && gpuDrew(g, addr, len)) {
 				gpuSync(n, r);
 			}
 			g->tmemDirty = true;
@@ -2497,6 +2581,13 @@ static void gpuCommand(struct N64* n, struct RDP* r, const uint64_t* w, int op) 
 	uint32_t z = r->zAddr + (uint32_t) y0 * r->colorWidth * 2;
 	uint32_t zLen = (uint32_t) (y1 - y0) * r->colorWidth * 2 + right * 2;
 	bool overlap = depth && z < color + colorLen && color < z + zLen;
+	// Bytes written aside are stale on the GPU: drawing over them, or past the drawn ranges' list
+	// (whose fallback brings back whole pages), waits for a sync first.
+	bool wraps = (color & (RDRAM_SIZE - 1)) + colorLen > RDRAM_SIZE || (depth && (z & (RDRAM_SIZE - 1)) + zLen > RDRAM_SIZE);
+	if (g->wroteCount && (wraps || g->drawnCount + 2 > GPU_RANGES || inRanges(g->wroteFrom, g->wroteTo, g->wroteCount, color, colorLen) ||
+	                      (depth && inRanges(g->wroteFrom, g->wroteTo, g->wroteCount, z, zLen)))) {
+		gpuSync(n, r);
+	}
 	bool shades = !(op == 0x36 && r->cycleType == 3) && !((op == 0x24 || op == 0x25) && r->cycleType == 2);
 	const struct Stage* firstStage = &r->stage[r->cycleType == 1 ? 0 : 1];
 	bool alone = right - 1 > r->colorWidth || overlap ||

@@ -323,7 +323,7 @@ uint32_t busRead32(struct N64* n, uint32_t addr) {
 	}
 	if (addr < RDRAM_SIZE) {
 		if (n->pageFlags[addr >> 12] & PAGE_RDP_WRITES) {
-			rdpWaitFor(n, addr & ~3u, 4);
+			rdpWaitRead(n, addr & ~3u, 4);
 		}
 		return be32(&n->rdram[addr & ~3u]);
 	}
@@ -615,7 +615,7 @@ void busWrite32(struct N64* n, uint32_t addr, uint32_t v) {
 				n->ai.queueLen[n->ai.queued++] = n->ai.len;
 				++n->stats.aiBuffers;
 				if (n->audioCapacity) {
-					rdpWaitFor(n, n->ai.dramAddr, n->ai.len);
+					rdpWaitRead(n, n->ai.dramAddr, n->ai.len);
 					aiKeep(n, n->ai.dramAddr, n->ai.len);
 				}
 				if (n->ai.queued == 1) {
