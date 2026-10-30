@@ -320,7 +320,7 @@ static const char fragmentHead[] =
 	"	return texelFetch(t, ivec2(clamp(i, 0, image.x - 1), clamp(j, 0, image.y - 1)), 0);\n"
 	"}\n"
 	"vec4 sampleTile(sampler2D t, ivec4 a, ivec4 b, ivec4 c, ivec4 image) {\n"
-	"	vec3 top = vTex - 0.5 * dFdy(vTex);\n"
+	"	vec3 top = vTex - 0.5 * dFdx(vTex) - 0.5 * dFdy(vTex);\n"
 	"	vec2 st = top.xy / top.z;\n"
 	"	int s = int(floor(st.x * 32.0 + 0.01)), tt = int(floor(st.y * 32.0 + 0.01));\n"
 	"	int fs, ft, f;\n"
@@ -1254,7 +1254,7 @@ void glrDraw(struct N64* n, struct RDP* r, const uint64_t* w, int op) {
 		return;
 	}
 	bool flip = op == 0x25;
-	float ax[2] = { x0 - cx0 - 0.5f, x1 + 1 - cx0 - 0.5f }, ay[2] = { (float) (y0 - cy0), (float) (y1 + 1 - cy0) };
+	float ax[2] = { (float) (x0 - cx0), (float) (x1 + 1 - cx0) }, ay[2] = { (float) (y0 - cy0), (float) (y1 + 1 - cy0) };
 	const float* along = flip ? ay : ax, * across = flip ? ax : ay;
 	float ss[2] = { s0 + along[0] * dsdx, s0 + along[1] * dsdx }, ts[2] = { t0 + across[0] * dtdy, t0 + across[1] * dtdy };
 	if (!drawState(n, g, r, true, false, r->zAddr && r->zPrim, tile, false, y0, y1 + 1)) {
