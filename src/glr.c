@@ -141,6 +141,7 @@ struct DrawState {
 	float prim[4], env[4], fog[4], blend[4], primLod, primDepth;
 	int scissor[4];
 	bool depthTest, depthWrite, decal, blendOn, persp;
+	int blendB;
 };
 
 struct Glr {
@@ -247,10 +248,11 @@ static const char fragmentHead[] =
 
 // modes: cycle type (bits 0-1), alpha compare (2), textured (3), shaded (4), the blender's first
 // cycle and last cycle selections (8-15, 16-23), blending with memory (24), depth from prim (25),
-// coverage times alpha with antialiasing (26), alpha as coverage (27).
+// coverage times alpha with antialiasing (26), alpha as coverage (27), the last cycle's blend formula
+// in the shader (28).
 enum {
 	MODE_CYCLE = 3, MODE_ALPHA_COMPARE = 4, MODE_TEXTURED = 8, MODE_SHADED = 16, MODE_BLEND = 1 << 24, MODE_PRIM_DEPTH = 1 << 25,
-	MODE_CVG_ALPHA = 1 << 26, MODE_ALPHA_CVG = 1 << 27,
+	MODE_CVG_ALPHA = 1 << 26, MODE_ALPHA_CVG = 1 << 27, MODE_BLEND_COLOR = 1 << 28,
 };
 
 static const char* rgbInput(int which, int sel) {
@@ -289,10 +291,24 @@ static void cycleSource(char* out, size_t size, uint64_t c, int cycle) {
 
 // The blender's P and A for a cycle (pixel, memory, blend color, fog): P as the color and A as the
 // alpha the GPU's blending then uses with memory.
-static void blendSource(char* out, size_t size, int p, int a) {
-	static const char* ps[4] = { "combined.rgb", "combined.rgb", "uBlend.rgb", "uFog.rgb" };
-	static const char* as[4] = { "combined.a", "uFog.a", "shade.a", "0.0" };
-	snprintf(out, size, "	oColor = vec4(%s, %s);\n", ps[p & 3], as[a & 3]);
+// The blender's inputs for one cycle's selections (P | A << 2 | M << 4 | B << 6): the pixel, memory
+// (which the shader can't read: the pixel stands in), the blend color or fog for P and M; the pixel
+// alpha, fog alpha, shade alpha or 0 for A; 1 - A, memory alpha (taken as 1), 1 or 0 for B.
+static const char* blendColorInput(int sel) {
+	static const char* inputs[4] = { "combined.rgb", "combined.rgb", "uBlend.rgb", "uFog.rgb" };
+	return inputs[sel & 3];
+}
+
+static const char* blendAlphaInput(int sel) {
+	static const char* inputs[4] = { "combined.a", "uFog.a", "shade.a", "0.0" };
+	return inputs[sel & 3];
+}
+
+// P * A + M * B into combined.rgb.
+static void blendFormula(char* out, size_t size, int sel) {
+	static const char* b[4] = { "1.0 - blendA", "1.0", "1.0", "0.0" };
+	snprintf(out, size, "	{ float blendA = %s; combined.rgb = clamp(%s * blendA + %s * (%s), 0.0, 1.0); }\n", blendAlphaInput(sel >> 2),
+	         blendColorInput(sel), blendColorInput(sel >> 4), b[(sel >> 6) & 3]);
 }
 
 static GLuint compile(struct Glr* g, GLenum type, const char* source) {
@@ -359,14 +375,20 @@ static struct Program* program(struct Glr* g, struct ProgramKey key) {
 	}
 	int first = (key.modes >> 8) & 0xFF, last = (key.modes >> 16) & 0xFF;
 	if (cycleType == 1) {
-		// The first cycle (fog, mostly): P * A + M * (1 - A) with M the pixel.
-		static const char* ps[4] = { "combined.rgb", "combined.rgb", "uBlend.rgb", "uFog.rgb" };
-		static const char* as[4] = { "combined.a", "uFog.a", "shade.a", "0.0" };
-		snprintf(line, sizeof(line), "	combined.rgb = mix(combined.rgb, %s, %s);\n", ps[first & 3], as[(first >> 2) & 3]);
+		// The first of two cycles always blends (fog, mostly).
+		blendFormula(line, sizeof(line), first);
 		strcat(source, line);
 	}
 	if (cycleType < 2) {
-		blendSource(line, sizeof(line), last & 3, (last >> 2) & 3);
+		// The last cycle: with force blend and memory as M the GPU blends P with the image, other
+		// inputs here; without, P passes.
+		if (key.modes & MODE_BLEND_COLOR) {
+			blendFormula(line, sizeof(line), last);
+			strcat(source, line);
+			snprintf(line, sizeof(line), "	oColor = vec4(combined.rgb, %s);\n", blendAlphaInput(last >> 2));
+		} else {
+			snprintf(line, sizeof(line), "	oColor = vec4(%s, %s);\n", blendColorInput(last), blendAlphaInput(last >> 2));
+		}
 		strcat(source, line);
 	} else {
 		strcat(source, "	oColor = combined;\n");
@@ -679,7 +701,7 @@ static void flushBatch(struct N64* n, struct Glr* g) {
 	}
 	if (s->blendOn) {
 		gl->Enable(GL_BLEND);
-		gl->BlendFuncSeparate(GL_SRC_ALPHA, GL_ONE_MINUS_SRC_ALPHA, GL_ONE, GL_ONE);
+		gl->BlendFuncSeparate(GL_SRC_ALPHA, s->blendB == 0 ? GL_ONE_MINUS_SRC_ALPHA : s->blendB == 3 ? GL_ZERO : GL_ONE, GL_ONE, GL_ONE);
 	} else {
 		gl->Disable(GL_BLEND);
 	}
@@ -707,10 +729,15 @@ static bool drawState(struct N64* n, struct Glr* g, struct RDP* r, bool textured
 	int cycleType = r->cycleType;
 	uint32_t modes = (uint32_t) cycleType | (r->alphaCompare ? MODE_ALPHA_COMPARE : 0) | (textured ? MODE_TEXTURED : 0) | (shaded ? MODE_SHADED : 0);
 	int lastCycle = cycleType == 1 ? 1 : 0;
-	modes |= (uint32_t) (r->blendSel[0][0] | r->blendSel[0][1] << 2) << 8;
-	modes |= (uint32_t) (r->blendSel[lastCycle][0] | r->blendSel[lastCycle][1] << 2) << 16;
-	bool blendMemory = r->blendSel[lastCycle][2] == 1 && r->blendSel[lastCycle][0] != 1;
+	const uint8_t* first = r->blendSel[0], * last = r->blendSel[lastCycle];
+	modes |= (uint32_t) (first[0] | first[1] << 2 | first[2] << 4 | first[3] << 6) << 8;
+	modes |= (uint32_t) (last[0] | last[1] << 2 | last[2] << 4 | last[3] << 6) << 16;
+	bool blendMemory = last[2] == 1 && last[0] != 1;
 	s.blendOn = cycleType < 2 && r->forceBlend && blendMemory;
+	s.blendB = last[3];
+	if (cycleType < 2 && r->forceBlend && !blendMemory) {
+		modes |= MODE_BLEND_COLOR;
+	}
 	if (s.blendOn) {
 		modes |= MODE_BLEND;
 	}
