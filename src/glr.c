@@ -27,7 +27,7 @@ enum {
 	GL_DEPTH_COMPONENT24 = 0x81A6, GL_FRAMEBUFFER_COMPLETE = 0x8CD5,
 	GL_TEXTURE_MIN_FILTER = 0x2801, GL_TEXTURE_MAG_FILTER = 0x2800, GL_NEAREST = 0x2600, GL_TEXTURE_WRAP_S = 0x2802,
 	GL_TEXTURE_WRAP_T = 0x2803, GL_CLAMP_TO_EDGE = 0x812F, GL_TEXTURE0 = 0x84C0,
-	GL_ARRAY_BUFFER = 0x8892, GL_STREAM_DRAW = 0x88E0, GL_TRIANGLES = 4,
+	GL_ARRAY_BUFFER = 0x8892, GL_STREAM_DRAW = 0x88E0, GL_TRIANGLES = 4, GL_MAP_WRITE_BIT = 2, GL_MAP_UNSYNCHRONIZED_BIT = 0x20,
 	GL_SCISSOR_TEST = 0x0C11, GL_DEPTH_TEST = 0x0B71, GL_BLEND = 0x0BE2, GL_POLYGON_OFFSET_FILL = 0x8037,
 	GL_DITHER = 0x0BD0, GL_COLOR_BUFFER_BIT = 0x4000, GL_DEPTH_BUFFER_BIT = 0x100,
 	GL_LESS = 0x201, GL_LEQUAL = 0x203, GL_ALWAYS = 0x207,
@@ -36,7 +36,8 @@ enum {
 	GL_PACK_ALIGNMENT = 0x0D05, GL_UNPACK_ALIGNMENT = 0x0CF5,
 };
 
-enum { TARGETS = 8, TARGET_ROWS = 480, PROGRAMS = 256, TEXTURES = 1024, BATCH_VERTICES = 1 << 16, VERTEX_FLOATS = 10 };
+enum { TARGETS = 8, TARGET_ROWS = 480, PROGRAMS = 256, TEXTURES = 1024, BATCH_VERTICES = 1 << 16, VERTEX_FLOATS = 10,
+       VERTEX_BUFFER_BYTES = BATCH_VERTICES * VERTEX_FLOATS * 4 * 2 };
 
 struct Gl {
 	void (*GenFramebuffers)(GLsizei, GLuint*);
@@ -93,6 +94,8 @@ struct Gl {
 	void (*GenBuffers)(GLsizei, GLuint*);
 	void (*BindBuffer)(GLenum, GLuint);
 	void (*BufferData)(GLenum, GLsizeiptr, const void*, GLenum);
+	void* (*MapBufferRange)(GLenum, GLintptr, GLsizeiptr, GLbitfield);
+	GLboolean (*UnmapBuffer)(GLenum);
 	void (*VertexAttribPointer)(GLuint, GLint, GLenum, GLboolean, GLsizei, const void*);
 	void (*EnableVertexAttribArray)(GLuint);
 	void (*DrawArrays)(GLenum, GLint, GLsizei);
@@ -177,6 +180,7 @@ struct Glr {
 	uint8_t* rows;
 	uint32_t* image;
 	struct Applied applied;
+	size_t vertexOffset;
 	uint64_t rawField;
 	int rawTriangles;
 	// The state of the last primitive, valid while the RDP's stateGen stays (and no sync).
@@ -252,7 +256,7 @@ static bool loadGl(struct Glr* g) {
 	       GLFN(CreateProgram) && GLFN(AttachShader) && GLFN(LinkProgram) && GLFN(GetProgramiv) && GLFN(GetProgramInfoLog) &&
 	       GLFN(UseProgram) && GLFN(DeleteProgram) && GLFN(GetUniformLocation) && GLFN(Uniform1i) && GLFN(Uniform1f) &&
 	       GLFN(Uniform2f) && GLFN(Uniform4f) && GLFN(Uniform4iv) && GLFN(GenVertexArrays) && GLFN(BindVertexArray) &&
-	       GLFN(GenBuffers) && GLFN(BindBuffer) && GLFN(BufferData) && GLFN(VertexAttribPointer) &&
+	       GLFN(GenBuffers) && GLFN(BindBuffer) && GLFN(BufferData) && GLFN(MapBufferRange) && GLFN(UnmapBuffer) && GLFN(VertexAttribPointer) &&
 	       GLFN(EnableVertexAttribArray) && GLFN(DrawArrays) && GLFN(Flush);
 #undef GLFN
 }
@@ -826,8 +830,20 @@ static void flushBatch(struct N64* n, struct Glr* g) {
 	}
 	gl->BindVertexArray(g->vertexArray);
 	gl->BindBuffer(GL_ARRAY_BUFFER, g->vertexBuffer);
-	gl->BufferData(GL_ARRAY_BUFFER, (GLsizeiptr) g->batchCount * VERTEX_FLOATS * 4, g->batch, GL_STREAM_DRAW);
-	gl->DrawArrays(GL_TRIANGLES, 0, g->batchCount);
+	// Batches go one after another into one vertex buffer, new storage only when it is full (the
+	// GPU may still be reading the old: a buffer a batch costs the kernel page work).
+	size_t bytes = (size_t) g->batchCount * VERTEX_FLOATS * 4;
+	if (g->vertexOffset + bytes > VERTEX_BUFFER_BYTES) {
+		gl->BufferData(GL_ARRAY_BUFFER, VERTEX_BUFFER_BYTES, NULL, GL_STREAM_DRAW);
+		g->vertexOffset = 0;
+	}
+	void* to = gl->MapBufferRange(GL_ARRAY_BUFFER, (GLintptr) g->vertexOffset, (GLsizeiptr) bytes, GL_MAP_WRITE_BIT | GL_MAP_UNSYNCHRONIZED_BIT);
+	if (to) {
+		memcpy(to, g->batch, bytes);
+		gl->UnmapBuffer(GL_ARRAY_BUFFER);
+		gl->DrawArrays(GL_TRIANGLES, (GLint) (g->vertexOffset / (VERTEX_FLOATS * 4)), g->batchCount);
+		g->vertexOffset += bytes;
+	}
 	g->batchCount = 0;
 }
 
@@ -1214,6 +1230,7 @@ struct Glr* glrCreate(struct N64* n) {
 	gl->BindVertexArray(g->vertexArray);
 	gl->GenBuffers(1, &g->vertexBuffer);
 	gl->BindBuffer(GL_ARRAY_BUFFER, g->vertexBuffer);
+	gl->BufferData(GL_ARRAY_BUFFER, VERTEX_BUFFER_BYTES, NULL, GL_STREAM_DRAW);
 	gl->VertexAttribPointer(0, 4, GL_FLOAT, 0, VERTEX_FLOATS * 4, (const void*) 0);
 	gl->VertexAttribPointer(1, 4, GL_FLOAT, 0, VERTEX_FLOATS * 4, (const void*) 16);
 	gl->VertexAttribPointer(2, 2, GL_FLOAT, 0, VERTEX_FLOATS * 4, (const void*) 32);
