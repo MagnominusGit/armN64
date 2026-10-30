@@ -535,6 +535,7 @@ static void writePixels(struct N64* n, struct Target* t, int from, int to);
 // The RDRAM pixels of rows from to to - 1, into the texture, with alpha 0: drawing sets it, and only
 // pixels with it go back.
 static void loadPixels(struct N64* n, struct Glr* g, struct Target* t, int from, int to) {
+	n->stats.glTargetRows += (uint64_t) (to - from);
 	uint32_t* out = g->image;
 	for (int y = from; y < to; ++y) {
 		for (uint32_t x = 0; x < t->width; ++x) {
@@ -726,6 +727,7 @@ static struct Texture* texture(struct N64* n, struct Glr* g, struct RDP* r, int 
 		return NULL;
 	}
 	rdpTileImage(r, index, w, h, convert, pixels);
+	++n->stats.glTextures;
 	uploadTexture(g, slot->texture);
 	if (same) {
 		// The same size: the texels replaced in place (no new storage).
