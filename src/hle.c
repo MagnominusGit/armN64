@@ -648,12 +648,13 @@ static void spriteDraw(struct N64* n, struct Hle* h, int s0, int t0, int x, int 
 	if (band < 1) {
 		return;
 	}
-	// The palette lookup the sprite needs (RGBA16 colors for color-indexed ones, none otherwise).
-	otherMode(n, h, true, 14, 2, format == 2 ? 2u << 14 : 0);
+	// A color-indexed sprite's palette, then RGBA16 colors looked up in it (other sprites leave the
+	// lookup as it was).
 	if (format == 2 && tlut) {
 		emit(n, h, (uint64_t) 0x3D << 56 | (uint64_t) 2 << 51 | tlut);
 		emit(n, h, (uint64_t) 0x35 << 56 | (uint64_t) 0x100 << 32 | (uint64_t) 7 << 24);
 		emit(n, h, (uint64_t) 0x30 << 56 | (uint64_t) 7 << 24 | (uint64_t) ((size ? 255 : 15) << 2) << 12);
+		otherMode(n, h, true, 14, 2, 2u << 14);
 	}
 	bool copy = ((h->modeH >> 20) & 3) == 2;
 	// The scales are texels per pixel.
@@ -663,13 +664,15 @@ static void spriteDraw(struct N64* n, struct Hle* h, int s0, int t0, int x, int 
 		int rows = height - t < band ? height - t : band;
 		emit(n, h, (uint64_t) 0x3D << 56 | (uint64_t) format << 53 | (uint64_t) loadSize << 51 | (uint64_t) (loadStride - 1) << 32 | image);
 		emit(n, h, (uint64_t) 0x35 << 56 | (uint64_t) format << 53 | (uint64_t) loadSize << 51 | (uint64_t) line << 41 | (uint64_t) 7 << 24 | 2 << 18 | 2 << 8);
-		emit(n, h, (uint64_t) 0x34 << 56 | (uint64_t) (loadS0 << 2) << 44 | (uint64_t) ((t0 + t) << 2) << 32 | (uint64_t) 7 << 24 |
-		           (uint64_t) (loadS1 << 2) << 12 | (uint64_t) ((t0 + t + rows - 1) << 2));
+		// 4-bit texels' columns as halves of the 8-bit ones (10.2), as the microcode gives them.
+		int sl = size ? loadS0 << 2 : s0 * 2, sh = size ? loadS1 << 2 : (s0 + width - 1) * 2;
+		emit(n, h, (uint64_t) 0x34 << 56 | (uint64_t) sl << 44 | (uint64_t) ((t0 + t) << 2) << 32 | (uint64_t) 7 << 24 | (uint64_t) sh << 12 |
+		           (uint64_t) ((t0 + t + rows - 1) << 2));
 		emit(n, h, (uint64_t) 0x35 << 56 | (uint64_t) format << 53 | (uint64_t) size << 51 | (uint64_t) line << 41 | 2 << 18 | 2 << 8);
 		// The tile from the band's first texel (the loaded pair's first for 4-bit ones), as the
 		// microcode makes it.
 		int first = size ? 0 : s0 & 1;
-		emit(n, h, (uint64_t) 0x32 << 56 | (uint64_t) ((first + width - 1) << 2) << 12 | (uint64_t) ((rows - 1) << 2));
+		emit(n, h, (uint64_t) 0x32 << 56 | (uint64_t) ((width - 1) << 2) << 12 | (uint64_t) ((rows - 1) << 2));
 		int yh = y + (int) (t * stepY * 4), yl = y + (int) ((t + rows) * stepY * 4) - (copy ? 4 : 0);
 		int xh = x, xl = x + (int) (width * stepX * 4) - (copy ? 4 : 0);
 		int s = (h->spriteFlipS ? first + width - 1 : first) << 5, tt = (h->spriteFlipT ? rows - 1 : 0) << 5;
