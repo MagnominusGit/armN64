@@ -580,6 +580,10 @@ void busWrite32(struct N64* n, uint32_t addr, uint32_t v) {
 		if (r) {
 			*r = v;
 		}
+		if ((addr & 0xFF) == 0x04 && n->skip.on && (v & 0xFFFFFF) != n->skip.shown[0]) {
+			memmove(n->skip.shown + 1, n->skip.shown, sizeof(n->skip.shown[0]) * 3);
+			n->skip.shown[0] = v & 0xFFFFFF;
+		}
 		return;
 	}
 	case 0x045:

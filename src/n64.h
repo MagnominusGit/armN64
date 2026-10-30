@@ -109,6 +109,22 @@ struct VI {
 	uint32_t line;
 };
 
+// N64_FRAMESKIP (a speed setting, not exact): every other frame drawn into a framebuffer the VI
+// shows is left undrawn (its triangles and rectangles; modes, loads and other images still run),
+// and the picture before it shown again.
+struct FrameSkip {
+	bool on;
+	// The VI's last few framebuffers, the one being drawn, frames counted, and each buffer's last
+	// frame skipped or not.
+	uint32_t shown[4];
+	uint32_t drawing;
+	bool intoShown;
+	uint64_t frames;
+	bool skipping;
+	uint32_t buffer[4];
+	bool skipped[4];
+};
+
 struct AI {
 	uint32_t dramAddr, len, control, dacrate, bitrate;
 	// Up to two buffers: the one playing and one queued behind it.
@@ -284,6 +300,10 @@ struct N64 {
 	// where that can't start.
 	bool viGpu;
 	struct Gles* viGles;
+	struct FrameSkip skip;
+	// The last picture made, shown again for a skipped frame.
+	uint32_t* lastPicture;
+	int lastWidth, lastHeight;
 	// CPU cycles per video field: 60 fields a second for NTSC and MPAL, 50 for PAL.
 	uint64_t fieldCycles;
 	uint64_t fields;
@@ -378,6 +398,7 @@ void jitFree(struct N64*);
 // rdp.c: waits for RDP commands still being drawn by other threads.
 void rdpWait(struct N64*);
 void rdpWaitDrawn(struct N64*, uint32_t addr, uint32_t len);
+bool frameSkipped(struct N64*, uint32_t origin);
 
 // Whether any word of RDRAM [addr, addr + len) inside page p is part of a block.
 static inline bool n64HoldsCode(struct N64* n, uint32_t p, uint32_t addr, uint32_t len) {

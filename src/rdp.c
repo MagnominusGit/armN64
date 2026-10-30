@@ -2466,6 +2466,56 @@ static void gpuCommand(struct N64* n, struct RDP* r, const uint64_t* w, int op) 
 	}
 }
 
+// N64_FRAMESKIP: whether a color image is one the VI shows (its origin within the first lines).
+static int shownBuffer(const struct N64* n, uint32_t addr) {
+	for (int i = 0; i < 4; ++i) {
+		if (n->skip.shown[i] && n->skip.shown[i] >= addr && n->skip.shown[i] - addr < 0x10000) {
+			return i;
+		}
+	}
+	return -1;
+}
+
+// Follows the color images to count frames into shown buffers; true for a primitive to leave
+// undrawn (the RDP's time for it still counts).
+static bool skipCommand(struct N64* n, const uint64_t* w, int op) {
+	struct FrameSkip* s = &n->skip;
+	if (op == 0x3F) {
+		uint32_t addr = w[0] & 0xFFFFFF;
+		s->intoShown = shownBuffer(n, addr) >= 0;
+		if (!s->intoShown) {
+			return false;
+		}
+		// Images drawn in between (textures) don't start a frame; another shown buffer does.
+		if (addr != s->drawing) {
+			s->drawing = addr;
+			s->skipping = ++s->frames & 1;
+			int slot = 0;
+			for (int i = 0; i < 4; ++i) {
+				if (s->buffer[i] == addr || !s->buffer[i]) {
+					slot = i;
+					break;
+				}
+			}
+			s->buffer[slot] = addr;
+			s->skipped[slot] = s->skipping;
+		}
+		return false;
+	}
+	bool draws = (op >= 0x08 && op <= 0x0F) || op == 0x24 || op == 0x25 || op == 0x36;
+	return draws && s->intoShown && s->skipping;
+}
+
+// Whether the frame in the buffer at the VI's origin was left undrawn.
+bool frameSkipped(struct N64* n, uint32_t origin) {
+	for (int i = 0; i < 4; ++i) {
+		if (n->skip.buffer[i] && origin >= n->skip.buffer[i] && origin - n->skip.buffer[i] < 0x10000) {
+			return n->skip.skipped[i];
+		}
+	}
+	return false;
+}
+
 // Starts a run of commands: the renderers or the GPU on first use, and when the RDP can take them.
 static struct RDP* beginCommands(struct N64* n, uint64_t* begin) {
 	struct RDP* r = state(n);
@@ -2502,6 +2552,13 @@ static void command(struct N64* n, struct RDP* r, const uint64_t* w, int op, int
 		}
 		n->dp.syncAt = at;
 		n64Event(n, n->dp.syncAt);
+		return;
+	}
+	if (n->skip.on && skipCommand(n, w, op)) {
+		uint64_t clocks = primitiveClocks(r, w, op);
+		r->clocks += clocks;
+		n->dp.bufBusy += (uint32_t) clocks;
+		n->dp.pipeBusy += (uint32_t) clocks;
 		return;
 	}
 	uint64_t clocks = primitiveClocks(r, w, op);

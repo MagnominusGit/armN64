@@ -48,6 +48,7 @@ void n64Destroy(struct N64* n) {
 		rspJitFree(n);
 		rdpDestroy(n);
 		glesDestroy(n->viGles);
+		free(n->lastPicture);
 		free(n->hle);
 		free(n->rdram);
 		free(n->hidden);
@@ -131,6 +132,8 @@ static void start(struct N64* n) {
 	if (n->rdpGpu && !n->rdpThreads) {
 		n->rdpThreads = 1;
 	}
+	const char* skip = getenv("N64_FRAMESKIP");
+	n->skip.on = skip && skip[0] == '1';
 	const char* viGpu = getenv("N64_VI_GPU");
 	n->viGpu = viGpu && viGpu[0] == '1';
 	rspJitFree(n);
@@ -463,7 +466,14 @@ bool n64PictureStart(struct N64* n, int* width, int* height) {
 		*width = *height = 0;
 		return false;
 	}
+	// A skipped frame: the GPU still has the picture before it.
+	if (n->skip.on && frameSkipped(n, s.origin) && n->viGles) {
+		*width = n->lastWidth;
+		*height = n->lastHeight;
+		return true;
+	}
 	viWait(n, &s);
+	n->lastWidth = s.w, n->lastHeight = s.h;
 	if (!viGpuStart(n, &s)) {
 		*width = *height = 0;
 		return false;
@@ -474,7 +484,7 @@ bool n64PictureStart(struct N64* n, int* width, int* height) {
 }
 
 // The picture the VI scans out, scaled by its X and Y scale registers, as 0x00RRGGBB.
-int n64Picture(struct N64* n, uint32_t* out, int* width, int* height) {
+static int viPicture(struct N64* n, uint32_t* out, int* width, int* height) {
 	struct ViSetup s;
 	if (!viSetup(n, &s)) {
 		*width = *height = 0;
@@ -578,4 +588,25 @@ int n64Picture(struct N64* n, uint32_t* out, int* width, int* height) {
 		}
 	}
 	return w * h;
+}
+
+int n64Picture(struct N64* n, uint32_t* out, int* width, int* height) {
+	if (!n->skip.on) {
+		return viPicture(n, out, width, height);
+	}
+	// A skipped frame shows the picture before it again.
+	if (frameSkipped(n, n->vi.reg[1] & 0xFFFFFF) && n->lastPicture && n->lastWidth) {
+		*width = n->lastWidth, *height = n->lastHeight;
+		memcpy(out, n->lastPicture, (size_t) n->lastWidth * n->lastHeight * 4);
+		return n->lastWidth * n->lastHeight;
+	}
+	int count = viPicture(n, out, width, height);
+	if (!n->lastPicture) {
+		n->lastPicture = malloc(640 * 480 * 4);
+	}
+	if (n->lastPicture && count) {
+		memcpy(n->lastPicture, out, (size_t) count * 4);
+		n->lastWidth = *width, n->lastHeight = *height;
+	}
+	return count;
 }
