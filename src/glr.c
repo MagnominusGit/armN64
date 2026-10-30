@@ -515,12 +515,13 @@ static struct Program* program(struct Glr* g, struct ProgramKey key) {
 			snprintf(line, sizeof(line), "	{ %s oColor = vec4(%s * blendB, %s); }\n", factors, blendColorInput(last >> 4),
 			         key.modes & MODE_BLEND_CONSTANT ? "1.0" : "blendA");
 		} else if (key.modes & MODE_BLEND) {
-			// The GPU blends P with the image: P * A here, B as the destination's factor; the sum a
-			// little low, so that rounding takes it down as the RDP does (its 32nds never reach
-			// half a step past one).
+			// The GPU blends P with the image: P * A here (a little low, so that rounding takes it
+			// down as the RDP does), B as the destination's factor from A itself (the RDP's extra
+			// 32nd of the image, rounded up, would show on dark colors over light ones).
 			char factors[384];
 			blendFactors(factors, sizeof(factors), last, "memoryKeep");
-			snprintf(line, sizeof(line), "	{ %s oColor = vec4(%s * blendA - (1.0 - reject) * 0.49 / 255.0, blendA); }\n", factors, blendColorInput(last));
+			snprintf(line, sizeof(line), "	{ %s oColor = vec4(%s * blendA - (1.0 - reject) * 0.49 / 255.0, mix(blendA8 / 255.0, 1.0, reject)); }\n", factors,
+			         blendColorInput(last));
 		} else {
 			snprintf(line, sizeof(line), "	oColor = vec4(%s, %s * memoryKeep);\n", blendColorInput(last), blendAlphaInput(last >> 2));
 		}
@@ -927,15 +928,13 @@ static void flushBatch(struct N64* n, struct Glr* g) {
 			gl->BlendFuncSeparate(GL_ONE, blend == 4 ? GL_SRC_ALPHA : GL_CONSTANT_ALPHA, GL_ONE, GL_ONE);
 		} else {
 			gl->Enable(GL_BLEND);
-			gl->BlendFuncSeparate(GL_ONE, blend == 0 ? GL_ONE_MINUS_SRC_ALPHA : blend == 3 ? GL_CONSTANT_ALPHA : GL_ONE, GL_ONE, GL_ONE);
+			gl->BlendFuncSeparate(GL_ONE, blend == 0 ? GL_ONE_MINUS_SRC_ALPHA : blend == 3 ? GL_ZERO : GL_ONE, GL_ONE, GL_ONE);
 		}
 		a->blend = blend;
 	}
-	// B of zero still takes 1/32 of the image.
-	float constant = blend == 3 ? 1.0f / 32 : s->blendConstant;
-	if ((blend == 3 || blend == 5) && a->blendConstant != constant) {
-		gl->BlendColor(0, 0, 0, constant);
-		a->blendConstant = constant;
+	if (blend == 5 && a->blendConstant != s->blendConstant) {
+		gl->BlendColor(0, 0, 0, s->blendConstant);
+		a->blendConstant = s->blendConstant;
 	}
 	gl->BindVertexArray(g->vertexArray);
 	gl->BindBuffer(GL_ARRAY_BUFFER, g->vertexBuffer);
