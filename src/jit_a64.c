@@ -130,6 +130,8 @@ struct Miss {
 	// The access's slow path, for a misaligned address or one past RDRAM, and its size.
 	struct Slow* slow;
 	int size;
+	// A load that, with the GL renderer, waits for the GPU's pages when the line comes in.
+	bool glLoad;
 };
 
 struct Jit {
@@ -152,7 +154,7 @@ struct Jit {
 	struct Miss codeChecks[64];
 	int codeCheckCount;
 	uint8_t* leave;
-	bool rdpThreads;
+	bool rdpThreads, rdpGl;
 	struct Cache cache;
 };
 
@@ -899,6 +901,7 @@ static void emitMemory(struct Jit* j, struct Slow* slow) {
 	m->resume = e->p;
 	m->slow = slow;
 	m->size = size;
+	m->glLoad = j->rdpGl && !isStore;
 	slow->keep = true;
 	if (isStore) {
 		aMovImm(e, 3, 1);
@@ -1290,7 +1293,8 @@ void* jitCompile(struct N64* n, const uint32_t* ops, uint32_t count, uint32_t va
 	uint8_t* start = arena + n->jitUsed;
 	j->e = (struct Emitter) { start, start, start + BLOCK_CODE_MAX };
 	j->exitCount = j->slowCount = j->missCount = j->codeCheckCount = 0;
-	j->rdpThreads = n->rdpThreads > 0 || n->rdpGl;
+	j->rdpThreads = n->rdpThreads > 0;
+	j->rdpGl = n->rdpGl;
 	struct Emitter* e = &j->e;
 	j->leave = e->p;
 	aB(e, n->jitLeave);
@@ -1414,6 +1418,13 @@ void* jitCompile(struct N64* n, const uint32_t* ops, uint32_t count, uint32_t va
 		}
 		aLsrImm(e, 2, 6, 23);
 		m->slow->site[m->slow->sites++] = aCbnz(e, 2, NULL);
+		if (m->glLoad) {
+			// A line coming in from a page the GPU draws to (a game invalidates its cache before
+			// reading what the RDP drew): the C path waits for the GPU.
+			aLsrImm(e, 3, 6, 12);
+			aLdst(e, L_LDRB, 3, PAGES, 3, L_UXTW);
+			m->slow->site[m->slow->sites++] = aTbnz(e, 3, 1, NULL);
+		}
 		aLogicImm(e, A_AND_IMM, 2, 6, ~0xFu);
 		aDpImm(e, A_SUB_IMM | W64, LEFT, LEFT, DCACHE_FILL);
 		aLdst(e, L_LDRB, 3, DIRTY, 1, L_UXTW);

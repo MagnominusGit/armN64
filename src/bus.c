@@ -306,7 +306,7 @@ uint32_t busRead32(struct N64* n, uint32_t addr) {
 	}
 	if (addr < RDRAM_SIZE) {
 		if (n->pageFlags[addr >> 12] & PAGE_RDP_WRITES) {
-			rdpWait(n);
+			rdpWaitFor(n, addr & ~3u, 4);
 		}
 		return be32(&n->rdram[addr & ~3u]);
 	}

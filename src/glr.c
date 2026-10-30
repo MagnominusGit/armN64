@@ -510,6 +510,7 @@ static void writePixels(struct N64* n, struct Target* t, int from, int to) {
 	struct Gl* gl = &g->gl;
 	gl->BindFramebuffer(GL_FRAMEBUFFER, t->framebuffer);
 	gl->ReadPixels(0, from, (GLsizei) t->width, to - from, GL_RGBA, GL_UNSIGNED_BYTE, g->image);
+	n->stats.glRows += (uint64_t) (to - from);
 	uint32_t bytes = t->size == 3 ? 4 : t->size == 1 ? 1 : 2;
 	uint32_t start = t->addr + (uint32_t) from * t->width * bytes;
 	n64RdramWrite(n, start & (RDRAM_SIZE - 1), (uint32_t) (to - from) * t->width * bytes);
@@ -769,17 +770,17 @@ static bool drawState(struct N64* n, struct Glr* g, struct RDP* r, bool textured
 		t->dirtyFrom = y0 < t->dirtyFrom ? y0 : t->dirtyFrom;
 		t->dirtyTo = y1 > t->dirtyTo ? y1 : t->dirtyTo;
 	}
-	// Reads and writes of these pages wait for the GPU (rdpWait), as for the renderers.
-	if (t->marked < rows) {
+	// Reads and writes of the pages of the rows drawn wait for the GPU (rdpWaitFor).
+	if (t->marked < t->dirtyTo) {
 		uint32_t bytes = r->colorSize == 3 ? 4 : r->colorSize == 1 ? 1 : 2;
-		uint32_t first = (r->colorAddr & (RDRAM_SIZE - 1)) >> 12, last = ((r->colorAddr + (uint32_t) rows * r->colorWidth * bytes - 1) & (RDRAM_SIZE - 1)) >> 12;
+		uint32_t first = (r->colorAddr & (RDRAM_SIZE - 1)) >> 12, last = ((r->colorAddr + (uint32_t) t->dirtyTo * r->colorWidth * bytes - 1) & (RDRAM_SIZE - 1)) >> 12;
 		for (uint32_t p = first;; p = (p + 1) & ((RDRAM_SIZE >> 12) - 1)) {
 			n->pageFlags[p] |= PAGE_RDP_WRITES;
 			if (p == last) {
 				break;
 			}
 		}
-		t->marked = rows;
+		t->marked = t->dirtyTo;
 	}
 	n->rdpPending = true;
 	return true;
@@ -992,6 +993,7 @@ bool glrShows(struct N64* n, uint32_t origin) {
 
 void glrSync(struct N64* n) {
 	struct Glr* g = n->glr;
+	++n->stats.glSyncs;
 	glesUse(g->gles);
 	flushBatch(n, g);
 	for (int i = 0; i < TARGETS; ++i) {

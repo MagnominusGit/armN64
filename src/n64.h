@@ -319,7 +319,7 @@ struct N64 {
 	const char* unimplemented;
 	// Activity counts for diagnostics.
 	struct {
-		uint64_t piDmas, piBytes, rspTasks, dpSyncs, aiBuffers, siDmas;
+		uint64_t piDmas, piBytes, rspTasks, dpSyncs, aiBuffers, siDmas, glSyncs, glRows;
 	} stats;
 	struct DD dd;
 };
@@ -400,6 +400,7 @@ void jitReset(struct N64*);
 void jitFree(struct N64*);
 // rdp.c: waits for RDP commands still being drawn by other threads.
 void rdpWait(struct N64*);
+void rdpWaitFor(struct N64*, uint32_t addr, uint32_t len);
 void rdpWaitDrawn(struct N64*, uint32_t addr, uint32_t len);
 bool frameSkipped(struct N64*, uint32_t origin);
 
@@ -423,7 +424,7 @@ static inline void n64RdramWrite(struct N64* n, uint32_t addr, uint32_t len) {
 	uint32_t first = (addr & (RDRAM_SIZE - 1)) >> 12, last = ((addr + len - 1) & (RDRAM_SIZE - 1)) >> 12;
 	for (uint32_t p = first;; p = (p + 1) & ((RDRAM_SIZE >> 12) - 1)) {
 		if (n->pageFlags[p] & PAGE_RDP) {
-			rdpWait(n);
+			rdpWaitFor(n, addr, len);
 		}
 		if ((n->pageFlags[p] & PAGE_CODE) && n64HoldsCode(n, p, addr, len)) {
 			blocksInvalidatePage(n, p);
@@ -442,7 +443,7 @@ static inline void n64RdramRead(struct N64* n, uint32_t addr, uint32_t len) {
 	uint32_t first = (addr & (RDRAM_SIZE - 1)) >> 12, last = ((addr + len - 1) & (RDRAM_SIZE - 1)) >> 12;
 	for (uint32_t p = first;; p = (p + 1) & ((RDRAM_SIZE >> 12) - 1)) {
 		if (n->pageFlags[p] & PAGE_RDP_WRITES) {
-			rdpWait(n);
+			rdpWaitFor(n, addr, len);
 			return;
 		}
 		if (p == last) {

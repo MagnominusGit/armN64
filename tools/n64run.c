@@ -127,7 +127,8 @@ int main(int argc, char** argv) {
 	if (getenv("N64PROF")) {
 		struct timespec mc;
 		clock_gettime(CLOCK_THREAD_CPUTIME_ID, &mc);
-		printf("PROF wall %.3f main_cpu %.3f pictures %.3f\n", secs, mc.tv_sec + mc.tv_nsec / 1e9, picSecs);
+		printf("PROF wall %.3f main_cpu %.3f pictures %.3f gl_syncs %llu gl_rows %llu\n", secs, mc.tv_sec + mc.tv_nsec / 1e9, picSecs,
+		       (unsigned long long) n->stats.glSyncs, (unsigned long long) n->stats.glRows);
 	}
 	if (getenv("N64STATE")) {
 		struct CPU* c = &n->cpu;

@@ -846,6 +846,17 @@ static void shadePixel(struct N64* n, struct RDP* r, int x, int y, struct Pixel*
 
 static void fillRect(struct N64* n, struct RDP* r, int x0, int y0, int x1, int y1) {
 	int bytes = r->colorSize == 3 ? 4 : 2;
+	// 32 pixels of the fill as a row from x0 stores them, and their hidden bits.
+	uint8_t pattern[128], hidden[32];
+	for (int k = 0; k < 32; ++k) {
+		if (bytes == 4) {
+			put32(pattern + k * 4, r->fillColor);
+		} else {
+			uint16_t v = __builtin_bswap16((uint16_t) ((x0 + k) & 1 ? r->fillColor : r->fillColor >> 16));
+			memcpy(pattern + k * 2, &v, 2);
+			hidden[k] = ((x0 + k) & 1 ? r->fillColor : r->fillColor >> 16) & 1 ? 3 : 0;
+		}
+	}
 	for (int y = y0; y <= y1; ++y) {
 		if (!ownsRow(r, y)) {
 			continue;
@@ -855,15 +866,12 @@ static void fillRect(struct N64* n, struct RDP* r, int x0, int y0, int x1, int y
 		uint32_t last = r->colorAddr + (y * r->colorWidth + x1) * bytes + bytes - 1;
 		if (r->colorSize >= 2 && x1 >= x0 && !(r->colorAddr & (bytes - 1)) && first <= last && last < RDRAM_SIZE) {
 			uint8_t* row = &n->rdram[first];
-			if (bytes == 4) {
-				for (int x = x0; x <= x1; ++x) {
-					put32(row + (x - x0) * 4, r->fillColor);
-				}
-			} else {
-				uint16_t even = __builtin_bswap16((uint16_t) (r->fillColor >> 16)), odd = __builtin_bswap16((uint16_t) r->fillColor);
-				for (int x = x0; x <= x1; ++x) {
-					memcpy(row + (x - x0) * 2, x & 1 ? &odd : &even, 2);
-					n->hidden[(first >> 1) + (uint32_t) (x - x0)] = (x & 1 ? r->fillColor : r->fillColor >> 16) & 1 ? 3 : 0;
+			int count = x1 - x0 + 1;
+			for (int k = 0; k < count; k += 32) {
+				int run = count - k < 32 ? count - k : 32;
+				memcpy(row + k * bytes, pattern, (size_t) run * bytes);
+				if (bytes == 2) {
+					memcpy(&n->hidden[(first >> 1) + (uint32_t) k], hidden, (size_t) run);
 				}
 			}
 			continue;
@@ -1782,6 +1790,18 @@ static void mark(struct N64* n, struct Renderers* all, uint32_t addr, uint32_t l
 
 // Waits until the RDP commands drawing to [addr, addr + len) are drawn, not the rest (the
 // renderers keep going); the pages stay flagged for the next full wait.
+// The CPU or a DMA is about to touch RDRAM [addr, addr + len) on a page the RDP draws to: with the
+// GL renderer only the GPU's own rows matter, else everything waits.
+void rdpWaitFor(struct N64* n, uint32_t addr, uint32_t len) {
+	if (n->glr) {
+		if (n->rdpPending && glrDrew(n, addr, len)) {
+			glrSync(n);
+		}
+		return;
+	}
+	rdpWait(n);
+}
+
 void rdpWaitDrawn(struct N64* n, uint32_t addr, uint32_t len) {
 	if (!n->rdpPending) {
 		return;

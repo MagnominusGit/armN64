@@ -87,6 +87,8 @@ struct Miss {
 	// The access's slow path, for a misaligned address or one past RDRAM, and its size.
 	struct Slow* slow;
 	int size;
+	// A load that, with the GL renderer, waits for the GPU's pages when the line comes in.
+	bool glLoad;
 };
 
 struct Jit {
@@ -109,7 +111,7 @@ struct Jit {
 	// The instruction set pc and nextPc itself (ERET): the block leaves after it.
 	bool jumped;
 	uint8_t* leave;
-	bool rdpThreads;
+	bool rdpThreads, rdpGl;
 };
 
 static void exitAt(struct Jit* j, uint8_t* site, uint64_t pc, enum Kind kind, bool delay, bool skip) {
@@ -699,6 +701,7 @@ static void emitMemory(struct Jit* j, struct Slow* slow) {
 	m->resume = e->p;
 	m->slow = slow;
 	m->size = size;
+	m->glLoad = j->rdpGl && !isStore;
 	slow->keep = true;
 	if (isStore) {
 		xStoreI(e, 1, MI(R12, RCX, 1, (int32_t) offsetof(struct CPU, dcacheDirty)), 1);
@@ -905,7 +908,8 @@ void* jitCompile(struct N64* n, const uint32_t* ops, uint32_t count, uint32_t va
 	j->e = (struct Emitter) { arena + n->jitUsed, arena + n->jitUsed, arena + n->jitUsed + BLOCK_CODE_MAX };
 	j->exitCount = j->slowCount = j->missCount = j->codeCheckCount = 0;
 	j->leave = n->jitLeave;
-	j->rdpThreads = n->rdpThreads > 0 || n->rdpGl;
+	j->rdpThreads = n->rdpThreads > 0;
+	j->rdpGl = n->rdpGl;
 	struct Emitter* e = &j->e;
 
 	if (blockIsIdleLoop(ops, count, vaddr)) {
@@ -999,6 +1003,14 @@ void* jitCompile(struct N64* n, const uint32_t* ops, uint32_t count, uint32_t va
 		}
 		xTestI(e, 4, R(RAX), ~(uint32_t) (RDRAM_SIZE - 1));
 		m->slow->site[m->slow->sites++] = xJcc(e, CC_NE, NULL);
+		if (m->glLoad) {
+			// A line coming in from a page the GPU draws to (a game invalidates its cache before
+			// reading what the RDP drew): the C path waits for the GPU.
+			xMovRR(e, 4, RDX, RAX);
+			xShiftI(e, X_SHR, 4, R(RDX), 12);
+			xTestI(e, 1, MI(RBX, RDX, 1, (int32_t) offsetof(struct N64, pageFlags)), PAGE_RDP_WRITES);
+			m->slow->site[m->slow->sites++] = xJcc(e, CC_NE, NULL);
+		}
 		xMovRR(e, 4, RDX, RAX);
 		xAluI(e, X_AND, 4, R(RDX), ~0xF);
 		struct Opnd dirty = MI(R12, RCX, 1, (int32_t) offsetof(struct CPU, dcacheDirty));
