@@ -119,10 +119,24 @@ struct ProgramKey {
 	uint32_t modes;
 };
 
+// A program's uniforms as last set.
+struct Uniforms {
+	float size[2], prim[4], env[4], fog[4], blend[4], primLod, primDepth;
+	int persp, tile[2][12], image[2][4];
+};
+
 struct Program {
 	struct ProgramKey key;
 	GLuint program;
 	GLint size, persp, prim, env, fog, blend, primLod, primDepth, tile[2], image[2], texture[2];
+	struct Uniforms set;
+	bool uniformsSet;
+};
+
+// What GL is set to (-1: not known), so a batch changes only what differs.
+struct Applied {
+	GLuint framebuffer, program, texture[3];
+	int unit, viewport, scissorOn, scissor[4], depth, depthMask, offset, blend;
 };
 
 struct Texture {
@@ -162,7 +176,62 @@ struct Glr {
 	int batchCount;
 	uint8_t* rows;
 	uint32_t* image;
+	struct Applied applied;
 };
+
+static void useFramebuffer(struct Glr* g, GLuint framebuffer) {
+	if (g->applied.framebuffer != framebuffer) {
+		g->gl.BindFramebuffer(GL_FRAMEBUFFER, framebuffer);
+		g->applied.framebuffer = framebuffer;
+	}
+}
+
+static void useTexture(struct Glr* g, int unit, GLuint texture) {
+	if (g->applied.texture[unit] != texture) {
+		if (g->applied.unit != unit) {
+			g->gl.ActiveTexture(GL_TEXTURE0 + (GLenum) unit);
+			g->applied.unit = unit;
+		}
+		g->gl.BindTexture(GL_TEXTURE_2D, texture);
+		g->applied.texture[unit] = texture;
+	}
+}
+
+// Unit 2 for uploads, active.
+static void uploadTexture(struct Glr* g, GLuint texture) {
+	useTexture(g, 2, texture);
+	if (g->applied.unit != 2) {
+		g->gl.ActiveTexture(GL_TEXTURE0 + 2);
+		g->applied.unit = 2;
+	}
+}
+
+static void useScissor(struct Glr* g, bool on, int x, int y, int w, int h) {
+	struct Applied* a = &g->applied;
+	if (a->scissorOn != on) {
+		on ? g->gl.Enable(GL_SCISSOR_TEST) : g->gl.Disable(GL_SCISSOR_TEST);
+		a->scissorOn = on;
+	}
+	if (on && (a->scissor[0] != x || a->scissor[1] != y || a->scissor[2] != w || a->scissor[3] != h)) {
+		g->gl.Scissor(x, y, w, h);
+		a->scissor[0] = x, a->scissor[1] = y, a->scissor[2] = w, a->scissor[3] = h;
+	}
+}
+
+static void useDepthMask(struct Glr* g, bool on) {
+	if (g->applied.depthMask != on) {
+		g->gl.DepthMask(on);
+		g->applied.depthMask = on;
+	}
+}
+
+static void uniform(struct Glr* g, GLint location, int count, const float* values, float* set) {
+	if (memcmp(values, set, (size_t) count * sizeof(float))) {
+		count == 1 ? g->gl.Uniform1f(location, values[0]) : count == 2 ? g->gl.Uniform2f(location, values[0], values[1])
+		                                                     : g->gl.Uniform4f(location, values[0], values[1], values[2], values[3]);
+		memcpy(set, values, (size_t) count * sizeof(float));
+	}
+}
 
 static bool loadGl(struct Glr* g) {
 	struct Gl* gl = &g->gl;
@@ -443,6 +512,7 @@ static struct Program* program(struct Glr* g, struct ProgramKey key) {
 	pr->texture[0] = gl->GetUniformLocation(p, "uTex0");
 	pr->texture[1] = gl->GetUniformLocation(p, "uTex1");
 	gl->UseProgram(p);
+	g->applied.program = p;
 	gl->Uniform1i(pr->texture[0], 0);
 	gl->Uniform1i(pr->texture[1], 1);
 	return pr;
@@ -475,7 +545,7 @@ static void loadPixels(struct N64* n, struct Glr* g, struct Target* t, int from,
 		}
 	}
 	struct Gl* gl = &g->gl;
-	gl->BindTexture(GL_TEXTURE_2D, t->texture);
+	uploadTexture(g, t->texture);
 	gl->TexSubImage2D(GL_TEXTURE_2D, 0, 0, from, (GLsizei) t->width, to - from, GL_RGBA, GL_UNSIGNED_BYTE, out);
 }
 
@@ -511,11 +581,11 @@ static struct Target* target(struct N64* n, struct Glr* g, uint32_t addr, uint32
 			gl->GenTextures(1, &t->texture);
 			gl->GenFramebuffers(1, &t->framebuffer);
 		}
-		gl->BindTexture(GL_TEXTURE_2D, t->texture);
+		uploadTexture(g, t->texture);
 		gl->TexImage2D(GL_TEXTURE_2D, 0, GL_RGBA8, (GLsizei) width, TARGET_ROWS, 0, GL_RGBA, GL_UNSIGNED_BYTE, NULL);
 		gl->TexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_NEAREST);
 		gl->TexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_NEAREST);
-		gl->BindFramebuffer(GL_FRAMEBUFFER, t->framebuffer);
+		useFramebuffer(g, t->framebuffer);
 		gl->FramebufferTexture2D(GL_FRAMEBUFFER, GL_COLOR_ATTACHMENT0, GL_TEXTURE_2D, t->texture, 0);
 		gl->FramebufferRenderbuffer(GL_FRAMEBUFFER, GL_DEPTH_ATTACHMENT, GL_RENDERBUFFER, g->depth);
 		t->addr = addr, t->width = width, t->size = size;
@@ -536,7 +606,7 @@ static struct Target* target(struct N64* n, struct Glr* g, uint32_t addr, uint32
 static void writePixels(struct N64* n, struct Target* t, int from, int to) {
 	struct Glr* g = n->glr;
 	struct Gl* gl = &g->gl;
-	gl->BindFramebuffer(GL_FRAMEBUFFER, t->framebuffer);
+	useFramebuffer(g, t->framebuffer);
 	gl->ReadPixels(0, from, (GLsizei) t->width, to - from, GL_RGBA, GL_UNSIGNED_BYTE, g->image);
 	n->stats.glRows += (uint64_t) (to - from);
 	uint32_t bytes = t->size == 3 ? 4 : t->size == 1 ? 1 : 2;
@@ -641,14 +711,12 @@ static struct Texture* texture(struct Glr* g, struct RDP* r, int index, bool con
 		return NULL;
 	}
 	rdpTileImage(r, index, w, h, convert, pixels);
-	gl->ActiveTexture(GL_TEXTURE0 + 2);
-	gl->BindTexture(GL_TEXTURE_2D, slot->texture);
+	uploadTexture(g, slot->texture);
 	gl->TexImage2D(GL_TEXTURE_2D, 0, GL_RGBA8, w, h, 0, GL_RGBA, GL_UNSIGNED_BYTE, pixels);
 	gl->TexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_NEAREST);
 	gl->TexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_NEAREST);
 	gl->TexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE);
 	gl->TexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE);
-	gl->ActiveTexture(GL_TEXTURE0);
 	free(pixels);
 	slot->hash = key, slot->width = w, slot->height = h, slot->used = ++g->clock;
 	g->tileTexture[index & 7] = slot, g->tileGen[index & 7] = r->tmemGen, g->tileTlut[index & 7] = tlutMode;
@@ -669,48 +737,76 @@ static void flushBatch(struct N64* n, struct Glr* g) {
 	struct Gl* gl = &g->gl;
 	struct DrawState* s = &g->state;
 	struct Program* p = s->program;
-	gl->BindFramebuffer(GL_FRAMEBUFFER, s->target->framebuffer);
-	gl->Viewport(0, 0, (GLsizei) s->target->width, TARGET_ROWS);
-	gl->Enable(GL_SCISSOR_TEST);
-	gl->Scissor(s->scissor[0], s->scissor[1], s->scissor[2] - s->scissor[0], s->scissor[3] - s->scissor[1]);
-	gl->UseProgram(p->program);
-	gl->Uniform2f(p->size, (float) s->target->width, (float) TARGET_ROWS);
-	gl->Uniform1i(p->persp, s->persp);
-	gl->Uniform4f(p->prim, s->prim[0], s->prim[1], s->prim[2], s->prim[3]);
-	gl->Uniform4f(p->env, s->env[0], s->env[1], s->env[2], s->env[3]);
-	gl->Uniform4f(p->fog, s->fog[0], s->fog[1], s->fog[2], s->fog[3]);
-	gl->Uniform4f(p->blend, s->blend[0], s->blend[1], s->blend[2], s->blend[3]);
-	gl->Uniform1f(p->primLod, s->primLod);
-	gl->Uniform1f(p->primDepth, s->primDepth);
+	struct Applied* a = &g->applied;
+	useFramebuffer(g, s->target->framebuffer);
+	if (a->viewport != (int) s->target->width) {
+		gl->Viewport(0, 0, (GLsizei) s->target->width, TARGET_ROWS);
+		a->viewport = (int) s->target->width;
+	}
+	useScissor(g, true, s->scissor[0], s->scissor[1], s->scissor[2] - s->scissor[0], s->scissor[3] - s->scissor[1]);
+	if (a->program != p->program) {
+		gl->UseProgram(p->program);
+		a->program = p->program;
+	}
+	struct Uniforms* u = &p->set;
+	if (!p->uniformsSet) {
+		memset(u, 0xFF, sizeof(*u));
+		p->uniformsSet = true;
+	}
+	const float size[2] = { (float) s->target->width, (float) TARGET_ROWS };
+	uniform(g, p->size, 2, size, u->size);
+	if (u->persp != s->persp) {
+		gl->Uniform1i(p->persp, s->persp);
+		u->persp = s->persp;
+	}
+	uniform(g, p->prim, 4, s->prim, u->prim);
+	uniform(g, p->env, 4, s->env, u->env);
+	uniform(g, p->fog, 4, s->fog, u->fog);
+	uniform(g, p->blend, 4, s->blend, u->blend);
+	uniform(g, p->primLod, 1, &s->primLod, &u->primLod);
+	uniform(g, p->primDepth, 1, &s->primDepth, &u->primDepth);
 	for (int k = 0; k < 2; ++k) {
 		if (s->texture[k]) {
-			gl->ActiveTexture(GL_TEXTURE0 + k);
-			gl->BindTexture(GL_TEXTURE_2D, s->texture[k]->texture);
-			gl->Uniform4iv(p->tile[k], 3, s->tile[k]);
+			useTexture(g, k, s->texture[k]->texture);
+			if (memcmp(u->tile[k], s->tile[k], sizeof(u->tile[k]))) {
+				gl->Uniform4iv(p->tile[k], 3, s->tile[k]);
+				memcpy(u->tile[k], s->tile[k], sizeof(u->tile[k]));
+			}
 			int image[4] = { s->texture[k]->width, s->texture[k]->height, 0, 0 };
-			gl->Uniform4iv(p->image[k], 1, image);
+			if (memcmp(u->image[k], image, sizeof(image))) {
+				gl->Uniform4iv(p->image[k], 1, image);
+				memcpy(u->image[k], image, sizeof(image));
+			}
 		}
 	}
-	gl->ActiveTexture(GL_TEXTURE0);
-	if (s->depthTest || s->depthWrite) {
-		gl->Enable(GL_DEPTH_TEST);
-		// The RDP passes what is no farther (within its depth slope), and anything on a cleared depth.
-		gl->DepthFunc(s->depthTest ? GL_LEQUAL : GL_ALWAYS);
-	} else {
-		gl->Disable(GL_DEPTH_TEST);
+	// The RDP passes what is no farther (within its depth slope), and anything on a cleared depth.
+	int depth = s->depthTest ? 1 : s->depthWrite ? 2 : 0;
+	if (a->depth != depth) {
+		depth ? gl->Enable(GL_DEPTH_TEST) : gl->Disable(GL_DEPTH_TEST);
+		if (depth) {
+			gl->DepthFunc(depth == 1 ? GL_LEQUAL : GL_ALWAYS);
+		}
+		a->depth = depth;
 	}
-	gl->DepthMask(s->depthWrite);
-	if (s->decal) {
-		gl->Enable(GL_POLYGON_OFFSET_FILL);
-		gl->PolygonOffset(-1, -1);
-	} else {
-		gl->Disable(GL_POLYGON_OFFSET_FILL);
+	useDepthMask(g, s->depthWrite);
+	if (a->offset != s->decal) {
+		if (s->decal) {
+			gl->Enable(GL_POLYGON_OFFSET_FILL);
+			gl->PolygonOffset(-1, -1);
+		} else {
+			gl->Disable(GL_POLYGON_OFFSET_FILL);
+		}
+		a->offset = s->decal;
 	}
-	if (s->blendOn) {
-		gl->Enable(GL_BLEND);
-		gl->BlendFuncSeparate(GL_SRC_ALPHA, s->blendB == 0 ? GL_ONE_MINUS_SRC_ALPHA : s->blendB == 3 ? GL_ZERO : GL_ONE, GL_ONE, GL_ONE);
-	} else {
-		gl->Disable(GL_BLEND);
+	int blend = s->blendOn ? s->blendB : -1;
+	if (a->blend != blend) {
+		if (blend < 0) {
+			gl->Disable(GL_BLEND);
+		} else {
+			gl->Enable(GL_BLEND);
+			gl->BlendFuncSeparate(GL_SRC_ALPHA, blend == 0 ? GL_ONE_MINUS_SRC_ALPHA : blend == 3 ? GL_ZERO : GL_ONE, GL_ONE, GL_ONE);
+		}
+		a->blend = blend;
 	}
 	gl->BindVertexArray(g->vertexArray);
 	gl->BindBuffer(GL_ARRAY_BUFFER, g->vertexBuffer);
@@ -924,9 +1020,9 @@ void glrDraw(struct N64* n, struct RDP* r, const uint64_t* w, int op) {
 			flushBatch(n, g);
 			if (g->stateSet) {
 				struct Gl* gl = &g->gl;
-				gl->BindFramebuffer(GL_FRAMEBUFFER, g->state.target->framebuffer);
-				gl->Disable(GL_SCISSOR_TEST);
-				gl->DepthMask(1);
+				useFramebuffer(g, g->state.target->framebuffer);
+				useScissor(g, false, 0, 0, 0, 0);
+				useDepthMask(g, true);
 				gl->ClearDepthf(1.0f);
 				gl->Clear(GL_DEPTH_BUFFER_BIT);
 			}
@@ -942,8 +1038,7 @@ void glrDraw(struct N64* n, struct RDP* r, const uint64_t* w, int op) {
 			}
 			flushBatch(n, g);
 			struct Gl* gl = &g->gl;
-			gl->BindFramebuffer(GL_FRAMEBUFFER, g->state.target->framebuffer);
-			gl->Enable(GL_SCISSOR_TEST);
+			useFramebuffer(g, g->state.target->framebuffer);
 			int sx0 = x0 >> 2 > g->state.scissor[0] ? x0 >> 2 : g->state.scissor[0];
 			int sx1 = (x1 >> 2) + 1 < g->state.scissor[2] ? (x1 >> 2) + 1 : g->state.scissor[2];
 			int sy0 = y0 >> 2 > g->state.scissor[1] ? y0 >> 2 : g->state.scissor[1];
@@ -951,7 +1046,7 @@ void glrDraw(struct N64* n, struct RDP* r, const uint64_t* w, int op) {
 			if (sx1 <= sx0 || sy1 <= sy0) {
 				return;
 			}
-			gl->Scissor(sx0, sy0, sx1 - sx0, sy1 - sy0);
+			useScissor(g, true, sx0, sy0, sx1 - sx0, sy1 - sy0);
 			uint32_t f = r->fillColor;
 			if (r->colorSize == 3) {
 				gl->ClearColor((f >> 24) / 255.0f, ((f >> 16) & 255) / 255.0f, ((f >> 8) & 255) / 255.0f, 1.0f);
@@ -1086,6 +1181,7 @@ struct Glr* glrCreate(struct N64* n) {
 	gl->PixelStorei(GL_PACK_ALIGNMENT, 1);
 	gl->PixelStorei(GL_UNPACK_ALIGNMENT, 1);
 	gl->Disable(GL_DITHER);
+	memset(&g->applied, 0xFF, sizeof(g->applied));
 	fprintf(stderr, "GL renderer on %s\n", glesRenderer(g->gles));
 	if (!g->vertexShader) {
 		glrDestroy(g);

@@ -1270,8 +1270,22 @@ static void loadTile(struct N64* n, struct RDP* r, uint64_t w, bool block) {
 		}
 		int dxt = th;
 		int lineT = 0;
+		// Plain texels a TMEM word at a time (a whole word, the halves swapped on odd lines).
+		bool plain = r->texSize < 3 && !(r->texSize == 2 && t->format == 1);
 		for (uint32_t i = 0; i < bytes; i += 8) {
 			bool odd = (lineT >> 11) & 1;
+			if (plain && ((src + i) & (RDRAM_SIZE - 1)) + 8 <= RDRAM_SIZE) {
+				const uint8_t* from = &n->rdram[(src + i) & (RDRAM_SIZE - 1)];
+				uint8_t* to = &r->tmem[(t->tmem * 8 + i) & 0xFF8];
+				if (odd) {
+					memcpy(to, from + 4, 4);
+					memcpy(to + 4, from, 4);
+				} else {
+					memcpy(to, from, 8);
+				}
+				lineT += dxt;
+				continue;
+			}
 			for (int b = 0; b < 8; ++b) {
 				uint32_t dst = (t->tmem * 8 + i + b) ^ (odd ? 4 : 0);
 				if (r->texSize == 2 && t->format == 1) {
