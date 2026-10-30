@@ -1,4 +1,5 @@
 #include "n64.h"
+#include "rdp.h"
 
 #include <math.h>
 #include <stdlib.h>
@@ -76,21 +77,41 @@ static uint32_t address(struct Hle* h, uint32_t a) {
 	return (h->segments[(a >> 24) & 15] + (a & 0xFFFFFF)) & 0xFFFFFF;
 }
 
+// The words of the command a list word starts.
+static size_t commandWords(uint64_t w) {
+	int op = (w >> 56) & 0x3F;
+	return op == 0x01 ? GLR_TRIANGLE_WORDS : op >= 0x08 && op <= 0x0F ? 4 + (op & 4 ? 8 : 0) + (op & 2 ? 8 : 0) + (op & 1 ? 2 : 0) :
+	       op == 0x24 || op == 0x25 ? 2 : 1;
+}
+
 static void flush(struct N64* n, struct Hle* h) {
-	if (!h->dry && h->fifoEnd - h->fifoStart >= h->count * 8 && h->count) {
+	size_t capacity = (h->fifoEnd - h->fifoStart) / 8;
+	if (!h->dry && capacity && h->count) {
 		// A FIFO microcode's commands go through its output buffer in RDRAM, the RDP's registers
-		// pointing at them, where programs can see them (DPC_CURRENT, the buffer).
-		n64RdramWrite(n, h->fifoStart, (uint32_t) h->count * 8);
-		for (size_t i = 0; i < h->count; ++i) {
-			uint8_t* p = &n->rdram[h->fifoStart + i * 8];
-			for (int b = 0; b < 8; ++b) {
-				p[b] = (uint8_t) (h->list[i] >> (56 - 8 * b));
+		// pointing at them, where programs can see them (DPC_CURRENT, the buffer); a list longer
+		// than the buffer goes round it, the RDP taking each fill.
+		for (size_t done = 0; done < h->count;) {
+			size_t end = done;
+			while (end < h->count && end - done + commandWords(h->list[end]) <= capacity) {
+				end += commandWords(h->list[end]);
 			}
+			if (end == done) {
+				break;
+			}
+			end = end > h->count ? h->count : end;
+			n64RdramWrite(n, h->fifoStart, (uint32_t) (end - done) * 8);
+			for (size_t i = done; i < end; ++i) {
+				uint8_t* p = &n->rdram[h->fifoStart + (i - done) * 8];
+				for (int b = 0; b < 8; ++b) {
+					p[b] = (uint8_t) (h->list[i] >> (56 - 8 * b));
+				}
+			}
+			n->dp.status &= ~1u;
+			n->dp.start = n->dp.current = h->fifoStart;
+			n->dp.end = h->fifoStart + (uint32_t) (end - done) * 8;
+			rdpRun(n);
+			done = end;
 		}
-		n->dp.status &= ~1u;
-		n->dp.start = n->dp.current = h->fifoStart;
-		n->dp.end = h->fifoStart + (uint32_t) h->count * 8;
-		rdpRun(n);
 	} else if (!h->dry) {
 		rdpCommands(n, h->list, h->count);
 	} else {
@@ -100,7 +121,7 @@ static void flush(struct N64* n, struct Hle* h) {
 			if (n->checkLen[1] < 4096) {
 				n->checkSeq[1][n->checkLen[1]++] = h->list[i];
 			}
-			i += op >= 0x08 && op <= 0x0F ? 4 + (op & 4 ? 8 : 0) + (op & 2 ? 8 : 0) + (op & 1 ? 2 : 0) : op == 0x24 || op == 0x25 ? 2 : 1;
+			i += commandWords(h->list[i]);
 		}
 	}
 	h->count = 0;
