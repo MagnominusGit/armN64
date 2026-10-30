@@ -662,15 +662,17 @@ static void spriteDraw(struct N64* n, struct Hle* h, int s0, int t0, int x, int 
 	for (int t = 0; t < height; t += band) {
 		int rows = height - t < band ? height - t : band;
 		emit(n, h, (uint64_t) 0x3D << 56 | (uint64_t) format << 53 | (uint64_t) loadSize << 51 | (uint64_t) (loadStride - 1) << 32 | image);
-		emit(n, h, (uint64_t) 0x35 << 56 | (uint64_t) format << 53 | (uint64_t) loadSize << 51 | (uint64_t) line << 41 | (uint64_t) 7 << 24);
+		emit(n, h, (uint64_t) 0x35 << 56 | (uint64_t) format << 53 | (uint64_t) loadSize << 51 | (uint64_t) line << 41 | (uint64_t) 7 << 24 | 2 << 18 | 2 << 8);
 		emit(n, h, (uint64_t) 0x34 << 56 | (uint64_t) (loadS0 << 2) << 44 | (uint64_t) ((t0 + t) << 2) << 32 | (uint64_t) 7 << 24 |
 		           (uint64_t) (loadS1 << 2) << 12 | (uint64_t) ((t0 + t + rows - 1) << 2));
 		emit(n, h, (uint64_t) 0x35 << 56 | (uint64_t) format << 53 | (uint64_t) size << 51 | (uint64_t) line << 41 | 2 << 18 | 2 << 8);
-		emit(n, h, (uint64_t) 0x32 << 56 | (uint64_t) ((size ? s0 : loadS0 * 2) << 2) << 44 | (uint64_t) ((t0 + t) << 2) << 32 | (uint64_t) ((s0 + width - 1) << 2) << 12 |
-		           (uint64_t) ((t0 + t + rows - 1) << 2));
+		// The tile from the band's first texel (the loaded pair's first for 4-bit ones), as the
+		// microcode makes it.
+		int first = size ? 0 : s0 & 1;
+		emit(n, h, (uint64_t) 0x32 << 56 | (uint64_t) ((first + width - 1) << 2) << 12 | (uint64_t) ((rows - 1) << 2));
 		int yh = y + (int) (t * stepY * 4), yl = y + (int) ((t + rows) * stepY * 4) - (copy ? 4 : 0);
 		int xh = x, xl = x + (int) (width * stepX * 4) - (copy ? 4 : 0);
-		int s = (h->spriteFlipS ? s0 + width - 1 : s0) << 5, tt = (h->spriteFlipT ? t0 + t + rows - 1 : t0 + t) << 5;
+		int s = (h->spriteFlipS ? first + width - 1 : first) << 5, tt = (h->spriteFlipT ? rows - 1 : 0) << 5;
 		int ds = h->spriteFlipS ? -dsdx : dsdx, dt = h->spriteFlipT ? -dtdy : dtdy;
 		emit(n, h, (uint64_t) 0x24 << 56 | (uint64_t) (xl & 0xFFF) << 44 | (uint64_t) (yl & 0xFFF) << 32 | (uint64_t) (xh & 0xFFF) << 12 | (uint64_t) (yh & 0xFFF));
 		emit(n, h, (uint64_t) (s & 0xFFFF) << 48 | (uint64_t) (tt & 0xFFFF) << 32 | (uint64_t) (ds & 0xFFFF) << 16 | (uint64_t) (dt & 0xFFFF));
