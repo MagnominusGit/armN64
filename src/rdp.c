@@ -2026,6 +2026,8 @@ struct Gpu {
 	uint8_t* tmem;
 	int tmemCount, tmemCap;
 	bool stateDirty, tmemDirty;
+	// A primitive in the batch reaches the image's last column or past it.
+	bool edge;
 	int32_t* upload;
 	size_t uploadCap;
 	uint8_t page[RDRAM_SIZE >> 12];
@@ -2516,8 +2518,11 @@ static void gpuSubmit(struct N64* n, struct RDP* r) {
 	}
 	glesData(g->gl, 2, d, total * sizeof(int32_t));
 	glesData(g->gl, 1, g->tmem, (size_t) g->tmemCount * 0x1000);
+	// 16-bit pixels go back a word at a time when no word holds pixels of two tiles.
+	bool words = !g->edge && r->colorSize == 2 && !(r->colorAddr & 7) && !(r->colorWidth & 3) && !(r->zAddr & 7);
+	g->edge = false;
 	int u[12] = { (int) binsAt, (int) listsAt, tx0, ty0, (int) across, (int) g->lastUsed, (int) r->colorAddr, (int) r->colorWidth,
-	              r->colorSize, (int) r->zAddr, 0, 0 };
+	              r->colorSize, (int) r->zAddr, words, 0 };
 	glesSelectProgram(g->gl, gpuVariant(g, g->features | r->colorSize << F_FLAGS));
 	g->features = 0;
 	glesUniforms(g->gl, u, 12);
@@ -2757,6 +2762,7 @@ static void gpuCommand(struct N64* n, struct RDP* r, const uint64_t* w, int op) 
 	}
 	g->entries += ((p[4] >> 4) - (p[2] >> 4) + 1) * ((p[5] >> 4) - (p[3] >> 4) + 1);
 	g->features |= gpuFeatures(r, op);
+	g->edge |= p[4] >= (int) r->colorWidth;
 	p[1] = gpuState(g, r);
 	gpuMark(n, g, color, colorLen);
 	if (depth) {

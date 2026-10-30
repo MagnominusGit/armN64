@@ -1058,6 +1058,43 @@ void drawPrim(int p, int x, int y, ivec4 span) {
 
 shared uint bestKey;
 shared ivec4 spans[256];
+shared uint colorOut[256], zOut[256];
+
+// A halfword and its hidden byte into the word at index w, when dirty.
+uint putHalf(uint word, uint v, int k) {
+	uint s = uint(k & 1) * 16u;
+	return (v & (1u << 18)) == 0u ? word : (word & ~(0xFFFFu << s)) | (((v >> 8) & 255u) | (v & 255u) << 8) << s;
+}
+
+uint putHidden(uint word, uint v, int k) {
+	uint s = uint(k) * 8u;
+	return (v & (1u << 18)) == 0u ? word : (word & ~(255u << s)) | ((v >> 16) & 3u) << s;
+}
+
+// The tile's 16-bit pixels back to RDRAM, each word by the thread of its first pixel: four pixels'
+// color and depth (two words each) and hidden bytes (a word each).
+void storeWords(int lx, int row) {
+	colorOut[row + lx] = fbColor | fbHidden << 16 | (colorDirty ? 1u << 18 : 0u);
+	zOut[row + lx] = fbZ | fbZHidden << 16 | (HAS_ZBUF && zDirty ? 1u << 18 : 0u);
+	barrier();
+	if ((lx & 3) != 0) {
+		return;
+	}
+	uvec4 c = uvec4(colorOut[row + lx], colorOut[row + lx + 1], colorOut[row + lx + 2], colorOut[row + lx + 3]);
+	if (((c.x | c.y | c.z | c.w) & (1u << 18)) != 0u) {
+		uint w = colorAt >> 2, h = hiddenAt() >> 2;
+		rdram[w] = putHalf(putHalf(rdram[w], c.x, 0), c.y, 1);
+		rdram[w + 1u] = putHalf(putHalf(rdram[w + 1u], c.z, 0), c.w, 1);
+		rdram[h] = putHidden(putHidden(putHidden(putHidden(rdram[h], c.x, 0), c.y, 1), c.z, 2), c.w, 3);
+	}
+	uvec4 z = uvec4(zOut[row + lx], zOut[row + lx + 1], zOut[row + lx + 2], zOut[row + lx + 3]);
+	if (HAS_ZBUF && ((z.x | z.y | z.z | z.w) & (1u << 18)) != 0u) {
+		uint w = zAt >> 2, h = (RDRAM_MASK + 1u + (zAt >> 1)) >> 2;
+		rdram[w] = putHalf(putHalf(rdram[w], z.x, 0), z.y, 1);
+		rdram[w + 1u] = putHalf(putHalf(rdram[w + 1u], z.z, 0), z.w, 1);
+		rdram[h] = putHidden(putHidden(putHidden(putHidden(rdram[h], z.x, 0), z.y, 1), z.z, 2), z.w, 3);
+	}
+}
 
 void main() {
 	ivec2 tileXY = ivec2(gl_WorkGroupID.xy) + ivec2(u[2], u[3]);
@@ -1103,8 +1140,12 @@ void main() {
 			barrier();
 		}
 	}
-	if (count > 0) {
-		storePixel();
+	if (u[10] == 0) {
+		if (count > 0) {
+			storePixel();
+		}
+	} else if (count > 0) {
+		storeWords(lx, row);
 	}
 	// The last pixel through the combiner, in drawing order, for the CPU's next lastCombined.
 	if (gl_LocalInvocationIndex == 0u) {
