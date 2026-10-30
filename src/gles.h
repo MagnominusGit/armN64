@@ -31,6 +31,11 @@ const void* glesMap(struct Gles*, int binding, size_t offset, size_t size);
 void glesUnmap(struct Gles*, int binding);
 // Maps ranges of buffers at once, one after another (glesUnmap when done).
 const void* glesMapRanges(struct Gles*, const int* bindings, const size_t* offsets, const size_t* sizes, int count);
+// Another program for the same buffers (its source built like glesCreate's), in use after: its index
+// for glesSelectProgram, -1 when it doesn't build or there are GLES_PROGRAMS already.
+enum { GLES_PROGRAMS = 64 };
+int glesAddProgram(struct Gles*, const char* source, char* error, size_t errorSize);
+void glesSelectProgram(struct Gles*, int index);
 // The program's "uniform int u[N]".
 void glesUniforms(struct Gles*, const int* values, int count);
 void glesDispatch(struct Gles*, unsigned x, unsigned y);

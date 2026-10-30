@@ -42,6 +42,10 @@ struct Gles {
 	// The frontend's context (glesFrontend), current already: nothing to make or switch.
 	bool external;
 	GLuint program, buffer[4];
+	// Programs added with glesAddProgram (the first is glesCreate's), and their uniforms.
+	GLuint programs[GLES_PROGRAMS];
+	GLint programUniforms[GLES_PROGRAMS];
+	int programCount;
 	// Where glesMap copies what it reads: memory the CPU reads cached, unlike the storage buffers.
 	GLuint staging;
 	size_t stagingSize;
@@ -299,7 +303,8 @@ static bool context(struct Gles* g, char* error, size_t errorSize) {
 	return true;
 }
 
-static bool program(struct Gles* g, const char* source, char* error, size_t errorSize) {
+// A compute program from source, in use after; 0 when it doesn't build.
+static GLuint compileProgram(struct Gles* g, const char* source, char* error, size_t errorSize) {
 	GLuint shader = g->glCreateShader(GL_COMPUTE_SHADER);
 	g->glShaderSource(shader, 1, &source, NULL);
 	g->glCompileShader(shader);
@@ -308,19 +313,30 @@ static bool program(struct Gles* g, const char* source, char* error, size_t erro
 	if (!ok) {
 		g->glGetShaderInfoLog(shader, (GLsizei) errorSize, NULL, error);
 		g->glDeleteShader(shader);
-		return false;
+		return 0;
 	}
-	g->program = g->glCreateProgram();
-	g->glAttachShader(g->program, shader);
-	g->glLinkProgram(g->program);
+	GLuint p = g->glCreateProgram();
+	g->glAttachShader(p, shader);
+	g->glLinkProgram(p);
 	g->glDeleteShader(shader);
-	g->glGetProgramiv(g->program, GL_LINK_STATUS, &ok);
+	g->glGetProgramiv(p, GL_LINK_STATUS, &ok);
 	if (!ok) {
-		g->glGetProgramInfoLog(g->program, (GLsizei) errorSize, NULL, error);
+		g->glGetProgramInfoLog(p, (GLsizei) errorSize, NULL, error);
+		g->glDeleteProgram(p);
+		return 0;
+	}
+	g->glUseProgram(p);
+	g->program = p;
+	g->uniforms = g->glGetUniformLocation(p, "u");
+	g->programs[g->programCount] = p;
+	g->programUniforms[g->programCount++] = g->uniforms;
+	return p;
+}
+
+static bool program(struct Gles* g, const char* source, char* error, size_t errorSize) {
+	if (!compileProgram(g, source, error, errorSize)) {
 		return false;
 	}
-	g->glUseProgram(g->program);
-	g->uniforms = g->glGetUniformLocation(g->program, "u");
 	g->glGenBuffers(4, g->buffer);
 	for (int i = 0; i < 4; ++i) {
 		g->glBindBuffer(GL_SHADER_STORAGE_BUFFER, g->buffer[i]);
@@ -370,7 +386,9 @@ void glesDestroy(struct Gles* g) {
 		if (g->program) {
 			g->glDeleteBuffers(4, g->buffer);
 			g->glDeleteBuffers(1, &g->staging);
-			g->glDeleteProgram(g->program);
+			for (int i = 0; i < g->programCount; ++i) {
+				g->glDeleteProgram(g->programs[i]);
+			}
 		}
 		free(g);
 		return;
@@ -380,7 +398,9 @@ void glesDestroy(struct Gles* g) {
 		if (g->program) {
 			g->glDeleteBuffers(4, g->buffer);
 			g->glDeleteBuffers(1, &g->staging);
-			g->glDeleteProgram(g->program);
+			for (int i = 0; i < g->programCount; ++i) {
+				g->glDeleteProgram(g->programs[i]);
+			}
 		}
 		g->eglMakeCurrent(g->display, NULL, NULL, NULL);
 		g->eglDestroyContext(g->display, g->context);
@@ -466,6 +486,23 @@ void glesUnmap(struct Gles* g, int binding) {
 	use(g);
 	g->glBindBuffer(GL_COPY_WRITE_BUFFER, g->staging);
 	g->glUnmapBuffer(GL_COPY_WRITE_BUFFER);
+}
+
+int glesAddProgram(struct Gles* g, const char* source, char* error, size_t errorSize) {
+	use(g);
+	if (g->programCount == GLES_PROGRAMS || !compileProgram(g, source, error, errorSize)) {
+		return -1;
+	}
+	return g->programCount - 1;
+}
+
+void glesSelectProgram(struct Gles* g, int index) {
+	use(g);
+	if (g->program != g->programs[index]) {
+		g->program = g->programs[index];
+		g->uniforms = g->programUniforms[index];
+		g->glUseProgram(g->program);
+	}
 }
 
 void glesUniforms(struct Gles* g, const int* values, int count) {

@@ -1977,7 +1977,18 @@ enum {
 	GPU_ENTRIES_MAX = 1024,
 	GPU_KIND_TRIANGLE = 0, GPU_KIND_TEXRECT = 1, GPU_KIND_FILL = 2, GPU_KIND_RECT = 3,
 	GPU_PAGE_BATCH = 1, GPU_PAGE_OWNED = 2, GPU_PAGE_MARKED = 4,
+	GPU_VARIANTS = 48,
 };
+
+// What a batch's primitives use, for the shader variant that leaves out the rest (rdp_gpu.glsl's
+// F_* defines, in this order; the color image's pixel size above them).
+enum {
+	F_TRI = 1 << 0, F_TEXRECT = 1 << 1, F_FILL = 1 << 2, F_RECT = 1 << 3, F_SHADE = 1 << 4, F_ZTRI = 1 << 5, F_TEX = 1 << 6,
+	F_LOD = 1 << 7, F_PERSP = 1 << 8, F_TWO = 1 << 9, F_COPY = 1 << 10, F_BILERP = 1 << 11, F_CONV = 1 << 12, F_ZBUF = 1 << 13,
+	F_TLUT = 1 << 14, F_FLAGS = 15,
+};
+static const char* const featureNames[F_FLAGS] = { "F_TRI", "F_TEXRECT", "F_FILL", "F_RECT", "F_SHADE", "F_ZTRI", "F_TEX", "F_LOD",
+	                                                   "F_PERSP", "F_TWO", "F_COPY", "F_BILERP", "F_CONV", "F_ZBUF", "F_TLUT" };
 
 struct Gpu {
 	struct Gles* gl;
@@ -2000,6 +2011,9 @@ struct Gpu {
 	uint32_t lastUsed;
 	uint32_t batchBase[GPU_BATCHES_MAX], batchTiles[GPU_BATCHES_MAX];
 	int batchCount;
+	// The batch's features, and the shader variants built so far (program 0 draws everything).
+	int features;
+	int variantKey[GPU_VARIANTS], variantProgram[GPU_VARIANTS], variantCount;
 };
 
 static void* grow(void* p, size_t* cap, size_t need, size_t size) {
@@ -2044,6 +2058,59 @@ static void gpuDestroy(struct Gpu* g) {
 	free(g->tmem);
 	free(g->upload);
 	free(g);
+}
+
+// The program for a batch's features: built the first time, the full one if that fails.
+static int gpuVariant(struct Gpu* g, int features) {
+	for (int i = 0; i < g->variantCount; ++i) {
+		if (g->variantKey[i] == features) {
+			return g->variantProgram[i];
+		}
+	}
+	if (g->variantCount == GPU_VARIANTS) {
+		return 0;
+	}
+	static char source[1 << 16];
+	const char* body = strchr(rdpGpuSource, '\n') + 1;
+	int at = snprintf(source, sizeof(source), "#version 310 es\n");
+	for (int i = 0; i < F_FLAGS; ++i) {
+		at += snprintf(source + at, sizeof(source) - (size_t) at, "#define %s %d\n", featureNames[i], (features >> i) & 1);
+	}
+	at += snprintf(source + at, sizeof(source) - (size_t) at, "#define F_CSIZE %d\n", features >> F_FLAGS);
+	snprintf(source + at, sizeof(source) - (size_t) at, "%s", body);
+	char error[2048] = "";
+	int program = glesAddProgram(g->gl, source, error, sizeof(error));
+	if (program < 0) {
+		fprintf(stderr, "GPU RDP variant %x unavailable (%s)\n", features, error);
+		program = 0;
+	}
+	g->variantKey[g->variantCount] = features;
+	g->variantProgram[g->variantCount++] = program;
+	return program;
+}
+
+// What a primitive uses, as gpuVariant's features (conservative: the shader's own tests decide).
+static int gpuFeatures(struct RDP* r, int op) {
+	uint64_t m = r->otherModes;
+	int f = 0;
+	bool tex;
+	if (op >= 0x08 && op <= 0x0F) {
+		f |= F_TRI | (op & 4 ? F_SHADE : 0) | (op & 1 ? F_ZTRI : 0) | ((op & 2) && ((m >> 51) & 1) ? F_PERSP : 0);
+		tex = op & 2;
+	} else if (op == 0x24 || op == 0x25) {
+		f |= F_TEXRECT | (r->cycleType == 2 ? F_COPY : 0);
+		tex = true;
+	} else {
+		f |= r->cycleType == 3 ? F_FILL : F_RECT;
+		tex = false;
+	}
+	if (tex) {
+		f |= F_TEX | (((m >> 48) & 1) || lodFracUsed(r) ? F_LOD : 0) | ((m >> 45) & 1 ? F_BILERP : 0) | ((m >> 47) & 1 ? F_TLUT : 0);
+		f |= !((m >> 43) & 1) || !((m >> 42) & 1) || ((m >> 41) & 1) ? F_CONV : 0;
+	}
+	f |= r->cycleType == 1 ? F_TWO : 0;
+	f |= r->zAddr && (((m >> 4) & 1) || ((m >> 5) & 1)) ? F_ZBUF : 0;
+	return f;
 }
 
 static int32_t packColor(struct Color c) {
@@ -2325,6 +2392,8 @@ static void gpuSubmit(struct N64* n, struct RDP* r) {
 	glesData(g->gl, 1, g->tmem, (size_t) g->tmemCount * 0x1000);
 	int u[12] = { (int) binsAt, (int) listsAt, tx0, ty0, (int) across, (int) g->lastUsed, (int) r->colorAddr, (int) r->colorWidth,
 	              r->colorSize, (int) r->zAddr, 0, 0 };
+	glesSelectProgram(g->gl, gpuVariant(g, g->features | r->colorSize << F_FLAGS));
+	g->features = 0;
 	glesUniforms(g->gl, u, 12);
 	glesDispatch(g->gl, across, down);
 	g->batchBase[g->batchCount] = g->lastUsed;
@@ -2478,6 +2547,7 @@ static void gpuCommand(struct N64* n, struct RDP* r, const uint64_t* w, int op) 
 		p[2] = x0, p[3] = y0, p[4] = x1, p[5] = y1;
 	}
 	g->entries += ((p[4] >> 4) - (p[2] >> 4) + 1) * ((p[5] >> 4) - (p[3] >> 4) + 1);
+	g->features |= gpuFeatures(r, op);
 	p[1] = gpuState(g, r);
 	gpuMark(n, g, color, colorLen);
 	if (depth) {
