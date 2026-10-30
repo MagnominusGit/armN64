@@ -33,7 +33,9 @@ foreach(GLSL rdp_gpu vi_gpu)
 endforeach()
 target_include_directories(n64 PUBLIC src PRIVATE ${CMAKE_BINARY_DIR}/generated)
 find_package(Threads REQUIRED)
-target_link_libraries(n64 m Threads::Threads ${CMAKE_DL_LIBS})
+# Code shared with armGBA: the code generators, and the libretro core's helpers.
+add_subdirectory(armulators)
+target_link_libraries(n64 m Threads::Threads ${CMAKE_DL_LIBS} armulators-emit)
 
 add_executable(n64run tools/n64run.c)
 target_link_libraries(n64run n64)
