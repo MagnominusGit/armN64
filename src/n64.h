@@ -92,6 +92,9 @@ struct RSP {
 
 struct DP {
 	uint32_t start, end, current, status;
+	// A command the buffer ended inside: its words so far, the rest from the next buffer's start.
+	uint64_t partial[22];
+	int partialWords;
 	// When the RDP finishes the commands it has, and when its pending full-sync interrupt is due.
 	uint64_t busyUntil, syncAt;
 	// With HLE, full syncs after the pending one (a whole task's commands arrive at once), each

@@ -2642,18 +2642,23 @@ void rdpRun(struct N64* n) {
 	}
 	uint64_t begin;
 	struct RDP* r = beginCommands(n, &begin);
-	while (n->dp.current < n->dp.end) {
-		uint64_t w[22];
-		w[0] = word(n, n->dp.current);
+	struct DP* d = &n->dp;
+	while (d->current < d->end) {
+		uint64_t* w = d->partial;
+		if (!d->partialWords) {
+			w[d->partialWords++] = word(n, d->current);
+			d->current += 8;
+		}
 		int op = (w[0] >> 56) & 0x3F;
 		int words = commandWords(op);
-		if (n->dp.current + words * 8 > n->dp.end) {
+		while (d->partialWords < words && d->current < d->end) {
+			w[d->partialWords++] = word(n, d->current);
+			d->current += 8;
+		}
+		if (d->partialWords < words) {
 			break;
 		}
-		for (int i = 1; i < words; ++i) {
-			w[i] = word(n, n->dp.current + i * 8);
-		}
-		n->dp.current += words * 8;
+		d->partialWords = 0;
 		command(n, r, w, op, words, begin);
 	}
 	endCommands(n, r, begin);
