@@ -1195,12 +1195,12 @@ static void triangle(struct N64* n, struct RDP* r, const uint64_t* w, int op) {
 			continue;
 		}
 		int x0 = sp.x0, x1 = sp.x1;
-		// Attributes too are evaluated at the middle of the scanline.
-		int64_t dy = (int64_t) y * 4 + 2 - (yh & ~3);
-		int64_t ey = dy / 4;
+		// Attributes at the scanline's top and the pixel's left edge: the RDP steps them a whole line
+		// at a time along the major edge.
+		int64_t ey = y - (yh >> 2);
 		// Each attribute at x0, then plus its x gradient a pixel (x moves dx by whole 65536s, so the
 		// shifted products step exactly).
-		int64_t dx0 = (int64_t) x0 * 65536 + 32768 - xh - dxh * dy / 4;
+		int64_t dx0 = (int64_t) x0 * 65536 - xh - dxh * ey;
 		int64_t shadeAt[4], zAt = 0, texAt[3];
 		for (int i = 0; i < 4; ++i) {
 			shadeAt[i] = sv[i] + sde[i] * ey + (sdx[i] * dx0 >> 16);
@@ -2181,9 +2181,8 @@ static bool gpuTriangle(struct Gpu* g, struct RDP* r, const uint64_t* w, int op,
 		maxX = x1 > maxX ? x1 : maxX;
 		minY = y < minY ? y : minY;
 		maxY = y;
-		int64_t dy = (int64_t) y * 4 + 2 - (e.yh & ~3);
-		int64_t ey = dy / 4;
-		int64_t dx0 = (int64_t) x0 * 65536 + 32768 - e.xh - e.dxh * dy / 4;
+		int64_t ey = y - (e.yh >> 2);
+		int64_t dx0 = (int64_t) x0 * 65536 - e.xh - e.dxh * ey;
 		for (int i = 0; i < 4; ++i) {
 			put64(row + 2 + i * 2, sv[i] + sde[i] * ey + (sdx[i] * dx0 >> 16));
 		}
