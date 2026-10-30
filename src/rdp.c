@@ -1313,11 +1313,7 @@ static void loadTile(struct N64* n, struct RDP* r, uint64_t w, bool block) {
 		uint32_t row = r->texAddr + (uint32_t) (tt * r->texWidth) * (bpp ? bpp : 1);
 		uint32_t line = t->tmem * 8 + (tt - t0) * t->line * 8;
 		uint32_t swap = (tt - t0) & 1 ? 4 : 0;
-		if (r->texSize == 0) {
-			for (int s = s0; s <= s1; s += 2) {
-				r->tmem[((line + (s - s0) / 2) ^ swap) & 0xFFF] = n->rdram[(row + s / 2) & (RDRAM_SIZE - 1)];
-			}
-		} else if (r->texSize == 3) {
+		if (r->texSize == 3) {
 			for (int s = s0; s <= s1; ++s) {
 				const uint8_t* src = &n->rdram[(row + s * 4) & (RDRAM_SIZE - 4)];
 				uint32_t d = (line + (s - s0) * 2) ^ swap;
@@ -1334,11 +1330,28 @@ static void loadTile(struct N64* n, struct RDP* r, uint64_t w, bool block) {
 				r->tmem[d & 0x7FF] = src[s & 1 ? 2 : 0];
 				r->tmem[0x800 | (d & 0x7FF)] = src[s & 1 ? 3 : 1];
 			}
-		} else {
-			for (int s = s0; s <= s1; ++s) {
-				for (int b = 0; b < bpp; ++b) {
-					uint32_t d = (line + (s - s0) * bpp + b) ^ swap;
-					r->tmem[d & 0xFFF] = n->rdram[(row + s * bpp + b) & (RDRAM_SIZE - 1)];
+		} else if (s1 >= s0) {
+			// The row's bytes in order (4-bit texels two to a byte), odd rows' word halves swapped.
+			uint32_t from = r->texSize == 0 ? row + (uint32_t) s0 / 2 : row + (uint32_t) (s0 * bpp);
+			uint32_t len = r->texSize == 0 ? (uint32_t) (s1 - s0) / 2 + 1 : (uint32_t) ((s1 - s0 + 1) * bpp);
+			if (line + len <= 0x1000 && (from & (RDRAM_SIZE - 1)) + len <= RDRAM_SIZE) {
+				const uint8_t* src = &n->rdram[from & (RDRAM_SIZE - 1)];
+				uint8_t* dst = &r->tmem[line];
+				uint32_t k = 0;
+				if (!swap) {
+					memcpy(dst, src, len);
+					k = len;
+				}
+				for (; k + 8 <= len; k += 8) {
+					memcpy(dst + k, src + k + 4, 4);
+					memcpy(dst + k + 4, src + k, 4);
+				}
+				for (; k < len; ++k) {
+					dst[k ^ swap] = src[k];
+				}
+			} else {
+				for (uint32_t k = 0; k < len; ++k) {
+					r->tmem[((line + k) ^ swap) & 0xFFF] = n->rdram[(from + k) & (RDRAM_SIZE - 1)];
 				}
 			}
 		}
