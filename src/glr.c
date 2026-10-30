@@ -302,6 +302,8 @@ static const char fragmentHead[] =
 	"uniform ivec4 uImage0, uImage1;\n"
 	"uniform highp sampler2D uTex0, uTex1;\n"
 	"out vec4 oColor;\n"
+	"vec3 e8(vec3 v) { return floor(v * 255.0 + 0.5); }\n"
+	"float e8(float v) { return floor(v * 255.0 + 0.5); }\n"
 	"int wrapCoord(int c, int shift, int lo, int hi, int cm, int mask, out int frac) {\n"
 	"	if (shift < 11) c >>= shift; else c <<= 16 - shift;\n"
 	"	c -= lo << 3;\n"
@@ -367,14 +369,28 @@ static const char* alphaInput(int sel, bool multiplier) {
 	return sel == 6 ? (multiplier ? "uPrimLod" : "1.0") : "0.0";
 }
 
-// One combiner cycle as GLSL: (a - b) * m + d for color and alpha, kept within 0-1.
+// An input as the combiner's integer: 0-255, and 256 for one.
+static const char* input8(char* out, size_t size, const char* input) {
+	if (!strcmp(input, "vec3(1.0)") || !strcmp(input, "1.0")) {
+		snprintf(out, size, "%s", input[0] == 'v' ? "vec3(256.0)" : "256.0");
+	} else {
+		snprintf(out, size, "e8(%s)", input);
+	}
+	return out;
+}
+
+// One combiner cycle as GLSL, in the RDP's integers: ((a - b) * m + d * 256 + 128) / 256 for color and
+// alpha, kept within 0-255.
 static void cycleSource(char* out, size_t size, uint64_t c, int cycle) {
 	int a = cycle ? (c >> 37) & 15 : (c >> 52) & 15, m = cycle ? (c >> 32) & 31 : (c >> 47) & 31;
 	int b = cycle ? (c >> 24) & 15 : (c >> 28) & 15, d = cycle ? (c >> 6) & 7 : (c >> 15) & 7;
 	int aa = cycle ? (c >> 21) & 7 : (c >> 44) & 7, ab = cycle ? (c >> 3) & 7 : (c >> 12) & 7;
 	int am = cycle ? (c >> 18) & 7 : (c >> 41) & 7, ad = cycle ? c & 7 : (c >> 9) & 7;
-	snprintf(out, size, "	combined = clamp(vec4((%s - %s) * %s + %s, (%s - %s) * %s + %s), 0.0, 1.0);\n", rgbInput(0, a), rgbInput(1, b),
-	         rgbInput(2, m), rgbInput(3, d), alphaInput(aa, false), alphaInput(ab, false), alphaInput(am, true), alphaInput(ad, false));
+	char in[8][64];
+	snprintf(out, size, "	combined = clamp(floor((vec4((%s - %s) * %s, (%s - %s) * %s) + vec4(%s, %s) * 256.0 + 128.0) / 256.0), 0.0, 255.0) / 255.0;\n",
+	         input8(in[0], 64, rgbInput(0, a)), input8(in[1], 64, rgbInput(1, b)), input8(in[2], 64, rgbInput(2, m)),
+	         input8(in[3], 64, alphaInput(aa, false)), input8(in[4], 64, alphaInput(ab, false)), input8(in[5], 64, alphaInput(am, true)),
+	         input8(in[6], 64, rgbInput(3, d)), input8(in[7], 64, alphaInput(ad, false)));
 }
 
 // The blender's P and A for a cycle (pixel, memory, blend color, fog): P as the color and A as the
@@ -392,11 +408,23 @@ static const char* blendAlphaInput(int sel) {
 	return inputs[sel & 3];
 }
 
-// P * A + M * B into combined.rgb.
+// The blender's factors as the RDP takes them, from alpha a (scaled by keep): a's top 5 bits (fa) for
+// P, and B's top 5 bits plus one (fb1) for M, over 32 (memory alpha taken as 1). With the pixel's alpha
+// as A, 1 - A as B and the pixel opaque, P passes (reject).
+static void blendFactors(char* out, size_t size, int sel, const char* keep) {
+	static const char* b[4] = { "floor((255.0 - blendA8) / 8.0) + 1.0", "32.0", "32.0", "1.0" };
+	bool rejects = !((sel >> 2) & 3) && !((sel >> 6) & 3);
+	snprintf(out, size, "float blendA8 = floor(%s * %s * 255.0 + 0.5); float fa = floor(blendA8 / 8.0), fb1 = %s; float reject = %s; "
+	         "float blendA = mix(fa / 32.0, 1.0, reject), blendB = mix(fb1 / 32.0, 0.0, reject);",
+	         blendAlphaInput(sel >> 2), keep, b[(sel >> 6) & 3], rejects ? "blendA8 >= 255.0 ? 1.0 : 0.0" : "0.0");
+}
+
+// P * A + M * B into combined.rgb, in the RDP's integers.
 static void blendFormula(char* out, size_t size, int sel) {
-	static const char* b[4] = { "1.0 - blendA", "1.0", "1.0", "0.0" };
-	snprintf(out, size, "	{ float blendA = %s; combined.rgb = clamp(%s * blendA + %s * (%s), 0.0, 1.0); }\n", blendAlphaInput(sel >> 2),
-	         blendColorInput(sel), blendColorInput(sel >> 4), b[(sel >> 6) & 3]);
+	char factors[384];
+	blendFactors(factors, sizeof(factors), sel, "1.0");
+	snprintf(out, size, "	{ %s combined.rgb = mix(clamp(floor((e8(%s) * fa + e8(%s) * fb1) / 32.0), 0.0, 255.0) / 255.0, %s, reject); }\n", factors,
+	         blendColorInput(sel), blendColorInput(sel >> 4), blendColorInput(sel));
 }
 
 static GLuint compile(struct Glr* g, GLenum type, const char* source) {
@@ -427,7 +455,7 @@ static struct Program* program(struct Glr* g, struct ProgramKey key) {
 	}
 	struct Gl* gl = &g->gl;
 	static char source[8192];
-	char line[512];
+	char line[1024];
 	int cycleType = key.modes & MODE_CYCLE;
 	snprintf(source, sizeof(source), "%s", fragmentHead);
 	strcat(source, "void main() {\n	vec4 combined = vec4(0.0);\n");
@@ -481,9 +509,17 @@ static struct Program* program(struct Glr* g, struct ProgramKey key) {
 			snprintf(line, sizeof(line), "	oColor = vec4(combined.rgb, %s);\n", blendAlphaInput(last >> 2));
 		} else if (key.modes & MODE_BLEND_MEMORY_FIRST) {
 			// Memory as P: M * B here, the GPU adds the image times A (the blend constant when A is).
-			static const char* b[4] = { "1.0 - blendA", "1.0", "1.0", "0.0" };
-			snprintf(line, sizeof(line), "	{ float blendA = %s; oColor = vec4(%s * (%s), %s); }\n", blendAlphaInput(last >> 2), blendColorInput(last >> 4),
-			         b[(last >> 6) & 3], key.modes & MODE_BLEND_CONSTANT ? "1.0" : "blendA");
+			char factors[384];
+			blendFactors(factors, sizeof(factors), last, "1.0");
+			snprintf(line, sizeof(line), "	{ %s oColor = vec4(%s * blendB, %s); }\n", factors, blendColorInput(last >> 4),
+			         key.modes & MODE_BLEND_CONSTANT ? "1.0" : "blendA");
+		} else if (key.modes & MODE_BLEND) {
+			// The GPU blends P with the image: P * A here, B as the destination's factor; the sum a
+			// little low, so that rounding takes it down as the RDP does (its 32nds never reach
+			// half a step past one).
+			char factors[384];
+			blendFactors(factors, sizeof(factors), last, "memoryKeep");
+			snprintf(line, sizeof(line), "	{ %s oColor = vec4(%s * blendA - (1.0 - reject) * 0.49 / 255.0, blendA); }\n", factors, blendColorInput(last));
 		} else {
 			snprintf(line, sizeof(line), "	oColor = vec4(%s, %s * memoryKeep);\n", blendColorInput(last), blendAlphaInput(last >> 2));
 		}
@@ -890,13 +926,15 @@ static void flushBatch(struct N64* n, struct Glr* g) {
 			gl->BlendFuncSeparate(GL_ONE, blend == 4 ? GL_SRC_ALPHA : GL_CONSTANT_ALPHA, GL_ONE, GL_ONE);
 		} else {
 			gl->Enable(GL_BLEND);
-			gl->BlendFuncSeparate(GL_SRC_ALPHA, blend == 0 ? GL_ONE_MINUS_SRC_ALPHA : blend == 3 ? GL_ZERO : GL_ONE, GL_ONE, GL_ONE);
+			gl->BlendFuncSeparate(GL_ONE, blend == 0 ? GL_ONE_MINUS_SRC_ALPHA : blend == 3 ? GL_CONSTANT_ALPHA : GL_ONE, GL_ONE, GL_ONE);
 		}
 		a->blend = blend;
 	}
-	if (blend == 5 && a->blendConstant != s->blendConstant) {
-		gl->BlendColor(0, 0, 0, s->blendConstant);
-		a->blendConstant = s->blendConstant;
+	// B of zero still takes 1/32 of the image.
+	float constant = blend == 3 ? 1.0f / 32 : s->blendConstant;
+	if ((blend == 3 || blend == 5) && a->blendConstant != constant) {
+		gl->BlendColor(0, 0, 0, constant);
+		a->blendConstant = constant;
 	}
 	gl->BindVertexArray(g->vertexArray);
 	gl->BindBuffer(GL_ARRAY_BUFFER, g->vertexBuffer);
@@ -949,7 +987,7 @@ static bool drawState(struct N64* n, struct Glr* g, struct RDP* r, bool textured
 	s.blendB = last[3];
 	if (cycleType < 2 && r->forceBlend && memoryFirst) {
 		s.memoryFirst = last[1] == 1 || last[1] == 3 ? 2 : 1;
-		s.blendConstant = last[1] == 1 ? r->fog.a / 255.0f : 0;
+		s.blendConstant = last[1] == 1 ? (r->fog.a >> 3) / 32.0f : 0;
 		modes |= MODE_BLEND_MEMORY_FIRST | (s.memoryFirst == 2 ? MODE_BLEND_CONSTANT : 0);
 	} else if (cycleType < 2 && r->forceBlend && !blendMemory) {
 		modes |= MODE_BLEND_COLOR;
