@@ -360,9 +360,8 @@ static struct Color sample(struct RDP* r, int tileIndex, int s, int t, bool filt
 
 static struct Color convert(const struct RDP* r, struct Color c);
 
-void rdpTileImage(struct RDP* r, int tileIndex, int w, int h, bool converted, uint32_t* out) {
-	const struct Tile* t = &r->tile[tileIndex & 7];
-	enum TexelKind kind = texelKind(r, t);
+// One kind of texel at a time: the compiler makes a loop for each, without the kind's tests inside.
+static inline __attribute__((always_inline)) void tileImageKind(struct RDP* r, const struct Tile* t, int w, int h, bool converted, uint32_t* out, enum TexelKind kind) {
 	for (int y = 0; y < h; ++y) {
 		for (int x = 0; x < w; ++x) {
 			struct Color c = texel(r, t, x, y, kind);
@@ -371,6 +370,26 @@ void rdpTileImage(struct RDP* r, int tileIndex, int w, int h, bool converted, ui
 			}
 			out[y * w + x] = (uint32_t) clamp8(c.r) | (uint32_t) clamp8(c.g) << 8 | (uint32_t) clamp8(c.b) << 16 | (uint32_t) clamp8(c.a) << 24;
 		}
+	}
+}
+
+void rdpTileImage(struct RDP* r, int tileIndex, int w, int h, bool converted, uint32_t* out) {
+	const struct Tile* t = &r->tile[tileIndex & 7];
+	switch (texelKind(r, t)) {
+	case TK_I4: tileImageKind(r, t, w, h, converted, out, TK_I4); break;
+	case TK_IA4: tileImageKind(r, t, w, h, converted, out, TK_IA4); break;
+	case TK_CI4: tileImageKind(r, t, w, h, converted, out, TK_CI4); break;
+	case TK_CI4_IA: tileImageKind(r, t, w, h, converted, out, TK_CI4_IA); break;
+	case TK_I8: tileImageKind(r, t, w, h, converted, out, TK_I8); break;
+	case TK_IA8: tileImageKind(r, t, w, h, converted, out, TK_IA8); break;
+	case TK_CI8: tileImageKind(r, t, w, h, converted, out, TK_CI8); break;
+	case TK_CI8_IA: tileImageKind(r, t, w, h, converted, out, TK_CI8_IA); break;
+	case TK_YUV16: tileImageKind(r, t, w, h, converted, out, TK_YUV16); break;
+	case TK_IA16: tileImageKind(r, t, w, h, converted, out, TK_IA16); break;
+	case TK_CI16: tileImageKind(r, t, w, h, converted, out, TK_CI16); break;
+	case TK_CI16_IA: tileImageKind(r, t, w, h, converted, out, TK_CI16_IA); break;
+	case TK_RGBA16: tileImageKind(r, t, w, h, converted, out, TK_RGBA16); break;
+	case TK_RGBA32: tileImageKind(r, t, w, h, converted, out, TK_RGBA32); break;
 	}
 }
 
