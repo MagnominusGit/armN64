@@ -1,4 +1,6 @@
 #include "n64.h"
+#include <stdio.h>
+#include <unistd.h>
 
 #include <stdlib.h>
 #include <string.h>
@@ -143,11 +145,27 @@ static struct Block* compile(struct N64* n, uint32_t vaddr, uint32_t paddr) {
 	b->count = count;
 	b->vaddr = vaddr;
 	b->code = NULL;
+	size_t before = n->jitUsed;
 	if (n->useJit && !(b->code = jitCompile(n, b->ops, count, vaddr, paddr))) {
 		// The code arena is full: start it again, and run this instruction on its own.
 		free(b);
 		blocksFree(n);
 		return NULL;
+	}
+	// N64_PERFMAP=1: compiled blocks named by guest address in /tmp/perf-<pid>.map for perf.
+	static FILE* perfMap;
+	static int perfMapState;
+	if (b->code && perfMapState == 0) {
+		perfMapState = getenv("N64_PERFMAP") ? 1 : -1;
+		if (perfMapState == 1) {
+			char path[64];
+			snprintf(path, sizeof(path), "/tmp/perf-%d.map", (int) getpid());
+			perfMap = fopen(path, "w");
+		}
+	}
+	if (b->code && perfMap) {
+		fprintf(perfMap, "%lx %lx n64_%08x\n", (unsigned long) (uintptr_t) b->code, (unsigned long) (n->jitUsed - before), vaddr);
+		fflush(perfMap);
 	}
 	return b;
 }
@@ -162,8 +180,140 @@ static void jitRun(struct N64* n, void* code) {
 	}
 }
 
+void idleLoad(struct N64* n, uint32_t paddr, int size, uint64_t value) {
+	struct Idle* d = &n->idle;
+	if (paddr >= RDRAM_SIZE || d->loads == (int) (sizeof(d->load) / sizeof(d->load[0]))) {
+		d->fatal = true;
+		return;
+	}
+	d->load[d->loads++] = (struct IdleLoad) { paddr, size, value };
+}
+
+static uint64_t rdramValue(const struct N64* n, uint32_t paddr, int size) {
+	uint64_t v = 0;
+	for (int i = 0; i < size; ++i) {
+		v = v << 8 | n->rdram[(paddr + (uint32_t) i) & (RDRAM_SIZE - 1)];
+	}
+	return v;
+}
+
+void idleStore(struct N64* n, uint32_t paddr, int size, uint64_t value) {
+	if (paddr >= RDRAM_SIZE) {
+		n->idle.fatal = true;
+	} else if (rdramValue(n, paddr, size) != (size == 8 ? value : value & ((1ull << (size * 8)) - 1))) {
+		n->idle.changed = true;
+	}
+}
+
+// Interpreter steps until pc (not in a delay slot) after at least one, within limit steps and the
+// slice; false when it doesn't get there or something fatal happened.
+static bool idleStepTo(struct N64* n, uint32_t pc, int limit) {
+	struct CPU* c = &n->cpu;
+	for (int k = 0; k < limit && n->cycles < n->eventAt; ++k) {
+		cpuStep(n);
+		n->cycles += 1 + c->stall;
+		c->stall = 0;
+		if (n->idle.fatal) {
+			return false;
+		}
+		if ((uint32_t) c->pc == pc && !c->nextInDelay) {
+			return true;
+		}
+	}
+	return false;
+}
+
+struct IdleRegs {
+	uint64_t gpr[32], hi, lo, fpr[32];
+	uint32_t fcr31;
+};
+
+static void idleRegs(const struct CPU* c, struct IdleRegs* out) {
+	memset(out, 0, sizeof(*out));
+	memcpy(out->gpr, c->gpr, sizeof(out->gpr));
+	memcpy(out->fpr, c->fpr, sizeof(out->fpr));
+	out->hi = c->hi, out->lo = c->lo, out->fcr31 = c->fcr31;
+}
+
+// A loop that only waits: two passes from here back to here, the second leaving every register as
+// it found it, storing nothing new and touching no register of the RCP. It then goes round the
+// same until something it loads changes, so the rest of each slice is skipped (interrupts and other
+// events still come at their times; hle only, the passes skipped aren't timed exactly).
+static bool idleRun(struct N64* n) {
+	struct Idle* d = &n->idle;
+	struct CPU* c = &n->cpu;
+	enum { PASS_LIMIT = 256 };
+	if (d->on) {
+		// One pass more, making the same loads with the same values as the traced one.
+		d->tracing = true, d->fatal = false, d->loads = d->passLoads;
+		bool back = idleStepTo(n, d->pc, PASS_LIMIT);
+		d->tracing = false;
+		bool same = back && d->loads == 2 * d->passLoads;
+		for (int i = 0; same && i < d->passLoads; ++i) {
+			same = !memcmp(&d->load[i], &d->load[d->passLoads + i], sizeof(d->load[i]));
+		}
+		if (!same) {
+			d->on = false;
+			return false;
+		}
+		n->cycles = n->eventAt;
+		return true;
+	}
+	if (d->near < 4 || c->nextInDelay) {
+		return false;
+	}
+	d->near = 0;
+	uint32_t pc = (uint32_t) c->pc;
+	struct IdleRegs before, after;
+	d->tracing = true, d->fatal = false, d->changed = false;
+	bool once = idleStepTo(n, pc, PASS_LIMIT);
+	idleRegs(c, &before);
+	d->changed = false, d->loads = 0;
+	bool twice = once && idleStepTo(n, pc, PASS_LIMIT);
+	idleRegs(c, &after);
+	d->tracing = false;
+	if (!twice || d->changed || d->loads > (int) (sizeof(d->load) / sizeof(d->load[0])) / 2 ||
+	    memcmp(&before, &after, sizeof(before))) {
+		d->backoff = 64;
+		return false;
+	}
+	d->passLoads = d->loads;
+	d->on = true;
+	d->pc = pc;
+	n->cycles = n->cycles > n->eventAt ? n->cycles : n->eventAt;
+	return true;
+}
+
+// At the end of a slice: where the CPU is, to see it staying in a small loop (with a call, two
+// places): the last slices ended in at most two 512-byte regions.
+static void idleWatch(struct N64* n) {
+	struct Idle* d = &n->idle;
+	enum { RECENT = sizeof(d->recent) / sizeof(d->recent[0]) };
+	memmove(d->recent + 1, d->recent, sizeof(d->recent) - sizeof(d->recent[0]));
+	d->recent[0] = (uint32_t) n->cpu.pc >> 9;
+	if (d->backoff) {
+		--d->backoff;
+		d->near = 0;
+		return;
+	}
+	uint32_t a = d->recent[0], b = a;
+	bool few = true;
+	for (int i = 1; i < RECENT && few; ++i) {
+		if (d->recent[i] != a) {
+			few = b == a || d->recent[i] == b;
+			b = d->recent[i];
+		}
+	}
+	d->near = few ? 4 : 0;
+}
+
 void blocksRun(struct N64* n) {
 	struct CPU* c = &n->cpu;
+	if (n->idle.enabled) {
+		if (idleRun(n)) {
+			return;
+		}
+	}
 	do {
 		uint32_t v = (uint32_t) c->pc;
 		struct JitEntry* je = &n->jitTable[(v >> 2) & (JIT_TABLE_SIZE - 1)];
@@ -228,4 +378,7 @@ void blocksRun(struct N64* n) {
 			}
 		}
 	} while (n->cycles < n->eventAt);
+	if (n->idle.enabled && !n->idle.on) {
+		idleWatch(n);
+	}
 }

@@ -91,6 +91,7 @@ uint32_t cpuCount(struct N64* n) {
 }
 
 void cpuException(struct N64* n, int code, int coprocessor) {
+	n->idle.fatal = true;
 	struct CPU* c = &n->cpu;
 	uint64_t* cop0 = c->cop0;
 	bool refill = (code == EXC_TLBL || code == EXC_TLBS) && c->exception;
@@ -435,6 +436,9 @@ static bool load(struct N64* n, uint64_t vaddr, int size, uint64_t* out) {
 	default:
 		*out = busRead64(n, p);
 	}
+	if (n->idle.tracing) {
+		idleLoad(n, p, size, *out);
+	}
 	return true;
 }
 
@@ -447,6 +451,9 @@ static bool store(struct N64* n, uint64_t vaddr, int size, uint64_t v) {
 		return false;
 	}
 	dataTiming(&n->cpu, vaddr, p, true);
+	if (n->idle.tracing) {
+		idleStore(n, p, size, v);
+	}
 	switch (size) {
 	case 1:
 		busWrite8(n, p, v);
@@ -912,12 +919,14 @@ static void loadStore(struct N64* n, uint32_t op) {
 			return;
 		}
 		r[RT] = size == 4 ? sext32(busRead32(n, p)) : busRead64(n, p);
+		n->idle.fatal = true;
 		c->llBit = true;
 		c->cop0[CP0_LLADDR] = p >> 4;
 		return;
 	}
 	case 0x38:
 	case 0x3C: {
+		n->idle.fatal = true;
 		int size = (op >> 26) == 0x38 ? 4 : 8;
 		if (c->llBit) {
 			if (!store(n, vaddr, size, r[RT])) {

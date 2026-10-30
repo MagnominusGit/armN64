@@ -322,6 +322,21 @@ struct N64 {
 		uint64_t piDmas, piBytes, rspTasks, dpSyncs, aiBuffers, siDmas, glSyncs, glRows;
 	} stats;
 	struct DD dd;
+	// hle: a CPU loop that only waits is skipped to the end of each slice (blocks.c idleRun). Its
+	// pass is traced in the interpreter: the loads it makes (to check they still read the same),
+	// whether it touched a register or took an exception (fatal), or stored a new value.
+	struct Idle {
+		bool enabled, tracing, fatal, changed, on;
+		uint32_t pc, recent[6], backoff;
+		int near;
+		// The traced pass's loads, then those of the pass being checked against them.
+		int loads, passLoads;
+		struct IdleLoad {
+			uint32_t addr;
+			int size;
+			uint64_t value;
+		} load[64];
+	} idle;
 };
 
 // n64.c
@@ -391,6 +406,8 @@ void blocksRun(struct N64*);
 void blocksFree(struct N64*);
 void blocksInvalidatePage(struct N64*, uint32_t page);
 bool blockIsIdleLoop(const uint32_t* ops, uint32_t count, uint32_t vaddr);
+void idleLoad(struct N64*, uint32_t paddr, int size, uint64_t value);
+void idleStore(struct N64*, uint32_t paddr, int size, uint64_t value);
 // The cycles one pass of a poll loop takes with its cache lines in, or 0 if the block isn't one: a
 // loop back to its start through loads and ALU instructions whose every pass reads the same.
 uint32_t blockPollPass(const uint32_t* ops, uint32_t count, uint32_t vaddr);

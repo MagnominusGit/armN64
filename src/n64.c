@@ -101,6 +101,8 @@ static void start(struct N64* n) {
 	// HLE draws at high level with the hardware's own timing; only lle-compatible behaves like the
 	// emulators hacks were made on.
 	n->compat = n->accuracy == ACCURACY_LLE_COMPATIBLE;
+	const char* idleSkip = getenv("N64_IDLESKIP");
+	n->idle.enabled = n->accuracy == ACCURACY_HLE && !(idleSkip && idleSkip[0] == '0');
 	n->hleCheck = getenv("N64HLECHECK") != NULL;
 	const char* mouse = getenv("N64_MOUSE");
 	n->mousePort = mouse && *mouse >= '1' && *mouse <= '4' ? *mouse - '0' : 0;
