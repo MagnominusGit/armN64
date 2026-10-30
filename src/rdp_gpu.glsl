@@ -50,9 +50,13 @@ const int TILES_ACROSS = 64;
 // Primitive kinds and record fields (rdp.c GPU_*).
 const int KIND_TRIANGLE = 0, KIND_TEXRECT = 1, KIND_FILL = 2, KIND_RECT = 3;
 const int P_KIND = 0, P_STATE = 1, P_X0 = 2, P_Y0 = 3, P_X1 = 4, P_Y1 = 5, P_TILE = 6, P_MAXLEVEL = 7;
-const int P_ROWS = 8, P_FIRST = 9, P_FLAGS = 10, P_SDX = 11, P_TDX = 15, P_TDY = 18, P_ZDX = 21;
+const int P_TRI = 8, P_FLAGS = 10, P_SDX = 11, P_TDX = 15, P_TDY = 18, P_ZDX = 21;
 const int P_S0 = 8, P_T0 = 9, P_DSDX = 10, P_DTDY = 11, P_CX0 = 12, P_CY0 = 13, P_FLIP = 14;
-const int PRIM_SIZE = 24, ROW_SIZE = 26;
+const int PRIM_SIZE = 24;
+// A triangle's record (rdp.c gpuTriangle): its edges, the scissor, and the shade, texture and depth
+// values at its top.
+const int T_YL = 0, T_YM = 1, T_YH = 2, T_XL = 3, T_DXL = 4, T_XH = 5, T_DXH = 6, T_XM = 7, T_DXM = 8, T_SCISSOR = 9;
+const int T_SV = 13, T_SDE = 17, T_TV = 21, T_TDE = 24, T_ZV = 27, T_ZDE = 28;
 const int S_OM_LO = 0, S_OM_HI = 1, S_CB_LO = 2, S_CB_HI = 3, S_CADDR = 4, S_CWIDTH = 5, S_CSIZE = 6, S_ZADDR = 7;
 const int S_FOG = 8, S_BLEND = 9, S_PRIM = 10, S_ENV = 11, S_PRIMLOD = 12, S_PRIMZ = 13, S_MINLEVEL = 14;
 const int S_K4 = 15, S_K5 = 16, S_FILL = 17, S_TMEM = 18, S_TILES = 19, TILE_SIZE = 15, S_KCONV = 19 + 8 * 15;
@@ -123,8 +127,28 @@ uvec2 mul64(int a, int b) {
 	return uvec2(uint(lo), uint(hi));
 }
 
-uvec2 load64(int i) {
-	return uvec2(uint(data[i]), uint(data[i + 1]));
+bool less64(uvec2 a, uvec2 b) {
+	return int(a.y) < int(b.y) || (a.y == b.y && a.x < b.x);
+}
+
+// v >> sh with sign, for 0 < sh < 32.
+uvec2 shift64(uvec2 v, int sh) {
+	return uvec2((v.x >> uint(sh)) | (v.y << uint(32 - sh)), uint(int(v.y) >> sh));
+}
+
+// C's v / 4 (toward zero).
+uvec2 quarter64(uvec2 v) {
+	return shift64(int(v.y) < 0 ? add64(v, uvec2(3u, 0u)) : v, 2);
+}
+
+// a * b, the low 64 bits.
+uvec2 mulWide(int a, uvec2 b) {
+	uint hi, lo;
+	umulExtended(uint(a), b.x, hi, lo);
+	if (a < 0) {
+		hi -= b.x;
+	}
+	return uvec2(lo, hi + uint(a) * b.y);
 }
 
 // (int) (v >> sh) for 0 < sh < 32.
@@ -826,8 +850,10 @@ void fillPixel(int x, int y) {
 	}
 }
 
-int shadeAt(int start, int step, int k) {
-	return bits64(add64(load64(start), mul64(k, data[step])), 16);
+// An attribute's value at the first pixel of the row (rdp.c triangle): at the top plus the edge
+// steps down, plus the x steps from the major edge.
+uvec2 attrStart(int t, int v, int de, int dx, uvec2 dx0, int ey) {
+	return add64(add64(ext64(data[t + v]), mul64(data[t + de], ey)), shift64(mulWide(dx, dx0), 16));
 }
 
 // One primitive at the pixel: the attributes by kind, then one path for texturing, the level of
@@ -846,8 +872,31 @@ void drawPrim(int p, int x, int y) {
 		return;
 	}
 	if (HAS_TRI && kind == KIND_TRIANGLE) {
-		int row = data[p + P_ROWS] + (y - data[p + P_FIRST]) * ROW_SIZE;
-		int x0 = data[row], x1 = data[row + 1];
+		// The row's span, its four sub-scanlines in eighths of a pixel (rdp.c span).
+		int t = data[p + P_TRI];
+		int yl = data[t + T_YL], ym = data[t + T_YM], yh = data[t + T_YH];
+		int xh = data[t + T_XH], dxh = data[t + T_DXH];
+		ivec4 sc = ivec4(data[t + T_SCISSOR], data[t + T_SCISSOR + 1], data[t + T_SCISSOR + 2], data[t + T_SCISSOR + 3]);
+		int x0 = 0x7FFFFFFF, x1 = -0x7FFFFFFF - 1;
+		ivec4 left = ivec4(0), right = ivec4(0);
+		for (int k = 0; k < 4; ++k) {
+			int q = y * 4 + k;
+			if (q < yh || q >= yl || q < sc.y || q >= sc.w) {
+				continue;
+			}
+			int dy = q - (yh & ~3);
+			uvec2 major = add64(ext64(xh), quarter64(mul64(dxh, dy)));
+			uvec2 minor = q < ym ? add64(ext64(data[t + T_XM]), quarter64(mul64(data[t + T_DXM], dy)))
+			                     : add64(ext64(data[t + T_XL]), quarter64(mul64(data[t + T_DXL], q - ym)));
+			bool majorFirst = less64(major, minor);
+			int l8 = max(bits64(majorFirst ? major : minor, 13), sc.x * 2), r8 = min(bits64(majorFirst ? minor : major, 13), sc.z * 2);
+			if (l8 >= r8) {
+				continue;
+			}
+			left[k] = l8, right[k] = r8;
+			x0 = min(x0, l8 >> 3);
+			x1 = max(x1, (r8 - 1) >> 3);
+		}
 		if (x < x0 || x > x1) {
 			return;
 		}
@@ -857,7 +906,7 @@ void drawPrim(int p, int x, int y) {
 			for (int j = 0; j < 2; ++j) {
 				int quarter = (k & 1) + j * 2;
 				int e = x * 8 + quarter * 2;
-				if (e >= data[row + 18 + k] && e < data[row + 22 + k]) {
+				if (e >= left[k] && e < right[k]) {
 					mask |= 1 << ((k < 2 ? 4 : 0) + 3 - quarter);
 				}
 			}
@@ -869,20 +918,28 @@ void drawPrim(int p, int x, int y) {
 		}
 		int k = x - x0;
 		int flags = data[p + P_FLAGS];
+		// Attributes at the scanline's top, from the major edge's x there.
+		int ey = y - (yh >> 2);
+		uvec2 dx0 = add64(mul64(x0, 65536), neg64(add64(ext64(xh), mul64(dxh, ey))));
 		if (HAS_SHADE && (flags & 4) != 0) {
-			pShade = clamp(ivec4(shadeAt(row + 2, p + P_SDX, k), shadeAt(row + 4, p + P_SDX + 1, k), shadeAt(row + 6, p + P_SDX + 2, k),
-			                     shadeAt(row + 8, p + P_SDX + 3, k)), 0, 255);
+			ivec4 c;
+			for (int i = 0; i < 4; ++i) {
+				int dx = data[p + P_SDX + i];
+				c[i] = bits64(add64(attrStart(t, T_SV + i, T_SDE + i, dx, dx0, ey), mul64(k, dx)), 16);
+			}
+			pShade = clamp(c, 0, 255);
 		}
 		if (HAS_ZTRI && (flags & 1) != 0) {
-			pZ = bits64(add64(load64(row + 16), mul64(k, data[p + P_ZDX])), 13);
+			int dz = data[p + P_ZDX];
+			pZ = bits64(add64(attrStart(t, T_ZV, T_ZDE, dz, dx0, ey), mul64(k, dz)), 13);
 		}
 		if (HAS_TEX && (flags & 2) != 0) {
 			tex = true;
 			lod = HAS_LOD && (((omHi >> 16) & 1u) != 0u || lodFracUsed());
 			bool persp = HAS_PERSP && ((omHi >> 19) & 1u) != 0u;
-			uvec2 sS = add64(load64(row + 10), mul64(k, data[p + P_TDX]));
-			uvec2 sT = add64(load64(row + 12), mul64(k, data[p + P_TDX + 1]));
-			uvec2 sW = add64(load64(row + 14), mul64(k, data[p + P_TDX + 2]));
+			uvec2 sS = add64(attrStart(t, T_TV, T_TDE, data[p + P_TDX], dx0, ey), mul64(k, data[p + P_TDX]));
+			uvec2 sT = add64(attrStart(t, T_TV + 1, T_TDE + 1, data[p + P_TDX + 1], dx0, ey), mul64(k, data[p + P_TDX + 1]));
+			uvec2 sW = add64(attrStart(t, T_TV + 2, T_TDE + 2, data[p + P_TDX + 2], dx0, ey), mul64(k, data[p + P_TDX + 2]));
 			int count = lod ? 3 : 1;
 			for (int j = 0; j < count; ++j) {
 				uvec2 a = sS, b = sT, c = sW;

@@ -1992,7 +1992,7 @@ static void submit(struct N64* n, struct RDP* r, const uint64_t* w, int op, int 
 #include "rdp_gpu_glsl.h"
 
 enum {
-	GPU_PRIM_SIZE = 24, GPU_ROW_SIZE = 26, GPU_TILE_FIELDS = 15, GPU_STATE_SIZE = 19 + 8 * GPU_TILE_FIELDS + 4,
+	GPU_PRIM_SIZE = 24, GPU_TRI_SIZE = 29, GPU_TILE_FIELDS = 15, GPU_STATE_SIZE = 19 + 8 * GPU_TILE_FIELDS + 4,
 	GPU_TILES = 64, GPU_PRIMS_MAX = 4000, GPU_LAST_SIZE = 1 << 20, GPU_BATCHES_MAX = 4096,
 	// Tiles times primitives in one dispatch: a long dispatch trips the kernel's GPU hang check.
 	GPU_ENTRIES_MAX = 1024,
@@ -2314,103 +2314,81 @@ static void gpuMark(struct N64* n, struct Gpu* g, uint32_t addr, uint32_t len) {
 	n->rdpPending = true;
 }
 
-static void put64(int32_t* to, int64_t v) {
-	to[0] = (int32_t) (uint32_t) v;
-	to[1] = (int32_t) (uint32_t) ((uint64_t) v >> 32);
+// One edge's x at sub-scanline q (span's arithmetic), for a bounding box.
+static int64_t edgeX(const struct Edges* e, int q, bool major) {
+	int64_t dy = q - (e->yh & ~3);
+	return major ? e->xh + e->dxh * dy / 4 : q < e->ym ? e->xm + e->dxm * dy / 4 : e->xl + e->dxl * (q - e->ym) / 4;
 }
 
-// triangle()'s setup: the spans and each row's attributes at its first pixel. False if it draws
-// nothing.
+// triangle()'s setup, for the shader to work out spans and attributes from (GPU_TRI_SIZE words:
+// edges, scissor, shade, texture and depth at the top), and a box around what it may draw. False if
+// that is nothing.
 static bool gpuTriangle(struct Gpu* g, struct RDP* r, const uint64_t* w, int op, int32_t* p) {
 	bool shade = op & 4, tex = op & 2, zbuf = op & 1;
 	struct Edges e = edges(w);
+	int first, end;
+	triangleRows(r, &e, &first, &end);
+	if (end <= first) {
+		return false;
+	}
+	// Each edge is a straight line between its sub-scanlines' ends (the minor one bends at ym).
+	int qa = first * 4 > e.yh ? first * 4 : e.yh, qb = end * 4 - 1 < e.yl - 1 ? end * 4 - 1 : e.yl - 1;
+	int64_t lo = INT64_MAX, hi = INT64_MIN;
+	const int qs[4] = { qa, qb, e.ym - 1, e.ym };
+	for (int i = 0; i < 4; ++i) {
+		if (qs[i] < qa || qs[i] > qb) {
+			continue;
+		}
+		for (int major = 0; major < 2; ++major) {
+			int64_t x = edgeX(&e, qs[i], major);
+			lo = x < lo ? x : lo;
+			hi = x > hi ? x : hi;
+		}
+	}
+	int64_t minX = lo >> 16, maxX = hi >> 16;
+	minX = minX < r->scissorX0 >> 2 ? r->scissorX0 >> 2 : minX;
+	maxX = maxX > (r->scissorX1 * 2 - 1) >> 3 ? (r->scissorX1 * 2 - 1) >> 3 : maxX;
+	if (lo > hi || minX > maxX) {
+		return false;
+	}
+	g->rows = grow(g->rows, &g->rowCap, g->rowCount + GPU_TRI_SIZE, sizeof(int32_t));
+	int32_t* t = g->rows + g->rowCount;
+	memset(t, 0, GPU_TRI_SIZE * sizeof(int32_t));
+	t[0] = e.yl, t[1] = e.ym, t[2] = e.yh;
+	t[3] = (int32_t) e.xl, t[4] = (int32_t) e.dxl, t[5] = (int32_t) e.xh, t[6] = (int32_t) e.dxh, t[7] = (int32_t) e.xm, t[8] = (int32_t) e.dxm;
+	t[9] = r->scissorX0, t[10] = r->scissorY0, t[11] = r->scissorX1, t[12] = r->scissorY1;
 	int idx = 4;
-	int64_t sv[4] = { 0 }, sdx[4] = { 0 }, sde[4] = { 0 };
-	int64_t tv[3] = { 0 }, tdx[3] = { 0 }, tde[3] = { 0 }, tdy[3] = { 0 };
-	int64_t zv = 0, zdx = 0, zde = 0;
 	if (shade) {
 		for (int i = 0; i < 4; ++i) {
 			int sh = 48 - i * 16;
-			sv[i] = (int64_t) ((int32_t) ((uint32_t) ((w[idx] >> sh) & 0xFFFF) << 16 | (uint32_t) ((w[idx + 2] >> sh) & 0xFFFF)));
-			sdx[i] = (int32_t) ((uint32_t) ((w[idx + 1] >> sh) & 0xFFFF) << 16 | (uint32_t) ((w[idx + 3] >> sh) & 0xFFFF));
-			sde[i] = (int32_t) ((uint32_t) ((w[idx + 4] >> sh) & 0xFFFF) << 16 | (uint32_t) ((w[idx + 6] >> sh) & 0xFFFF));
+			t[13 + i] = (int32_t) ((uint32_t) ((w[idx] >> sh) & 0xFFFF) << 16 | (uint32_t) ((w[idx + 2] >> sh) & 0xFFFF));
+			p[11 + i] = (int32_t) ((uint32_t) ((w[idx + 1] >> sh) & 0xFFFF) << 16 | (uint32_t) ((w[idx + 3] >> sh) & 0xFFFF));
+			t[17 + i] = (int32_t) ((uint32_t) ((w[idx + 4] >> sh) & 0xFFFF) << 16 | (uint32_t) ((w[idx + 6] >> sh) & 0xFFFF));
 		}
 		idx += 8;
 	}
 	if (tex) {
 		for (int i = 0; i < 3; ++i) {
 			int sh = 48 - i * 16;
-			tv[i] = (int32_t) ((uint32_t) ((w[idx] >> sh) & 0xFFFF) << 16 | (uint32_t) ((w[idx + 2] >> sh) & 0xFFFF));
-			tdx[i] = (int32_t) ((uint32_t) ((w[idx + 1] >> sh) & 0xFFFF) << 16 | (uint32_t) ((w[idx + 3] >> sh) & 0xFFFF));
-			tde[i] = (int32_t) ((uint32_t) ((w[idx + 4] >> sh) & 0xFFFF) << 16 | (uint32_t) ((w[idx + 6] >> sh) & 0xFFFF));
-			tdy[i] = (int32_t) ((uint32_t) ((w[idx + 5] >> sh) & 0xFFFF) << 16 | (uint32_t) ((w[idx + 7] >> sh) & 0xFFFF));
+			t[21 + i] = (int32_t) ((uint32_t) ((w[idx] >> sh) & 0xFFFF) << 16 | (uint32_t) ((w[idx + 2] >> sh) & 0xFFFF));
+			p[15 + i] = (int32_t) ((uint32_t) ((w[idx + 1] >> sh) & 0xFFFF) << 16 | (uint32_t) ((w[idx + 3] >> sh) & 0xFFFF));
+			t[24 + i] = (int32_t) ((uint32_t) ((w[idx + 4] >> sh) & 0xFFFF) << 16 | (uint32_t) ((w[idx + 6] >> sh) & 0xFFFF));
+			p[18 + i] = (int32_t) ((uint32_t) ((w[idx + 5] >> sh) & 0xFFFF) << 16 | (uint32_t) ((w[idx + 7] >> sh) & 0xFFFF));
 		}
 		idx += 8;
 	}
 	if (zbuf) {
-		zv = fix(w[idx], 32);
-		zdx = fix(w[idx], 0);
-		zde = fix(w[idx + 1], 32);
-	}
-	int first, end;
-	triangleRows(r, &e, &first, &end);
-	if (end <= first) {
-		return false;
-	}
-	g->rows = grow(g->rows, &g->rowCap, (g->rowCount + (size_t) (end - first)) * GPU_ROW_SIZE, sizeof(int32_t));
-	int32_t* rows = g->rows + g->rowCount * GPU_ROW_SIZE;
-	int minX = INT32_MAX, maxX = INT32_MIN, minY = INT32_MAX, maxY = INT32_MIN;
-	for (int y = first; y < end; ++y) {
-		int32_t* row = rows + (y - first) * GPU_ROW_SIZE;
-		memset(row, 0, GPU_ROW_SIZE * sizeof(int32_t));
-		struct Span sp;
-		if (!span(r, &e, y, &sp) || sp.x1 < sp.x0) {
-			row[0] = 1;
-			row[1] = 0;
-			continue;
-		}
-		int x0 = sp.x0, x1 = sp.x1;
-		row[0] = x0;
-		row[1] = x1;
-		for (int k = 0; k < 4; ++k) {
-			row[18 + k] = sp.left[k];
-			row[22 + k] = sp.right[k];
-		}
-		minX = x0 < minX ? x0 : minX;
-		maxX = x1 > maxX ? x1 : maxX;
-		minY = y < minY ? y : minY;
-		maxY = y;
-		int64_t ey = y - (e.yh >> 2);
-		int64_t dx0 = (int64_t) x0 * 65536 - e.xh - e.dxh * ey;
-		for (int i = 0; i < 4; ++i) {
-			put64(row + 2 + i * 2, sv[i] + sde[i] * ey + (sdx[i] * dx0 >> 16));
-		}
-		for (int i = 0; i < 3; ++i) {
-			put64(row + 10 + i * 2, tv[i] + tde[i] * ey + (tdx[i] * dx0 >> 16));
-		}
-		if (zbuf) {
-			put64(row + 16, zv + zde * ey + (zdx * dx0 >> 16));
-		}
-	}
-	if (maxY < minY) {
-		return false;
+		t[27] = (int32_t) fix(w[idx], 32);
+		p[21] = (int32_t) fix(w[idx], 0);
+		t[28] = (int32_t) fix(w[idx + 1], 32);
 	}
 	p[0] = GPU_KIND_TRIANGLE;
-	p[2] = minX, p[3] = minY, p[4] = maxX, p[5] = maxY;
+	p[2] = (int32_t) minX, p[3] = first, p[4] = (int32_t) maxX, p[5] = end - 1;
 	p[6] = (w[0] >> 48) & 7;
 	p[7] = (w[0] >> 51) & 7;
-	p[8] = (int32_t) (g->rowCount * GPU_ROW_SIZE);
-	p[9] = first;
+	p[8] = (int32_t) g->rowCount;
 	p[10] = op & 7;
-	for (int i = 0; i < 4; ++i) {
-		p[11 + i] = (int32_t) sdx[i];
-	}
-	for (int i = 0; i < 3; ++i) {
-		p[15 + i] = (int32_t) tdx[i];
-		p[18 + i] = (int32_t) tdy[i];
-	}
-	p[21] = (int32_t) zdx;
-	g->rowCount += (size_t) (end - first);
+	g->rowCount += GPU_TRI_SIZE;
 	return true;
 }
 
@@ -2485,7 +2463,7 @@ static void gpuSubmit(struct N64* n, struct RDP* r) {
 	}
 	size_t statesAt = (size_t) g->primCount * GPU_PRIM_SIZE;
 	size_t rowsAt = statesAt + (size_t) g->stateCount * GPU_STATE_SIZE;
-	size_t binsAt = rowsAt + g->rowCount * GPU_ROW_SIZE;
+	size_t binsAt = rowsAt + g->rowCount;
 	size_t listsAt = binsAt + GPU_TILES * GPU_TILES * 2;
 	size_t total = listsAt + entries;
 	g->upload = grow(g->upload, &g->uploadCap, total, sizeof(int32_t));
@@ -2499,7 +2477,7 @@ static void gpuSubmit(struct N64* n, struct RDP* r) {
 		}
 	}
 	memcpy(d + statesAt, g->states, (size_t) g->stateCount * GPU_STATE_SIZE * sizeof(int32_t));
-	memcpy(d + rowsAt, g->rows, g->rowCount * GPU_ROW_SIZE * sizeof(int32_t));
+	memcpy(d + rowsAt, g->rows, g->rowCount * sizeof(int32_t));
 	int32_t* bins = d + binsAt;
 	int32_t offset = 0;
 	for (int t = 0; t < GPU_TILES * GPU_TILES; ++t) {
