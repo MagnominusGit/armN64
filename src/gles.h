@@ -29,6 +29,8 @@ void glesSubData(struct Gles*, int binding, size_t offset, const void* data, siz
 // Maps [offset, offset + size) of a buffer for reading after the dispatches so far; NULL on failure.
 const void* glesMap(struct Gles*, int binding, size_t offset, size_t size);
 void glesUnmap(struct Gles*, int binding);
+// Maps ranges of buffers at once, one after another (glesUnmap when done).
+const void* glesMapRanges(struct Gles*, const int* bindings, const size_t* offsets, const size_t* sizes, int count);
 // The program's "uniform int u[N]".
 void glesUniforms(struct Gles*, const int* values, int count);
 void glesDispatch(struct Gles*, unsigned x, unsigned y);

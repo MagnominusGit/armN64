@@ -2343,35 +2343,41 @@ static void gpuSync(struct N64* n, struct RDP* r) {
 	struct Gpu* g = r->gpu;
 	gpuSubmit(n, r);
 	gpuCollectLast(g, r);
-	int lo = RDRAM_SIZE >> 12, hi = -1;
+	// The pages the GPU drew, each run of neighbours with its hidden bits, copied out all at once
+	// (each read waits for the GPU).
+	const int drawn = GPU_PAGE_OWNED | GPU_PAGE_MARKED;
+	static int bindings[RDRAM_SIZE >> 11];
+	static size_t offsets[RDRAM_SIZE >> 11], sizes[RDRAM_SIZE >> 11];
+	static int firsts[RDRAM_SIZE >> 12], runs[RDRAM_SIZE >> 12];
+	int count = 0;
 	for (int i = 0; i < g->markedPageCount; ++i) {
 		int p = g->markedPages[i];
-		if (g->page[p] & GPU_PAGE_OWNED) {
-			lo = p < lo ? p : lo;
-			hi = p > hi ? p : hi;
+		if ((g->page[p] & drawn) != drawn) {
+			continue;
 		}
+		while (p > 0 && (g->page[p - 1] & drawn) == drawn) {
+			--p;
+		}
+		int run = 1;
+		while (p + run < (RDRAM_SIZE >> 12) && (g->page[p + run] & drawn) == drawn) {
+			++run;
+		}
+		for (int k = 0; k < run; ++k) {
+			g->page[p + k] &= ~GPU_PAGE_OWNED;
+		}
+		firsts[count / 2] = p, runs[count / 2] = run;
+		bindings[count] = 0, offsets[count] = (size_t) p << 12, sizes[count++] = (size_t) run << 12;
+		bindings[count] = 0, offsets[count] = RDRAM_SIZE + ((size_t) p << 11), sizes[count++] = (size_t) run << 11;
 	}
-	if (hi >= lo) {
-		const uint8_t* m = glesMap(g->gl, 0, (size_t) lo << 12, (size_t) (hi - lo + 1) << 12);
-		if (m) {
-			for (int i = 0; i < g->markedPageCount; ++i) {
-				int p = g->markedPages[i];
-				if (g->page[p] & GPU_PAGE_OWNED) {
-					memcpy(&n->rdram[(size_t) p << 12], m + ((size_t) (p - lo) << 12), 0x1000);
-				}
-			}
-			glesUnmap(g->gl, 0);
+	const uint8_t* m = count ? glesMapRanges(g->gl, bindings, offsets, sizes, count) : NULL;
+	if (m) {
+		for (int i = 0; i < count / 2; ++i) {
+			memcpy(&n->rdram[(size_t) firsts[i] << 12], m, (size_t) runs[i] << 12);
+			m += (size_t) runs[i] << 12;
+			memcpy(&n->hidden[(size_t) firsts[i] << 11], m, (size_t) runs[i] << 11);
+			m += (size_t) runs[i] << 11;
 		}
-		const uint8_t* h = glesMap(g->gl, 0, RDRAM_SIZE + ((size_t) lo << 11), (size_t) (hi - lo + 1) << 11);
-		if (h) {
-			for (int i = 0; i < g->markedPageCount; ++i) {
-				int p = g->markedPages[i];
-				if (g->page[p] & GPU_PAGE_OWNED) {
-					memcpy(&n->hidden[(size_t) p << 11], h + ((size_t) (p - lo) << 11), 0x800);
-				}
-			}
-			glesUnmap(g->gl, 0);
-		}
+		glesUnmap(g->gl, 0);
 	}
 	for (int i = 0; i < g->markedPageCount; ++i) {
 		int p = g->markedPages[i];

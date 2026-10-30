@@ -29,6 +29,7 @@ enum {
 	EGL_PLATFORM_SURFACELESS_MESA = 0x31DD, EGL_DRAW = 0x3059, EGL_READ = 0x305A,
 	GL_COMPUTE_SHADER = 0x91B9, GL_COMPILE_STATUS = 0x8B81, GL_LINK_STATUS = 0x8B82, GL_INFO_LOG_LENGTH = 0x8B84,
 	GL_SHADER_STORAGE_BUFFER = 0x90D2, GL_DYNAMIC_DRAW = 0x88E8, GL_MAP_READ_BIT = 0x0001,
+	GL_STREAM_READ = 0x88E1, GL_COPY_READ_BUFFER = 0x8F36, GL_COPY_WRITE_BUFFER = 0x8F37,
 	GL_SHADER_STORAGE_BARRIER_BIT = 0x2000, GL_BUFFER_UPDATE_BARRIER_BIT = 0x0200, GL_RENDERER = 0x1F01,
 };
 
@@ -41,6 +42,9 @@ struct Gles {
 	// The frontend's context (glesFrontend), current already: nothing to make or switch.
 	bool external;
 	GLuint program, buffer[4];
+	// Where glesMap copies what it reads: memory the CPU reads cached, unlike the storage buffers.
+	GLuint staging;
+	size_t stagingSize;
 	GLint uniforms;
 	char renderer[128];
 
@@ -88,6 +92,7 @@ struct Gles {
 	void (*glDispatchCompute)(GLuint, GLuint, GLuint);
 	void (*glMemoryBarrier)(GLbitfield);
 	void (*glFlush)(void);
+	void (*glCopyBufferSubData)(GLenum, GLenum, GLintptr, GLintptr, GLsizeiptr);
 	const unsigned char* (*glGetString)(GLenum);
 };
 
@@ -133,7 +138,7 @@ static bool loadGl(struct Gles* g) {
 	       LOAD(glDeleteProgram) && LOAD(glGetUniformLocation) && LOAD(glUniform1iv) && LOAD(glGenBuffers) &&
 	       LOAD(glDeleteBuffers) && LOAD(glBindBuffer) && LOAD(glBindBufferBase) && LOAD(glBufferData) &&
 	       LOAD(glBufferSubData) && LOAD(glMapBufferRange) && LOAD(glUnmapBuffer) && LOAD(glDispatchCompute) &&
-	       LOAD(glMemoryBarrier) && LOAD(glGetString) && LOAD(glFlush);
+	       LOAD(glMemoryBarrier) && LOAD(glGetString) && LOAD(glFlush) && LOAD(glCopyBufferSubData);
 }
 
 // The context current on this thread, and how many contexts share the initialized display (EGL
@@ -364,6 +369,7 @@ void glesDestroy(struct Gles* g) {
 	if (g->external) {
 		if (g->program) {
 			g->glDeleteBuffers(4, g->buffer);
+			g->glDeleteBuffers(1, &g->staging);
 			g->glDeleteProgram(g->program);
 		}
 		free(g);
@@ -373,6 +379,7 @@ void glesDestroy(struct Gles* g) {
 		use(g);
 		if (g->program) {
 			g->glDeleteBuffers(4, g->buffer);
+			g->glDeleteBuffers(1, &g->staging);
 			g->glDeleteProgram(g->program);
 		}
 		g->eglMakeCurrent(g->display, NULL, NULL, NULL);
@@ -418,14 +425,47 @@ void glesSubData(struct Gles* g, int binding, size_t offset, const void* data, s
 const void* glesMap(struct Gles* g, int binding, size_t offset, size_t size) {
 	use(g);
 	g->glMemoryBarrier(GL_BUFFER_UPDATE_BARRIER_BIT);
-	g->glBindBuffer(GL_SHADER_STORAGE_BUFFER, g->buffer[binding]);
-	return g->glMapBufferRange(GL_SHADER_STORAGE_BUFFER, (GLintptr) offset, (GLsizeiptr) size, GL_MAP_READ_BIT);
+	if (!g->staging) {
+		g->glGenBuffers(1, &g->staging);
+	}
+	g->glBindBuffer(GL_COPY_READ_BUFFER, g->buffer[binding]);
+	g->glBindBuffer(GL_COPY_WRITE_BUFFER, g->staging);
+	if (size > g->stagingSize) {
+		g->glBufferData(GL_COPY_WRITE_BUFFER, (GLsizeiptr) size, NULL, GL_STREAM_READ);
+		g->stagingSize = size;
+	}
+	g->glCopyBufferSubData(GL_COPY_READ_BUFFER, GL_COPY_WRITE_BUFFER, (GLintptr) offset, 0, (GLsizeiptr) size);
+	return g->glMapBufferRange(GL_COPY_WRITE_BUFFER, 0, (GLsizeiptr) size, GL_MAP_READ_BIT);
+}
+
+const void* glesMapRanges(struct Gles* g, const int* bindings, const size_t* offsets, const size_t* sizes, int count) {
+	use(g);
+	g->glMemoryBarrier(GL_BUFFER_UPDATE_BARRIER_BIT);
+	size_t total = 0;
+	for (int i = 0; i < count; ++i) {
+		total += sizes[i];
+	}
+	if (!g->staging) {
+		g->glGenBuffers(1, &g->staging);
+	}
+	g->glBindBuffer(GL_COPY_WRITE_BUFFER, g->staging);
+	if (total > g->stagingSize) {
+		g->glBufferData(GL_COPY_WRITE_BUFFER, (GLsizeiptr) total, NULL, GL_STREAM_READ);
+		g->stagingSize = total;
+	}
+	size_t at = 0;
+	for (int i = 0; i < count; ++i) {
+		g->glBindBuffer(GL_COPY_READ_BUFFER, g->buffer[bindings[i]]);
+		g->glCopyBufferSubData(GL_COPY_READ_BUFFER, GL_COPY_WRITE_BUFFER, (GLintptr) offsets[i], (GLintptr) at, (GLsizeiptr) sizes[i]);
+		at += sizes[i];
+	}
+	return g->glMapBufferRange(GL_COPY_WRITE_BUFFER, 0, (GLsizeiptr) total, GL_MAP_READ_BIT);
 }
 
 void glesUnmap(struct Gles* g, int binding) {
 	use(g);
-	g->glBindBuffer(GL_SHADER_STORAGE_BUFFER, g->buffer[binding]);
-	g->glUnmapBuffer(GL_SHADER_STORAGE_BUFFER);
+	g->glBindBuffer(GL_COPY_WRITE_BUFFER, g->staging);
+	g->glUnmapBuffer(GL_COPY_WRITE_BUFFER);
 }
 
 void glesUniforms(struct Gles* g, const int* values, int count) {
