@@ -706,8 +706,14 @@ static bool emitInline(struct Jit* j, uint32_t op, uint64_t pc, enum Kind* kind)
 	case 0x09: case 0x19:
 		if (rt) {
 			int s = readReg(j, rs), d = writeReg(j, rt);
-			movConst(e, 1, (uint64_t) (int64_t) imm);
-			aDp(e, A_ADD | (op >> 26 == 0x19 ? W64 : 0), d, s, 1, S_LSL, 0);
+			uint32_t wide = op >> 26 == 0x19 ? W64 : 0;
+			// Small immediates added as they are (register 31 is SP there, so r0 takes the long way).
+			if (s != ZR && imm >= -4095 && imm <= 4095) {
+				aDpImm(e, (imm < 0 ? A_SUB_IMM : A_ADD_IMM) | wide, d, s, (unsigned) (imm < 0 ? -imm : imm));
+			} else {
+				movConst(e, 1, (uint64_t) (int64_t) imm);
+				aDp(e, A_ADD | wide, d, s, 1, S_LSL, 0);
+			}
 			if (op >> 26 == 0x09) {
 				aSxtw(e, d, d);
 			}
@@ -717,8 +723,12 @@ static bool emitInline(struct Jit* j, uint32_t op, uint64_t pc, enum Kind* kind)
 	case 0x0A: case 0x0B:
 		if (rt) {
 			int s = readReg(j, rs), d = writeReg(j, rt);
-			movConst(e, 1, (uint64_t) (int64_t) imm);
-			aDp(e, A_SUBS | W64, ZR, s, 1, S_LSL, 0);
+			if (s != ZR && imm >= -4095 && imm <= 4095) {
+				aDpImm(e, (imm < 0 ? A_ADDS_IMM : A_SUBS_IMM) | W64, ZR, s, (unsigned) (imm < 0 ? -imm : imm));
+			} else {
+				movConst(e, 1, (uint64_t) (int64_t) imm);
+				aDp(e, A_SUBS | W64, ZR, s, 1, S_LSL, 0);
+			}
 			aCset(e, d, op >> 26 == 0x0A ? C_LT : C_LO);
 			commit(j, rt, d);
 		}
@@ -727,6 +737,11 @@ static bool emitInline(struct Jit* j, uint32_t op, uint64_t pc, enum Kind* kind)
 		if (rt) {
 			static const uint32_t alu[] = { A_AND, A_ORR, A_EOR };
 			int s = readReg(j, rs), d = writeReg(j, rt);
+			// ANDI by a mask AArch64 encodes: the 32-bit form clears the upper half as ANDI does.
+			if (op >> 26 == 0x0C && (uint16_t) op && aLogicImm(e, A_AND_IMM, d, s, (uint16_t) op)) {
+				commit(j, rt, d);
+				return true;
+			}
 			aMovImm(e, 1, (uint16_t) op);
 			aDp(e, alu[(op >> 26) - 0x0C] | W64, d, s, 1, S_LSL, 0);
 			commit(j, rt, d);
