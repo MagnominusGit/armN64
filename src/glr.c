@@ -201,7 +201,8 @@ static const char vertexSource[] =
 	"}\n";
 
 // Texture addressing as the RDP does it (rdp.c wrapCoord, sample): tile = shiftS, shiftT, sl, tl,
-// sh, th, cmS, cmT, maskS, maskT, bilinear, unused.
+// sh, th, cmS, cmT, maskS, maskT, bilinear, unused. The RDP's coordinates are fixed point: a little
+// bias keeps interpolation just under a whole step from flooring to the one before.
 static const char fragmentHead[] =
 	"#version 300 es\n"
 	"precision highp float;\n"
@@ -231,7 +232,7 @@ static const char fragmentHead[] =
 	"}\n"
 	"vec4 sampleTile(sampler2D t, ivec4 a, ivec4 b, ivec4 c, ivec4 image) {\n"
 	"	vec2 st = vTex.xy / vTex.z;\n"
-	"	int s = int(floor(st.x * 32.0)), tt = int(floor(st.y * 32.0));\n"
+	"	int s = int(floor(st.x * 32.0 + 0.01)), tt = int(floor(st.y * 32.0 + 0.01));\n"
 	"	int fs, ft, f;\n"
 	"	int s0 = wrapCoord(s, a.x, a.z, b.x, b.z, c.x, fs);\n"
 	"	int t0 = wrapCoord(tt, a.y, a.w, b.y, b.w, c.y, ft);\n"
@@ -688,7 +689,8 @@ static void flushBatch(struct N64* n, struct Glr* g) {
 	gl->ActiveTexture(GL_TEXTURE0);
 	if (s->depthTest || s->depthWrite) {
 		gl->Enable(GL_DEPTH_TEST);
-		gl->DepthFunc(s->depthTest ? (s->decal ? GL_LEQUAL : GL_LESS) : GL_ALWAYS);
+		// The RDP passes what is no farther (within its depth slope), and anything on a cleared depth.
+		gl->DepthFunc(s->depthTest ? GL_LEQUAL : GL_ALWAYS);
 	} else {
 		gl->Disable(GL_DEPTH_TEST);
 	}
@@ -962,33 +964,31 @@ void glrDraw(struct N64* n, struct RDP* r, const uint64_t* w, int op) {
 		rectangle(g, x0 / 4.0f, y0 / 4.0f, x1 / 4.0f, y1 / 4.0f, 0, zero, zero, false);
 		return;
 	}
-	// Texture rectangles: the texels at the top left and their steps a pixel (s5.10), copy mode
-	// four pixels a step and both edges in.
-	int xl = (int) ((c >> 44) & 0xFFF), yl = (int) ((c >> 32) & 0xFFF), tile = (c >> 24) & 7;
-	int xh = (int) ((c >> 12) & 0xFFF), yh = (int) (c & 0xFFF);
+	// Texture rectangles: the pixels the RDP covers, and the texel it takes at each pixel's corner
+	// (GL samples at its centre, half a pixel on); steps a pixel in s5.10, copy mode four pixels.
+	int tile = (c >> 24) & 7;
 	uint64_t d = w[1];
 	float s0 = (int16_t) (d >> 48) / 32.0f, t0 = (int16_t) (d >> 32) / 32.0f;
 	float dsdx = (int16_t) (d >> 16) / 1024.0f, dtdy = (int16_t) d / 1024.0f;
-	bool copy = r->cycleType == 2, fill = r->cycleType == 3;
-	if (fill) {
+	if (r->cycleType == 3) {
 		return;
 	}
-	if (copy) {
+	if (r->cycleType == 2) {
 		dsdx /= 4;
-		xl += 4, yl += 4;
 	}
-	float x0 = xh / 4.0f, y0 = yh / 4.0f, x1 = xl / 4.0f, y1 = yl / 4.0f;
-	bool flip = op == 0x25;
-	float sx = dsdx * (x1 - x0), ty = dtdy * (y1 - y0);
-	float ss[2] = { s0, s0 + (flip ? ty : sx) }, ts[2] = { t0, t0 + (flip ? sx : ty) };
-	if (flip) {
-		ss[1] = s0 + dsdx * (y1 - y0);
-		ts[1] = t0 + dtdy * (x1 - x0);
-	}
-	if (!drawState(n, g, r, true, false, r->zAddr && r->zPrim, tile, false, yh >> 2, (yl >> 2) + 1)) {
+	int cx0, cy0, x0, y0, x1, y1;
+	rdpRectBounds(r, c, &cx0, &cy0, &x0, &y0, &x1, &y1);
+	if (x1 < x0 || y1 < y0) {
 		return;
 	}
-	rectangle(g, x0, y0, x1, y1, (float) (r->primZ >> 3) / 0x7FFF, ss, ts, flip);
+	bool flip = op == 0x25;
+	float ax[2] = { x0 - cx0 - 0.5f, x1 + 1 - cx0 - 0.5f }, ay[2] = { y0 - cy0 - 0.5f, y1 + 1 - cy0 - 0.5f };
+	const float* along = flip ? ay : ax, * across = flip ? ax : ay;
+	float ss[2] = { s0 + along[0] * dsdx, s0 + along[1] * dsdx }, ts[2] = { t0 + across[0] * dtdy, t0 + across[1] * dtdy };
+	if (!drawState(n, g, r, true, false, r->zAddr && r->zPrim, tile, false, y0, y1 + 1)) {
+		return;
+	}
+	rectangle(g, (float) x0, (float) y0, (float) (x1 + 1), (float) (y1 + 1), (float) (r->primZ >> 3) / 0x7FFF, ss, ts, flip);
 }
 
 bool glrDrew(struct N64* n, uint32_t addr, uint32_t len) {

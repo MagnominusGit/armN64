@@ -1000,6 +1000,10 @@ static void textureRectBounds(struct RDP* r, uint64_t w0, int* cx0, int* cy0, in
 	clipRect(r, x0, y0, x1, y1);
 }
 
+void rdpRectBounds(struct RDP* r, uint64_t w0, int* cx0, int* cy0, int* x0, int* y0, int* x1, int* y1) {
+	textureRectBounds(r, w0, cx0, cy0, x0, y0, x1, y1);
+}
+
 static void textureRect(struct N64* n, struct RDP* r, uint64_t w0, uint64_t w1, bool flip) {
 	int tile = (w0 >> 24) & 7;
 	int s0 = (int16_t) (w1 >> 48), t0 = (int16_t) (w1 >> 32);

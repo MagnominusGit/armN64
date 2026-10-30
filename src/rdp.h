@@ -95,6 +95,8 @@ void glrDraw(struct N64*, struct RDP*, const uint64_t* w, int op);
 void glrSync(struct N64*);
 // Whether the VI's framebuffer (origin) is one the GPU draws: then the picture is the GPU's,
 // without bringing it back (a frontend shows that texture).
+// A texture rectangle's pixels (inclusive, scissored) and the corner its coordinates start at.
+void rdpRectBounds(struct RDP*, uint64_t w0, int* cx0, int* cy0, int* x0, int* y0, int* x1, int* y1);
 // The RDP time of a GL triangle (op 0x01).
 uint64_t glrTriangleClocks(const struct RDP*, const uint64_t* w);
 // Whether the GPU has drawn RDRAM [addr, addr + len) and not given it back.
