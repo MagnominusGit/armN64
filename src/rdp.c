@@ -2515,11 +2515,7 @@ static void command(struct N64* n, struct RDP* r, const uint64_t* w, int op, int
 	if (n->glr && n->rdpPending && (op == 0x30 || op == 0x33 || op == 0x34)) {
 		uint32_t addr, len;
 		loadSource(r, w, op, &addr, &len);
-		bool drawn = false;
-		FOR_PAGES(addr, len, p) {
-			drawn |= (n->pageFlags[p] & PAGE_RDP_WRITES) != 0;
-		}
-		if (drawn) {
+		if (glrDrew(n, addr, len)) {
 			glrSync(n);
 		}
 	}

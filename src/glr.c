@@ -65,6 +65,7 @@ struct Gl {
 	void (*DepthFunc)(GLenum);
 	void (*DepthMask)(GLboolean);
 	void (*BlendFunc)(GLenum, GLenum);
+	void (*BlendFuncSeparate)(GLenum, GLenum, GLenum, GLenum);
 	void (*PolygonOffset)(float, float);
 	void (*ReadPixels)(GLint, GLint, GLsizei, GLsizei, GLenum, GLenum, void*);
 	void (*PixelStorei)(GLenum, GLint);
@@ -104,13 +105,12 @@ struct Target {
 	uint32_t addr, width;
 	int size;
 	GLuint texture, framebuffer;
-	bool loaded;
+	// Rows loaded from RDRAM since the GPU last gave its pixels back.
+	int loadedRows;
 	int dirtyFrom, dirtyTo;
 	uint64_t used;
 	// Rows whose pages are flagged for rdpWait since the last sync.
 	int marked;
-	// The texture's pixels as RDRAM has them: only pixels the GPU changes go back.
-	uint32_t* pixels;
 };
 
 // What the fragment shader is made for.
@@ -171,7 +171,7 @@ static bool loadGl(struct Glr* g) {
 	       GLFN(RenderbufferStorage) && GLFN(GenTextures) && GLFN(DeleteTextures) && GLFN(BindTexture) && GLFN(ActiveTexture) &&
 	       GLFN(TexImage2D) && GLFN(TexSubImage2D) && GLFN(TexParameteri) && GLFN(Viewport) && GLFN(Scissor) && GLFN(Enable) &&
 	       GLFN(Disable) && GLFN(ClearColor) && GLFN(ClearDepthf) && GLFN(Clear) && GLFN(DepthFunc) && GLFN(DepthMask) &&
-	       GLFN(BlendFunc) && GLFN(PolygonOffset) && GLFN(ReadPixels) && GLFN(PixelStorei) && GLFN(CreateShader) &&
+	       GLFN(BlendFunc) && GLFN(BlendFuncSeparate) && GLFN(PolygonOffset) && GLFN(ReadPixels) && GLFN(PixelStorei) && GLFN(CreateShader) &&
 	       GLFN(ShaderSource) && GLFN(CompileShader) && GLFN(GetShaderiv) && GLFN(GetShaderInfoLog) && GLFN(DeleteShader) &&
 	       GLFN(CreateProgram) && GLFN(AttachShader) && GLFN(LinkProgram) && GLFN(GetProgramiv) && GLFN(GetProgramInfoLog) &&
 	       GLFN(UseProgram) && GLFN(DeleteProgram) && GLFN(GetUniformLocation) && GLFN(Uniform1i) && GLFN(Uniform1f) &&
@@ -247,10 +247,10 @@ static const char fragmentHead[] =
 
 // modes: cycle type (bits 0-1), alpha compare (2), textured (3), shaded (4), the blender's first
 // cycle and last cycle selections (8-15, 16-23), blending with memory (24), depth from prim (25),
-// coverage times alpha with antialiasing (26), alpha as coverage (27), coverage times alpha (28).
+// coverage times alpha with antialiasing (26), alpha as coverage (27).
 enum {
 	MODE_CYCLE = 3, MODE_ALPHA_COMPARE = 4, MODE_TEXTURED = 8, MODE_SHADED = 16, MODE_BLEND = 1 << 24, MODE_PRIM_DEPTH = 1 << 25,
-	MODE_CVG_ALPHA = 1 << 26, MODE_ALPHA_CVG = 1 << 27, MODE_CVG_TIMES = 1 << 28,
+	MODE_CVG_ALPHA = 1 << 26, MODE_ALPHA_CVG = 1 << 27,
 };
 
 static const char* rgbInput(int which, int sel) {
@@ -350,12 +350,12 @@ static struct Program* program(struct Glr* g, struct ProgramKey key) {
 		strcat(source, "	if (combined.a < 0.125) discard;\n");
 	}
 	if (key.modes & MODE_ALPHA_CVG) {
-		// Alpha as coverage: inside the primitive the full coverage, or what coverage times alpha leaves.
-		strcat(source, key.modes & MODE_CVG_TIMES ? "	combined.a = min(floor((combined.a * 2040.0 + 4.0) / 256.0) * 32.0, 255.0) / 255.0;\n"
-		                                          : "	combined.a = 1.0;\n");
+		// Alpha as coverage: full inside the primitive.
+		strcat(source, "	combined.a = 1.0;\n");
 	}
 	if (key.modes & MODE_ALPHA_COMPARE) {
-		strcat(source, "	if (combined.a < uBlend.a) discard;\n");
+		// Copy mode drops texels with no alpha, the other modes those below the blend alpha.
+		strcat(source, cycleType == 2 ? "	if (combined.a == 0.0) discard;\n" : "	if (combined.a < uBlend.a) discard;\n");
 	}
 	int first = (key.modes >> 8) & 0xFF, last = (key.modes >> 16) & 0xFF;
 	if (cycleType == 1) {
@@ -370,6 +370,10 @@ static struct Program* program(struct Glr* g, struct ProgramKey key) {
 		strcat(source, line);
 	} else {
 		strcat(source, "	oColor = combined;\n");
+	}
+	if (!(key.modes & MODE_BLEND)) {
+		// Alpha in the image marks the pixels drawn (blending adds the pixel's).
+		strcat(source, "	oColor.a = 1.0;\n");
 	}
 	if (key.modes & MODE_PRIM_DEPTH) {
 		strcat(source, "	gl_FragDepth = uPrimDepth;\n");
@@ -420,30 +424,31 @@ static struct Program* program(struct Glr* g, struct ProgramKey key) {
 
 static void writePixels(struct N64* n, struct Target* t, int from, int to);
 
-// The RDRAM pixels of rows 0 to rows - 1, into the texture.
-static void loadPixels(struct N64* n, struct Glr* g, struct Target* t, int rows) {
-	uint32_t* out = t->pixels;
-	for (int y = 0; y < rows; ++y) {
+// The RDRAM pixels of rows from to to - 1, into the texture, with alpha 0: drawing sets it, and only
+// pixels with it go back.
+static void loadPixels(struct N64* n, struct Glr* g, struct Target* t, int from, int to) {
+	uint32_t* out = g->image;
+	for (int y = from; y < to; ++y) {
 		for (uint32_t x = 0; x < t->width; ++x) {
 			uint32_t i = y * t->width + x, c;
 			if (t->size == 3) {
 				const uint8_t* p = &n->rdram[(t->addr + i * 4) & (RDRAM_SIZE - 4)];
-				c = (uint32_t) p[0] | (uint32_t) p[1] << 8 | (uint32_t) p[2] << 16 | (uint32_t) p[3] << 24;
+				c = (uint32_t) p[0] | (uint32_t) p[1] << 8 | (uint32_t) p[2] << 16;
 			} else if (t->size == 2) {
 				uint32_t a = (t->addr + i * 2) & (RDRAM_SIZE - 2);
 				uint16_t v = (uint16_t) (n->rdram[a] << 8 | n->rdram[a + 1]);
 				int r = (v >> 11) & 31, gr = (v >> 6) & 31, b = (v >> 1) & 31;
-				c = (uint32_t) (r << 3 | r >> 2) | (uint32_t) (gr << 3 | gr >> 2) << 8 | (uint32_t) (b << 3 | b >> 2) << 16 | (v & 1 ? 0xFF000000u : 0);
+				c = (uint32_t) (r << 3 | r >> 2) | (uint32_t) (gr << 3 | gr >> 2) << 8 | (uint32_t) (b << 3 | b >> 2) << 16;
 			} else {
 				uint8_t v = n->rdram[(t->addr + i) & (RDRAM_SIZE - 1)];
-				c = v | (uint32_t) v << 8 | (uint32_t) v << 16 | 0xFF000000u;
+				c = v | (uint32_t) v << 8 | (uint32_t) v << 16;
 			}
-			out[i] = c;
+			out[(y - from) * t->width + x] = c;
 		}
 	}
 	struct Gl* gl = &g->gl;
 	gl->BindTexture(GL_TEXTURE_2D, t->texture);
-	gl->TexSubImage2D(GL_TEXTURE_2D, 0, 0, 0, (GLsizei) t->width, rows, GL_RGBA, GL_UNSIGNED_BYTE, out);
+	gl->TexSubImage2D(GL_TEXTURE_2D, 0, 0, from, (GLsizei) t->width, to - from, GL_RGBA, GL_UNSIGNED_BYTE, out);
 }
 
 static void flushBatch(struct N64* n, struct Glr* g);
@@ -478,11 +483,6 @@ static struct Target* target(struct N64* n, struct Glr* g, uint32_t addr, uint32
 			gl->GenTextures(1, &t->texture);
 			gl->GenFramebuffers(1, &t->framebuffer);
 		}
-		uint32_t* pixels = realloc(t->pixels, (size_t) width * TARGET_ROWS * 4);
-		if (!pixels) {
-			return NULL;
-		}
-		t->pixels = pixels;
 		gl->BindTexture(GL_TEXTURE_2D, t->texture);
 		gl->TexImage2D(GL_TEXTURE_2D, 0, GL_RGBA8, (GLsizei) width, TARGET_ROWS, 0, GL_RGBA, GL_UNSIGNED_BYTE, NULL);
 		gl->TexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_NEAREST);
@@ -491,13 +491,14 @@ static struct Target* target(struct N64* n, struct Glr* g, uint32_t addr, uint32
 		gl->FramebufferTexture2D(GL_FRAMEBUFFER, GL_COLOR_ATTACHMENT0, GL_TEXTURE_2D, t->texture, 0);
 		gl->FramebufferRenderbuffer(GL_FRAMEBUFFER, GL_DEPTH_ATTACHMENT, GL_RENDERBUFFER, g->depth);
 		t->addr = addr, t->width = width, t->size = size;
-		t->loaded = false;
+		t->loadedRows = 0;
 		t->dirtyFrom = t->dirtyTo = 0;
 	}
 	t->used = ++g->clock;
-	if (!t->loaded) {
-		loadPixels(n, g, t, rows > TARGET_ROWS ? TARGET_ROWS : rows);
-		t->loaded = true;
+	rows = rows > TARGET_ROWS ? TARGET_ROWS : rows;
+	if (rows > t->loadedRows) {
+		loadPixels(n, g, t, t->loadedRows, rows);
+		t->loadedRows = rows;
 	}
 	return t;
 }
@@ -515,10 +516,9 @@ static void writePixels(struct N64* n, struct Target* t, int from, int to) {
 	for (int y = from; y < to; ++y) {
 		for (uint32_t x = 0; x < t->width; ++x) {
 			uint32_t c = g->image[(y - from) * t->width + x], i = y * t->width + x;
-			if (c == t->pixels[i]) {
+			if (!(c >> 24)) {
 				continue;
 			}
-			t->pixels[i] = c;
 			int r = c & 255, gr = (c >> 8) & 255, b = (c >> 16) & 255;
 			if (t->size == 3) {
 				uint8_t* p = &n->rdram[(t->addr + i * 4) & (RDRAM_SIZE - 4)];
@@ -678,7 +678,7 @@ static void flushBatch(struct N64* n, struct Glr* g) {
 	}
 	if (s->blendOn) {
 		gl->Enable(GL_BLEND);
-		gl->BlendFunc(GL_SRC_ALPHA, GL_ONE_MINUS_SRC_ALPHA);
+		gl->BlendFuncSeparate(GL_SRC_ALPHA, GL_ONE_MINUS_SRC_ALPHA, GL_ONE, GL_ONE);
 	} else {
 		gl->Disable(GL_BLEND);
 	}
@@ -703,9 +703,6 @@ static bool drawState(struct N64* n, struct Glr* g, struct RDP* r, bool textured
 		flushBatch(n, g);
 	}
 	s.target = target(n, g, r->colorAddr, r->colorWidth, r->colorSize, rows);
-	if (!s.target) {
-		return false;
-	}
 	int cycleType = r->cycleType;
 	uint32_t modes = (uint32_t) cycleType | (r->alphaCompare ? MODE_ALPHA_COMPARE : 0) | (textured ? MODE_TEXTURED : 0) | (shaded ? MODE_SHADED : 0);
 	int lastCycle = cycleType == 1 ? 1 : 0;
@@ -713,14 +710,18 @@ static bool drawState(struct N64* n, struct Glr* g, struct RDP* r, bool textured
 	modes |= (uint32_t) (r->blendSel[lastCycle][0] | r->blendSel[lastCycle][1] << 2) << 16;
 	bool blendMemory = r->blendSel[lastCycle][2] == 1 && r->blendSel[lastCycle][0] != 1;
 	s.blendOn = cycleType < 2 && r->forceBlend && blendMemory;
+	if (s.blendOn) {
+		modes |= MODE_BLEND;
+	}
 	if (depth && r->zPrim) {
 		modes |= MODE_PRIM_DEPTH;
 	}
 	if (r->cvgTimesAlpha && r->antialias) {
 		modes |= MODE_CVG_ALPHA;
 	}
-	if (r->cvgAlpha) {
-		modes |= MODE_ALPHA_CVG | (r->cvgTimesAlpha ? MODE_CVG_TIMES : 0);
+	// With coverage times alpha too the alpha stays (the VI's antialiasing is what smooths those edges).
+	if (r->cvgAlpha && !r->cvgTimesAlpha) {
+		modes |= MODE_ALPHA_CVG;
 	}
 	struct ProgramKey key = { cycleType < 2 ? r->combine : 0, modes };
 	s.program = program(g, key);
@@ -841,7 +842,7 @@ void glrDraw(struct N64* n, struct RDP* r, const uint64_t* w, int op) {
 		rdpDrawSoftware(n, r, w, op);
 		for (int i = 0; i < TARGETS; ++i) {
 			if (g->target[i].addr == r->colorAddr) {
-				g->target[i].loaded = false;
+				g->target[i].loadedRows = 0;
 			}
 		}
 		return;
@@ -883,10 +884,10 @@ void glrDraw(struct N64* n, struct RDP* r, const uint64_t* w, int op) {
 			gl->Scissor(sx0, sy0, sx1 - sx0, sy1 - sy0);
 			uint32_t f = r->fillColor;
 			if (r->colorSize == 3) {
-				gl->ClearColor((f >> 24) / 255.0f, ((f >> 16) & 255) / 255.0f, ((f >> 8) & 255) / 255.0f, (f & 255) / 255.0f);
+				gl->ClearColor((f >> 24) / 255.0f, ((f >> 16) & 255) / 255.0f, ((f >> 8) & 255) / 255.0f, 1.0f);
 			} else {
 				uint32_t v = f >> 16;
-				gl->ClearColor(((v >> 11) & 31) / 31.0f, ((v >> 6) & 31) / 31.0f, ((v >> 1) & 31) / 31.0f, v & 1);
+				gl->ClearColor(((v >> 11) & 31) / 31.0f, ((v >> 6) & 31) / 31.0f, ((v >> 1) & 31) / 31.0f, 1.0f);
 			}
 			gl->Clear(GL_COLOR_BUFFER_BIT);
 			return;
@@ -927,6 +928,19 @@ void glrDraw(struct N64* n, struct RDP* r, const uint64_t* w, int op) {
 	rectangle(g, x0, y0, x1, y1, (float) (r->primZ >> 3) / 0x7FFF, ss, ts, flip);
 }
 
+bool glrDrew(struct N64* n, uint32_t addr, uint32_t len) {
+	struct Glr* g = n->glr;
+	for (int i = 0; i < TARGETS; ++i) {
+		struct Target* t = &g->target[i];
+		uint32_t bytes = t->size == 3 ? 4 : t->size == 1 ? 1 : 2;
+		uint32_t from = t->addr + (uint32_t) t->dirtyFrom * t->width * bytes, to = t->addr + (uint32_t) t->dirtyTo * t->width * bytes;
+		if (t->texture && t->dirtyTo > t->dirtyFrom && addr < to && addr + len > from) {
+			return true;
+		}
+	}
+	return false;
+}
+
 bool glrShows(struct N64* n, uint32_t origin) {
 	struct Glr* g = n->glr;
 	for (int i = 0; i < TARGETS; ++i) {
@@ -963,7 +977,7 @@ void glrSync(struct N64* n) {
 			t->dirtyFrom = t->dirtyTo = 0;
 		}
 		// RDRAM may change before the GPU draws here again.
-		t->loaded = false;
+		t->loadedRows = 0;
 		t->marked = 0;
 	}
 	n->rdpPending = false;
@@ -1017,9 +1031,6 @@ void glrDestroy(struct Glr* g) {
 		return;
 	}
 	glesDestroy(g->gles);
-	for (int i = 0; i < TARGETS; ++i) {
-		free(g->target[i].pixels);
-	}
 	free(g->batch);
 	free(g->image);
 	free(g);

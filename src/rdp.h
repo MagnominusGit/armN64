@@ -95,6 +95,8 @@ void glrDraw(struct N64*, struct RDP*, const uint64_t* w, int op);
 void glrSync(struct N64*);
 // Whether the VI's framebuffer (origin) is one the GPU draws: then the picture is the GPU's,
 // without bringing it back (a frontend shows that texture).
+// Whether the GPU has drawn RDRAM [addr, addr + len) and not given it back.
+bool glrDrew(struct N64*, uint32_t addr, uint32_t len);
 bool glrShows(struct N64*, uint32_t origin);
 // The RDP's own drawing of a primitive, into RDRAM.
 void rdpDrawSoftware(struct N64*, struct RDP*, const uint64_t* w, int op);
