@@ -31,7 +31,7 @@ enum {
 	GL_SCISSOR_TEST = 0x0C11, GL_DEPTH_TEST = 0x0B71, GL_BLEND = 0x0BE2, GL_POLYGON_OFFSET_FILL = 0x8037,
 	GL_DITHER = 0x0BD0, GL_COLOR_BUFFER_BIT = 0x4000, GL_DEPTH_BUFFER_BIT = 0x100,
 	GL_LESS = 0x201, GL_LEQUAL = 0x203, GL_ALWAYS = 0x207,
-	GL_ZERO = 0, GL_ONE = 1, GL_SRC_ALPHA = 0x302, GL_ONE_MINUS_SRC_ALPHA = 0x303,
+	GL_ZERO = 0, GL_ONE = 1, GL_SRC_ALPHA = 0x302, GL_ONE_MINUS_SRC_ALPHA = 0x303, GL_CONSTANT_ALPHA = 0x8003,
 	GL_VERTEX_SHADER = 0x8B31, GL_FRAGMENT_SHADER = 0x8B30, GL_COMPILE_STATUS = 0x8B81, GL_LINK_STATUS = 0x8B82,
 	GL_PACK_ALIGNMENT = 0x0D05, GL_UNPACK_ALIGNMENT = 0x0CF5,
 };
@@ -67,6 +67,7 @@ struct Gl {
 	void (*DepthMask)(GLboolean);
 	void (*BlendFunc)(GLenum, GLenum);
 	void (*BlendFuncSeparate)(GLenum, GLenum, GLenum, GLenum);
+	void (*BlendColor)(float, float, float, float);
 	void (*PolygonOffset)(float, float);
 	void (*ReadPixels)(GLint, GLint, GLsizei, GLsizei, GLenum, GLenum, void*);
 	void (*PixelStorei)(GLenum, GLint);
@@ -140,6 +141,7 @@ struct Program {
 struct Applied {
 	GLuint framebuffer, program, texture[3];
 	int unit, viewport, scissorOn, scissor[4], depth, depthMask, offset, blend;
+	float blendConstant;
 };
 
 struct Texture {
@@ -161,6 +163,9 @@ struct DrawState {
 	int scissor[4];
 	bool depthTest, depthWrite, decal, blendOn, persp;
 	int blendB;
+	// Memory as P: 1 with a per-pixel A, 2 with a constant one (blendConstant).
+	int memoryFirst;
+	float blendConstant;
 };
 
 struct Glr {
@@ -254,7 +259,7 @@ static bool loadGl(struct Glr* g) {
 	       GLFN(RenderbufferStorage) && GLFN(GenTextures) && GLFN(DeleteTextures) && GLFN(BindTexture) && GLFN(ActiveTexture) &&
 	       GLFN(TexImage2D) && GLFN(TexSubImage2D) && GLFN(TexParameteri) && GLFN(Viewport) && GLFN(Scissor) && GLFN(Enable) &&
 	       GLFN(Disable) && GLFN(ClearColor) && GLFN(ClearDepthf) && GLFN(Clear) && GLFN(DepthFunc) && GLFN(DepthMask) &&
-	       GLFN(BlendFunc) && GLFN(BlendFuncSeparate) && GLFN(PolygonOffset) && GLFN(ReadPixels) && GLFN(PixelStorei) && GLFN(CreateShader) &&
+	       GLFN(BlendFunc) && GLFN(BlendFuncSeparate) && GLFN(BlendColor) && GLFN(PolygonOffset) && GLFN(ReadPixels) && GLFN(PixelStorei) && GLFN(CreateShader) &&
 	       GLFN(ShaderSource) && GLFN(CompileShader) && GLFN(GetShaderiv) && GLFN(GetShaderInfoLog) && GLFN(DeleteShader) &&
 	       GLFN(CreateProgram) && GLFN(AttachShader) && GLFN(LinkProgram) && GLFN(GetProgramiv) && GLFN(GetProgramInfoLog) &&
 	       GLFN(UseProgram) && GLFN(DeleteProgram) && GLFN(GetUniformLocation) && GLFN(Uniform1i) && GLFN(Uniform1f) &&
@@ -335,7 +340,7 @@ static const char fragmentHead[] =
 // in the shader (28).
 enum {
 	MODE_CYCLE = 3, MODE_ALPHA_COMPARE = 4, MODE_TEXTURED = 8, MODE_SHADED = 16, MODE_BLEND = 1 << 24, MODE_PRIM_DEPTH = 1 << 25,
-	MODE_CVG_ALPHA = 1 << 26, MODE_ALPHA_CVG = 1 << 27, MODE_BLEND_COLOR = 1 << 28,
+	MODE_CVG_ALPHA = 1 << 26, MODE_ALPHA_CVG = 1 << 27, MODE_BLEND_COLOR = 1 << 28, MODE_BLEND_MEMORY_FIRST = 1 << 29, MODE_BLEND_CONSTANT = 1 << 30,
 };
 
 static const char* rgbInput(int which, int sel) {
@@ -474,6 +479,11 @@ static struct Program* program(struct Glr* g, struct ProgramKey key) {
 			blendFormula(line, sizeof(line), last);
 			strcat(source, line);
 			snprintf(line, sizeof(line), "	oColor = vec4(combined.rgb, %s);\n", blendAlphaInput(last >> 2));
+		} else if (key.modes & MODE_BLEND_MEMORY_FIRST) {
+			// Memory as P: M * B here, the GPU adds the image times A (the blend constant when A is).
+			static const char* b[4] = { "1.0 - blendA", "1.0", "1.0", "0.0" };
+			snprintf(line, sizeof(line), "	{ float blendA = %s; oColor = vec4(%s * (%s), %s); }\n", blendAlphaInput(last >> 2), blendColorInput(last >> 4),
+			         b[(last >> 6) & 3], key.modes & MODE_BLEND_CONSTANT ? "1.0" : "blendA");
 		} else {
 			snprintf(line, sizeof(line), "	oColor = vec4(%s, %s * memoryKeep);\n", blendColorInput(last), blendAlphaInput(last >> 2));
 		}
@@ -481,7 +491,7 @@ static struct Program* program(struct Glr* g, struct ProgramKey key) {
 	} else {
 		strcat(source, "	oColor = combined;\n");
 	}
-	if (!(key.modes & MODE_BLEND)) {
+	if (!(key.modes & MODE_BLEND) && (key.modes & (MODE_BLEND_MEMORY_FIRST | MODE_BLEND_CONSTANT)) != MODE_BLEND_MEMORY_FIRST) {
 		// Alpha in the image marks the pixels drawn (blending adds the pixel's).
 		strcat(source, "	oColor.a = 1.0;\n");
 	}
@@ -871,15 +881,22 @@ static void flushBatch(struct N64* n, struct Glr* g) {
 		}
 		a->offset = s->decal;
 	}
-	int blend = s->blendOn ? s->blendB : -1;
+	int blend = s->blendOn ? s->blendB : s->memoryFirst ? 3 + s->memoryFirst : -1;
 	if (a->blend != blend) {
 		if (blend < 0) {
 			gl->Disable(GL_BLEND);
+		} else if (blend >= 4) {
+			gl->Enable(GL_BLEND);
+			gl->BlendFuncSeparate(GL_ONE, blend == 4 ? GL_SRC_ALPHA : GL_CONSTANT_ALPHA, GL_ONE, GL_ONE);
 		} else {
 			gl->Enable(GL_BLEND);
 			gl->BlendFuncSeparate(GL_SRC_ALPHA, blend == 0 ? GL_ONE_MINUS_SRC_ALPHA : blend == 3 ? GL_ZERO : GL_ONE, GL_ONE, GL_ONE);
 		}
 		a->blend = blend;
+	}
+	if (blend == 5 && a->blendConstant != s->blendConstant) {
+		gl->BlendColor(0, 0, 0, s->blendConstant);
+		a->blendConstant = s->blendConstant;
 	}
 	gl->BindVertexArray(g->vertexArray);
 	gl->BindBuffer(GL_ARRAY_BUFFER, g->vertexBuffer);
@@ -927,10 +944,14 @@ static bool drawState(struct N64* n, struct Glr* g, struct RDP* r, bool textured
 	const uint8_t* first = r->blendSel[0], * last = r->blendSel[lastCycle];
 	modes |= (uint32_t) (first[0] | first[1] << 2 | first[2] << 4 | first[3] << 6) << 8;
 	modes |= (uint32_t) (last[0] | last[1] << 2 | last[2] << 4 | last[3] << 6) << 16;
-	bool blendMemory = last[2] == 1 && last[0] != 1;
+	bool blendMemory = last[2] == 1 && last[0] != 1, memoryFirst = last[0] == 1 && last[2] != 1;
 	s.blendOn = cycleType < 2 && r->forceBlend && blendMemory;
 	s.blendB = last[3];
-	if (cycleType < 2 && r->forceBlend && !blendMemory) {
+	if (cycleType < 2 && r->forceBlend && memoryFirst) {
+		s.memoryFirst = last[1] == 1 || last[1] == 3 ? 2 : 1;
+		s.blendConstant = last[1] == 1 ? r->fog.a / 255.0f : 0;
+		modes |= MODE_BLEND_MEMORY_FIRST | (s.memoryFirst == 2 ? MODE_BLEND_CONSTANT : 0);
+	} else if (cycleType < 2 && r->forceBlend && !blendMemory) {
 		modes |= MODE_BLEND_COLOR;
 	}
 	if (s.blendOn) {
