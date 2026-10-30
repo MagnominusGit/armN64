@@ -84,10 +84,25 @@ int main(int argc, char** argv) {
 	printf("CIC %d\n", n->cic);
 	int fields = atoi(argv[2]);
 	const char* reported = NULL;
+	// N64PICS=1: a picture every field as a frontend takes it (on the GPU when it can); N64PROF=1
+	// prints the wall, main-thread and picture times.
+	double picSecs = 0;
+	bool pics = getenv("N64PICS") != NULL;
+	static uint32_t frame[640 * 480];
 	struct timespec t0, t1;
 	clock_gettime(CLOCK_MONOTONIC, &t0);
 	for (int f = 0; f < fields; ++f) {
 		n64RunField(n);
+		if (pics) {
+			struct timespec a, b;
+			int pw, ph;
+			clock_gettime(CLOCK_MONOTONIC, &a);
+			if (!n64PictureStart(n, &pw, &ph)) {
+				n64Picture(n, frame, &pw, &ph);
+			}
+			clock_gettime(CLOCK_MONOTONIC, &b);
+			picSecs += (b.tv_sec - a.tv_sec) + (b.tv_nsec - a.tv_nsec) / 1e9;
+		}
 		// N64SHOTS=prefix N64SHOTEVERY=fields: a picture every so many fields, as prefix-<field>.ppm.
 		if (getenv("N64SHOTS") && (f + 1) % atoi(getenv("N64SHOTEVERY") ? getenv("N64SHOTEVERY") : "300") == 0) {
 			char path[1024];
@@ -109,6 +124,11 @@ int main(int argc, char** argv) {
 	double secs = (t1.tv_sec - t0.tv_sec) + (t1.tv_nsec - t0.tv_nsec) / 1e9;
 	printf("%d fields in %.2f s (%.1fx real time), pc %08x\n", fields, secs, fields / 60.0 / secs,
 	       (uint32_t) n->cpu.pc);
+	if (getenv("N64PROF")) {
+		struct timespec mc;
+		clock_gettime(CLOCK_THREAD_CPUTIME_ID, &mc);
+		printf("PROF wall %.3f main_cpu %.3f pictures %.3f\n", secs, mc.tv_sec + mc.tv_nsec / 1e9, picSecs);
+	}
 	if (getenv("N64STATE")) {
 		struct CPU* c = &n->cpu;
 		printf("sp status %04x pc %03x, dp status %x, mi intr %02x mask %02x, pi status %x, vi intr %d\n",
