@@ -155,6 +155,9 @@ struct Jit {
 	int codeCheckCount;
 	uint8_t* leave;
 	bool rdpThreads, rdpGl;
+	// Status.FR as the block was compiled: with it clear, odd 32-bit FPU registers are the high
+	// halves of even ones.
+	bool fr;
 	struct Cache cache;
 };
 
@@ -307,6 +310,132 @@ static bool fpuOpValid(uint32_t op) {
 		return false;
 	}
 	return func <= 15 || func == 32 || func == 33 || func == 36 || func == 37 || func >= 0x30;
+}
+
+// Single-precision instructions on s registers.
+enum { F_MUL = 0x1E200800, F_DIV = 0x1E201800, F_ADD = 0x1E202800, F_SUB = 0x1E203800, F_ABS = 0x1E20C000, F_NEG = 0x1E214000 };
+
+static void aFop(struct Emitter* e, uint32_t op, int d, int n, int m) {
+	emit32(e, op | m << 16 | n << 5 | d);
+}
+
+static void aFldr(struct Emitter* e, int t, int n, unsigned offset) {
+	emit32(e, 0xBD400000 | (offset / 4) << 10 | n << 5 | t);
+}
+
+static void aFstr(struct Emitter* e, int t, int n, unsigned offset) {
+	emit32(e, 0xBD000000 | (offset / 4) << 10 | n << 5 | t);
+}
+
+// A 32-bit FPU register, as get32 and set32 find it.
+static unsigned fprOff(const struct Jit* j, int r) {
+	return j->fr ? CPU_OFF(fpr) + 8 * r : CPU_OFF(fpr) + 8 * (r & ~1) + 4 * (r & 1);
+}
+
+// A single-precision result in w0 as setS stores it: flushed to zero when subnormal with FCR31.FS
+// set, and the host's default NaN made the VR4300's.
+static void storeSingle(struct Jit* j, int fd) {
+	struct Emitter* e = &j->e;
+	aLdr(e, 17, CPU, CPU_OFF(fcr31));
+	uint8_t* keep = aTbz(e, 17, 24, NULL);
+	aLogicImm(e, A_ANDS_IMM, ZR, 0, 0x7F800000);
+	uint8_t* normal = aBcond(e, C_NE, NULL);
+	aLogicImm(e, A_AND_IMM, 0, 0, 0x80000000);
+	patchHere(e, keep);
+	patchHere(e, normal);
+	aLogicImm(e, A_AND_IMM, 1, 0, 0x7FFFFFFF);
+	aMovImm(e, 2, 0x7FC00000);
+	aDp(e, A_SUBS, ZR, 1, 2, S_LSL, 0);
+	aMovImm(e, 2, 0x7FBFFFFF);
+	aCsel(e, 0, 2, 0, C_EQ);
+	aStr(e, 0, CPU, fprOff(j, fd));
+}
+
+// The FPU instructions most code runs, inline for the Status.FR the block was compiled with.
+static bool emitFpu(struct Jit* j, uint32_t op) {
+	struct Emitter* e = &j->e;
+	int fmt = (op >> 21) & 31, func = op & 0x3F, ft = (op >> 16) & 31, fs = (op >> 11) & 31, fd = (op >> 6) & 31;
+	bool single = fmt == 16 && (func <= 3 || (func >= 5 && func <= 7) || func == 13 || func >= 0x30);
+	if (!(fmt == 0 || fmt == 2 || fmt == 4 || single || (fmt == 20 && func == 32))) {
+		return false;
+	}
+	needCop1(j);
+	j->slow->site[j->slow->sites++] = j->fr ? aTbz(e, 16, 26, NULL) : aTbnz(e, 16, 26, NULL);
+	switch (fmt) {
+	case 0:
+		if (ft) {
+			int d = writeReg(j, ft);
+			aLdr(e, d, CPU, fprOff(j, fs));
+			aSxtw(e, d, d);
+			commit(j, ft, d);
+		}
+		return true;
+	case 2:
+		if (fs == 31) {
+			int d = writeReg(j, ft);
+			aLdr(e, d, CPU, CPU_OFF(fcr31));
+			aSxtw(e, d, d);
+			commit(j, ft, d);
+		} else {
+			setConst(j, ft, fs == 0 ? 0xA00 : 0);
+		}
+		return true;
+	case 4:
+		aStr(e, readReg(j, ft), CPU, fprOff(j, fs));
+		return true;
+	case 20:
+		aLdr(e, 0, CPU, fprOff(j, fs));
+		emit32(e, 0x1E220000 | 0 << 5 | 0);
+		aFstr(e, 0, CPU, fprOff(j, fd));
+		j->extraCycles = (int) fpuCycles(fmt, func);
+		return true;
+	}
+	j->extraCycles = (int) fpuCycles(fmt, func);
+	aFldr(e, 0, CPU, fprOff(j, fs));
+	if (func >= 0x30) {
+		// c.cond.s: FCMP gives N for less, Z for equal and V for unordered.
+		aFldr(e, 1, CPU, fprOff(j, ft));
+		emit32(e, 0x1E202000 | 1 << 16 | 0 << 5);
+		aMovImm(e, 0, 0);
+		static const int conds[3] = { C_VS, C_EQ, C_MI };
+		for (int k = 0; k < 3; ++k) {
+			if (func & (1 << k)) {
+				aCset(e, 1, conds[k]);
+				aDp(e, A_ORR, 0, 0, 1, S_LSL, 0);
+			}
+		}
+		aLdr(e, 1, CPU, CPU_OFF(fcr31));
+		aBfi(e, 1, 0, 23, 1);
+		aStr(e, 1, CPU, CPU_OFF(fcr31));
+		return true;
+	}
+	switch (func) {
+	case 6:
+		aFstr(e, 0, CPU, fprOff(j, fd));
+		return true;
+	case 13:
+		// trunc.w.s: out of range or NaN gives the most negative word, as toWord.
+		emit32(e, 0x9E380000 | 0 << 5 | 0);
+		aSxtw(e, 1, 0);
+		aMovImm(e, 2, 0x80000000);
+		aDp(e, A_SUBS | W64, ZR, 1, 0, S_LSL, 0);
+		aCsel(e, 0, 0, 2, C_EQ);
+		emit32(e, 0x1E202000 | 0 << 16 | 0 << 5);
+		aCsel(e, 0, 0, 2, C_VC);
+		aStr(e, 0, CPU, fprOff(j, fd));
+		return true;
+	case 5:
+	case 7:
+		aFop(e, func == 5 ? F_ABS : F_NEG, 0, 0, 0);
+		break;
+	default:
+		aFldr(e, 1, CPU, fprOff(j, ft));
+		aFop(e, (const uint32_t[]) { F_ADD, F_SUB, F_MUL, F_DIV }[func], 0, 0, 1);
+		break;
+	}
+	emit32(e, 0x1E260000 | 0 << 5 | 0);
+	storeSingle(j, fd);
+	return true;
 }
 
 // MFC0 and DMFC0 of anything but Random; MTC0 and DMTC0 of Status, EPC and ErrorEPC.
@@ -614,6 +743,9 @@ static bool emitInline(struct Jit* j, uint32_t op, uint64_t pc, enum Kind* kind)
 		}
 		if (!fpuOpValid(op)) {
 			return false;
+		}
+		if (emitFpu(j, op)) {
+			return true;
 		}
 		// The FPU's own code, called directly: it raises nothing once CU1 is on. Its stall counts.
 		needCop1(j);
@@ -1295,6 +1427,7 @@ void* jitCompile(struct N64* n, const uint32_t* ops, uint32_t count, uint32_t va
 	j->exitCount = j->slowCount = j->missCount = j->codeCheckCount = 0;
 	j->rdpThreads = n->rdpThreads > 0;
 	j->rdpGl = n->rdpGl;
+	j->fr = n->cpu.cop0[CP0_STATUS] & (1 << 26);
 	struct Emitter* e = &j->e;
 	j->leave = e->p;
 	aB(e, n->jitLeave);

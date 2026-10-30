@@ -125,7 +125,7 @@ static void result(struct N64* n, int fmt, int r, double v) {
 }
 
 // Cycles an operation holds the pipeline beyond the first (VR4300 manual, as ares has them).
-static uint32_t fpuCycles(int fmt, int func) {
+uint32_t fpuCycles(int fmt, int func) {
 	bool dbl = fmt == 17;
 	switch (func) {
 	case 0:
@@ -166,8 +166,13 @@ void fpuExecute(struct N64* n, uint32_t op) {
 		return;
 	case 6:
 		if (FS == 31) {
+			// The host's rounding mode, set again only when it changes.
+			static _Thread_local int hostMode;
 			c->fcr31 = (uint32_t) c->gpr[FT] & 0x0183FFFF;
-			fesetround(roundModes[c->fcr31 & 3]);
+			if ((int) (c->fcr31 & 3) != hostMode) {
+				hostMode = (int) (c->fcr31 & 3);
+				fesetround(roundModes[hostMode]);
+			}
 		}
 		return;
 	}

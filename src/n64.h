@@ -484,6 +484,7 @@ static inline void n64Event(struct N64* n, uint64_t at) {
 
 // fpu.c
 void fpuExecute(struct N64*, uint32_t op);
+uint32_t fpuCycles(int fmt, int func);
 
 // bus.c
 uint8_t busRead8(struct N64*, uint32_t addr);
