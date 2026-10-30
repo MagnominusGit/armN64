@@ -608,6 +608,25 @@ static struct Target* target(struct N64* n, struct Glr* g, uint32_t addr, uint32
 	}
 	t->used = ++g->clock;
 	rows = rows > TARGET_ROWS ? TARGET_ROWS : rows;
+	// Another color image over these rows (the same address at another width, say): what it drew
+	// goes back to RDRAM first, and both load again from there.
+	uint32_t rowBytes = width * (size == 3 ? 4 : size == 1 ? 1 : 2), from = addr, to = addr + (uint32_t) rows * rowBytes;
+	for (int i = 0; i < TARGETS; ++i) {
+		struct Target* o = &g->target[i];
+		uint32_t oRow = o->width * (o->size == 3 ? 4 : o->size == 1 ? 1 : 2);
+		if (o == t || !o->texture || o->dirtyTo <= o->dirtyFrom || o->addr + o->dirtyFrom * oRow >= to || from >= o->addr + o->dirtyTo * oRow) {
+			continue;
+		}
+		flushBatch(n, g);
+		writePixels(n, o, o->dirtyFrom, o->dirtyTo);
+		o->dirtyFrom = o->dirtyTo = 0;
+		o->loadedRows = 0;
+		if (t->dirtyTo > t->dirtyFrom) {
+			writePixels(n, t, t->dirtyFrom, t->dirtyTo);
+			t->dirtyFrom = t->dirtyTo = 0;
+		}
+		t->loadedRows = 0;
+	}
 	if (rows > t->loadedRows) {
 		loadPixels(n, g, t, t->loadedRows, rows);
 		t->loadedRows = rows;
@@ -620,12 +639,13 @@ static struct Target* target(struct N64* n, struct Glr* g, uint32_t addr, uint32
 static void writePixels(struct N64* n, struct Target* t, int from, int to) {
 	struct Glr* g = n->glr;
 	struct Gl* gl = &g->gl;
+	uint32_t bytes = t->size == 3 ? 4 : t->size == 1 ? 1 : 2;
+	uint32_t start = t->addr + (uint32_t) from * t->width * bytes;
+	// First, as it may give back another target's rows (through g->image).
+	n64RdramWrite(n, start & (RDRAM_SIZE - 1), (uint32_t) (to - from) * t->width * bytes);
 	useFramebuffer(g, t->framebuffer);
 	gl->ReadPixels(0, from, (GLsizei) t->width, to - from, GL_RGBA, GL_UNSIGNED_BYTE, g->image);
 	n->stats.glRows += (uint64_t) (to - from);
-	uint32_t bytes = t->size == 3 ? 4 : t->size == 1 ? 1 : 2;
-	uint32_t start = t->addr + (uint32_t) from * t->width * bytes;
-	n64RdramWrite(n, start & (RDRAM_SIZE - 1), (uint32_t) (to - from) * t->width * bytes);
 	for (int y = from; y < to; ++y) {
 		for (uint32_t x = 0; x < t->width; ++x) {
 			uint32_t c = g->image[(y - from) * t->width + x], i = y * t->width + x;
