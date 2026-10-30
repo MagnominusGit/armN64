@@ -300,6 +300,9 @@ struct N64 {
 	// where that can't start.
 	bool viGpu;
 	struct Gles* viGles;
+	// N64_RDP_GL (with hle): the GL renderer draws what the HLE makes (glr.c).
+	bool rdpGl;
+	struct Glr* glr;
 	struct FrameSkip skip;
 	// The last picture made, shown again for a skipped frame.
 	uint32_t* lastPicture;

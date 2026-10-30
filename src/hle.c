@@ -275,6 +275,28 @@ static int32_t fixed16(float f) {
 // One RDP triangle (after libdragon's rdpq_triangle_cpu): edges, then shade, texture and depth
 // coefficients as the command asks for them.
 static void triangle(struct N64* n, struct Hle* h, const struct ScreenVertex* a, const struct ScreenVertex* b, const struct ScreenVertex* c, const struct ScreenVertex* flat) {
+	if (n->rdpGl) {
+		// For the GL renderer: the corners as they are (flat shading takes the one colour).
+		bool persp = h->modeH & 0x80000;
+		uint64_t head = (uint64_t) 0x01 << 56 | (uint64_t) ((h->geometry & GEOM_SHADE ? 4 : 0) | (h->texOn ? 2 : 0) | (h->geometry & GEOM_ZBUFFER ? 1 : 0)) |
+		                (uint64_t) (h->texTile & 7) << 8 | (uint64_t) (h->texLevel & 7) << 12 | (uint64_t) persp << 16;
+		emit(n, h, head);
+		const struct ScreenVertex* corners[3] = { a, b, c };
+		for (int k = 0; k < 3; ++k) {
+			struct ScreenVertex v = *corners[k];
+			if (flat) {
+				v.r = flat->r, v.g = flat->g, v.b = flat->b, v.a = flat->a;
+			}
+			const float f[10] = { v.x, v.y, v.z, v.invW, v.r, v.g, v.b, v.a, v.s, v.t };
+			for (int i = 0; i < 10; i += 2) {
+				uint32_t hi, lo;
+				memcpy(&hi, &f[i], 4);
+				memcpy(&lo, &f[i + 1], 4);
+				emit(n, h, (uint64_t) hi << 32 | lo);
+			}
+		}
+		return;
+	}
 	if (a->y > b->y) {
 		const struct ScreenVertex* t = a; a = b; b = t;
 	}

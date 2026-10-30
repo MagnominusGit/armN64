@@ -1,5 +1,6 @@
 #include "n64.h"
 #include "gles.h"
+#include "rdp.h"
 #include "vi_gpu_glsl.h"
 
 #include <stdio.h>
@@ -134,6 +135,12 @@ static void start(struct N64* n) {
 	}
 	const char* skip = getenv("N64_FRAMESKIP");
 	n->skip.on = skip && skip[0] == '1';
+	const char* rdpGl = getenv("N64_RDP_GL");
+	n->rdpGl = n->accuracy == ACCURACY_HLE && rdpGl && rdpGl[0] == '1';
+	if (n->rdpGl) {
+		n->rdpThreads = 0;
+		n->rdpGpu = false;
+	}
 	const char* viGpu = getenv("N64_VI_GPU");
 	n->viGpu = viGpu && viGpu[0] == '1';
 	rspJitFree(n);
@@ -465,6 +472,11 @@ bool n64PictureStart(struct N64* n, int* width, int* height) {
 	if (!n->viGpu || !viSetup(n, &s)) {
 		*width = *height = 0;
 		return false;
+	}
+	if (n->glr && glrShows(n, s.origin)) {
+		*width = s.w;
+		*height = s.h;
+		return true;
 	}
 	// A skipped frame: the GPU still has the picture before it.
 	if (n->skip.on && frameSkipped(n, s.origin) && n->viGles) {

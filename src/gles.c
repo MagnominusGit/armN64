@@ -250,6 +250,26 @@ static bool program(struct Gles* g, const char* source, char* error, size_t erro
 	return true;
 }
 
+struct Gles* glesCreateContext(char* error, size_t errorSize) {
+	struct Gles* g = calloc(1, sizeof(*g));
+	if (!g) {
+		return NULL;
+	}
+	if (!context(g, error, errorSize)) {
+		glesDestroy(g);
+		return NULL;
+	}
+	return g;
+}
+
+void* glesProc(struct Gles* g, const char* name) {
+	return lookup(g, name);
+}
+
+void glesUse(struct Gles* g) {
+	use(g);
+}
+
 struct Gles* glesCreate(const char* source, char* error, size_t errorSize) {
 	struct Gles* g = calloc(1, sizeof(*g));
 	if (!g) {

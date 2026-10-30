@@ -1,30 +1,12 @@
 #include "n64.h"
 #include "gles.h"
+#include "rdp.h"
 
 #include <pthread.h>
 #include <stdio.h>
 #include <stdatomic.h>
 #include <stdlib.h>
 #include <string.h>
-
-struct Tile {
-	int format, size, line, tmem, palette;
-	int cmS, cmT, maskS, maskT, shiftS, shiftT;
-	int sl, tl, sh, th;
-};
-
-struct Color {
-	int r, g, b, a;
-};
-
-struct Pixel {
-	struct Color shade, tex0, tex1, combined;
-	int z;
-	int lodFrac;
-	// Samples of the pixel's 8 the primitive covers, and whether the first is one of them.
-	int cvg;
-	bool cvbit;
-};
 
 // Colors as four lanes: red, green, blue and alpha.
 typedef int32_t i4 __attribute__((vector_size(16)));
@@ -44,65 +26,6 @@ static struct Color color(i4 v) {
 	memcpy(&c, &v, sizeof(c));
 	return c;
 }
-
-// A combiner input for one cycle: three channel values, or with step 0 one value for all three.
-struct Input {
-	const int* v;
-	int step;
-};
-
-// One combiner cycle's inputs, (a - b) * m + d for color and alpha, and whether it uses noise.
-struct Stage {
-	struct Input a, b, m, d;
-	const int* alpha[4];
-	bool noise;
-	// Every input is 0-255 (or 1.0 outside the multiplier), so the 9-bit sign rules change nothing.
-	bool raw;
-	// An input is the combined value, which in the first cycle is the previous pixel's.
-	bool readsCombined;
-};
-
-struct RDP {
-	uint8_t tmem[0x1000];
-	struct Tile tile[8];
-	uint32_t colorAddr, colorWidth;
-	int colorSize, colorFormat;
-	uint32_t zAddr;
-	uint32_t texAddr, texWidth;
-	int texSize, texFormat;
-	int scissorX0, scissorY0, scissorX1, scissorY1;
-	uint64_t otherModes, combine;
-	uint32_t fillColor;
-	struct Color fog, blend, prim, env;
-	int primLod, primZ, primDz;
-	// The last triangle's depth slope (dzpix), and the blender's shifts for memory alpha from the
-	// depth test.
-	int dzpix, blShiftA, blShiftB;
-	int minLevel, maxLevel;
-	// The combiner's last output: what "combined" reads in one-cycle mode and in the first cycle.
-	struct Color lastCombined;
-	int k4, k5;
-	// The texture convert unit's YUV factors as it uses them (2K + 1).
-	int k0, k1, k2, k3;
-	// RDP clocks spent on the commands so far.
-	uint64_t clocks;
-	// The pixel being drawn, and where the combiner's inputs come from for the current combine mode.
-	struct Pixel pix;
-	struct Stage stage[2];
-	// otherModes taken apart (setupModes): the cycle type, depth and alpha tests, and the blender's
-	// P, A, M and B inputs for each cycle.
-	int cycleType, zMode, cvgDest;
-	bool antialias, imageRead, colorOnCvg, zCompare, zUpdate, zPrim, alphaCompare, cvgAlpha, cvgTimesAlpha, forceBlend, texConvert;
-	uint8_t blendSel[2][4];
-	// The rows this renderer draws: y % rowCount == rowIndex (rowCount 0: none).
-	int rowIndex, rowCount;
-	// Primitives drawn so far, and the primitive, y and x of the pixel that left lastCombined, for
-	// finding the latest across renderers.
-	uint64_t seq, lastPos;
-	// Other threads drawing the commands, or the GPU (the main thread's state only).
-	struct Renderers* renderers;
-	struct Gpu* gpu;
-};
 
 static bool ownsRow(const struct RDP* r, int y) {
 	return r->rowCount == 1 || (r->rowCount && (uint32_t) y % (uint32_t) r->rowCount == (uint32_t) r->rowIndex);
@@ -427,6 +350,17 @@ static struct Color sample(struct RDP* r, int tileIndex, int s, int t, bool filt
 #undef SAMPLE_AS
 	default:
 		return sampleAs(r, tile, s, t, bilinear, TK_RGBA32);
+	}
+}
+
+void rdpTileImage(struct RDP* r, int tileIndex, int w, int h, uint32_t* out) {
+	const struct Tile* t = &r->tile[tileIndex & 7];
+	enum TexelKind kind = texelKind(r, t);
+	for (int y = 0; y < h; ++y) {
+		for (int x = 0; x < w; ++x) {
+			struct Color c = texel(r, t, x, y, kind);
+			out[y * w + x] = (uint32_t) clamp8(c.r) | (uint32_t) clamp8(c.g) << 8 | (uint32_t) clamp8(c.b) << 16 | (uint32_t) clamp8(c.a) << 24;
+		}
 	}
 }
 
@@ -1400,6 +1334,10 @@ static void loadTlut(struct N64* n, struct RDP* r, uint64_t w) {
 // ---- Command processing
 
 static int commandWords(int op) {
+	// The HLE's triangle for the GL renderer: a header and three vertices.
+	if (op == 0x01) {
+		return GLR_TRIANGLE_WORDS;
+	}
 	if (op >= 0x08 && op <= 0x0F) {
 		return 4 + (op & 4 ? 8 : 0) + (op & 2 ? 8 : 0) + (op & 1 ? 2 : 0);
 	}
@@ -1444,6 +1382,9 @@ static uint64_t primitiveClocks(struct RDP* r, const uint64_t* w, int op) {
 // Every command but the full sync, drawing the rows r owns.
 static void execute(struct N64* n, struct RDP* r, const uint64_t* w, int op) {
 	uint64_t c = w[0];
+	if (op == 0x30 || op == 0x32 || op == 0x33 || op == 0x34 || op == 0x35) {
+		++r->tmemGen;
+	}
 	if ((op >= 0x08 && op <= 0x0F) || op == 0x24 || op == 0x25 || op == 0x36) {
 		++r->seq;
 	}
@@ -1759,6 +1700,10 @@ static void stopRenderers(struct Renderers* all) {
 
 void rdpWait(struct N64* n) {
 	if (!n->rdpPending) {
+		return;
+	}
+	if (n->glr) {
+		glrSync(n);
 		return;
 	}
 	if (n->rdp->gpu) {
@@ -2516,6 +2461,10 @@ bool frameSkipped(struct N64* n, uint32_t origin) {
 	return false;
 }
 
+void rdpDrawSoftware(struct N64* n, struct RDP* r, const uint64_t* w, int op) {
+	execute(n, r, w, op);
+}
+
 // Starts a run of commands: the renderers or the GPU on first use, and when the RDP can take them.
 static struct RDP* beginCommands(struct N64* n, uint64_t* begin) {
 	struct RDP* r = state(n);
@@ -2523,7 +2472,10 @@ static struct RDP* beginCommands(struct N64* n, uint64_t* begin) {
 		r->gpu = gpuCreate();
 		n->rdpGpu = r->gpu != NULL;
 	}
-	if (n->rdpThreads && !r->renderers && !r->gpu) {
+	if (n->rdpGl && !n->glr) {
+		n->glr = glrCreate(n);
+	}
+	if (n->rdpThreads && !r->renderers && !r->gpu && !n->glr) {
 		r->renderers = startRenderers(n, r);
 	}
 	*begin = n->dp.busyUntil > n->cycles ? n->dp.busyUntil : n->cycles;
@@ -2552,6 +2504,17 @@ static void command(struct N64* n, struct RDP* r, const uint64_t* w, int op, int
 		}
 		n->dp.syncAt = at;
 		n64Event(n, n->dp.syncAt);
+		return;
+	}
+	// The GL renderer draws; the RDP keeps the state (texture loads included) and the time.
+	if (n->glr && (op == 0x01 || (op >= 0x08 && op <= 0x0F) || op == 0x24 || op == 0x25 || op == 0x36)) {
+		if (!(n->skip.on && skipCommand(n, w, op))) {
+			glrDraw(n, r, w, op);
+		}
+		uint64_t clocks = op == 0x01 ? 0 : primitiveClocks(r, w, op);
+		r->clocks += clocks;
+		n->dp.bufBusy += (uint32_t) clocks;
+		n->dp.pipeBusy += (uint32_t) clocks;
 		return;
 	}
 	if (n->skip.on && skipCommand(n, w, op)) {
@@ -2633,6 +2596,10 @@ void rdpCommands(struct N64* n, const uint64_t* list, size_t count) {
 }
 
 void rdpDestroy(struct N64* n) {
+	if (n->glr) {
+		glrDestroy(n->glr);
+		n->glr = NULL;
+	}
 	if (n->rdp && n->rdp->renderers) {
 		rdpWait(n);
 		stopRenderers(n->rdp->renderers);

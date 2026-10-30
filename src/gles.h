@@ -9,6 +9,11 @@
 struct Gles;
 
 struct Gles* glesCreate(const char* source, char* error, size_t errorSize);
+// A context without a program, for code making its own GL calls: glesProc finds them, glesUse
+// makes the context current first.
+struct Gles* glesCreateContext(char* error, size_t errorSize);
+void* glesProc(struct Gles*, const char* name);
+void glesUse(struct Gles*);
 void glesDestroy(struct Gles*);
 const char* glesRenderer(struct Gles*);
 // Gives a buffer new storage of size bytes (data may be NULL).
