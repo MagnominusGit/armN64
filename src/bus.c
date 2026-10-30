@@ -202,6 +202,14 @@ static uint8_t cartByte(struct N64* n, uint32_t c) {
 	return 0;
 }
 
+// A byte the PI writes at its 24-bit RDRAM address: nothing answers past the RDRAM there is.
+static void piRdramByte(struct N64* n, uint32_t addr, uint8_t v) {
+	addr &= 0xFFFFFF;
+	if (addr < RDRAM_SIZE) {
+		n->rdram[addr] = v;
+	}
+}
+
 // Cartridge to RDRAM goes through the RCP's 128-byte buffer, a block at a time, never crossing a
 // 2 KiB RDRAM page. Odd blocks fetch a byte more. An unaligned RDRAM address starts the first block
 // part way into the buffer, which then writes back only up to the block length counted from the
@@ -209,7 +217,7 @@ static uint8_t cartByte(struct N64* n, uint32_t c) {
 static void piDmaToRdram(struct N64* n, uint32_t len) {
 	if (n->compat) {
 		for (uint32_t i = 0; i < len; ++i) {
-			n->rdram[(n->pi.dramAddr + i) & (RDRAM_SIZE - 1)] = cartByte(n, n->pi.cartAddr + i);
+			piRdramByte(n, n->pi.dramAddr + i, cartByte(n, n->pi.cartAddr + i));
 		}
 		n->pi.dramAddr = (n->pi.dramAddr + len) & 0xFFFFFF;
 		n->pi.cartAddr += len;
@@ -231,12 +239,12 @@ static void piDmaToRdram(struct N64* n, uint32_t len) {
 		if (first) {
 			uint32_t end = mis == 0 && fetched == 128 ? 128 : block;
 			for (uint32_t i = mis; i < end; ++i) {
-				n->rdram[(base + i) & (RDRAM_SIZE - 1)] = buf[i];
+				piRdramByte(n, base + i, buf[i]);
 			}
 			dram = (dram + block + 7) & ~7u;
 		} else {
 			for (uint32_t i = 0; i < fetched; ++i) {
-				n->rdram[(dram + i) & (RDRAM_SIZE - 1)] = buf[i];
+				piRdramByte(n, dram + i, buf[i]);
 			}
 			dram += fetched;
 		}
