@@ -48,19 +48,30 @@ ivec4 pixel(int x, int y) {
 	return ivec4(c << 3 | c >> 2, int((px & 1u) << 2 | hiddenByte(a >> 1)));
 }
 
+// The workgroup's framebuffer pixels (columns -3 to 18, rows -1 to 16 of its 16 by 16, packed) and
+// fetches (columns -1 to 16): neighbours share them instead of each reading its own.
+shared uint near[22 * 18];
+shared ivec4 fetched[18 * 16];
+ivec2 corner;
+
+ivec4 nearPixel(int x, int y) {
+	uint v = near[(y - corner.y + 1) * 22 + x - corner.x + 3];
+	return ivec4(int(v & 255u), int((v >> 8) & 255u), int((v >> 16) & 255u), int(v >> 24));
+}
+
 // The VI's fetch of a pixel, with its coverage as the divot filter sees it: with antialiasing, a
 // partly covered pixel moves toward the colour the fully covered pixels around it agree on, by the
 // coverage it lacks; with the dither filter, a fully covered one moves a step toward each of its
 // eight neighbours.
 ivec4 fetch(int x, int y) {
-	ivec4 c = pixel(x, y);
+	ivec4 c = nearPixel(x, y);
 	if ((u[7] & 1) == 0 || c.w == 7) {
 		if ((u[7] & 2) != 0) {
 			ivec3 b = c.rgb >> 3, s = ivec3(0);
 			for (int dy = -1; dy <= 1; ++dy) {
 				for (int dx = -1; dx <= 1; ++dx) {
 					if (dx != 0 || dy != 0) {
-						ivec3 o = pixel(x + dx, y + dy).rgb >> 3;
+						ivec3 o = nearPixel(x + dx, y + dy).rgb >> 3;
 						s += ivec3(lessThan(b, o)) - ivec3(greaterThan(b, o));
 					}
 				}
@@ -74,7 +85,7 @@ ivec4 fetch(int x, int y) {
 	ivec3 hi1 = c.rgb, hi2 = ivec3(-1), lo1 = c.rgb, lo2 = ivec3(256);
 	const ivec2 around[6] = ivec2[6](ivec2(-1, -1), ivec2(1, -1), ivec2(-2, 0), ivec2(2, 0), ivec2(-1, 1), ivec2(1, 1));
 	for (int k = 0; k < 6; ++k) {
-		ivec4 o = pixel(x + around[k].x, y + around[k].y);
+		ivec4 o = nearPixel(x + around[k].x, y + around[k].y);
 		if (o.w == 7) {
 			hi2 = max(hi2, min(hi1, o.rgb));
 			hi1 = max(hi1, o.rgb);
@@ -103,11 +114,29 @@ int gamma(int v) {
 }
 
 void main() {
+	corner = ivec2(gl_WorkGroupID.xy) * 16;
+	int lastX = min(corner.x + 15, u[3] - 1), lastY = min(corner.y + 15, u[4] - 1);
+	for (int i = int(gl_LocalInvocationIndex); i < 22 * 18; i += 256) {
+		int nx = corner.x - 3 + i % 22, ny = corner.y - 1 + i / 22;
+		if (nx <= lastX + 3 && ny <= lastY + 1) {
+			ivec4 c = pixel(nx, ny);
+			near[i] = uint(c.r) | uint(c.g) << 8 | uint(c.b) << 16 | uint(c.w) << 24;
+		}
+	}
+	barrier();
+	for (int i = int(gl_LocalInvocationIndex); i < 18 * 16; i += 256) {
+		int fx = corner.x - 1 + i % 18, fy = corner.y + i / 18;
+		if (fx <= lastX + 1 && fy <= lastY) {
+			fetched[i] = fetch(fx, fy);
+		}
+	}
+	barrier();
 	int x = int(gl_GlobalInvocationID.x), y = int(gl_GlobalInvocationID.y);
 	if (x >= u[3] || y >= u[4]) {
 		return;
 	}
-	ivec4 l = fetch(x - 1, y), c = fetch(x, y), r = fetch(x + 1, y);
+	int at = int(gl_LocalInvocationID.y) * 18 + int(gl_LocalInvocationID.x);
+	ivec4 l = fetched[at], c = fetched[at + 1], r = fetched[at + 2];
 	ivec3 v = c.rgb;
 	// The divot filter: each channel the median of a pixel and its neighbours, unless all three are
 	// fully covered.
