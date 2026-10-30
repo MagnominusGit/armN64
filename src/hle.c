@@ -649,13 +649,16 @@ static void spriteDraw(struct N64* n, struct Hle* h, int s0, int t0, int x, int 
 	if (band < 1) {
 		return;
 	}
-	// A color-indexed sprite's palette, then RGBA16 colors looked up in it (other sprites leave the
-	// lookup as it was).
+	// A color-indexed sprite's palette, then RGBA16 colors looked up in it; other sprites without the
+	// lookup (each changed only when it differs, after the palette load, as the microcode does).
 	if (format == 2 && tlut) {
 		emit(n, h, (uint64_t) 0x3D << 56 | (uint64_t) 2 << 51 | tlut);
 		emit(n, h, (uint64_t) 0x35 << 56 | (uint64_t) 0x100 << 32 | (uint64_t) 7 << 24);
 		emit(n, h, (uint64_t) 0x30 << 56 | (uint64_t) 7 << 24 | (uint64_t) ((size ? 255 : 15) << 2) << 12);
-		otherMode(n, h, true, 14, 2, 2u << 14);
+	}
+	uint32_t lookup = format == 2 ? 2u << 14 : 0;
+	if ((h->modeH & (3u << 14)) != lookup) {
+		otherMode(n, h, true, 14, 2, lookup);
 	}
 	bool copy = ((h->modeH >> 20) & 3) == 2;
 	// The scales are texels per pixel.
