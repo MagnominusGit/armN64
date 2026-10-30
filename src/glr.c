@@ -147,7 +147,8 @@ struct Applied {
 struct Texture {
 	uint64_t hash;
 	GLuint texture;
-	int width, height;
+	// Its rows repeat every period (TMEM wraps): only those are decoded, 0 when all are.
+	int width, height, period;
 	uint64_t used;
 	// The next texture in its hash bucket (index + 1, 0 for none).
 	int next;
@@ -317,7 +318,9 @@ static const char fragmentHead[] =
 	"	return i;\n"
 	"}\n"
 	"vec4 tap(sampler2D t, ivec4 image, int i, int j) {\n"
-	"	return texelFetch(t, ivec2(clamp(i, 0, image.x - 1), clamp(j, 0, image.y - 1)), 0);\n"
+	"	j = clamp(j, 0, image.y - 1);\n"
+	"	if (image.w != 0) j %= image.w;\n"
+	"	return texelFetch(t, ivec2(clamp(i, 0, image.x - 1), j), 0);\n"
 	"}\n"
 	"vec4 sampleTile(sampler2D t, ivec4 a, ivec4 b, ivec4 c, ivec4 image) {\n"
 	"	vec3 top = vTex - 0.5 * dFdx(vTex) - 0.5 * dFdy(vTex);\n"
@@ -819,29 +822,40 @@ static struct Texture* texture(struct N64* n, struct Glr* g, struct RDP* r, int 
 	if (g->batchCount && (g->state.texture[0] == slot || g->state.texture[1] == slot)) {
 		flushBatch(n, g);
 	}
-	bool same = slot->texture && slot->width == w && slot->height == h;
+	// A row's texels depend on it through its TMEM address (line * 8 bytes a row, wrapping at 4 KiB, or
+	// 2 KiB for the halves 32-bit and YUV texels use) and whether it is odd: rows repeat after that.
+	uint32_t wrap = t->size == 3 || (t->size == 2 && t->format == 1) ? 0x800 : 0x1000, common = wrap;
+	for (uint32_t x = (uint32_t) t->line * 8 % wrap, y = wrap; y;) {
+		uint32_t z = x % y;
+		x = y, y = z;
+		common = x;
+	}
+	int period = (int) (wrap / common);
+	period += period & 1;
+	int rows = period < h ? period : h;
+	bool same = slot->texture && slot->width == w && (slot->period ? slot->period : slot->height) == rows;
 	if (!slot->texture) {
 		gl->GenTextures(1, &slot->texture);
 	}
-	uint32_t* pixels = malloc((size_t) w * h * 4);
+	uint32_t* pixels = malloc((size_t) w * rows * 4);
 	if (!pixels) {
 		return NULL;
 	}
-	rdpTileImage(r, index, w, h, convert, pixels);
+	rdpTileImage(r, index, w, rows, convert, pixels);
 	++n->stats.glTextures;
 	uploadTexture(g, slot->texture);
 	if (same) {
 		// The same size: the texels replaced in place (no new storage).
-		gl->TexSubImage2D(GL_TEXTURE_2D, 0, 0, 0, w, h, GL_RGBA, GL_UNSIGNED_BYTE, pixels);
+		gl->TexSubImage2D(GL_TEXTURE_2D, 0, 0, 0, w, rows, GL_RGBA, GL_UNSIGNED_BYTE, pixels);
 	} else {
-		gl->TexImage2D(GL_TEXTURE_2D, 0, GL_RGBA8, w, h, 0, GL_RGBA, GL_UNSIGNED_BYTE, pixels);
+		gl->TexImage2D(GL_TEXTURE_2D, 0, GL_RGBA8, w, rows, 0, GL_RGBA, GL_UNSIGNED_BYTE, pixels);
 		gl->TexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_NEAREST);
 		gl->TexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_NEAREST);
 		gl->TexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE);
 		gl->TexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE);
 	}
 	free(pixels);
-	slot->hash = key, slot->width = w, slot->height = h, slot->used = ++g->clock;
+	slot->hash = key, slot->width = w, slot->height = h, slot->period = rows < h ? rows : 0, slot->used = ++g->clock;
 	slot->next = *bucket, *bucket = (int) (slot - g->textures) + 1;
 	g->tileTexture[index & 7] = slot, g->tileGen[index & 7] = r->tmemGen, g->tileTlut[index & 7] = tlutMode;
 	return slot;
@@ -896,7 +910,7 @@ static void flushBatch(struct N64* n, struct Glr* g) {
 				gl->Uniform4iv(p->tile[k], 3, s->tile[k]);
 				memcpy(u->tile[k], s->tile[k], sizeof(u->tile[k]));
 			}
-			int image[4] = { s->texture[k]->width, s->texture[k]->height, 0, 0 };
+			int image[4] = { s->texture[k]->width, s->texture[k]->height, 0, s->texture[k]->period };
 			if (memcmp(u->image[k], image, sizeof(image))) {
 				gl->Uniform4iv(p->image[k], 1, image);
 				memcpy(u->image[k], image, sizeof(image));
