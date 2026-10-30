@@ -482,7 +482,12 @@ static void drawTriangle(struct N64* n, struct Hle* h, int i0, int i1, int i2) {
 	for (int i = 1; i + 1 < count; ++i) {
 		area += (s[i].x - s[0].x) * (s[i + 1].y - s[0].y) - (s[i + 1].x - s[0].x) * (s[i].y - s[0].y);
 	}
-	if ((area > 0 && (h->geometry & GEOM_CULL_BACK)) || (area < 0 && (h->geometry & GEOM_CULL_FRONT)) || area == 0) {
+	// Fast3D and F3DEX cull nothing with both faces' bits set.
+	uint32_t cull = h->geometry & (GEOM_CULL_FRONT | GEOM_CULL_BACK);
+	if (h->family != FAMILY_F3DEX2 && cull == (GEOM_CULL_FRONT | GEOM_CULL_BACK)) {
+		cull = 0;
+	}
+	if ((area > 0 && (cull & GEOM_CULL_BACK)) || (area < 0 && (cull & GEOM_CULL_FRONT)) || area == 0) {
 		return;
 	}
 	// Flat shading takes the colour of the triangle's first vertex.
