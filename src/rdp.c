@@ -1262,6 +1262,13 @@ static void triangle(struct N64* n, struct RDP* r, const uint64_t* w, int op) {
 
 // ---- Texture loads
 
+static void tmemPut(struct N64* n, struct RDP* r, uint32_t to, uint32_t from) {
+	r->tmem[to] = n->rdram[from];
+	if (r->tmemSource) {
+		r->tmemSource[to] = from;
+	}
+}
+
 static void loadTile(struct N64* n, struct RDP* r, uint64_t w, bool block) {
 	struct Tile* t = &r->tile[(w >> 24) & 7];
 	int sl = (w >> 44) & 0xFFF, tl = (w >> 32) & 0xFFF, sh = (w >> 12) & 0xFFF, th = w & 0xFFF;
@@ -1278,7 +1285,7 @@ static void loadTile(struct N64* n, struct RDP* r, uint64_t w, bool block) {
 		// Plain texels a TMEM word at a time (a whole word, the halves swapped on odd lines).
 		bool plain = r->texSize < 3 && !(r->texSize == 2 && t->format == 1);
 		uint32_t words = (bytes + 7) & ~7u;
-		if (plain && bytes <= 0x1000 && t->tmem * 8u + words <= 0x1000 && (src & (RDRAM_SIZE - 1)) + words <= RDRAM_SIZE) {
+		if (plain && !r->tmemSource && bytes <= 0x1000 && t->tmem * 8u + words <= 0x1000 && (src & (RDRAM_SIZE - 1)) + words <= RDRAM_SIZE) {
 			const uint8_t* from = &n->rdram[src & (RDRAM_SIZE - 1)];
 			uint8_t* to = &r->tmem[t->tmem * 8];
 			for (uint32_t i = 0; i < words; i += 8, lineT += dxt) {
@@ -1293,7 +1300,7 @@ static void loadTile(struct N64* n, struct RDP* r, uint64_t w, bool block) {
 		}
 		for (uint32_t i = 0; i < bytes; i += 8) {
 			bool odd = (lineT >> 11) & 1;
-			if (plain && ((src + i) & (RDRAM_SIZE - 1)) + 8 <= RDRAM_SIZE) {
+			if (plain && !r->tmemSource && ((src + i) & (RDRAM_SIZE - 1)) + 8 <= RDRAM_SIZE) {
 				const uint8_t* from = &n->rdram[(src + i) & (RDRAM_SIZE - 1)];
 				uint8_t* to = &r->tmem[(t->tmem * 8 + i) & 0xFF8];
 				if (odd) {
@@ -1310,13 +1317,13 @@ static void loadTile(struct N64* n, struct RDP* r, uint64_t w, bool block) {
 				if (r->texSize == 2 && t->format == 1) {
 					uint32_t texel = (i + b) / 2, part = (i + b) & 3;
 					uint32_t d = (t->tmem * 8 + (texel & ~1u) + (part >= 2 ? 1 : 0)) ^ (odd ? 4 : 0);
-					r->tmem[(d & 0x7FF) | (part & 1 ? 0x800 : 0)] = n->rdram[(src + i + b) & (RDRAM_SIZE - 1)];
+					tmemPut(n, r, (d & 0x7FF) | (part & 1 ? 0x800 : 0), (src + i + b) & (RDRAM_SIZE - 1));
 				} else if (r->texSize == 3) {
 					uint32_t texelIndex = (i + b) / 4, part = (i + b) & 3;
 					uint32_t d = (t->tmem * 8 + texelIndex * 2 + (part & 1)) ^ (odd ? 4 : 0);
-					r->tmem[(d + (part >= 2 ? 0x800 : 0)) & 0xFFF] = n->rdram[(src + i + b) & (RDRAM_SIZE - 1)];
+					tmemPut(n, r, (d + (part >= 2 ? 0x800 : 0)) & 0xFFF, (src + i + b) & (RDRAM_SIZE - 1));
 				} else {
-					r->tmem[dst & 0xFFF] = n->rdram[(src + i + b) & (RDRAM_SIZE - 1)];
+					tmemPut(n, r, dst & 0xFFF, (src + i + b) & (RDRAM_SIZE - 1));
 				}
 			}
 			lineT += dxt;
@@ -1334,26 +1341,26 @@ static void loadTile(struct N64* n, struct RDP* r, uint64_t w, bool block) {
 		uint32_t swap = (tt - t0) & 1 ? 4 : 0;
 		if (r->texSize == 3) {
 			for (int s = s0; s <= s1; ++s) {
-				const uint8_t* src = &n->rdram[(row + s * 4) & (RDRAM_SIZE - 4)];
+				uint32_t src = (row + s * 4) & (RDRAM_SIZE - 4);
 				uint32_t d = (line + (s - s0) * 2) ^ swap;
-				r->tmem[d & 0x7FF] = src[0];
-				r->tmem[(d + 1) & 0x7FF] = src[1];
-				r->tmem[0x800 | (d & 0x7FF)] = src[2];
-				r->tmem[0x800 | ((d + 1) & 0x7FF)] = src[3];
+				tmemPut(n, r, d & 0x7FF, src);
+				tmemPut(n, r, (d + 1) & 0x7FF, src + 1);
+				tmemPut(n, r, 0x800 | (d & 0x7FF), src + 2);
+				tmemPut(n, r, 0x800 | ((d + 1) & 0x7FF), src + 3);
 			}
 		} else if (r->texSize == 2 && t->format == 1) {
 			// YUV: U Y0 V Y1 in RDRAM; Y to the upper half, U and V to the lower.
 			for (int s = s0; s <= s1; ++s) {
 				uint32_t d = (line + (s - s0)) ^ swap;
-				const uint8_t* src = &n->rdram[(row + (s & ~1) * 2) & (RDRAM_SIZE - 4)];
-				r->tmem[d & 0x7FF] = src[s & 1 ? 2 : 0];
-				r->tmem[0x800 | (d & 0x7FF)] = src[s & 1 ? 3 : 1];
+				uint32_t src = (row + (s & ~1) * 2) & (RDRAM_SIZE - 4);
+				tmemPut(n, r, d & 0x7FF, src + (s & 1 ? 2 : 0));
+				tmemPut(n, r, 0x800 | (d & 0x7FF), src + (s & 1 ? 3 : 1));
 			}
 		} else if (s1 >= s0) {
 			// The row's bytes in order (4-bit texels two to a byte), odd rows' word halves swapped.
 			uint32_t from = r->texSize == 0 ? row + (uint32_t) s0 / 2 : row + (uint32_t) (s0 * bpp);
 			uint32_t len = r->texSize == 0 ? (uint32_t) (s1 - s0) / 2 + 1 : (uint32_t) ((s1 - s0 + 1) * bpp);
-			if (line + len <= 0x1000 && (from & (RDRAM_SIZE - 1)) + len <= RDRAM_SIZE) {
+			if (!r->tmemSource && line + len <= 0x1000 && (from & (RDRAM_SIZE - 1)) + len <= RDRAM_SIZE) {
 				const uint8_t* src = &n->rdram[from & (RDRAM_SIZE - 1)];
 				uint8_t* dst = &r->tmem[line];
 				uint32_t k = 0;
@@ -1370,7 +1377,7 @@ static void loadTile(struct N64* n, struct RDP* r, uint64_t w, bool block) {
 				}
 			} else {
 				for (uint32_t k = 0; k < len; ++k) {
-					r->tmem[((line + k) ^ swap) & 0xFFF] = n->rdram[(from + k) & (RDRAM_SIZE - 1)];
+					tmemPut(n, r, ((line + k) ^ swap) & 0xFFF, (from + k) & (RDRAM_SIZE - 1));
 				}
 			}
 		}
@@ -1388,8 +1395,8 @@ static void loadTlut(struct N64* n, struct RDP* r, uint64_t w) {
 		uint32_t src = (r->texAddr + i * 2) & (RDRAM_SIZE - 2);
 		uint32_t dst = t->tmem * 8 + (i - sl) * 8;
 		for (int copy = 0; copy < 4; ++copy) {
-			r->tmem[(dst + copy * 2) & 0xFFF] = n->rdram[src];
-			r->tmem[(dst + copy * 2 + 1) & 0xFFF] = n->rdram[src + 1];
+			tmemPut(n, r, (dst + copy * 2) & 0xFFF, src);
+			tmemPut(n, r, (dst + copy * 2 + 1) & 0xFFF, src + 1);
 		}
 	}
 }
@@ -1999,6 +2006,8 @@ enum {
 	GPU_TILES = 64, GPU_PRIMS_MAX = 4000, GPU_LAST_SIZE = 1 << 20, GPU_BATCHES_MAX = 4096,
 	// Tiles times primitives in one dispatch: a long dispatch trips the kernel's GPU hang check.
 	GPU_ENTRIES_MAX = 1024,
+	// TMEM bytes loaded from what the GPU drew, between full syncs.
+	GPU_PATCHES_MAX = 1 << 20,
 	GPU_KIND_TRIANGLE = 0, GPU_KIND_TEXRECT = 1, GPU_KIND_FILL = 2, GPU_KIND_RECT = 3,
 	GPU_PAGE_BATCH = 1, GPU_PAGE_OWNED = 2, GPU_PAGE_MARKED = 4,
 	GPU_VARIANTS = 48, GPU_RANGES = 64,
@@ -2053,7 +2062,46 @@ struct Gpu {
 	// The batch's features, and the shader variants built so far (program 0 draws everything).
 	int features;
 	int variantKey[GPU_VARIANTS], variantProgram[GPU_VARIANTS], variantCount;
+	// Loads of what the GPU drew: each such TMEM byte's value is gathered on the GPU into the patch
+	// buffer when loaded (patch[d] its index, else -1), and put into the batch's TMEM copies (apply:
+	// snapshot byte, index) before it draws. The CPU's TMEM has them after a full sync.
+	uint32_t source[0x1000];
+	int32_t patch[0x1000];
+	int patched, gatherProgram, applyProgram;
+	uint32_t patchUsed;
+	uint32_t* apply;
+	size_t applyCount, applyCap;
 };
+
+static const char gatherSource[] =
+	"#version 310 es\n"
+	"layout(local_size_x = 64) in;\n"
+	"layout(std430, binding = 0) readonly buffer Rdram { uint rdram[]; };\n"
+	"layout(std430, binding = 5) buffer Patch { uint gathered[]; };\n"
+	"uniform int u[2];\n"
+	"void main() {\n"
+	"	int i = int(gl_GlobalInvocationID.x);\n"
+	"	if (i < u[1]) {\n"
+	"		uint a = gathered[u[0] + i];\n"
+	"		gathered[u[0] + i] = (rdram[a >> 2] >> ((a & 3u) * 8u)) & 255u;\n"
+	"	}\n"
+	"}\n";
+
+static const char applySource[] =
+	"#version 310 es\n"
+	"layout(local_size_x = 64) in;\n"
+	"layout(std430, binding = 1) buffer Tmem { uint tmem[]; };\n"
+	"layout(std430, binding = 2) readonly buffer Data { uint data[]; };\n"
+	"layout(std430, binding = 5) readonly buffer Patch { uint gathered[]; };\n"
+	"uniform int u[2];\n"
+	"void main() {\n"
+	"	int i = int(gl_GlobalInvocationID.x);\n"
+	"	if (i < u[1]) {\n"
+	"		uint at = data[u[0] + i * 2], s = (at & 3u) * 8u;\n"
+	"		atomicAnd(tmem[at >> 2], ~(255u << s));\n"
+	"		atomicOr(tmem[at >> 2], gathered[data[u[0] + i * 2 + 1]] << s);\n"
+	"	}\n"
+	"}\n";
 
 static void* grow(void* p, size_t* cap, size_t need, size_t size) {
 	if (need <= *cap) {
@@ -2086,6 +2134,13 @@ static struct Gpu* gpuCreate(void) {
 	fprintf(stderr, "GPU RDP on %s\n", glesRenderer(g->gl));
 	glesData(g->gl, 0, NULL, RDRAM_SIZE + RDRAM_SIZE / 2);
 	glesData(g->gl, 3, NULL, GPU_LAST_SIZE * 4);
+	glesData(g->gl, 5, NULL, GPU_PATCHES_MAX * 4);
+	g->gatherProgram = glesAddProgram(g->gl, gatherSource, error, sizeof(error));
+	g->applyProgram = g->gatherProgram < 0 ? -1 : glesAddProgram(g->gl, applySource, error, sizeof(error));
+	if (g->applyProgram < 0) {
+		fprintf(stderr, "GPU RDP loads of drawn texels unavailable (%s)\n", error);
+	}
+	memset(g->patch, 0xFF, sizeof(g->patch));
 	g->stateDirty = g->tmemDirty = true;
 	return g;
 }
@@ -2096,6 +2151,7 @@ static void gpuDestroy(struct Gpu* g) {
 	free(g->rows);
 	free(g->tmem);
 	free(g->upload);
+	free(g->apply);
 	free(g);
 }
 
@@ -2163,6 +2219,13 @@ static int gpuState(struct Gpu* g, struct RDP* r) {
 		g->tmem = grow(g->tmem, &cap, (size_t) (g->tmemCount + 1) * 0x1000, 1);
 		g->tmemCap = (int) cap;
 		memcpy(g->tmem + (size_t) g->tmemCount * 0x1000, r->tmem, 0x1000);
+		for (int d = 0; g->patched && d < 0x1000; ++d) {
+			if (g->patch[d] >= 0) {
+				g->apply = grow(g->apply, &g->applyCap, g->applyCount * 2 + 2, sizeof(uint32_t));
+				g->apply[g->applyCount * 2] = (uint32_t) g->tmemCount * 0x1000 + (uint32_t) d;
+				g->apply[g->applyCount++ * 2 + 1] = (uint32_t) g->patch[d];
+			}
+		}
 		++g->tmemCount;
 		g->tmemDirty = false;
 		g->stateDirty = true;
@@ -2516,7 +2579,8 @@ static void gpuSubmit(struct N64* n, struct RDP* r) {
 	size_t rowsAt = statesAt + (size_t) g->stateCount * GPU_STATE_SIZE;
 	size_t binsAt = rowsAt + g->rowCount;
 	size_t listsAt = binsAt + GPU_TILES * GPU_TILES * 2;
-	size_t total = listsAt + entries;
+	size_t applyAt = listsAt + entries;
+	size_t total = applyAt + g->applyCount * 2;
 	g->upload = grow(g->upload, &g->uploadCap, total, sizeof(int32_t));
 	int32_t* d = g->upload;
 	memcpy(d, g->prims, statesAt * sizeof(int32_t));
@@ -2552,8 +2616,16 @@ static void gpuSubmit(struct N64* n, struct RDP* r) {
 	if (g->lastUsed + across * down * 3 > GPU_LAST_SIZE || g->batchCount == GPU_BATCHES_MAX) {
 		gpuCollectLast(g, r);
 	}
+	memcpy(d + applyAt, g->apply, g->applyCount * 2 * sizeof(int32_t));
 	glesData(g->gl, 2, d, total * sizeof(int32_t));
 	glesData(g->gl, 1, g->tmem, (size_t) g->tmemCount * 0x1000);
+	if (g->applyCount) {
+		int a[2] = { (int) applyAt, (int) g->applyCount };
+		glesSelectProgram(g->gl, g->applyProgram);
+		glesUniforms(g->gl, a, 2);
+		glesDispatch(g->gl, (unsigned) (g->applyCount + 63) / 64, 1);
+		g->applyCount = 0;
+	}
 	// 16-bit pixels go back a word at a time when no word holds pixels of two tiles.
 	bool words = !g->edge && r->colorSize == 2 && !(r->colorAddr & 7) && !(r->colorWidth & 3) && !(r->zAddr & 7);
 	g->edge = false;
@@ -2635,6 +2707,69 @@ static void gpuSync(struct N64* n, struct RDP* r) {
 	g->drawnAll = false;
 	g->overCount = 0;
 	n->rdpPending = false;
+	if (g->patched) {
+		const uint32_t* v = glesMap(g->gl, 5, 0, g->patchUsed * 4);
+		for (int d = 0; v && d < 0x1000; ++d) {
+			if (g->patch[d] >= 0) {
+				r->tmem[d] = (uint8_t) v[g->patch[d]];
+			}
+		}
+		glesUnmap(g->gl, 5);
+		memset(g->patch, 0xFF, sizeof(g->patch));
+		g->patched = 0;
+	}
+	g->patchUsed = 0;
+}
+
+// A load from bytes the GPU drew, done without waiting: the CPU loads (with RDRAM's older bytes)
+// and keeps each TMEM byte's source, then the GPU gathers the drawn ones after the drawing before
+// it. False when it can't: without the drawn bytes' ranges, or (after a full sync) with the patch
+// buffer full.
+static bool gpuLoadDrawn(struct N64* n, struct RDP* r, const uint64_t* w, int op) {
+	struct Gpu* g = r->gpu;
+	if (g->applyProgram < 0 || g->drawnAll) {
+		return false;
+	}
+	gpuSubmit(n, r);
+	gpuUpdate(n, g);
+	memset(g->source, 0xFF, sizeof(g->source));
+	r->tmemSource = g->source;
+	execute(n, r, w, op);
+	r->tmemSource = NULL;
+	static uint32_t addrs[0x1000];
+	uint32_t m = 0;
+	for (int d = 0; d < 0x1000; ++d) {
+		if (g->source[d] == UINT32_MAX) {
+			continue;
+		}
+		g->patch[d] = -1;
+		if (gpuReadNeeds(g, g->source[d], 1)) {
+			g->patch[d] = (int32_t) (g->patchUsed + m);
+			addrs[m++] = g->source[d];
+		}
+	}
+	bool fits = g->patchUsed + m <= GPU_PATCHES_MAX;
+	g->patched = 0;
+	for (int d = 0; d < 0x1000; ++d) {
+		if (!fits && g->source[d] != UINT32_MAX) {
+			g->patch[d] = -1;
+		}
+		g->patched += g->patch[d] >= 0;
+	}
+	if (!fits) {
+		gpuSync(n, r);
+		return false;
+	}
+	if (!m) {
+		return true;
+	}
+	glesSubData(g->gl, 5, g->patchUsed * 4, addrs, m * 4);
+	int u[2] = { (int) g->patchUsed, (int) m };
+	glesSelectProgram(g->gl, g->gatherProgram);
+	glesUniforms(g->gl, u, 2);
+	glesDispatch(g->gl, (m + 63) / 64, 1);
+	g->patchUsed += m;
+	return true;
 }
 
 // For a read of [addr, addr + len): what the GPU drew on those pages, back in RDRAM and off the drawn
@@ -2719,10 +2854,31 @@ static void gpuCommand(struct N64* n, struct RDP* r, const uint64_t* w, int op) 
 		if (op == 0x30 || op == 0x33 || op == 0x34) {
 			uint32_t addr, len;
 			loadSource(r, w, op, &addr, &len);
-			if (n->rdpPending && gpuReadNeeds(g, addr, len)) {
-				gpuSyncRead(n, r, addr, len);
-			}
 			g->tmemDirty = true;
+			if (n->rdpPending && gpuReadNeeds(g, addr, len)) {
+				if (gpuLoadDrawn(n, r, w, op)) {
+					g->stateDirty = true;
+					return;
+				}
+				if (n->rdpPending) {
+					gpuSyncRead(n, r, addr, len);
+				}
+			}
+			if (g->patched) {
+				// Bytes loaded over gathered ones are RDRAM's now.
+				memset(g->source, 0xFF, sizeof(g->source));
+				r->tmemSource = g->source;
+				execute(n, r, w, op);
+				r->tmemSource = NULL;
+				for (int d = 0; d < 0x1000; ++d) {
+					if (g->source[d] != UINT32_MAX && g->patch[d] >= 0) {
+						g->patch[d] = -1;
+						--g->patched;
+					}
+				}
+				g->stateDirty = true;
+				return;
+			}
 		} else if ((op == 0x3E || op == 0x3F) && g->primCount) {
 			gpuSubmit(n, r);
 		}

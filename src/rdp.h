@@ -42,6 +42,8 @@ struct Stage {
 
 struct RDP {
 	uint8_t tmem[0x1000];
+	// While set, loads keep each TMEM byte's RDRAM address here (the GPU RDP's loads of what it drew).
+	uint32_t* tmemSource;
 	struct Tile tile[8];
 	uint32_t colorAddr, colorWidth;
 	int colorSize, colorFormat;

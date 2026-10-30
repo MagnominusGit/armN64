@@ -8,7 +8,7 @@
 // each call makes its own context current.
 struct Gles;
 
-enum { GLES_BUFFERS = 5 };
+enum { GLES_BUFFERS = 6 };
 
 struct Gles* glesCreate(const char* source, char* error, size_t errorSize);
 // A context without a program, for code making its own GL calls: glesProc finds them, glesUse
