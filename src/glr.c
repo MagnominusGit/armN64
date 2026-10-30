@@ -761,7 +761,10 @@ static struct Texture* texture(struct N64* n, struct Glr* g, struct RDP* r, int 
 	int h = t->maskT ? 1 << t->maskT : ((t->th - t->tl) >> 2) + 1;
 	w = w < 1 ? 1 : w > 1024 ? 1024 : w;
 	h = h < 1 ? 1 : h > 1024 ? 1024 : h;
-	uint64_t key = hashBytes(0xCBF29CE484222325ull, (const uint8_t*) t, sizeof(*t));
+	// What the texels are decoded from (the tile's position, wrapping and clamping are the shader's,
+	// so a scrolling tile keeps its texture).
+	int decode[5] = { t->format, t->size, t->line, t->tmem, t->palette };
+	uint64_t key = hashBytes(0xCBF29CE484222325ull, (const uint8_t*) decode, sizeof(decode));
 	key = hashBytes(key, (const uint8_t*) &w, sizeof(w));
 	key = hashBytes(key, (const uint8_t*) &h, sizeof(h));
 	uint64_t tlut = (r->otherModes >> 46) & 3;
