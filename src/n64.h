@@ -309,6 +309,9 @@ struct N64 {
 	// Many RDP triangles in a field (a microcode left to the RSP): the GL renderer gives way to the
 	// RDP threads asked for, between slices.
 	int rdpThreadsAsked;
+	// With the GL renderer, graphics tasks lately and those the RSP ran (microcodes the HLE doesn't
+	// know): mostly those, and the RDP threads take over (the GPU would only add syncs).
+	uint32_t glTasks, glRspTasks;
 	bool glrStop;
 	struct FrameSkip skip;
 	// The last picture made, shown again for a skipped frame.
