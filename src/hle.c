@@ -65,6 +65,11 @@ struct Hle {
 	int sp;
 	bool waiting;
 	uint32_t waitPc;
+	// Microcodes (by a hash of their first code) whose lists broke a family's rules: theirs run on
+	// the RSP.
+	uint32_t ucode, rejected[8];
+	int rejectedCount;
+	bool rejectedNow;
 	// Counting the commands instead of drawing them (N64HLECHECK).
 	bool dry;
 	uint64_t list[LIST_MAX];
@@ -871,6 +876,14 @@ static void runList(struct N64* n, struct Hle* h, uint32_t pc) {
 				}
 				break;
 			case 0xBF:
+				// Fast3D's indices are vertex numbers times 10: other ones are another microcode's.
+				if (!f3dex && (((w1 >> 16) & 0xFF) % 10 || ((w1 >> 8) & 0xFF) % 10 || (w1 & 0xFF) % 10)) {
+					if (h->rejectedCount < 8) {
+						h->rejected[h->rejectedCount++] = h->ucode;
+					}
+					h->rejectedNow = true;
+					return;
+				}
 				drawTriangle(n, h, ((w1 >> 16) & 0xFF) / scale, ((w1 >> 8) & 0xFF) / scale, (w1 & 0xFF) / scale);
 				break;
 			}
@@ -961,6 +974,16 @@ bool hleGraphics(struct N64* n, bool dry) {
 	if (be32(task) != 1) {
 		return false;
 	}
+	// A microcode rejected before runs on the RSP, its yielded tasks too.
+	uint32_t code = be32(task + 0x10) & 0xFFFFFF, ucode = 2166136261u;
+	for (uint32_t i = 0; i < 1024; ++i) {
+		ucode = (ucode ^ n->rdram[(code + i) & (RDRAM_SIZE - 1)]) * 16777619u;
+	}
+	for (int i = 0; n->hle && i < n->hle->rejectedCount; ++i) {
+		if (n->hle->rejected[i] == ucode) {
+			return false;
+		}
+	}
 	// A yielded task started again: one run here drew all of it, so it is done (its data is the
 	// yield buffer, which the microcode would restore itself from).
 	uint32_t list = be32(task + 0x30) & 0xFFFFFF;
@@ -983,6 +1006,7 @@ bool hleGraphics(struct N64* n, bool dry) {
 		}
 	}
 	struct Hle* h = n->hle;
+	h->ucode = ucode;
 	h->family = f;
 	h->dry = dry;
 	memset(h->segments, 0, sizeof(h->segments));
@@ -1007,7 +1031,14 @@ bool hleGraphics(struct N64* n, bool dry) {
 	h->fifoStart = fifo ? fifoStart : 0;
 	h->fifoEnd = fifo ? fifoEnd & ~7u : 0;
 	h->sp = 0;
+	h->rejectedNow = false;
 	runList(n, h, address(h, be32(task + 0x30)));
+	if (h->rejectedNow) {
+		// The RSP runs this task from the start (what the list made so far goes).
+		h->count = 0;
+		h->doneList = 0;
+		return false;
+	}
 	finishTask(n, h);
 	h->doneList = dry ? h->doneList : list;
 	return true;
