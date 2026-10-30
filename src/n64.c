@@ -467,6 +467,10 @@ static bool viGpuStart(struct N64* n, const struct ViSetup* s) {
 		}
 		n->viSharedProgram = index < 0 ? -1 : index + 1;
 	}
+	// With the GPU RDP asked for, the VI runs in its context or on the CPU, never in one of its own.
+	if (n->rdpGpu && !(shared && n->viSharedProgram > 0)) {
+		return false;
+	}
 	if (shared && n->viSharedProgram > 0) {
 		glesSelectProgram(shared, n->viSharedProgram - 1);
 		int u[8] = { (int) s->origin, (int) s->stride, s->wide, s->w, s->h, 0, -(int) RDRAM_SIZE,
@@ -501,6 +505,10 @@ static bool viGpuStart(struct N64* n, const struct ViSetup* s) {
 	glesDispatch(n->viGles, (unsigned) (s->w + 15) / 16, (unsigned) (s->h + 15) / 16);
 	n->pictureGles = n->viGles, n->pictureBinding = 2;
 	return true;
+}
+
+unsigned n64PictureBuffer(struct N64* n) {
+	return n->pictureGles && n->pictureBinding == 4 ? glesBuffer(n->pictureGles, 4) : 0;
 }
 
 bool n64PictureStart(struct N64* n, int* width, int* height) {

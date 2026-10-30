@@ -63,6 +63,8 @@ static struct {
 	void (*FramebufferTexture2D)(unsigned, unsigned, unsigned, unsigned, int);
 	void (*BlitFramebuffer)(int, int, int, int, int, int, int, int, unsigned, unsigned);
 	void (*Disable)(unsigned);
+	void (*BindBuffer)(unsigned, unsigned);
+	void (*MemoryBarrier)(unsigned);
 } gl;
 static unsigned presentTexture, presentFramebuffer;
 static uint32_t presentRgba[640 * 480];
@@ -112,6 +114,10 @@ static const char* settings(const char* name) {
 	}
 	if (!strcmp(name, "N64_RDP_GL") || !strcmp(name, "N64_RDP_GPU")) {
 		return hwWanted ? "1" : "0";
+	}
+	// The GPU RDP's pictures stay on the GPU (the VI in its context).
+	if (!strcmp(name, "N64_VI_GPU")) {
+		return hwWanted && !optionIs(environment, "armn64_accuracy", "hle") ? "1" : "0";
 	}
 	if (!strcmp(name, "N64_FRAMESKIP")) {
 		return optionIs(environment, "armn64_frameskip", "enabled") ? "1" : "0";
@@ -215,7 +221,7 @@ static struct N64* startMachine(void) {
 enum {
 	GL_TEXTURE_2D = 0x0DE1, GL_RGBA = 0x1908, GL_RGBA8 = 0x8058, GL_UNSIGNED_BYTE = 0x1401, GL_READ_FRAMEBUFFER = 0x8CA8,
 	GL_DRAW_FRAMEBUFFER = 0x8CA9, GL_COLOR_ATTACHMENT0 = 0x8CE0, GL_COLOR_BUFFER_BIT = 0x4000, GL_NEAREST = 0x2600,
-	GL_SCISSOR_TEST = 0x0C11,
+	GL_SCISSOR_TEST = 0x0C11, GL_PIXEL_UNPACK_BUFFER = 0x88EC, GL_PIXEL_BUFFER_BARRIER_BIT = 0x80,
 };
 
 static void* hwProc(const char* name) {
@@ -227,7 +233,8 @@ static void hwReset(void) {
 	glesFrontend(hwProc);
 	void** fns = (void**) &gl;
 	static const char* const names[] = { "glGenTextures", "glDeleteTextures", "glBindTexture", "glTexImage2D", "glTexSubImage2D", "glGenFramebuffers",
-		                                   "glDeleteFramebuffers", "glBindFramebuffer", "glFramebufferTexture2D", "glBlitFramebuffer", "glDisable" };
+		                                   "glDeleteFramebuffers", "glBindFramebuffer", "glFramebufferTexture2D", "glBlitFramebuffer", "glDisable",
+		                                   "glBindBuffer", "glMemoryBarrier" };
 	hwReady = true;
 	for (size_t i = 0; i < sizeof(names) / sizeof(*names); ++i) {
 		fns[i] = hwProc(names[i]);
@@ -279,15 +286,23 @@ static bool askHardwareContext(void) {
 	return true;
 }
 
-// The VI's picture into the frontend's framebuffer, upside down as GL keeps it.
-static void present(int width, int height) {
-	for (int i = 0; i < width * height; ++i) {
-		uint32_t p = picture[i];
-		presentRgba[i] = (p >> 16 & 0xFF) | (p & 0xFF00) | (p & 0xFF) << 16 | 0xFF000000u;
-	}
+// The VI's picture into the frontend's framebuffer, upside down as GL keeps it: from the GL buffer
+// the GPU made it in, else from picture.
+static void present(int width, int height, unsigned buffer) {
 	gl.Disable(GL_SCISSOR_TEST);
 	gl.BindTexture(GL_TEXTURE_2D, presentTexture);
-	gl.TexSubImage2D(GL_TEXTURE_2D, 0, 0, 0, width, height, GL_RGBA, GL_UNSIGNED_BYTE, presentRgba);
+	if (buffer) {
+		gl.MemoryBarrier(GL_PIXEL_BUFFER_BARRIER_BIT);
+		gl.BindBuffer(GL_PIXEL_UNPACK_BUFFER, buffer);
+		gl.TexSubImage2D(GL_TEXTURE_2D, 0, 0, 0, width, height, GL_RGBA, GL_UNSIGNED_BYTE, NULL);
+		gl.BindBuffer(GL_PIXEL_UNPACK_BUFFER, 0);
+	} else {
+		for (int i = 0; i < width * height; ++i) {
+			uint32_t p = picture[i];
+			presentRgba[i] = (p >> 16 & 0xFF) | (p & 0xFF00) | (p & 0xFF) << 16 | 0xFF000000u;
+		}
+		gl.TexSubImage2D(GL_TEXTURE_2D, 0, 0, 0, width, height, GL_RGBA, GL_UNSIGNED_BYTE, presentRgba);
+	}
 	gl.BindFramebuffer(GL_READ_FRAMEBUFFER, presentFramebuffer);
 	gl.BindFramebuffer(GL_DRAW_FRAMEBUFFER, (unsigned) hw.get_current_framebuffer());
 	gl.BlitFramebuffer(0, 0, width, height, 0, height, width, 0, GL_COLOR_BUFFER_BIT, GL_NEAREST);
@@ -482,7 +497,16 @@ void retro_run(void) {
 	machine->buttons = readController();
 	n64RunField(machine);
 	int width = 0, height = 0;
-	if (n64Picture(machine, picture, &width, &height) && width && height) {
+	// The GPU RDP's picture goes from its buffer to the frontend's framebuffer without the CPU.
+	unsigned buffer = 0;
+	if (shared && hwReady && n64PictureStart(machine, &width, &height) && width && height && (buffer = n64PictureBuffer(machine))) {
+		if (width != pictureWidth || height != pictureHeight) {
+			pictureWidth = width, pictureHeight = height;
+			struct retro_game_geometry geometry = { (unsigned) width, (unsigned) height, 640, 480, 4.0f / 3.0f };
+			environment(RETRO_ENVIRONMENT_SET_GEOMETRY, &geometry);
+		}
+		present(width, height, buffer);
+	} else if (n64Picture(machine, picture, &width, &height) && width && height) {
 		if (width != pictureWidth || height != pictureHeight) {
 			pictureWidth = width, pictureHeight = height;
 			struct retro_game_geometry geometry = { (unsigned) width, (unsigned) height, 640, 480, 4.0f / 3.0f };
@@ -491,7 +515,7 @@ void retro_run(void) {
 		if (!shared) {
 			videoRefresh(picture, (unsigned) width, (unsigned) height, (size_t) width * 4);
 		} else if (hwReady) {
-			present(width, height);
+			present(width, height, 0);
 		}
 	} else {
 		videoRefresh(NULL, (unsigned) pictureWidth, (unsigned) pictureHeight, 0);
