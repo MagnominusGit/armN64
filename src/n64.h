@@ -303,6 +303,10 @@ struct N64 {
 	// N64_RDP_GL (with hle): the GL renderer draws what the HLE makes (glr.c).
 	bool rdpGl;
 	struct Glr* glr;
+	// Many RDP triangles in a field (a microcode left to the RSP): the GL renderer gives way to the
+	// RDP threads asked for, between slices.
+	int rdpThreadsAsked;
+	bool glrStop;
 	struct FrameSkip skip;
 	// The last picture made, shown again for a skipped frame.
 	uint32_t* lastPicture;
@@ -496,6 +500,7 @@ void rdpCommands(struct N64*, const uint64_t* list, size_t count);
 
 // hle.c
 bool hleGraphics(struct N64*, bool dry);
+void glrEnd(struct N64*);
 // A task waiting where its display list branches to itself (the CPU still writing it); a look
 // whether it can go on.
 bool hleWaiting(struct N64*);

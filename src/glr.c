@@ -177,6 +177,8 @@ struct Glr {
 	uint8_t* rows;
 	uint32_t* image;
 	struct Applied applied;
+	uint64_t rawField;
+	int rawTriangles;
 };
 
 static void useFramebuffer(struct Glr* g, GLuint framebuffer) {
@@ -1003,7 +1005,13 @@ void glrDraw(struct N64* n, struct RDP* r, const uint64_t* w, int op) {
 		return;
 	}
 	if (op >= 0x08 && op <= 0x0F) {
-		// An RDP triangle (from a microcode run on the RSP): the RDP draws it in RDRAM.
+		// An RDP triangle (from a microcode run on the RSP): the RDP draws it in RDRAM; many in a
+		// field and the RDP threads take over.
+		if (g->rawField != n->fields) {
+			g->rawField = n->fields;
+			g->rawTriangles = 0;
+		}
+		n->glrStop |= ++g->rawTriangles > 100;
 		glrSync(n);
 		rdpDrawSoftware(n, r, w, op);
 		for (int i = 0; i < TARGETS; ++i) {
@@ -1195,6 +1203,16 @@ struct Glr* glrCreate(struct N64* n) {
 		return NULL;
 	}
 	return g;
+}
+
+void glrEnd(struct N64* n) {
+	glrSync(n);
+	glrDestroy(n->glr);
+	n->glr = NULL;
+	n->rdpGl = n->glrStop = false;
+	n->rdpThreads = n->rdpThreadsAsked;
+	// Compiled loads check the RDP's pages as the renderers need.
+	blocksFree(n);
 }
 
 void glrDestroy(struct Glr* g) {

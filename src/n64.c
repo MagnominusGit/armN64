@@ -129,7 +129,7 @@ static void start(struct N64* n) {
 #endif
 	n->useBlocks = n->useJit || (n->slice && blocks && blocks[0] == '1');
 	const char* rdpThreads = getenv("N64_RDP_THREADS");
-	n->rdpThreads = rdpThreads ? atoi(rdpThreads) : 0;
+	n->rdpThreads = n->rdpThreadsAsked = rdpThreads ? atoi(rdpThreads) : 0;
 	const char* rdpGpu = getenv("N64_RDP_GPU");
 	n->rdpGpu = rdpGpu && rdpGpu[0] == '1';
 	if (n->rdpGpu && !n->rdpThreads) {
@@ -205,6 +205,9 @@ static uint64_t viIntrAt(struct N64* n, uint64_t start) {
 void n64RunField(struct N64* n) {
 	uint64_t start = n->nextVi - n->fieldCycles, passed = start;
 	while (n->cycles < n->nextVi) {
+		if (n->glrStop) {
+			glrEnd(n);
+		}
 		uint64_t intrAt = viIntrAt(n, start);
 		if (intrAt >= passed && intrAt <= n->cycles) {
 			n64Interrupt(n, MI_VI, true);
