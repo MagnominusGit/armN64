@@ -320,7 +320,8 @@ static const char fragmentHead[] =
 	"	return texelFetch(t, ivec2(clamp(i, 0, image.x - 1), clamp(j, 0, image.y - 1)), 0);\n"
 	"}\n"
 	"vec4 sampleTile(sampler2D t, ivec4 a, ivec4 b, ivec4 c, ivec4 image) {\n"
-	"	vec2 st = vTex.xy / vTex.z;\n"
+	"	vec3 top = vTex - 0.5 * dFdy(vTex);\n"
+	"	vec2 st = top.xy / top.z;\n"
 	"	int s = int(floor(st.x * 32.0 + 0.01)), tt = int(floor(st.y * 32.0 + 0.01));\n"
 	"	int fs, ft, f;\n"
 	"	int s0 = wrapCoord(s, a.x, a.z, b.x, b.z, c.x, fs);\n"
@@ -1233,8 +1234,8 @@ void glrDraw(struct N64* n, struct RDP* r, const uint64_t* w, int op) {
 		rectangle(g, x0 / 4.0f, y0 / 4.0f, x1 / 4.0f, y1 / 4.0f, 0, zero, zero, false);
 		return;
 	}
-	// Texture rectangles: the pixels the RDP covers, and the texel it takes at each pixel's corner
-	// (GL samples at its centre, half a pixel on); steps a pixel in s5.10, copy mode four pixels.
+	// Texture rectangles: the pixels the RDP covers, and the texels at their corners (the shader
+	// samples at the top of a pixel, here half a pixel left); steps a pixel in s5.10, copy mode four.
 	int tile = (c >> 24) & 7;
 	uint64_t d = w[1];
 	float s0 = (int16_t) (d >> 48) / 32.0f, t0 = (int16_t) (d >> 32) / 32.0f;
@@ -1251,7 +1252,7 @@ void glrDraw(struct N64* n, struct RDP* r, const uint64_t* w, int op) {
 		return;
 	}
 	bool flip = op == 0x25;
-	float ax[2] = { x0 - cx0 - 0.5f, x1 + 1 - cx0 - 0.5f }, ay[2] = { y0 - cy0 - 0.5f, y1 + 1 - cy0 - 0.5f };
+	float ax[2] = { x0 - cx0 - 0.5f, x1 + 1 - cx0 - 0.5f }, ay[2] = { (float) (y0 - cy0), (float) (y1 + 1 - cy0) };
 	const float* along = flip ? ay : ax, * across = flip ? ax : ay;
 	float ss[2] = { s0 + along[0] * dsdx, s0 + along[1] * dsdx }, ts[2] = { t0 + across[0] * dtdy, t0 + across[1] * dtdy };
 	if (!drawState(n, g, r, true, false, r->zAddr && r->zPrim, tile, false, y0, y1 + 1)) {
