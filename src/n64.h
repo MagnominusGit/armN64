@@ -323,7 +323,7 @@ struct N64 {
 	const char* unimplemented;
 	// Activity counts for diagnostics.
 	struct {
-		uint64_t piDmas, piBytes, rspTasks, dpSyncs, aiBuffers, siDmas, glSyncs, glRows;
+		uint64_t piDmas, piBytes, rspTasks, dpSyncs, aiBuffers, siDmas, glSyncs, glRows, idleSlices, idleCycles;
 	} stats;
 	struct DD dd;
 	// hle: a CPU loop that only waits is skipped to the end of each slice (blocks.c idleRun). Its
@@ -408,6 +408,7 @@ void rspArenaFree(struct N64*);
 // blocks.c: the CPU runs from blocks of instructions fetched once, until the next event.
 void blocksRun(struct N64*);
 void blocksFree(struct N64*);
+void perfMapAdd(const void* code, size_t size, const char* kind, uint32_t address);
 void blocksInvalidatePage(struct N64*, uint32_t page);
 bool blockIsIdleLoop(const uint32_t* ops, uint32_t count, uint32_t vaddr);
 void idleLoad(struct N64*, uint32_t paddr, int size, uint64_t value);

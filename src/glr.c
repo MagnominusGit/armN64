@@ -179,6 +179,10 @@ struct Glr {
 	struct Applied applied;
 	uint64_t rawField;
 	int rawTriangles;
+	// The state of the last primitive, valid while the RDP's stateGen stays (and no sync).
+	bool fastValid;
+	uint32_t fastGen;
+	int fastKey, fastRows;
 };
 
 static void useFramebuffer(struct Glr* g, GLuint framebuffer) {
@@ -818,10 +822,17 @@ static void flushBatch(struct N64* n, struct Glr* g) {
 }
 
 // The state a primitive draws with, from the RDP's; the batch so far goes first when it differs.
+static bool drawRows(struct N64* n, struct Glr* g, struct RDP* r, int rows, int y0, int y1);
+
 static bool drawState(struct N64* n, struct Glr* g, struct RDP* r, bool textured, bool shaded, bool depth, int tile, bool persp,
                       int y0, int y1) {
 	if (r->colorSize < 1) {
 		return false;
+	}
+	// No command but primitives since the last: the same state.
+	int primitive = textured | shaded << 1 | depth << 2 | tile << 3 | persp << 6;
+	if (g->fastValid && g->stateSet && g->fastGen == r->stateGen && g->fastKey == primitive) {
+		return drawRows(n, g, r, g->fastRows, y0, y1);
 	}
 	struct DrawState s;
 	memset(&s, 0, sizeof(s));
@@ -890,10 +901,16 @@ static bool drawState(struct N64* n, struct Glr* g, struct RDP* r, bool textured
 		g->state = s;
 		g->stateSet = true;
 	}
+	g->fastValid = true, g->fastGen = r->stateGen, g->fastKey = primitive, g->fastRows = rows;
+	return drawRows(n, g, r, rows, y0, y1);
+}
+
+// A primitive's rows y0 to y1 - 1 in the state's target: they go back to RDRAM, their pages wait.
+static bool drawRows(struct N64* n, struct Glr* g, struct RDP* r, int rows, int y0, int y1) {
 	if (g->batchCount + 6 > BATCH_VERTICES) {
 		flushBatch(n, g);
 	}
-	struct Target* t = s.target;
+	struct Target* t = g->state.target;
 	y0 = y0 < 0 ? 0 : y0;
 	y1 = y1 > rows ? rows : y1;
 	if (t->dirtyTo <= t->dirtyFrom) {
@@ -1134,6 +1151,7 @@ bool glrShows(struct N64* n, uint32_t origin) {
 
 void glrSync(struct N64* n) {
 	struct Glr* g = n->glr;
+	g->fastValid = false;
 	++n->stats.glSyncs;
 	glesUse(g->gles);
 	flushBatch(n, g);

@@ -69,11 +69,13 @@ void* rspJitLookup(struct N64* n, uint32_t pc) {
 	}
 	b->count = count;
 	memcpy(b->ops, &imem[pc], count * 4);
+	size_t before = n->rspUsed;
 	if (!(b->code = rspCompile(n, b->ops, count, pc))) {
 		free(b);
 		rspJitFree(n);
 		return NULL;
 	}
+	perfMapAdd(b->code, n->rspUsed - before, "rsp", pc);
 	b->next = n->rspVariants[pc >> 2];
 	n->rspVariants[pc >> 2] = b;
 	*t = (struct RspJitEntry) { n->rspCodeGen, b->code };

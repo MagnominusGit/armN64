@@ -82,6 +82,8 @@ struct RDP {
 	struct Gpu* gpu;
 	// Bumped by texture loads and tile changes (the GL renderer's texture lookups).
 	uint32_t tmemGen;
+	// Bumped by every command but a primitive (the GL renderer's state is the same while it is).
+	uint32_t stateGen;
 };
 
 enum { GLR_TRIANGLE_WORDS = 16 };

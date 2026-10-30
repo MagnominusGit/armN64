@@ -1418,6 +1418,8 @@ static void execute(struct N64* n, struct RDP* r, const uint64_t* w, int op) {
 	}
 	if ((op >= 0x08 && op <= 0x0F) || op == 0x24 || op == 0x25 || op == 0x36) {
 		++r->seq;
+	} else {
+		++r->stateGen;
 	}
 	switch (op) {
 	case 0x08:
