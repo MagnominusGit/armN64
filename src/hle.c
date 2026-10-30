@@ -332,6 +332,10 @@ static int32_t fixed16(float f) {
 // One RDP triangle (after libdragon's rdpq_triangle_cpu): edges, then shade, texture and depth
 // coefficients as the command asks for them.
 static void triangle(struct N64* n, struct Hle* h, const struct ScreenVertex* a, const struct ScreenVertex* b, const struct ScreenVertex* c, const struct ScreenVertex* flat) {
+	// The microcodes scale 1/w so the corners' largest is a half, and send S and T times it: the
+	// RDP divides that out with perspective correction and takes S and T as they are without.
+	float maxW = a->invW > b->invW ? (a->invW > c->invW ? a->invW : c->invW) : (b->invW > c->invW ? b->invW : c->invW);
+	float k = maxW > 0 ? 0.5f / maxW : 0.5f;
 	if (n->rdpGl) {
 		// For the GL renderer: the corners as they are (flat shading takes the one colour).
 		bool persp = h->modeH & 0x80000;
@@ -339,10 +343,13 @@ static void triangle(struct N64* n, struct Hle* h, const struct ScreenVertex* a,
 		                (uint64_t) (h->texTile & 7) << 8 | (uint64_t) (h->texLevel & 7) << 12 | (uint64_t) persp << 16;
 		emit(n, h, head);
 		const struct ScreenVertex* corners[3] = { a, b, c };
-		for (int k = 0; k < 3; ++k) {
-			struct ScreenVertex v = *corners[k];
+		for (int j = 0; j < 3; ++j) {
+			struct ScreenVertex v = *corners[j];
 			if (flat) {
 				v.r = flat->r, v.g = flat->g, v.b = flat->b, v.a = flat->a;
+			}
+			if (!persp) {
+				v.s *= v.invW * k, v.t *= v.invW * k;
 			}
 			const float f[10] = { v.x, v.y, v.z, v.invW, v.r, v.g, v.b, v.a, v.s, v.t };
 			for (int i = 0; i < 10; i += 2) {
@@ -405,13 +412,7 @@ static void triangle(struct N64* n, struct Hle* h, const struct ScreenVertex* a,
 		}
 	}
 	if (tex) {
-		// With perspective correction the RDP divides S and T by W: they go in times 1/w, scaled
-		// so the largest 1/w is 0x7FFF.
-		bool persp = h->modeH & 0x80000;
-		float w1 = persp ? a->invW : 1, w2 = persp ? b->invW : 1, w3 = persp ? c->invW : 1;
-		float maxW = w1 > w2 ? (w1 > w3 ? w1 : w3) : (w2 > w3 ? w2 : w3);
-		float k = maxW > 0 ? 1 / maxW : 1;
-		w1 *= k, w2 *= k, w3 *= k;
+		float w1 = a->invW * k, w2 = b->invW * k, w3 = c->invW * k;
 		int32_t st[3], dx[3], de[3], dy[3];
 		GRADIENT(a->s * 32 * w1, b->s * 32 * w2, c->s * 32 * w3, st[0], dx[0], de[0], dy[0]);
 		GRADIENT(a->t * 32 * w1, b->t * 32 * w2, c->t * 32 * w3, st[1], dx[1], de[1], dy[1]);
@@ -437,8 +438,9 @@ static void triangle(struct N64* n, struct Hle* h, const struct ScreenVertex* a,
 static struct ScreenVertex project(struct Hle* h, const struct Vertex* v) {
 	struct ScreenVertex s;
 	float iw = 1 / v->w;
-	s.x = v->x * iw * h->vscale[0] + h->vtrans[0];
-	s.y = -v->y * iw * h->vscale[1] + h->vtrans[1];
+	// On screen in quarter pixels, as the microcodes keep it.
+	s.x = floorf((v->x * iw * h->vscale[0] + h->vtrans[0]) * 4) / 4;
+	s.y = floorf((-v->y * iw * h->vscale[1] + h->vtrans[1]) * 4) / 4;
 	float z = (v->z * iw * h->vscale[2] + h->vtrans[2]) * 32 / 0x7FFF;
 	s.z = z < 0 ? 0 : z > 1 ? 1 : z;
 	s.invW = iw;
