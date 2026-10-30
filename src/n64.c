@@ -221,7 +221,9 @@ void n64RunField(struct N64* n) {
 				memmove(n->dp.syncQueue, n->dp.syncQueue + 1, sizeof(n->dp.syncQueue[0]) * (size_t) --n->dp.syncQueued);
 			}
 		}
-		if (n->sp.hleDoneAt && n->cycles >= n->sp.hleDoneAt) {
+		if (n->sp.hleDoneAt && n->cycles >= n->sp.hleDoneAt && hleWaiting(n)) {
+			hleResume(n);
+		} else if (n->sp.hleDoneAt && n->cycles >= n->sp.hleDoneAt) {
 			// A task run at high level ends as its microcode would: halted at a break with the
 			// task-done signal.
 			n->sp.hleDoneAt = 0;

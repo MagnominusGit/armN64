@@ -496,6 +496,10 @@ void rdpCommands(struct N64*, const uint64_t* list, size_t count);
 
 // hle.c
 bool hleGraphics(struct N64*, bool dry);
+// A task waiting where its display list branches to itself (the CPU still writing it); a look
+// whether it can go on.
+bool hleWaiting(struct N64*);
+void hleResume(struct N64*);
 void rdpDestroy(struct N64*);
 
 // carts.c

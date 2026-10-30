@@ -59,6 +59,12 @@ struct Hle {
 	uint32_t sprite;
 	bool spriteMode, spriteFlipS, spriteFlipT;
 	float spriteScaleX, spriteScaleY;
+	// The display list's call stack, and where it branches to itself (a list the CPU is still
+	// writing: the task waits there until that command changes).
+	uint32_t stack[DL_DEPTH];
+	int sp;
+	bool waiting;
+	uint32_t waitPc;
 	// Counting the commands instead of drawing them (N64HLECHECK).
 	bool dry;
 	uint64_t list[LIST_MAX];
@@ -452,8 +458,9 @@ static void drawTriangle(struct N64* n, struct Hle* h, int i0, int i1, int i2) {
 		int out = 0;
 		for (int i = 0; i < count; ++i) {
 			const struct Vertex* a = &poly[cur][i], * b = &poly[cur][(i + 1) % count];
-			float da = a->x * pl[0] + a->y * pl[1] + a->z * pl[2] + a->w * pl[3] - (p == 0 ? 1e-5f : 0);
-			float db = b->x * pl[0] + b->y * pl[1] + b->z * pl[2] + b->w * pl[3] - (p == 0 ? 1e-5f : 0);
+			// The near plane keeps what lies on it (2D layers at z = -w), give or take rounding.
+			float da = a->x * pl[0] + a->y * pl[1] + a->z * pl[2] + a->w * pl[3] + (p == 0 ? 1e-4f * fabsf(a->w) : 0);
+			float db = b->x * pl[0] + b->y * pl[1] + b->z * pl[2] + b->w * pl[3] + (p == 0 ? 1e-4f * fabsf(b->w) : 0);
 			if (da >= 0) {
 				poly[cur ^ 1][out++] = *a;
 			}
@@ -630,10 +637,10 @@ static void spriteDraw(struct N64* n, struct Hle* h, int x, int y) {
 	}
 }
 
-static void runList(struct N64* n, struct Hle* h, uint32_t start) {
-	uint32_t stack[DL_DEPTH];
-	int sp = 0;
-	uint32_t pc = address(h, start);
+static void runList(struct N64* n, struct Hle* h, uint32_t pc) {
+	uint32_t* stack = h->stack;
+	int sp = h->sp;
+	h->waiting = false;
 	bool f3dex2 = h->family == FAMILY_F3DEX2, f3dex = h->family == FAMILY_F3DEX;
 	for (int guard = 0; guard < 1 << 22; ++guard) {
 		uint32_t w0 = rd32(n, pc), w1 = rd32(n, pc + 4);
@@ -717,6 +724,9 @@ static void runList(struct N64* n, struct Hle* h, uint32_t start) {
 			case 0xDE:
 				if (!((w0 >> 16) & 0xFF) && sp < DL_DEPTH) {
 					stack[sp++] = next;
+				} else if (address(h, w1) == pc) {
+					h->waiting = true, h->waitPc = pc, h->sp = sp;
+					return;
 				}
 				next = address(h, w1);
 				break;
@@ -781,6 +791,9 @@ static void runList(struct N64* n, struct Hle* h, uint32_t start) {
 			case 0x06:
 				if (!((w0 >> 16) & 0xFF) && sp < DL_DEPTH) {
 					stack[sp++] = next;
+				} else if (address(h, w1) == pc) {
+					h->waiting = true, h->waitPc = pc, h->sp = sp;
+					return;
 				}
 				next = address(h, w1);
 				break;
@@ -910,6 +923,33 @@ static int family(struct N64* n, uint32_t data, uint32_t size) {
 }
 
 // Runs the graphics task in DMEM at high level when its microcode is one of the known families;
+// A task's list run (or run until it waits): the RSP's time for it, roughly, before the RDP can
+// start on what it made; waiting, it looks again a little later.
+static void finishTask(struct N64* n, struct Hle* h) {
+	if (!h->dry && h->waiting) {
+		n->sp.hleDoneAt = n->cycles + 2048;
+	} else if (!h->dry) {
+		n->sp.hleDoneAt = n->cycles + 4096 + 64 * (uint64_t) h->count;
+		n->dp.busyUntil = n->dp.busyUntil > n->sp.hleDoneAt ? n->dp.busyUntil : n->sp.hleDoneAt;
+	}
+	flush(n, h);
+}
+
+bool hleWaiting(struct N64* n) {
+	return n->hle && n->hle->waiting;
+}
+
+// A waiting task looks at the command it waits on again, and goes on when the CPU changed it.
+void hleResume(struct N64* n) {
+	struct Hle* h = n->hle;
+	if (rd32(n, h->waitPc) >> 24 == (h->family == FAMILY_F3DEX2 ? 0xDE : 0x06) && address(h, rd32(n, h->waitPc + 4)) == h->waitPc) {
+		n->sp.hleDoneAt = n->cycles + 2048;
+		return;
+	}
+	runList(n, h, h->waitPc);
+	finishTask(n, h);
+}
+
 // false leaves it to the RSP. Dry, it only counts the RDP commands it would send.
 bool hleGraphics(struct N64* n, bool dry) {
 	const uint8_t* task = &n->sp.mem[0xFC0];
@@ -961,13 +1001,9 @@ bool hleGraphics(struct N64* n, bool dry) {
 	bool fifo = fifoStart && !(fifoStart & 7) && fifoEnd > fifoStart && fifoEnd <= RDRAM_SIZE;
 	h->fifoStart = fifo ? fifoStart : 0;
 	h->fifoEnd = fifo ? fifoEnd & ~7u : 0;
-	runList(n, h, be32(task + 0x30));
-	if (!dry) {
-		// The RSP's time for the task, roughly, before the RDP can start on what it made.
-		n->sp.hleDoneAt = n->cycles + 4096 + 64 * (uint64_t) h->count;
-		n->dp.busyUntil = n->dp.busyUntil > n->sp.hleDoneAt ? n->dp.busyUntil : n->sp.hleDoneAt;
-	}
-	flush(n, h);
+	h->sp = 0;
+	runList(n, h, address(h, be32(task + 0x30)));
+	finishTask(n, h);
 	h->doneList = dry ? h->doneList : list;
 	return true;
 }
