@@ -33,6 +33,10 @@ struct ScreenVertex {
 };
 
 struct Hle {
+	// The display list of the last task drawn here, for a yielded copy of it.
+	uint32_t doneList;
+	// The task's output buffer (FIFO microcodes), when it has one in RDRAM.
+	uint32_t fifoStart, fifoEnd;
 	int family;
 	uint32_t segments[16];
 	float modelview[MATRICES][16];
@@ -73,7 +77,21 @@ static uint32_t address(struct Hle* h, uint32_t a) {
 }
 
 static void flush(struct N64* n, struct Hle* h) {
-	if (!h->dry) {
+	if (!h->dry && h->fifoEnd - h->fifoStart >= h->count * 8 && h->count) {
+		// A FIFO microcode's commands go through its output buffer in RDRAM, the RDP's registers
+		// pointing at them, where programs can see them (DPC_CURRENT, the buffer).
+		n64RdramWrite(n, h->fifoStart, (uint32_t) h->count * 8);
+		for (size_t i = 0; i < h->count; ++i) {
+			uint8_t* p = &n->rdram[h->fifoStart + i * 8];
+			for (int b = 0; b < 8; ++b) {
+				p[b] = (uint8_t) (h->list[i] >> (56 - 8 * b));
+			}
+		}
+		n->dp.status &= ~1u;
+		n->dp.start = n->dp.current = h->fifoStart;
+		n->dp.end = h->fifoStart + (uint32_t) h->count * 8;
+		rdpRun(n);
+	} else if (!h->dry) {
 		rdpCommands(n, h->list, h->count);
 	} else {
 		for (size_t i = 0; i < h->count;) {
@@ -214,6 +232,31 @@ static void loadVertices(struct N64* n, struct Hle* h, uint32_t a, int first, in
 			float f = (v->w != 0 ? v->z / v->w : 0) * h->fogMul + h->fogOffset;
 			v->a = (f < 0 ? 0 : f > 255 ? 255 : f) / 255.0f;
 		}
+	}
+}
+
+// G_MODIFYVTX (and F3DEX's G_MOVEWORD to the points): a loaded vertex's colour, texture
+// coordinates (already scaled) or position on screen (s13.2, kept by moving it in clip space at its
+// own w).
+static void modifyVertex(struct Hle* h, int index, int where, uint32_t value) {
+	if (index >= VERTICES) {
+		return;
+	}
+	struct Vertex* v = &h->v[index];
+	switch (where) {
+	case 0x10:
+		v->r = (value >> 24) / 255.0f, v->g = ((value >> 16) & 0xFF) / 255.0f;
+		v->b = ((value >> 8) & 0xFF) / 255.0f, v->a = (value & 0xFF) / 255.0f;
+		break;
+	case 0x14:
+		v->s = (int16_t) (value >> 16) / 32.0f, v->t = (int16_t) value / 32.0f;
+		break;
+	case 0x18:
+		if (h->vscale[0] != 0 && h->vscale[1] != 0) {
+			v->x = ((int16_t) (value >> 16) / 4.0f - h->vtrans[0]) / h->vscale[0] * v->w;
+			v->y = -((int16_t) value / 4.0f - h->vtrans[1]) / h->vscale[1] * v->w;
+		}
+		break;
 	}
 }
 
@@ -440,6 +483,15 @@ static void viewport(struct N64* n, struct Hle* h, uint32_t a) {
 	}
 }
 
+// G_BRANCH_Z: whether the vertex's depth on screen (16.16, the viewport's 0-0x3FF range) is at most
+// the limit gSPBranchLessZ made.
+static bool branchZ(const struct Hle* h, int index, uint32_t limit) {
+	const struct Vertex* v = &h->v[index];
+	float z = (v->w != 0 ? v->z / v->w : 0) * h->vscale[2] + h->vtrans[2];
+	int64_t fixed = (int64_t) (z * 65536.0f);
+	return fixed <= (int64_t) limit;
+}
+
 static void otherMode(struct N64* n, struct Hle* h, bool high, int shift, int len, uint32_t bits) {
 	uint32_t mask = (len >= 32 ? 0xFFFFFFFFu : ((1u << len) - 1)) << shift;
 	uint32_t* m = high ? &h->modeH : &h->modeL;
@@ -511,7 +563,7 @@ static void runList(struct N64* n, struct Hle* h, uint32_t start) {
 				cullOrEnd(h, (w0 & 0xFFFF) / 2, (w1 & 0xFFFF) / 2, &end);
 				break;
 			case 0x04:
-				if ((uint32_t) (h->v[((w0 >> 1) & 0x7FF) % VERTICES].z) <= w1) {
+				if (branchZ(h, ((w0 >> 1) & 0x7FF) % VERTICES, w1)) {
 					next = address(h, h->half1);
 				}
 				break;
@@ -554,6 +606,9 @@ static void runList(struct N64* n, struct Hle* h, uint32_t start) {
 				uint32_t a = address(h, w1);
 				if (index == 8) {
 					viewport(n, h, a);
+				} else if (index == 14) {
+					// gSPForceMatrix: the combined matrix itself, until the next matrix command.
+					readMatrix(n, a, h->mvp);
 				} else if (index == 10) {
 					int l = offset / 24;
 					if (l < 2) {
@@ -569,6 +624,9 @@ static void runList(struct N64* n, struct Hle* h, uint32_t start) {
 					stack[sp++] = next;
 				}
 				next = address(h, w1);
+				break;
+			case 0x02:
+				modifyVertex(h, (int) (w0 & 0xFFFF) / 2, (w0 >> 16) & 0xFF, w1);
 				break;
 			case 0xDF:
 				end = true;
@@ -599,6 +657,10 @@ static void runList(struct N64* n, struct Hle* h, uint32_t start) {
 				uint32_t a = address(h, w1);
 				if (index == 0x80) {
 					viewport(n, h, a);
+				} else if (index == 0x9E) {
+					// gSPForceMatrix sends the combined matrix in four parts from one place; the first
+					// takes all of it, until the next matrix command.
+					readMatrix(n, a, h->mvp);
 				} else if (index == 0x82 || index == 0x84) {
 					readLookat(n, h, a, index == 0x84 ? 0 : 1);
 				} else if (index >= 0x86 && index <= 0x94) {
@@ -666,6 +728,8 @@ static void runList(struct N64* n, struct Hle* h, uint32_t start) {
 					h->segments[(offset / 4) & 15] = w1 & 0xFFFFFF;
 				} else if (index == 8) {
 					h->fogMul = (int16_t) (w1 >> 16), h->fogOffset = (int16_t) w1;
+				} else if (index == 0x0C) {
+					modifyVertex(h, offset / 40, offset % 40, w1);
 				}
 				break;
 			}
@@ -690,9 +754,9 @@ static void runList(struct N64* n, struct Hle* h, uint32_t start) {
 	}
 }
 
-// The microcode family from the strings in its data; without them, from the commands the display
-// list starts with (F3DEX2 ones from 0xD7 to 0xDF, Fast3D ones from 0xB6 to 0xBF).
-static int family(struct N64* n, uint32_t data, uint32_t size, uint32_t list) {
+// The microcode family from the first ID string in its data (the block may run on into the next
+// microcode's data, and its string).
+static int family(struct N64* n, uint32_t data, uint32_t size) {
 	if (size > 0x1000) {
 		size = 0x1000;
 	}
@@ -702,25 +766,34 @@ static int family(struct N64* n, uint32_t data, uint32_t size, uint32_t list) {
 		text[i] = c >= 32 && c < 127 ? (char) c : ' ';
 	}
 	text[size] = 0;
-	if (strstr(text, "F3DEX2") || strstr(text, "F3DZEX") || strstr(text, "F3DLX2") || strstr(text, "F3DLP2")) {
-		return FAMILY_F3DEX2;
+	const char* id = strstr(text, "RSP Gfx ucode ");
+	const char* sw = strstr(text, "RSP SW Version");
+	if (sw && (!id || sw < id)) {
+		return FAMILY_F3D;
 	}
-	if (strstr(text, "S2DEX") || strstr(text, "L3DEX") || strstr(text, "F3DEX3") || strstr(text, "Turbo")) {
+	if (!id) {
 		return FAMILY_NONE;
 	}
-	if (strstr(text, "F3DEX") || strstr(text, "F3DLX") || strstr(text, "F3DLP")) {
-		return FAMILY_F3DEX;
+	const char* name = id + 14;
+	if ((!strncmp(name, "F3DEX2", 6) || !strncmp(name, "F3DZEX", 6) || !strncmp(name, "F3DLX2", 6) || !strncmp(name, "F3DLP2", 6)) &&
+	    (name[6] == ' ' || name[6] == '.' || name[6] == '_')) {
+		return FAMILY_F3DEX2;
 	}
-	if (strstr(text, "RSP Gfx") || strstr(text, "RSP SW Version")) {
-		return strstr(text, "RSP SW Version") ? FAMILY_F3D : FAMILY_NONE;
+	if (strncmp(name, "F3DEX", 5) && strncmp(name, "F3DLX", 5) && strncmp(name, "F3DLP", 5)) {
+		return FAMILY_NONE;
 	}
-	int f3dex2 = 0, f3d = 0;
-	for (int i = 0; i < 64; ++i) {
-		int op = n->rdram[(list + i * 8) & (RDRAM_SIZE - 1)];
-		f3dex2 += op >= 0xD7 && op <= 0xDF;
-		f3d += op >= 0xB6 && op <= 0xBF;
+	// Variants with their own names (F3DEX3, F3DEXBG...) are other microcodes.
+	if (name[5] != ' ' && name[5] != '.' && name[5] != '_') {
+		return FAMILY_NONE;
 	}
-	return f3dex2 > f3d ? FAMILY_F3DEX2 : FAMILY_F3D;
+	// F3DEX2's builds also call themselves F3DEX (F3DLX, F3DLP), with versions from 2.0; F3DEX's
+	// are 0.x and 1.x.
+	for (const char* c = name; *c && c < name + 48; ++c) {
+		if (c[0] == ' ' && c[1] >= '0' && c[1] <= '9' && c[2] == '.' && c[3] >= '0' && c[3] <= '9') {
+			return c[1] >= '2' ? FAMILY_F3DEX2 : FAMILY_F3DEX;
+		}
+	}
+	return FAMILY_F3DEX;
 }
 
 // Runs the graphics task in DMEM at high level when its microcode is one of the known families;
@@ -730,8 +803,18 @@ bool hleGraphics(struct N64* n, bool dry) {
 	if (be32(task) != 1) {
 		return false;
 	}
+	// A yielded task started again: one run here drew all of it, so it is done (its data is the
+	// yield buffer, which the microcode would restore itself from).
+	uint32_t list = be32(task + 0x30) & 0xFFFFFF;
+	if (be32(task + 4) & 1) {
+		if (n->hle && n->hle->doneList == list && !dry) {
+			n->sp.hleDoneAt = n->cycles + 4096;
+			return true;
+		}
+		return false;
+	}
 	uint32_t data = be32(task + 0x18) & 0xFFFFFF, dataSize = be32(task + 0x1C);
-	int f = family(n, data, dataSize, be32(task + 0x30) & 0xFFFFFF);
+	int f = family(n, data, dataSize);
 	if (f == FAMILY_NONE) {
 		return false;
 	}
@@ -760,7 +843,17 @@ bool hleGraphics(struct N64* n, bool dry) {
 	// So do the other modes (the data's set-other-modes command).
 	h->modeH = 0x080CFF, h->modeL = 0;
 	h->count = 0;
+	uint32_t fifoStart = be32(task + 0x28) & 0xFFFFFF, fifoEnd = be32(task + 0x2C) & 0xFFFFFF;
+	bool fifo = fifoStart && !(fifoStart & 7) && fifoEnd > fifoStart && fifoEnd <= RDRAM_SIZE;
+	h->fifoStart = fifo ? fifoStart : 0;
+	h->fifoEnd = fifo ? fifoEnd & ~7u : 0;
 	runList(n, h, be32(task + 0x30));
+	if (!dry) {
+		// The RSP's time for the task, roughly, before the RDP can start on what it made.
+		n->sp.hleDoneAt = n->cycles + 4096 + 64 * (uint64_t) h->count;
+		n->dp.busyUntil = n->dp.busyUntil > n->sp.hleDoneAt ? n->dp.busyUntil : n->sp.hleDoneAt;
+	}
 	flush(n, h);
+	h->doneList = dry ? h->doneList : list;
 	return true;
 }

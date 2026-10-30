@@ -96,7 +96,9 @@ static void start(struct N64* n) {
 	const char* accuracy = getenv("N64_ACCURACY");
 	n->accuracy = !accuracy ? ACCURACY_LLE_ACCURATE : !strcmp(accuracy, "lle-compatible") ? ACCURACY_LLE_COMPATIBLE :
 	              !strcmp(accuracy, "hle") ? ACCURACY_HLE : ACCURACY_LLE_ACCURATE;
-	n->compat = n->accuracy >= ACCURACY_LLE_COMPATIBLE;
+	// HLE draws at high level with the hardware's own timing; only lle-compatible behaves like the
+	// emulators hacks were made on.
+	n->compat = n->accuracy == ACCURACY_LLE_COMPATIBLE;
 	n->hleCheck = getenv("N64HLECHECK") != NULL;
 	const char* mouse = getenv("N64_MOUSE");
 	n->mousePort = mouse && *mouse >= '1' && *mouse <= '4' ? *mouse - '0' : 0;
@@ -160,7 +162,7 @@ void rspCatchUp(struct N64* n) {
 	}
 	// The RSP runs at two thirds of the CPU clock, on its own cycle count.
 	uint64_t rspNow = n->cycles * 2 / 3;
-	if (n->sp.status & 1) {
+	if ((n->sp.status & 1) || n->sp.hleDoneAt) {
 		n->rsp.clock = rspNow;
 		return;
 	}
@@ -202,6 +204,19 @@ void n64RunField(struct N64* n) {
 		if (n->dp.syncAt && n->cycles >= n->dp.syncAt) {
 			n->dp.syncAt = 0;
 			n64Interrupt(n, MI_DP, true);
+			if (n->dp.syncQueued) {
+				n->dp.syncAt = n->dp.syncQueue[0];
+				memmove(n->dp.syncQueue, n->dp.syncQueue + 1, sizeof(n->dp.syncQueue[0]) * (size_t) --n->dp.syncQueued);
+			}
+		}
+		if (n->sp.hleDoneAt && n->cycles >= n->sp.hleDoneAt) {
+			// A task run at high level ends as its microcode would: halted at a break with the
+			// task-done signal.
+			n->sp.hleDoneAt = 0;
+			n->sp.status |= 0x203;
+			if (n->sp.status & 0x40) {
+				n64Interrupt(n, MI_SP, true);
+			}
 		}
 		if (n->si.busyUntil && n->cycles >= n->si.busyUntil) {
 			n->si.busyUntil = 0;
@@ -229,6 +244,7 @@ void n64RunField(struct N64* n) {
 			n64Event(n, n->ai.queued ? n->ai.endsAt : until);
 			n64Event(n, n->dp.syncAt ? n->dp.syncAt : until);
 			n64Event(n, n->si.busyUntil ? n->si.busyUntil : until);
+			n64Event(n, n->sp.hleDoneAt ? n->sp.hleDoneAt : until);
 			n64Event(n, n->pi.busyUntil ? n->pi.busyUntil : until);
 			n64Event(n, n->dd.mechaAt ? n->dd.mechaAt : until);
 			n64Event(n, n->dd.bmAt ? n->dd.bmAt : until);

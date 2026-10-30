@@ -51,8 +51,6 @@ static void spWriteStatus(struct N64* n, uint32_t v) {
 	uint32_t* s = &n->sp.status;
 	if ((v & 1) && (*s & 1)) {
 		++n->stats.rspTasks;
-		// A graphics task run at high level ends as its microcode would: halted at a break with the
-		// task-done signal.
 		if (n->hleCheck && be32(&n->sp.mem[0xFC0]) == 1 && !(be32(&n->sp.mem[0xFC4]) & 1)) {
 			// The last graphics task's commands, from its microcode and at high level.
 			static uint64_t task;
@@ -89,15 +87,11 @@ static void spWriteStatus(struct N64* n, uint32_t v) {
 			hleGraphics(n, true);
 			++task;
 		}
+		// A graphics task run at high level: the RSP shows it running until hleDoneAt.
 		if (n->accuracy == ACCURACY_HLE && hleGraphics(n, false)) {
-			*s |= 0x203;
-			if (*s & 0x40) {
-				n64Interrupt(n, MI_SP, true);
-			}
-			v &= ~1u;
-		} else {
-			*s &= ~1u;
+			n64Event(n, n->sp.hleDoneAt);
 		}
+		*s &= ~1u;
 		// N64TASKDUMP=number,file: the RSP's memories, registers and RDRAM as that task starts.
 		static const char* taskDump;
 		static bool looked;

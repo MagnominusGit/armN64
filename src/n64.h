@@ -62,6 +62,8 @@ struct CPU {
 struct SP {
 	uint8_t mem[0x2000];
 	uint32_t memAddr, dramAddr, status, semaphore, pc;
+	// A task hleGraphics ran: the RSP shows it running (doing nothing) until then.
+	uint64_t hleDoneAt;
 };
 
 struct RSP {
@@ -92,6 +94,10 @@ struct DP {
 	uint32_t start, end, current, status;
 	// When the RDP finishes the commands it has, and when its pending full-sync interrupt is due.
 	uint64_t busyUntil, syncAt;
+	// With HLE, full syncs after the pending one (a whole task's commands arrive at once), each
+	// interrupting when the RDP gets there.
+	uint64_t syncQueue[8];
+	int syncQueued;
 	// The 24-bit counters: RCP cycles since the clock counter was cleared (at clockBase, in RCP
 	// cycles), and RDP clocks with the command buffer busy, the pipeline busy and TMEM loading.
 	uint64_t clockBase;
@@ -225,8 +231,9 @@ struct N64 {
 	// emulators: RDRAM starts zeroed, misaligned CPU accesses align down instead of raising address
 	// errors, unmapped null-pointer accesses read zero, PI DMA copies between the exact addresses
 	// and takes a quarter cycle a byte, SP DMA keeps the RDRAM address's low bits, and a blanked VI
-	// window still shows the picture. hle adds
-	// high-level graphics (hle.c) to that. compat is true for both.
+	// window still shows the picture. hle is the
+	// hardware with high-level graphics (hle.c) for the microcodes it knows. compat is true for
+	// lle-compatible only.
 	int accuracy;
 	bool compat;
 	// The RSP is being caught up: its own accesses to the shared registers must not catch it up again.
