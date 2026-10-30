@@ -2,6 +2,8 @@ cmake_minimum_required(VERSION 3.13)
 project(armN64 C)
 
 set(CMAKE_C_STANDARD 11)
+# The libretro core is a shared library built from the same emulator.
+set(CMAKE_POSITION_INDEPENDENT_CODE ON)
 if(NOT CMAKE_BUILD_TYPE)
 	set(CMAKE_BUILD_TYPE Release)
 endif()
@@ -39,3 +41,9 @@ target_link_libraries(n64 m Threads::Threads ${CMAKE_DL_LIBS} armulators-emit)
 
 add_executable(n64run tools/n64run.c)
 target_link_libraries(n64run n64)
+
+# The libretro core.
+add_library(armn64_libretro SHARED libretro/libretro.c)
+target_link_libraries(armn64_libretro n64 armulators-libretro)
+set_target_properties(armn64_libretro PROPERTIES PREFIX "")
+target_link_options(armn64_libretro PRIVATE -Wl,--version-script=${ARMULATORS_LINK_SCRIPT} -Wl,--no-undefined)

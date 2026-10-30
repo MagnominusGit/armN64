@@ -156,6 +156,14 @@ static uint64_t aiDuration(struct N64* n, uint32_t len) {
 	return rate ? (uint64_t) (len / 4) * CPU_HZ / rate : 0;
 }
 
+// A buffer the game queued, kept for a frontend as it is now in RDRAM.
+static void aiKeep(struct N64* n, uint32_t addr, uint32_t len) {
+	n->audioRate = (uint32_t) (48681812ull / (n->ai.dacrate + 1));
+	for (uint32_t i = 0; i < len && n->audioCount < n->audioCapacity; i += 2) {
+		n->audio[n->audioCount++] = (int16_t) (n->rdram[(addr + i) & (RDRAM_SIZE - 1)] << 8 | n->rdram[(addr + i + 1) & (RDRAM_SIZE - 1)]);
+	}
+}
+
 static void aiStartNext(struct N64* n) {
 	n->ai.startedAt = n->cycles;
 	n->ai.endsAt = n->cycles + aiDuration(n, n->ai.queueLen[0]);
@@ -606,6 +614,10 @@ void busWrite32(struct N64* n, uint32_t addr, uint32_t v) {
 			if (n->ai.len && n->ai.queued < 2) {
 				n->ai.queueLen[n->ai.queued++] = n->ai.len;
 				++n->stats.aiBuffers;
+				if (n->audioCapacity) {
+					rdpWaitFor(n, n->ai.dramAddr, n->ai.len);
+					aiKeep(n, n->ai.dramAddr, n->ai.len);
+				}
 				if (n->ai.queued == 1) {
 					aiStartNext(n);
 				}

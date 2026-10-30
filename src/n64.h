@@ -322,6 +322,14 @@ struct N64 {
 	// CPU cycles per video field: 60 fields a second for NTSC and MPAL, 50 for PAL.
 	uint64_t fieldCycles;
 	uint64_t fields;
+	// Where the settings (N64_ACCURACY and the others) come from when the machine starts: the
+	// environment unless a frontend gives its own lookup.
+	const char* (*settings)(const char* name);
+	// The samples the AI was given (left and right, 16-bit), for a frontend to play at audioRate a
+	// second; none are kept until it sets audioCapacity and audio.
+	int16_t* audio;
+	size_t audioCount, audioCapacity;
+	uint32_t audioRate;
 	// Controller 1: buttons in the top half, stick (or with a mouse, the X and Y movement) below.
 	uint32_t buttons;
 	// The port (1-4) with an N64 Mouse (N64_MOUSE=port), 0 for none, and its buttons and movement in

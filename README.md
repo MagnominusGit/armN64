@@ -32,3 +32,7 @@ A lean, low-level Nintendo 64 emulator for x86-64 and ARM handhelds.
 - `src/` the emulator: `n64.c` (machine and scheduler), `cpu.c` (VR4300), `bus.c` (memory map
   and RCP registers), `pif.c` (boot and controllers).
 - `tools/n64run.c` runs a ROM headless and writes the last picture.
+- `libretro/` the libretro core (`armn64_libretro`): a field each run, the VI's picture, the AI's
+  samples at 44.1 kHz, controller 1 and the cartridge's save memory (EEPROM, then SRAM or flash).
+- `armulators/` the code shared with armGBA (submodule): the code generators and the libretro
+  core's helpers.

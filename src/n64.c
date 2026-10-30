@@ -93,18 +93,23 @@ bool n64LoadRom(struct N64* n, const uint8_t* data, size_t size) {
 	return true;
 }
 
+// A setting by its environment variable's name, from the frontend's lookup when it gave one.
+static const char* setting(struct N64* n, const char* name) {
+	return n->settings ? n->settings(name) : getenv(name);
+}
+
 // From power-on: the PIF's boot from the cartridge, or from the 64DD's IPL without one.
 static void start(struct N64* n) {
-	const char* accuracy = getenv("N64_ACCURACY");
+	const char* accuracy = setting(n, "N64_ACCURACY");
 	n->accuracy = !accuracy ? ACCURACY_LLE_ACCURATE : !strcmp(accuracy, "lle-compatible") ? ACCURACY_LLE_COMPATIBLE :
 	              !strcmp(accuracy, "hle") ? ACCURACY_HLE : ACCURACY_LLE_ACCURATE;
 	// HLE draws at high level with the hardware's own timing; only lle-compatible behaves like the
 	// emulators hacks were made on.
 	n->compat = n->accuracy == ACCURACY_LLE_COMPATIBLE;
-	const char* idleSkip = getenv("N64_IDLESKIP");
+	const char* idleSkip = setting(n, "N64_IDLESKIP");
 	n->idle.enabled = n->accuracy == ACCURACY_HLE && !(idleSkip && idleSkip[0] == '0');
-	n->hleCheck = getenv("N64HLECHECK") != NULL;
-	const char* mouse = getenv("N64_MOUSE");
+	n->hleCheck = setting(n, "N64HLECHECK") != NULL;
+	const char* mouse = setting(n, "N64_MOUSE");
 	n->mousePort = mouse && *mouse >= '1' && *mouse <= '4' ? *mouse - '0' : 0;
 	if (n->compat) {
 		memset(n->rdram, 0, RDRAM_SIZE);
@@ -118,32 +123,32 @@ static void start(struct N64* n) {
 	n->vi.reg[6] = n->cpu.gpr[20] == 0 ? 0x271 : 0x20D;
 	n->nextVi = n->fieldCycles;
 	n->eventAt = 0;
-	const char* slice = getenv("N64_SLICE");
+	const char* slice = setting(n, "N64_SLICE");
 	n->slice = slice ? strtoull(slice, NULL, 0) : 0;
-	const char* blocks = getenv("N64_BLOCKS");
+	const char* blocks = setting(n, "N64_BLOCKS");
 #ifdef N64_HAS_JIT
-	const char* jit = getenv("N64_JIT");
-	const char* rspJit = getenv("N64_RSPJIT");
+	const char* jit = setting(n, "N64_JIT");
+	const char* rspJit = setting(n, "N64_RSPJIT");
 	n->useJit = n->slice && jit && jit[0] == '1';
 	n->useRspJit = rspJit && rspJit[0] == '1';
 #endif
 	n->useBlocks = n->useJit || (n->slice && blocks && blocks[0] == '1');
-	const char* rdpThreads = getenv("N64_RDP_THREADS");
+	const char* rdpThreads = setting(n, "N64_RDP_THREADS");
 	n->rdpThreads = n->rdpThreadsAsked = rdpThreads ? atoi(rdpThreads) : 0;
-	const char* rdpGpu = getenv("N64_RDP_GPU");
+	const char* rdpGpu = setting(n, "N64_RDP_GPU");
 	n->rdpGpu = rdpGpu && rdpGpu[0] == '1';
 	if (n->rdpGpu && !n->rdpThreads) {
 		n->rdpThreads = 1;
 	}
-	const char* skip = getenv("N64_FRAMESKIP");
+	const char* skip = setting(n, "N64_FRAMESKIP");
 	n->skip.on = skip && skip[0] == '1';
-	const char* rdpGl = getenv("N64_RDP_GL");
+	const char* rdpGl = setting(n, "N64_RDP_GL");
 	n->rdpGl = n->accuracy == ACCURACY_HLE && rdpGl && rdpGl[0] == '1';
 	if (n->rdpGl) {
 		n->rdpThreads = 0;
 		n->rdpGpu = false;
 	}
-	const char* viGpu = getenv("N64_VI_GPU");
+	const char* viGpu = setting(n, "N64_VI_GPU");
 	n->viGpu = viGpu && viGpu[0] == '1';
 	rspJitFree(n);
 	++n->rspCodeGen;
