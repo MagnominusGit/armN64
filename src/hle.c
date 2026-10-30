@@ -627,16 +627,17 @@ static void spriteDraw(struct N64* n, struct Hle* h, int x, int y) {
 		emit(n, h, (uint64_t) 0x30 << 56 | (uint64_t) 7 << 24 | (uint64_t) ((size ? 255 : 15) << 2) << 12);
 	}
 	bool copy = ((h->modeH >> 20) & 3) == 2;
-	int dsdx = copy ? 4 << 10 : (int) (1024 / h->spriteScaleX), dtdy = copy ? 1 << 10 : (int) (1024 / h->spriteScaleY);
-	float stepX = copy ? 1 : h->spriteScaleX, stepY = copy ? 1 : h->spriteScaleY;
+	// The scales are texels per pixel.
+	int dsdx = copy ? 4 << 10 : (int) (1024 * h->spriteScaleX), dtdy = copy ? 1 << 10 : (int) (1024 * h->spriteScaleY);
+	float stepX = copy ? 1 : 1 / h->spriteScaleX, stepY = copy ? 1 : 1 / h->spriteScaleY;
 	for (int t = 0; t < height; t += band) {
 		int rows = height - t < band ? height - t : band;
 		emit(n, h, (uint64_t) 0x3D << 56 | (uint64_t) format << 53 | (uint64_t) loadSize << 51 | (uint64_t) (loadStride - 1) << 32 | image);
 		emit(n, h, (uint64_t) 0x35 << 56 | (uint64_t) format << 53 | (uint64_t) loadSize << 51 | (uint64_t) line << 41 | (uint64_t) 7 << 24);
 		emit(n, h, (uint64_t) 0x34 << 56 | (uint64_t) (loadS0 << 2) << 44 | (uint64_t) ((t0 + t) << 2) << 32 | (uint64_t) 7 << 24 |
 		           (uint64_t) (loadS1 << 2) << 12 | (uint64_t) ((t0 + t + rows - 1) << 2));
-		emit(n, h, (uint64_t) 0x35 << 56 | (uint64_t) format << 53 | (uint64_t) size << 51 | (uint64_t) line << 41);
-		emit(n, h, (uint64_t) 0x32 << 56 | (uint64_t) (s0 << 2) << 44 | (uint64_t) ((t0 + t) << 2) << 32 | (uint64_t) ((s0 + width - 1) << 2) << 12 |
+		emit(n, h, (uint64_t) 0x35 << 56 | (uint64_t) format << 53 | (uint64_t) size << 51 | (uint64_t) line << 41 | 2 << 18 | 2 << 8);
+		emit(n, h, (uint64_t) 0x32 << 56 | (uint64_t) ((size ? s0 : loadS0 * 2) << 2) << 44 | (uint64_t) ((t0 + t) << 2) << 32 | (uint64_t) ((s0 + width - 1) << 2) << 12 |
 		           (uint64_t) ((t0 + t + rows - 1) << 2));
 		int yh = y + (int) (t * stepY * 4), yl = y + (int) ((t + rows) * stepY * 4) - (copy ? 4 : 0);
 		int xh = x, xl = x + (int) (width * stepX * 4) - (copy ? 4 : 0);
