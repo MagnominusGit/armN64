@@ -856,14 +856,42 @@ uvec2 attrStart(int t, int v, int de, int dx, uvec2 dx0, int ey) {
 	return add64(add64(ext64(data[t + v]), mul64(data[t + de], ey)), shift64(mulWide(dx, dx0), 16));
 }
 
+// A triangle's span on row y, its four sub-scanlines in eighths of a pixel, left | right << 16
+// (rdp.c span); empty ones 0.
+ivec4 rowSpan(int p, int y) {
+	int t = data[p + P_TRI];
+	int yl = data[t + T_YL], ym = data[t + T_YM], yh = data[t + T_YH];
+	int xh = data[t + T_XH], dxh = data[t + T_DXH];
+	ivec4 sc = ivec4(data[t + T_SCISSOR], data[t + T_SCISSOR + 1], data[t + T_SCISSOR + 2], data[t + T_SCISSOR + 3]);
+	ivec4 span = ivec4(0);
+	for (int k = 0; k < 4; ++k) {
+		int q = y * 4 + k;
+		if (q < yh || q >= yl || q < sc.y || q >= sc.w) {
+			continue;
+		}
+		int dy = q - (yh & ~3);
+		uvec2 major = add64(ext64(xh), quarter64(mul64(dxh, dy)));
+		uvec2 minor = q < ym ? add64(ext64(data[t + T_XM]), quarter64(mul64(data[t + T_DXM], dy)))
+		                     : add64(ext64(data[t + T_XL]), quarter64(mul64(data[t + T_DXL], q - ym)));
+		bool majorFirst = less64(major, minor);
+		int l8 = max(bits64(majorFirst ? major : minor, 13), sc.x * 2), r8 = min(bits64(majorFirst ? minor : major, 13), sc.z * 2);
+		if (l8 < r8) {
+			span[k] = l8 | r8 << 16;
+		}
+	}
+	return span;
+}
+
 // One primitive at the pixel: the attributes by kind, then one path for texturing, the level of
 // detail, and shading.
-void drawPrim(int p, int x, int y) {
+void drawPrim(int p, int x, int y, ivec4 span) {
 	int kind = data[p + P_KIND];
+	if (!(HAS_TRI && kind == KIND_TRIANGLE)) {
+		loadState(p);
+	}
 	clearPixel();
 	pDz = data[p + 22];
 	pPrimDz = data[p + 23];
-	int cycleType = int(omHi >> 20) & 3;
 	int tile = data[p + P_TILE];
 	bool tex = false, lod = false, copy = false;
 	ivec2 st = ivec2(0), sx = ivec2(0), sy = ivec2(0);
@@ -872,24 +900,13 @@ void drawPrim(int p, int x, int y) {
 		return;
 	}
 	if (HAS_TRI && kind == KIND_TRIANGLE) {
-		// The row's span, its four sub-scanlines in eighths of a pixel (rdp.c span).
 		int t = data[p + P_TRI];
-		int yl = data[t + T_YL], ym = data[t + T_YM], yh = data[t + T_YH];
+		int yh = data[t + T_YH];
 		int xh = data[t + T_XH], dxh = data[t + T_DXH];
-		ivec4 sc = ivec4(data[t + T_SCISSOR], data[t + T_SCISSOR + 1], data[t + T_SCISSOR + 2], data[t + T_SCISSOR + 3]);
 		int x0 = 0x7FFFFFFF, x1 = -0x7FFFFFFF - 1;
 		ivec4 left = ivec4(0), right = ivec4(0);
 		for (int k = 0; k < 4; ++k) {
-			int q = y * 4 + k;
-			if (q < yh || q >= yl || q < sc.y || q >= sc.w) {
-				continue;
-			}
-			int dy = q - (yh & ~3);
-			uvec2 major = add64(ext64(xh), quarter64(mul64(dxh, dy)));
-			uvec2 minor = q < ym ? add64(ext64(data[t + T_XM]), quarter64(mul64(data[t + T_DXM], dy)))
-			                     : add64(ext64(data[t + T_XL]), quarter64(mul64(data[t + T_DXL], q - ym)));
-			bool majorFirst = less64(major, minor);
-			int l8 = max(bits64(majorFirst ? major : minor, 13), sc.x * 2), r8 = min(bits64(majorFirst ? minor : major, 13), sc.z * 2);
+			int l8 = span[k] & 0xFFFF, r8 = span[k] >> 16;
 			if (l8 >= r8) {
 				continue;
 			}
@@ -911,11 +928,13 @@ void drawPrim(int p, int x, int y) {
 				}
 			}
 		}
-		pCvg = bitCount(mask);
-		pCvbit = (mask & 0x80) != 0;
-		if (((omLo >> 3) & 1u) != 0u ? mask == 0 : !pCvbit) {
+		bool cvbit = (mask & 0x80) != 0;
+		if ((data[data[p + P_STATE] + S_OM_LO] & 8) != 0 ? mask == 0 : !cvbit) {
 			return;
 		}
+		loadState(p);
+		pCvg = bitCount(mask);
+		pCvbit = cvbit;
 		int k = x - x0;
 		int flags = data[p + P_FLAGS];
 		// Attributes at the scanline's top, from the major edge's x there.
@@ -960,6 +979,7 @@ void drawPrim(int p, int x, int y) {
 			}
 		}
 	} else if (HAS_TEXRECT && kind == KIND_TEXRECT) {
+		int cycleType = int(omHi >> 20) & 3;
 		int s0 = data[p + P_S0], t0 = data[p + P_T0], dsdx = data[p + P_DSDX], dtdy = data[p + P_DTDY];
 		bool flip = data[p + P_FLIP] != 0;
 		int dx = x - data[p + P_CX0], dy = y - data[p + P_CY0];
@@ -981,6 +1001,7 @@ void drawPrim(int p, int x, int y) {
 			pLodFrac = levelOfDetail(tile, st.x, st.y, sx.x, sx.y, sy.x, sy.y, t1, t2);
 		}
 		// Each cycle filters or converts from YUV; convert-one converts the first cycle's texel.
+		int cycleType = int(omHi >> 20) & 3;
 		bool filter0 = cycleType >= 2 || ((omHi >> 11) & 1u) != 0u, filter1 = ((omHi >> 10) & 1u) != 0u;
 		bool convertOne = HAS_CONV && ((omHi >> 9) & 1u) != 0u;
 		int samples = HAS_TWO && cycleType == 1 ? 2 : 1;
@@ -1036,6 +1057,7 @@ void drawPrim(int p, int x, int y) {
 }
 
 shared uint bestKey;
+shared ivec4 spans[256];
 
 void main() {
 	ivec2 tileXY = ivec2(gl_WorkGroupID.xy) + ivec2(u[2], u[3]);
@@ -1049,18 +1071,36 @@ void main() {
 	if (count > 0) {
 		loadPixel(x, y);
 	}
-	for (int i = 0; i < count; ++i) {
-		int index = data[u[1] + first + i];
-		int p = index * PRIM_SIZE;
-		if (x < data[p + P_X0] || x > data[p + P_X1] || y < data[p + P_Y0] || y > data[p + P_Y1]) {
-			continue;
+	// Sixteen primitives at a time: each thread works out one's span on its row for the others.
+	int lx = int(gl_LocalInvocationID.x), row = int(gl_LocalInvocationID.y) * 16;
+	for (int base = 0; base < count; base += 16) {
+		int n = min(16, count - base);
+		if (HAS_TRI) {
+			ivec4 span = ivec4(0);
+			if (lx < n) {
+				int p = data[u[1] + first + base + lx] * PRIM_SIZE;
+				if (data[p + P_KIND] == KIND_TRIANGLE && y >= data[p + P_Y0] && y <= data[p + P_Y1]) {
+					span = rowSpan(p, y);
+				}
+			}
+			spans[row + lx] = span;
+			barrier();
 		}
-		loadState(p);
-		shaded = false;
-		drawPrim(p, x, y);
-		if (shaded) {
-			key = uint(index + 1) << 20 | uint(y) << 10 | uint(x);
-			keyColor = lastCombined;
+		for (int j = 0; j < n; ++j) {
+			int index = data[u[1] + first + base + j];
+			int p = index * PRIM_SIZE;
+			if (x < data[p + P_X0] || x > data[p + P_X1] || y < data[p + P_Y0] || y > data[p + P_Y1]) {
+				continue;
+			}
+			shaded = false;
+			drawPrim(p, x, y, HAS_TRI ? spans[row + j] : ivec4(0));
+			if (shaded) {
+				key = uint(index + 1) << 20 | uint(y) << 10 | uint(x);
+				keyColor = lastCombined;
+			}
+		}
+		if (HAS_TRI) {
+			barrier();
 		}
 	}
 	if (count > 0) {
