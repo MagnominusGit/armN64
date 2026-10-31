@@ -638,8 +638,9 @@ void rspStep(struct N64* n) {
 		case 0x2B:
 			result = s < t;
 			break;
+		// The rest act as SRLV rd, rs, rs (sauraen's rsp_inval_instrs).
 		default:
-			dest = -1;
+			result = s >> (s & 31);
 		}
 		break;
 	case 0x01: {

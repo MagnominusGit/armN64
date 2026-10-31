@@ -887,6 +887,12 @@ static enum Kind emitInstruction(struct Jit* j, uint32_t op, uint32_t pc, bool d
 			}
 			return PLAIN;
 		}
+		// The rest act as SRLV rd, rs, rs.
+		if (rd) {
+			aLdr(e, 0, RSP, gprOff(rs));
+			aDp(e, A_LSRV, 0, 0, 0, S_LSL, 0);
+			aStr(e, 0, RSP, gprOff(rd));
+		}
 		return PLAIN;
 	}
 	case 0x01:

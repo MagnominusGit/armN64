@@ -497,7 +497,13 @@ static bool emitInline(struct Jit* j, uint32_t op, uint64_t pc, enum Kind* kind)
 		case 0x1A: case 0x1B: {
 			// LO the quotient and HI the remainder, sign-extended (INT32_MIN / -1 wraps, as SDIV does).
 			// By zero HI is the dividend and LO all ones, or 1 for a negative dividend in DIV.
+			// DIV by a divisor that isn't a 32-bit one sign-extended divides as 64 bits, in C.
 			int s = readReg(j, rs), t = readReg(j, rt);
+			if (f == 0x1A && t != ZR) {
+				aSxtw(e, 2, t);
+				aDp(e, A_SUBS | W64, ZR, t, 2, S_LSL, 0);
+				slowIf(j, C_NE);
+			}
 			emit32(e, (f == 0x1A ? 0x1AC00C00 : 0x1AC00800) | (t << 16) | (s << 5) | 0);
 			emit32(e, 0x1B008000 | (t << 16) | (s << 10) | (0 << 5) | 1);
 			aSxtw(e, 1, 1);

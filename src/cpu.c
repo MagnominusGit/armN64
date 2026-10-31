@@ -949,13 +949,13 @@ static void special(struct N64* n, uint32_t op) {
 	}
 	case 0x1A: {
 		c->stall += 36;
-		int32_t a = (int32_t) s, b = (int32_t) t;
+		// A divisor whose bits 63 and 31 agree divides as 64 bits (Thar0's integer multiply and divide
+		// test); the others as their low 32 bits.
+		int32_t const a = (int32_t) s;
+		int64_t const b = (t >> 63) == ((t >> 31) & 1) ? (int64_t) t : (int32_t) t;
 		if (b == 0) {
 			c->lo = a < 0 ? 1 : ~0ull;
 			c->hi = sext32((uint32_t) a);
-		} else if (a == INT32_MIN && b == -1) {
-			c->lo = sext32((uint32_t) a);
-			c->hi = 0;
 		} else {
 			c->lo = sext32((uint32_t) (a / b));
 			c->hi = sext32((uint32_t) (a % b));
