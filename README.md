@@ -49,3 +49,10 @@ The app, and its AppImages and APK (into `build-appimage/` and `build-android/`)
     armulators/package/android/build.sh
 
 Licensed under the GNU General Public License, version 2 or (at your option) any later version (`LICENSE`).
+Parts come from other projects under their own licences, kept in their files:
+
+- The RDP's rasterization, dither and texture sampling follow paraLLEl-RDP (Copyright (c) 2020
+  Themaister, MIT licence).
+- Some HLE microcode details (F3DAM's texture coordinates) follow GLideN64 (Sergey Lipskiy and
+  contributors, GPL-2.0), so a build of armN64 as a whole is under GPL-2.0.
+- The audio HLE is mupen64plus-rsp-hle's (GPL-2.0-or-later).
