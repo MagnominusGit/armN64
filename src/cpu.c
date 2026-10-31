@@ -345,9 +345,12 @@ static void cop0Write(struct N64* n, int r, uint64_t v) {
 		n->cpu.countBase = (n->cycles >> 1) - (uint32_t) v;
 		n->cpu.lastCount = (uint32_t) v;
 		return;
+	// The timer is checked from the Count at the write on, as each instruction checks it (compiled
+	// code checks it only where blocks start).
 	case CP0_COMPARE:
 		cop0[r] = (uint32_t) v;
 		cop0[CP0_CAUSE] &= ~0x8000ull;
+		n->cpu.lastCount = cpuCount(n);
 		return;
 	case CP0_CAUSE:
 		cop0[r] = (cop0[r] & ~0x300ull) | (v & 0x300);
