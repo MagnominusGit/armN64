@@ -107,6 +107,56 @@ static void writePicture(struct N64* n, const char* path) {
 	fclose(out);
 }
 
+// N64RDPDUMP=file: the RDP's commands from field N64RDPDUMPFROM on, in paraLLEl-RDP's dump layout
+// (RDRAM big-endian): before each batch, what else changed RDRAM and its hidden bits since the
+// last; after a batch with a full sync, a completion, where a replay compares (tools/rdpcmp).
+static FILE* rdpDump;
+static uint8_t* rdpDumpRam;
+static bool rdpDumping, rdpDumpBatch, rdpDumpSynced;
+
+static void rdpDumpWords(const uint32_t* w, size_t count) {
+	fwrite(w, sizeof(*w), count, rdpDump);
+}
+
+static void rdpDumpChanges(const uint8_t* now, uint8_t* was, uint32_t size, uint32_t block, uint32_t flush) {
+	for (uint32_t a = 0; a < size; a += 4096) {
+		if (memcmp(now + a, was + a, 4096)) {
+			rdpDumpWords((uint32_t[]) { block, a, 4096 }, 3);
+			fwrite(now + a, 1, 4096, rdpDump);
+		}
+	}
+	rdpDumpWords(&flush, 1);
+	memcpy(was, now, size);
+}
+
+static void rdpDumpTap(struct N64* n, const uint64_t* w, int count) {
+	if (!count) {
+		if (rdpDumpBatch) {
+			memcpy(rdpDumpRam, n->rdram, RDRAM_SIZE);
+			memcpy(rdpDumpRam + RDRAM_SIZE, n->hidden, RDRAM_SIZE / 2);
+			if (rdpDumpSynced) {
+				rdpDumpWords((uint32_t[]) { 5 }, 1);
+			}
+		}
+		rdpDumpBatch = rdpDumpSynced = false;
+		return;
+	}
+	if (!rdpDumping) {
+		return;
+	}
+	if (!rdpDumpBatch) {
+		rdpDumpChanges(n->rdram, rdpDumpRam, RDRAM_SIZE, 1, 7);
+		rdpDumpChanges(n->hidden, rdpDumpRam + RDRAM_SIZE, RDRAM_SIZE / 2, 8, 9);
+		rdpDumpBatch = true;
+	}
+	uint32_t op = (uint32_t) (w[0] >> 56) & 0x3F;
+	rdpDumpWords((uint32_t[]) { 2, op, (uint32_t) count * 2 }, 3);
+	for (int i = 0; i < count; ++i) {
+		rdpDumpWords((uint32_t[]) { (uint32_t) (w[i] >> 32), (uint32_t) w[i] }, 2);
+	}
+	rdpDumpSynced |= op == 0x29;
+}
+
 int main(int argc, char** argv) {
 	if (argc < 3) {
 		fprintf(stderr, "usage: %s rom fields [picture.ppm]\n", argv[0]);
@@ -215,6 +265,20 @@ int main(int argc, char** argv) {
 		free(saved);
 	}
 	const char* input = getenv("N64INPUT");
+	int rdpDumpFrom = getenv("N64RDPDUMPFROM") ? atoi(getenv("N64RDPDUMPFROM")) : 0;
+	if (getenv("N64RDPDUMP")) {
+		rdpDump = fopen(getenv("N64RDPDUMP"), "wb");
+		rdpDumpRam = calloc(1, RDRAM_SIZE + RDRAM_SIZE / 2);
+		if (!rdpDump || !rdpDumpRam) {
+			fprintf(stderr, "can't write %s\n", getenv("N64RDPDUMP"));
+			return 1;
+		}
+		fwrite("RDPDUMP2", 8, 1, rdpDump);
+		rdpDumpWords((uint32_t[]) { RDRAM_SIZE, RDRAM_SIZE / 2 }, 2);
+		// Commands drawn as they come, on this thread.
+		n->rdpThreads = 0, n->rdpGpu = false, n->rdpGl = false;
+		n->rdpTap = rdpDumpTap;
+	}
 	// N64STATETEST=field: a save state there, then after the run it is loaded and the rest run again;
 	// RDRAM and the picture must come out the same.
 	int stateAt = getenv("N64STATETEST") ? atoi(getenv("N64STATETEST")) : -1;
@@ -265,7 +329,11 @@ int main(int argc, char** argv) {
 			memcpy(before, n->rdram, RDRAM_SIZE);
 			memset(n->dirtyPages, 0xFF, sizeof(n->dirtyPages));
 		}
+		rdpDumping = rdpDump && f >= rdpDumpFrom;
 		n64RunField(n);
+		if (rdpDumping) {
+			rdpDumpWords((uint32_t[]) { 4 }, 1);
+		}
 		if (dirtyTest) {
 			rdpWait(n);
 			for (uint32_t p = 0; p < (RDRAM_SIZE >> 12); ++p) {
@@ -477,5 +545,9 @@ int main(int argc, char** argv) {
 		writePicture(n, argv[3]);
 	}
 	n64Destroy(n);
+	if (rdpDump) {
+		rdpDumpWords((uint32_t[]) { 6 }, 1);
+		fclose(rdpDump);
+	}
 	return 0;
 }

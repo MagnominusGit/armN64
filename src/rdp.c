@@ -54,6 +54,44 @@ static struct RDP* state(struct N64* n) {
 	return n->rdp;
 }
 
+// Noise: a hash of the pixel and the primitive (the hardware's sequence isn't known), the same
+// however many renderers draw and after a save state.
+static uint32_t pixelNoise(const struct RDP* r, int x, int y, uint32_t tag) {
+	uint32_t h = (uint32_t) x * 0x9E3779B1u ^ (uint32_t) y * 0x85EBCA77u ^ (uint32_t) r->seq * 0xC2B2AE3Du ^ tag;
+	h ^= h >> 15;
+	h *= 0x2C1B3C6Du;
+	h ^= h >> 12;
+	return h;
+}
+
+// The magic square and Bayer dither matrices (paraLLEl-RDP's dither.h, MIT).
+static const uint8_t ditherMatrix[2][16] = {
+	{ 0, 6, 1, 7, 4, 2, 5, 3, 3, 5, 2, 4, 7, 1, 6, 0 },
+	{ 0, 4, 1, 5, 4, 0, 5, 1, 3, 7, 2, 6, 7, 3, 6, 2 },
+};
+
+// Whether the pixels take noise: from the combiner, a noise dither or the alpha test's dither.
+static bool usesNoise(const struct RDP* r) {
+	uint64_t m = r->otherModes;
+	return r->stage[r->cycleType == 1 ? 0 : 1].noise || (r->cycleType == 1 && r->stage[1].noise) || ((m >> 38) & 3) == 2 || ((m >> 36) & 3) == 2 ||
+	       ((m & 1) && ((m >> 1) & 1));
+}
+
+// A pixel's dither: three bits for each colour channel (red lowest) and alpha's.
+static void ditherAt(const struct RDP* r, int x, int y, int* rgb, int* alpha) {
+	int modeRgb = (int) (r->otherModes >> 38) & 3, modeAlpha = (int) (r->otherModes >> 36) & 3;
+	int i = (y & 3) * 4 + (x & 3);
+	*rgb = modeRgb < 2 ? ditherMatrix[modeRgb][i] * 0x49 : modeRgb == 2 ? (int) (pixelNoise(r, x, y, 4) & 0x1FF) : 0;
+	if (modeAlpha == 3) {
+		*alpha = 0;
+	} else if (modeAlpha == 2) {
+		*alpha = (int) (pixelNoise(r, x, y, 5) & 7);
+	} else {
+		*alpha = modeRgb >= 2 ? ditherMatrix[modeRgb & 1][i] : *rgb & 7;
+		*alpha = modeAlpha == 1 ? ~*alpha & 7 : *alpha;
+	}
+}
+
 static uint64_t word(struct N64* n, uint32_t addr) {
 	if (!(n->dp.status & 1) && (n->pageFlags[(addr & (RDRAM_SIZE - 8)) >> 12] & PAGE_RDP_WRITES)) {
 		rdpWaitRead(n, addr & (RDRAM_SIZE - 8), 8);
@@ -105,7 +143,7 @@ static struct Color readPixel(struct N64* n, struct RDP* r, int x, int y) {
 	uint16_t p = (uint16_t) (n->rdram[a] << 8 | n->rdram[a + 1]);
 	int cr = (p >> 11) & 31, cg = (p >> 6) & 31, cb = (p >> 1) & 31;
 	// The coverage: the colour's low bit over the two hidden bits.
-	return (struct Color) { cr << 3 | cr >> 2, cg << 3 | cg >> 2, cb << 3 | cb >> 2, ((p & 1) << 2 | n->hidden[a >> 1]) << 5 };
+	return (struct Color) { cr << 3, cg << 3, cb << 3, ((p & 1) << 2 | n->hidden[a >> 1]) << 5 };
 }
 
 static void writePixel(struct N64* n, struct RDP* r, int x, int y, struct Color c) {
@@ -322,39 +360,78 @@ static inline __attribute__((always_inline)) int wrapCoord(int c, int shift, int
 	return i;
 }
 
-static inline __attribute__((always_inline)) struct Color sampleAs(struct RDP* r, const struct Tile* tile, int s, int t, bool bilinear,
+// Texture coordinates and filtering follow paraLLEl-RDP's texture.h (MIT): a 10.5 coordinate
+// clamped to 16 bits, shifted, offset by the tile's start and, with clamping, held at its last whole
+// texel; masked and mirrored per texel.
+static inline __attribute__((always_inline)) int texClamp(int c, bool clamp, int lo, int hi, int shift) {
+	c = c < -0x8000 ? -0x8000 : c > 0x7FFF ? 0x7FFF : c;
+	c = shift < 11 ? c >> shift : (int32_t) ((uint32_t) c << (32 - shift)) >> 16;
+	if (!clamp) {
+		return c - (lo << 3);
+	}
+	if ((c >> 3) >= hi) {
+		return (((hi >> 2) - (lo >> 2)) & 0x3FF) << 5;
+	}
+	c -= lo << 3;
+	return c < 0 ? 0 : c;
+}
+
+static inline __attribute__((always_inline)) int texMask(int c, int mask, bool mirror) {
+	if (mask) {
+		int m = 1 << (mask > 10 ? 10 : mask);
+		if (mirror && (c & m)) {
+			c ^= m - 1;
+		}
+		c &= m - 1;
+	}
+	return c;
+}
+
+static inline __attribute__((always_inline)) struct Color sampleAs(struct RDP* r, const struct Tile* tile, int s, int t, bool bilerp,
                                                                     enum TexelKind kind) {
-	int fs, ft;
-	int s0 = wrapCoord(s, tile->shiftS, tile->sl, tile->sh, tile->cmS, tile->maskS, &fs);
-	int t0 = wrapCoord(t, tile->shiftT, tile->tl, tile->th, tile->cmT, tile->maskT, &ft);
-	if (!bilinear) {
-		return texel(r, tile, s0, t0, kind);
+	uint64_t m = r->otherModes;
+	bool quad = (m >> 45) & 1, tlut = (m >> 47) & 1, midMode = (m >> 40) & 1;
+	int cs = texClamp(s, (tile->cmS & 2) || !tile->maskS, tile->sl, tile->sh, tile->shiftS);
+	int ct = texClamp(t, (tile->cmT & 2) || !tile->maskT, tile->tl, tile->th, tile->shiftT);
+	int fs = quad || tlut ? cs & 31 : 0, ft = quad || tlut ? ct & 31 : 0;
+	int sum = fs + ft;
+	cs >>= 5, ct >>= 5;
+	int s0 = texMask(cs, tile->maskS, tile->cmS & 1), s1 = texMask(cs + 1, tile->maskS, tile->cmS & 1);
+	int t0 = texMask(ct, tile->maskT, tile->cmT & 1), t1 = texMask(ct + 1, tile->maskT, tile->cmT & 1);
+	int tdiff = t1 - t0 < -255 ? -255 : t1 - t0;
+	t1 = (t0 & 0xFF) + tdiff, t0 &= 0xFF;
+	bool mid = midMode && bilerp && fs == 16 && ft == 16;
+	if (mid) {
+		sum = 0;
 	}
-	int f;
-	int s1 = wrapCoord(s + (32 << (tile->shiftS < 11 ? tile->shiftS : 0)), tile->shiftS, tile->sl, tile->sh, tile->cmS,
-	                   tile->maskS, &f);
-	int t1 = wrapCoord(t + (32 << (tile->shiftT < 11 ? tile->shiftT : 0)), tile->shiftT, tile->tl, tile->th, tile->cmT,
-	                   tile->maskT, &f);
-	i4 c0 = lanes(texel(r, tile, s0, t0, kind)), c1 = lanes(texel(r, tile, s1, t0, kind)), c2 = lanes(texel(r, tile, s0, t1, kind));
-	// Three-point filtering: the triangle of texels nearest the sample point.
-	if (fs + ft < 32) {
-		return color(c0 + ((c1 - c0) * fs + (c2 - c0) * ft) / 32);
+	int bs = sum >= 32 ? s1 : s0, bt = sum >= 32 ? t1 : t0;
+	if (tlut && !quad) {
+		bs = s0, bt = t0, s1 = s0, t1 = t0;
 	}
-	i4 c3 = lanes(texel(r, tile, s1, t1, kind));
-	return color(c3 + ((c2 - c3) * (32 - fs) + (c1 - c3) * (32 - ft)) / 32);
+	struct Color base = texel(r, tile, bs, bt, kind);
+	if (mid) {
+		i4 sum4 = lanes(base) + lanes(texel(r, tile, s1, t0, kind)) + lanes(texel(r, tile, s0, t1, kind)) + lanes(texel(r, tile, s1, t1, kind));
+		return color((sum4 + 2) >> 2);
+	}
+	if (!bilerp || !(quad || tlut)) {
+		return base;
+	}
+	i4 b = lanes(base), t10 = lanes(texel(r, tile, s1, t0, kind)), t01 = lanes(texel(r, tile, s0, t1, kind));
+	int fx = sum >= 32 ? 32 - ft : fs, fy = sum >= 32 ? 32 - fs : ft;
+	return color((((t10 - b) * fx + (t01 - b) * fy + 0x10) >> 5) + b);
 }
 
 static struct Color sample(struct RDP* r, int tileIndex, int s, int t, bool filter) {
 	struct Tile* tile = &r->tile[tileIndex & 7];
-	bool bilinear = filter && ((r->otherModes >> 45) & 1) && ((r->otherModes >> 52) & 3) < 2;
+	bool bilerp = filter && ((r->otherModes >> 52) & 3) < 2;
 	switch (texelKind(r, tile)) {
-#define SAMPLE_AS(kind) case kind: return sampleAs(r, tile, s, t, bilinear, kind);
+#define SAMPLE_AS(kind) case kind: return sampleAs(r, tile, s, t, bilerp, kind);
 	SAMPLE_AS(TK_I4) SAMPLE_AS(TK_IA4) SAMPLE_AS(TK_CI4) SAMPLE_AS(TK_CI4_IA) SAMPLE_AS(TK_I8) SAMPLE_AS(TK_IA8)
 	SAMPLE_AS(TK_CI8) SAMPLE_AS(TK_CI8_IA) SAMPLE_AS(TK_YUV16) SAMPLE_AS(TK_IA16) SAMPLE_AS(TK_CI16) SAMPLE_AS(TK_CI16_IA)
 	SAMPLE_AS(TK_RGBA16)
 #undef SAMPLE_AS
 	default:
-		return sampleAs(r, tile, s, t, bilinear, TK_RGBA32);
+		return sampleAs(r, tile, s, t, bilerp, TK_RGBA32);
 	}
 }
 
@@ -456,11 +533,7 @@ static int rgbInput(struct RDP* r, struct Pixel* p, int sel, int channel, int wh
 		if (which == 0 && sel == 7) {
 			// Noise: a hash of the pixel and the primitive (the hardware's sequence isn't known), the
 			// same however many renderers draw and after a save state.
-			uint32_t h = (uint32_t) p->x * 0x9E3779B1u ^ (uint32_t) p->y * 0x85EBCA77u ^ (uint32_t) r->seq * 0xC2B2AE3Du ^ (uint32_t) channel;
-			h ^= h >> 15;
-			h *= 0x2C1B3C6Du;
-			h ^= h >> 12;
-			return (int) (h & 255);
+			return (int) (pixelNoise(r, p->x, p->y, (uint32_t) channel) & 255);
 		}
 		if (which == 1 && sel == 7) {
 			return r->k4;
@@ -766,17 +839,39 @@ static void shadePixel(struct N64* n, struct RDP* r, int x, int y, struct Pixel*
 	p->combined = r->lastCombined;
 	struct Color c = combineCycle(r, p, cycleType == 1 ? 0 : 1);
 	if (cycleType == 1) {
+		// The second cycle sees the pipelined texels: texel 1 as texel 0 (and texel 0 as texel 1, as
+		// paraLLEl-RDP has it for the next pixel's).
+		struct Color t = p->tex0;
+		p->tex0 = p->tex1, p->tex1 = t;
 		p->combined = c;
 		c = combineCycle(r, p, 1);
 	}
 	r->lastCombined = c;
 	r->lastPos = r->seq << 24 | (uint64_t) y << 12 | (uint32_t) x;
 	c = (struct Color) { clamp9(c.r), clamp9(c.g), clamp9(c.b), clamp9(c.a) };
-	// Coverage times alpha scales the coverage, and alpha as coverage replaces alpha with it.
-	int cvg = r->cvgTimesAlpha ? (((c.a * p->cvg + 4) >> 3) >> 5) & 15 : p->cvg;
-	if (r->cvgAlpha) {
-		c.a = cvg << 5 > 255 ? 255 : cvg << 5;
+	int rgbDither, alphaDither;
+	ditherAt(r, x, y, &rgbDither, &alphaDither);
+	// Alpha with 255 as 256; coverage times alpha scales the coverage, alpha as coverage replaces
+	// alpha with that (else alpha is dithered). Two-cycle mode tests the first cycle's alpha.
+	int reference = 0;
+	if (cycleType == 1 && r->alphaCompare) {
+		int a0 = clamp9(p->combined.a);
+		a0 += (a0 + 1) >> 8;
+		a0 = r->cvgAlpha ? (r->cvgTimesAlpha ? (a0 * p->cvg + 4) >> 3 : p->cvg << 5) : a0 + alphaDither;
+		reference = a0 < 0 ? 0 : a0 > 255 ? 255 : a0;
 	}
+	int alpha = c.a + ((c.a + 1) >> 8);
+	int cvg = p->cvg, scaled = cvg << 5;
+	if (r->cvgTimesAlpha) {
+		scaled = (alpha * cvg + 4) >> 3;
+		cvg = scaled >> 5;
+	}
+	alpha = r->cvgAlpha ? scaled : alpha + alphaDither;
+	c.a = alpha < 0 ? 0 : alpha > 255 ? 255 : alpha;
+	if (cycleType != 1) {
+		reference = c.a;
+	}
+	p->shade.a = p->shade.a + alphaDither > 255 ? 255 : p->shade.a + alphaDither;
 	struct Color memory = readPixel(n, r, x, y);
 	int memCvg = r->imageRead ? memory.a >> 5 : 7;
 	if (!r->imageRead) {
@@ -837,7 +932,7 @@ static void shadePixel(struct N64* n, struct RDP* r, int x, int y, struct Pixel*
 		r->blShiftB = dzEnc < 11 ? 4 : 15 - dzEnc;
 		blend = r->forceBlend || (!overflow && r->antialias);
 	}
-	if (r->alphaCompare && c.a < r->blend.a) {
+	if (r->alphaCompare && reference < ((r->otherModes >> 1) & 1 ? (int) (pixelNoise(r, x, y, 6) & 255) : r->blend.a)) {
 		return;
 	}
 	if (r->antialias ? !cvg : !p->cvbit) {
@@ -865,6 +960,14 @@ static void shadePixel(struct N64* n, struct RDP* r, int x, int y, struct Pixel*
 	}
 	// The image keeps the coverage (the alpha bit of 16-bit pixels with two hidden bits, the top 3
 	// alpha bits of 32-bit ones), as cvg_dest says.
+	if (((r->otherModes >> 38) & 3) != 3) {
+		int* o = &out.r;
+		for (int ch = 0; ch < 3; ++ch) {
+			if (((rgbDither >> (ch * 3)) & 7) < (o[ch] & 7)) {
+				o[ch] = o[ch] > 247 ? 255 : (o[ch] & 0xF8) + 8;
+			}
+		}
+	}
 	int kept = r->cvgDest == 0 ? (blend ? cvg + memCvg : cvg - 1) : r->cvgDest == 1 ? (cvg + memCvg) & 7 : r->cvgDest == 2 ? 7 : memCvg;
 	out.a = (kept & 8 ? 7 : kept & 7) << 5;
 	writePixel(n, r, x, y, out);
@@ -948,19 +1051,6 @@ static int t0Coord(int t0, int d, int dtdy) {
 }
 
 // Texture coordinates for the texture unit: S and T over W when perspective is on.
-static void texCoords(int64_t sS, int64_t sT, int64_t sW, bool persp, int* s, int* t) {
-	if (persp) {
-		int wv = (int) ((sW >> 16) & 0x7FFF);
-		if (wv == 0) {
-			wv = 1;
-		}
-		*s = (int) (((sS >> 16) * 0x8000) / wv);
-		*t = (int) (((sT >> 16) * 0x8000) / wv);
-	} else {
-		*s = (int) (sS >> 16);
-		*t = (int) (sT >> 16);
-	}
-}
 
 // Whether the combiner reads the LOD fraction in the cycles in use (then the RDP works out the LOD
 // even with mipmapping off).
@@ -1098,10 +1188,11 @@ static int32_t fix(uint64_t w, int shift) {
 }
 
 // A triangle's edges: the y of its bottom, middle and top in quarter lines, and x and its slope
-// along the low, high (major) and middle edges.
+// along the low, high (major) and middle edges as the command has them (s15.16), and its direction.
 struct Edges {
 	int yl, ym, yh;
 	int64_t xl, dxl, xh, dxh, xm, dxm;
+	bool flip;
 };
 
 static struct Edges edges(const uint64_t* w) {
@@ -1112,6 +1203,7 @@ static struct Edges edges(const uint64_t* w) {
 		.xl = fix(w[1], 32), .dxl = fix(w[1], 0),
 		.xh = fix(w[2], 32), .dxh = fix(w[2], 0),
 		.xm = fix(w[3], 32), .dxm = fix(w[3], 0),
+		.flip = (w[0] >> 55) & 1,
 	};
 }
 
@@ -1126,102 +1218,203 @@ static int triangleDz(const uint64_t* w, int op) {
 	return normalizeDz(sum & 0xFFFF) & 0xFFFF;
 }
 
-// The first and past-the-last scanline a triangle may cover inside the scissor.
+// The first and past-the-last scanline with a sub-scanline inside the triangle and the scissor.
 static void triangleRows(const struct RDP* r, const struct Edges* t, int* first, int* end) {
 	int top = t->yh < r->scissorY0 ? r->scissorY0 : t->yh;
 	int bottom = t->yl > r->scissorY1 ? r->scissorY1 : t->yl;
-	*first = (top + 3) >> 2;
-	*end = (bottom + 3) >> 2;
+	*first = top >> 2;
+	*end = ((bottom - 1) >> 2) + 1;
+	if (*end < *first) {
+		*end = *first;
+	}
+}
+
+// Spans, coverage and attribute stepping follow paraLLEl-RDP (Copyright (c) 2020 Themaister, MIT
+// licence: span_setup.comp, coverage.h, interpolation.h, perspective.h), itself checked against
+// Angrylion-Plus.
+
+static int32_t sext(uint32_t v, int bits) {
+	return (int32_t) (v << (32 - bits)) >> (32 - bits);
 }
 
 // A triangle on scanline y: each of its four sub-scanlines' edges in eighths of a pixel inside the
-// scissor (left >= right where it has none), and the pixels they reach (none if x1 < x0).
+// scissor (0xFFFF and 0 where it has none), and the pixels they reach.
 struct Span {
 	int x0, x1;
 	int32_t left[4], right[4];
 };
 
-static bool span(const struct RDP* r, const struct Edges* t, int y, struct Span* s) {
-	s->x0 = INT32_MAX, s->x1 = INT32_MIN;
-	bool any = false;
-	for (int k = 0; k < 4; ++k) {
-		int64_t q = (int64_t) y * 4 + k;
-		s->left[k] = 0, s->right[k] = 0;
-		if (q < t->yh || q >= t->yl || q < r->scissorY0 || q >= r->scissorY1) {
-			continue;
-		}
-		int64_t dy = q - (t->yh & ~3);
-		int64_t major = t->xh + t->dxh * dy / 4;
-		int64_t minor = q < t->ym ? t->xm + t->dxm * dy / 4 : t->xl + t->dxl * (q - t->ym) / 4;
-		int64_t lo = major < minor ? major : minor, hi = major < minor ? minor : major;
-		int64_t l8 = lo >> 13, r8 = hi >> 13;
-		l8 = l8 < r->scissorX0 * 2 ? r->scissorX0 * 2 : l8;
-		r8 = r8 > r->scissorX1 * 2 ? r->scissorX1 * 2 : r8;
-		if (l8 >= r8) {
-			continue;
-		}
-		s->left[k] = (int32_t) l8, s->right[k] = (int32_t) r8;
-		s->x0 = (int) (l8 >> 3) < s->x0 ? (int) (l8 >> 3) : s->x0;
-		s->x1 = (int) ((r8 - 1) >> 3) > s->x1 ? (int) ((r8 - 1) >> 3) : s->x1;
-		any = true;
-	}
-	return any;
+// An edge's x snapped to eighths of a pixel, the bits below kept as one.
+static int32_t snapX(int32_t x) {
+	return (x >> 12) | ((x & 0xFFF) != 0);
 }
 
-// The samples of pixel x a span covers, bit 7 first: two to a sub-scanline, at quarters 0 and 2 of
-// the pixel on even ones and 1 and 3 on odd ones.
+static bool span(const struct RDP* r, const struct Edges* t, int y, struct Span* s) {
+	int32_t xh0 = sext((uint32_t) t->xh, 28) >> 1, xm0 = sext((uint32_t) t->xm, 28) >> 1, xl0 = sext((uint32_t) t->xl, 28) >> 1;
+	int32_t dxh = sext((uint32_t) t->dxh >> 2, 28) >> 1, dxm = sext((uint32_t) t->dxm >> 2, 28) >> 1, dxl = sext((uint32_t) t->dxl >> 2, 28) >> 1;
+	int ylo = t->yh > r->scissorY0 ? t->yh : r->scissorY0, yhi = t->yl < r->scissorY1 ? t->yl : r->scissorY1;
+	int32_t loScissor = r->scissorX0 << 1, hiScissor = r->scissorX1 << 1;
+	bool allInvalid = true, allOver = true, allUnder = true;
+	int32_t start = INT32_MAX, end = INT32_MIN;
+	for (int k = 0; k < 4; ++k) {
+		int q = y * 4 + k;
+		uint32_t dy = (uint32_t) (q - (t->yh & ~3));
+		int32_t xh = sext((uint32_t) xh0 + dy * (uint32_t) dxh, 27);
+		int32_t xl = q < t->ym ? sext((uint32_t) xm0 + dy * (uint32_t) dxm, 27) : sext((uint32_t) xl0 + (uint32_t) (q - t->ym) * (uint32_t) dxl, 27);
+		int32_t left = t->flip ? snapX(xh) : snapX(xl), right = t->flip ? snapX(xl) : snapX(xh);
+		bool invalid = (left >> 1) > (right >> 1);
+		allOver &= (left < right ? left : right) >= hiScissor;
+		allUnder &= (left > right ? left : right) < loScissor;
+		left = left < loScissor ? loScissor : left > hiScissor ? hiScissor : left;
+		right = right < loScissor ? loScissor : right > hiScissor ? hiScissor : right;
+		if (invalid || q < ylo || q >= yhi) {
+			left = 0xFFFF, right = 0;
+		} else {
+			allInvalid = false;
+		}
+		s->left[k] = left, s->right[k] = right;
+		start = left < start ? left : start;
+		end = right > end ? right : end;
+	}
+	s->x0 = start >> 3, s->x1 = end >> 3;
+	return !allInvalid && !allOver && !allUnder;
+}
+
+// The samples of pixel x a span covers: two to a sub-scanline, bit 0 the first, at eighths 0 and 4
+// of the pixel on even sub-scanlines and 2 and 6 on odd ones.
 static int coverageMask(const struct Span* s, int x) {
 	int mask = 0;
 	for (int k = 0; k < 4; ++k) {
 		for (int j = 0; j < 2; ++j) {
-			int quarter = (k & 1) + j * 2;
-			int e = x * 8 + quarter * 2;
+			int32_t e = x * 8 + (k & 1) * 2 + j * 4;
 			if (e >= s->left[k] && e < s->right[k]) {
-				mask |= 1 << ((k < 2 ? 4 : 0) + 3 - quarter);
+				mask |= 1 << (k * 2 + j);
 			}
 		}
 	}
 	return mask;
 }
 
+// The first covered sample's offset from the pixel's corner, in quarter pixels (for attributes taken
+// there).
+static void sampleOffset(int mask, int* xoff, int* yoff) {
+	int first = __builtin_ctz((unsigned) mask);
+	*yoff = first >> 1;
+	*xoff = ((first & 1) << 1) + (*yoff & 1);
+}
+
+// Depth, 19 bits clamped to 18 the same way.
+static int clampZ(int z) {
+	z = sext((uint32_t) (z - (1 << 17)), 19) + (1 << 17);
+	return z < 0 ? 0 : z > 0x3FFFF ? 0x3FFFF : z;
+}
+
+static const int16_t perspectiveTable[64][2] = {
+	{ 0x4000, -252 * 4 }, { 0x3f04, -244 * 4 }, { 0x3e10, -238 * 4 }, { 0x3d22, -230 * 4 }, { 0x3c3c, -223 * 4 }, { 0x3b5d, -218 * 4 },
+	{ 0x3a83, -210 * 4 }, { 0x39b1, -205 * 4 }, { 0x38e4, -200 * 4 }, { 0x381c, -194 * 4 }, { 0x375a, -189 * 4 }, { 0x369d, -184 * 4 },
+	{ 0x35e5, -179 * 4 }, { 0x3532, -175 * 4 }, { 0x3483, -170 * 4 }, { 0x33d9, -166 * 4 }, { 0x3333, -162 * 4 }, { 0x3291, -157 * 4 },
+	{ 0x31f4, -155 * 4 }, { 0x3159, -150 * 4 }, { 0x30c3, -147 * 4 }, { 0x3030, -143 * 4 }, { 0x2fa1, -140 * 4 }, { 0x2f15, -137 * 4 },
+	{ 0x2e8c, -134 * 4 }, { 0x2e06, -131 * 4 }, { 0x2d83, -128 * 4 }, { 0x2d03, -125 * 4 }, { 0x2c86, -123 * 4 }, { 0x2c0b, -120 * 4 },
+	{ 0x2b93, -117 * 4 }, { 0x2b1e, -115 * 4 }, { 0x2aab, -113 * 4 }, { 0x2a3a, -110 * 4 }, { 0x29cc, -108 * 4 }, { 0x2960, -106 * 4 },
+	{ 0x28f6, -104 * 4 }, { 0x288e, -102 * 4 }, { 0x2828, -100 * 4 }, { 0x27c4, -98 * 4 },  { 0x2762, -96 * 4 },  { 0x2702, -94 * 4 },
+	{ 0x26a4, -92 * 4 },  { 0x2648, -91 * 4 },  { 0x25ed, -89 * 4 },  { 0x2594, -87 * 4 },  { 0x253d, -86 * 4 },  { 0x24e7, -85 * 4 },
+	{ 0x2492, -83 * 4 },  { 0x243f, -81 * 4 },  { 0x23ee, -80 * 4 },  { 0x239e, -79 * 4 },  { 0x234f, -77 * 4 },  { 0x2302, -76 * 4 },
+	{ 0x22b6, -74 * 4 },  { 0x226c, -74 * 4 },  { 0x2222, -72 * 4 },  { 0x21da, -71 * 4 },  { 0x2193, -70 * 4 },  { 0x214d, -69 * 4 },
+	{ 0x2108, -67 * 4 },  { 0x20c5, -67 * 4 },  { 0x2082, -65 * 4 },  { 0x2041, -65 * 4 },
+};
+
+// Texture coordinates from s, t and w (each the top 16 bits): with perspective, s and t times a
+// table's reciprocal of w (the RDP's divide), saturating; 17 bits signed.
+static void texCoords(int32_t sS, int32_t sT, int32_t sW, bool persp, int* s, int* t) {
+	int32_t st[2] = { sS >> 16, sT >> 16 };
+	if (persp) {
+		int32_t w = sW >> 16;
+		bool carry = w <= 0;
+		w &= 0x7FFF;
+		int msb = w ? 31 - __builtin_clz((unsigned) w) : -1;
+		int shift = 14 - msb < 14 ? 14 - msb : 14;
+		int norm = (w << shift) & 0x3FFF;
+		int rcp = ((perspectiveTable[norm >> 8][1] * (norm & 0xFF)) >> 10) + perspectiveTable[norm >> 8][0];
+		int32_t mask = ((1 << 30) - 1) & -((1 << 29) >> shift);
+		for (int i = 0; i < 2; ++i) {
+			int32_t prod = (int32_t) ((uint32_t) st[i] * (uint32_t) rcp);
+			int32_t outside = prod & mask;
+			int32_t v = shift != 14 ? prod >> (13 - shift) : (int32_t) ((uint32_t) prod << 1);
+			if (outside != mask && outside != 0) {
+				int32_t shifted = shift != 14 ? prod >> (13 - shift) : prod;
+				v = (shifted & (1 << 29)) == 0 ? 0x7FFF : -0x8000;
+			}
+			st[i] = carry ? 0x7FFF : v;
+		}
+	}
+	*s = st[0] < -0x10000 ? -0x10000 : st[0] > 0xFFFF ? 0xFFFF : st[0];
+	*t = st[1] < -0x10000 ? -0x10000 : st[1] > 0xFFFF ? 0xFFFF : st[1];
+}
+
+// The attributes' 32-bit values: shade r g b a, then s t w, then z; at the top, along x, along the
+// major edge and along y.
+struct Attributes {
+	int32_t v[8], dx[8], de[8], dy[8];
+};
+
+static struct Attributes attributes(const uint64_t* w, int op) {
+	struct Attributes a;
+	memset(&a, 0, sizeof(a));
+	int idx = 4;
+	for (int part = 0; part < 2; ++part) {
+		bool on = part == 0 ? op & 4 : op & 2;
+		if (!on) {
+			continue;
+		}
+		for (int i = 0; i < (part == 0 ? 4 : 3); ++i) {
+			int sh = 48 - i * 16, k = part * 4 + i;
+			a.v[k] = (int32_t) ((uint32_t) ((w[idx] >> sh) & 0xFFFF) << 16 | (uint32_t) ((w[idx + 2] >> sh) & 0xFFFF));
+			a.dx[k] = (int32_t) ((uint32_t) ((w[idx + 1] >> sh) & 0xFFFF) << 16 | (uint32_t) ((w[idx + 3] >> sh) & 0xFFFF));
+			a.de[k] = (int32_t) ((uint32_t) ((w[idx + 4] >> sh) & 0xFFFF) << 16 | (uint32_t) ((w[idx + 6] >> sh) & 0xFFFF));
+			a.dy[k] = (int32_t) ((uint32_t) ((w[idx + 5] >> sh) & 0xFFFF) << 16 | (uint32_t) ((w[idx + 7] >> sh) & 0xFFFF));
+		}
+		idx += 8;
+	}
+	if (op & 1) {
+		a.v[7] = fix(w[idx], 32), a.dx[7] = fix(w[idx], 0), a.de[7] = fix(w[idx + 1], 32), a.dy[7] = fix(w[idx + 1], 0);
+	}
+	return a;
+}
+
+// The attributes on scanline y at pixel *baseX: stepped down the major edge a line at a time, then
+// back along x by the edge's fraction of a pixel (latched on the last sub-scanline when the major
+// edge leans away from the triangle).
+static void rowAttributes(const struct Edges* t, const struct Attributes* a, int y, bool skipFrac, int32_t* at, int* baseX) {
+	int32_t xh0 = sext((uint32_t) t->xh, 28) >> 1, dxh = sext((uint32_t) t->dxh >> 2, 28) >> 1;
+	bool doOffset = t->flip == (((uint32_t) t->dxh >> 31) != 0);
+	uint32_t dy = (uint32_t) (y - (t->yh >> 2));
+	int32_t xh = (int32_t) ((uint32_t) xh0 + dy * ((uint32_t) dxh << 2));
+	if (doOffset) {
+		xh = (int32_t) ((uint32_t) xh + 3u * (uint32_t) dxh);
+	}
+	*baseX = xh >> 15;
+	int32_t xfrac = skipFrac ? 0 : (xh >> 7) & 0xFF;
+	for (int i = 0; i < 8; ++i) {
+		int32_t diff = 0;
+		if (doOffset) {
+			int32_t deh = a->de[i] & ~0x1FF, dyh = a->dy[i] & ~0x1FF;
+			diff = deh - (deh >> 2) - dyh + (dyh >> 2);
+		}
+		int32_t v = (int32_t) ((uint32_t) a->v[i] + dy * (uint32_t) a->de[i]);
+		at[i] = (int32_t) (((uint32_t) (v & ~0x1FF) + (uint32_t) diff - (uint32_t) xfrac * (uint32_t) ((a->dx[i] >> 8) & ~1)) & ~0x3FFu);
+	}
+}
+
 static void triangle(struct N64* n, struct RDP* r, const uint64_t* w, int op) {
 	bool shade = op & 4, tex = op & 2, zbuf = op & 1;
 	int tile = (w[0] >> 48) & 7;
 	struct Edges e = edges(w);
-	int64_t xh = e.xh, dxh = e.dxh;
-	int yh = e.yh;
-	int idx = 4;
-	int64_t sv[4] = { 0 }, sdx[4] = { 0 }, sde[4] = { 0 };
-	int64_t tv[3] = { 0 }, tdx[3] = { 0 }, tde[3] = { 0 }, tdy[3] = { 0 };
-	int64_t zv = 0, zdx = 0, zde = 0;
-	if (shade) {
-		for (int i = 0; i < 4; ++i) {
-			int sh = 48 - i * 16;
-			sv[i] = (int64_t) ((int32_t) ((uint32_t) ((w[idx] >> sh) & 0xFFFF) << 16 | (uint32_t) ((w[idx + 2] >> sh) & 0xFFFF)));
-			sdx[i] = (int32_t) ((uint32_t) ((w[idx + 1] >> sh) & 0xFFFF) << 16 | (uint32_t) ((w[idx + 3] >> sh) & 0xFFFF));
-			sde[i] = (int32_t) ((uint32_t) ((w[idx + 4] >> sh) & 0xFFFF) << 16 | (uint32_t) ((w[idx + 6] >> sh) & 0xFFFF));
-		}
-		idx += 8;
-	}
-	if (tex) {
-		for (int i = 0; i < 3; ++i) {
-			int sh = 48 - i * 16;
-			tv[i] = (int32_t) ((uint32_t) ((w[idx] >> sh) & 0xFFFF) << 16 | (uint32_t) ((w[idx + 2] >> sh) & 0xFFFF));
-			tdx[i] = (int32_t) ((uint32_t) ((w[idx + 1] >> sh) & 0xFFFF) << 16 | (uint32_t) ((w[idx + 3] >> sh) & 0xFFFF));
-			tde[i] = (int32_t) ((uint32_t) ((w[idx + 4] >> sh) & 0xFFFF) << 16 | (uint32_t) ((w[idx + 6] >> sh) & 0xFFFF));
-			tdy[i] = (int32_t) ((uint32_t) ((w[idx + 5] >> sh) & 0xFFFF) << 16 | (uint32_t) ((w[idx + 7] >> sh) & 0xFFFF));
-		}
-		idx += 8;
-	}
+	struct Attributes a = attributes(w, op);
 	r->maxLevel = (w[0] >> 51) & 7;
 	r->dzpix = triangleDz(w, op);
 	bool doLod = tex && (((r->otherModes >> 48) & 1) || lodFracUsed(r));
-	if (zbuf) {
-		zv = fix(w[idx], 32);
-		zdx = fix(w[idx], 0);
-		zde = fix(w[idx + 1], 32);
-	}
 	bool persp = (r->otherModes >> 51) & 1;
+	int32_t dir = e.flip ? 1 : -1;
 	int first, end;
 	triangleRows(r, &e, &first, &end);
 	for (int y = first; y < end; ++y) {
@@ -1229,63 +1422,58 @@ static void triangle(struct N64* n, struct RDP* r, const uint64_t* w, int op) {
 		if (!ownsRow(r, y) || !span(r, &e, y, &sp)) {
 			continue;
 		}
-		int x0 = sp.x0, x1 = sp.x1;
-		// Attributes at the scanline's top and the pixel's left edge: the RDP steps them a whole line
-		// at a time along the major edge.
-		int64_t ey = y - (yh >> 2);
-		// Each attribute at x0, then plus its x gradient a pixel (x moves dx by whole 65536s, so the
-		// shifted products step exactly).
-		int64_t dx0 = (int64_t) x0 * 65536 - xh - dxh * ey;
-		int64_t shadeAt[4], zAt = 0, texAt[3];
-		for (int i = 0; i < 4; ++i) {
-			shadeAt[i] = sv[i] + sde[i] * ey + (sdx[i] * dx0 >> 16);
-		}
-		for (int i = 0; i < 3; ++i) {
-			texAt[i] = tv[i] + tde[i] * ey + (tdx[i] * dx0 >> 16);
-		}
-		if (zbuf) {
-			zAt = zv + zde * ey + (zdx * dx0 >> 16);
-		}
-		for (int x = x0; x <= x1; ++x) {
+		int32_t row[8];
+		int baseX;
+		rowAttributes(&e, &a, y, r->cycleType == 2, row, &baseX);
+		for (int x = sp.x0; x <= sp.x1; ++x) {
+			int mask = coverageMask(&sp, x);
+			// A pixel is drawn when any sample is covered with antialiasing, else when the first is.
+			if (!mask || (!r->antialias && !(mask & 1))) {
+				continue;
+			}
 			struct Pixel* p = &r->pix;
 			*p = (struct Pixel) { 0 };
-			// A pixel is drawn when any sample is covered with antialiasing, else when the first is.
-			int mask = coverageMask(&sp, x);
 			p->cvg = __builtin_popcount((unsigned) mask);
-			p->cvbit = (mask & 0x80) != 0;
-			bool drawn = r->antialias ? mask != 0 : p->cvbit;
+			p->cvbit = mask & 1;
+			uint32_t dx = (uint32_t) (x - baseX);
+			int xoff, yoff;
+			sampleOffset(mask, &xoff, &yoff);
 			if (shade) {
-				p->shade = (struct Color) { clamp8((int) (shadeAt[0] >> 16)), clamp8((int) (shadeAt[1] >> 16)),
-				                            clamp8((int) (shadeAt[2] >> 16)), clamp8((int) (shadeAt[3] >> 16)) };
+				int c[4];
 				for (int i = 0; i < 4; ++i) {
-					shadeAt[i] += sdx[i];
+					int32_t v = (int32_t) ((uint32_t) row[i] + (uint32_t) (a.dx[i] & ~0x1F) * dx);
+					int16_t snapped = (int16_t) (v >> 14);
+					snapped = (int16_t) (snapped << 2);
+					snapped = (int16_t) (snapped + (int16_t) (xoff * (int16_t) (a.dx[i] >> 14)) + (int16_t) (yoff * (int16_t) (a.dy[i] >> 14)));
+					c[i] = clamp9(snapped >> 4);
 				}
+				p->shade = (struct Color) { c[0], c[1], c[2], c[3] };
 			}
 			if (zbuf) {
-				p->z = (int) (zAt >> 13);
-				zAt += zdx;
+				int32_t z = (int32_t) ((uint32_t) row[7] + (uint32_t) a.dx[7] * dx);
+				int32_t snapped = z >> 10;
+				snapped = (int32_t) ((uint32_t) snapped << 2) + xoff * (a.dx[7] >> 10) + yoff * (a.dy[7] >> 10);
+				p->z = clampZ(snapped >> 5);
 			}
 			if (tex) {
-				int64_t sS = texAt[0], sT = texAt[1], sW = texAt[2];
+				int32_t stw[3], stwX[3], stwY[3];
 				for (int i = 0; i < 3; ++i) {
-					texAt[i] += tdx[i];
-				}
-				if (!drawn) {
-					continue;
+					int32_t step = a.dx[4 + i] & ~0x1F;
+					stw[i] = (int32_t) ((uint32_t) row[4 + i] + (uint32_t) step * dx);
+					stwX[i] = (int32_t) ((uint32_t) stw[i] + (uint32_t) (dir * step));
+					stwY[i] = (int32_t) ((uint32_t) stw[i] + (uint32_t) (a.dy[4 + i] & ~0x7FFF));
 				}
 				int s, t, t1 = tile, t2 = tile + 1;
-				texCoords(sS, sT, sW, persp, &s, &t);
+				texCoords(stw[0], stw[1], stw[2], persp, &s, &t);
 				if (doLod) {
 					int sx, tx, sy, ty;
-					texCoords(sS + tdx[0], sT + tdx[1], sW + tdx[2], persp, &sx, &tx);
-					texCoords(sS + tdy[0], sT + tdy[1], sW + tdy[2], persp, &sy, &ty);
+					texCoords(stwX[0], stwX[1], stwX[2], persp, &sx, &tx);
+					texCoords(stwY[0], stwY[1], stwY[2], persp, &sy, &ty);
 					p->lodFrac = levelOfDetail(r, tile, s, t, sx, tx, sy, ty, &t1, &t2);
 				}
 				textures(r, p, t1, t2, s, t);
 			}
-			if (drawn) {
-				shadePixel(n, r, x, y, p);
-			}
+			shadePixel(n, r, x, y, p);
 		}
 	}
 }
@@ -2014,7 +2202,7 @@ static void submit(struct N64* n, struct RDP* r, const uint64_t* w, int op, int 
 		}
 		bool shades = !(op == 0x36 && r->cycleType == 3) && !((op == 0x24 || op == 0x25) && r->cycleType == 2);
 		const struct Stage* first = &r->stage[r->cycleType == 1 ? 0 : 1];
-		if (shades && (first->readsCombined || first->noise || (r->cycleType == 1 && r->stage[1].noise))) {
+		if (shades && (first->readsCombined || usesNoise(r))) {
 			header |= ENTRY_ALONE;
 		}
 	}
@@ -2034,7 +2222,7 @@ static void submit(struct N64* n, struct RDP* r, const uint64_t* w, int op, int 
 #include "rdp_gpu_glsl.h"
 
 enum {
-	GPU_PRIM_SIZE = 24, GPU_TRI_SIZE = 29, GPU_TILE_FIELDS = 15, GPU_STATE_SIZE = 19 + 8 * GPU_TILE_FIELDS + 4,
+	GPU_PRIM_SIZE = 24, GPU_TRI_SIZE = 35, GPU_TILE_FIELDS = 15, GPU_STATE_SIZE = 19 + 8 * GPU_TILE_FIELDS + 4,
 	GPU_TILES = 64, GPU_PRIMS_MAX = 4000, GPU_LAST_SIZE = 1 << 20, GPU_BATCHES_MAX = 4096,
 	// Tiles times primitives in one dispatch: a long dispatch trips the kernel's GPU hang check.
 	GPU_ENTRIES_MAX = 1024,
@@ -2476,6 +2664,7 @@ static bool gpuTriangle(struct Gpu* g, struct RDP* r, const uint64_t* w, int op,
 			t[13 + i] = (int32_t) ((uint32_t) ((w[idx] >> sh) & 0xFFFF) << 16 | (uint32_t) ((w[idx + 2] >> sh) & 0xFFFF));
 			p[11 + i] = (int32_t) ((uint32_t) ((w[idx + 1] >> sh) & 0xFFFF) << 16 | (uint32_t) ((w[idx + 3] >> sh) & 0xFFFF));
 			t[17 + i] = (int32_t) ((uint32_t) ((w[idx + 4] >> sh) & 0xFFFF) << 16 | (uint32_t) ((w[idx + 6] >> sh) & 0xFFFF));
+			t[29 + i] = (int32_t) ((uint32_t) ((w[idx + 5] >> sh) & 0xFFFF) << 16 | (uint32_t) ((w[idx + 7] >> sh) & 0xFFFF));
 		}
 		idx += 8;
 	}
@@ -2493,7 +2682,9 @@ static bool gpuTriangle(struct Gpu* g, struct RDP* r, const uint64_t* w, int op,
 		t[27] = (int32_t) fix(w[idx], 32);
 		p[21] = (int32_t) fix(w[idx], 0);
 		t[28] = (int32_t) fix(w[idx + 1], 32);
+		t[33] = (int32_t) fix(w[idx + 1], 0);
 	}
+	t[34] = e.flip;
 	p[0] = GPU_KIND_TRIANGLE;
 	p[2] = (int32_t) minX, p[3] = first, p[4] = (int32_t) maxX, p[5] = end - 1;
 	p[6] = (w[0] >> 48) & 7;
@@ -2512,7 +2703,7 @@ static void rowTiles(const struct Gpu* g, const int32_t* p, int ty, int* tx0, in
 		return;
 	}
 	const int32_t* t = g->rows + p[8];
-	struct Edges e = { t[0], t[1], t[2], t[3], t[4], t[5], t[6], t[7], t[8] };
+	struct Edges e = { t[0], t[1], t[2], t[3], t[4], t[5], t[6], t[7], t[8], false };
 	int qa = p[3] * 4 > e.yh ? p[3] * 4 : e.yh, qb = p[5] * 4 + 3 < e.yl - 1 ? p[5] * 4 + 3 : e.yl - 1;
 	qa = qa > ty * 64 ? qa : ty * 64;
 	qb = qb < ty * 64 + 63 ? qb : ty * 64 + 63;
@@ -2938,7 +3129,7 @@ static void gpuCommand(struct N64* n, struct RDP* r, const uint64_t* w, int op) 
 	bool shades = !(op == 0x36 && r->cycleType == 3) && !((op == 0x24 || op == 0x25) && r->cycleType == 2);
 	const struct Stage* firstStage = &r->stage[r->cycleType == 1 ? 0 : 1];
 	bool alone = right - 1 > r->colorWidth || overlap ||
-	             (shades && (firstStage->readsCombined || firstStage->noise || (r->cycleType == 1 && r->stage[1].noise)));
+	             (shades && (firstStage->readsCombined || usesNoise(r)));
 	if (alone || y1 >= GPU_TILES * 16) {
 		gpuSync(n, r);
 		execute(n, r, w, op);
@@ -3174,6 +3365,9 @@ static void command(struct N64* n, struct RDP* r, const uint64_t* w, int op, int
 }
 
 static void endCommands(struct N64* n, struct RDP* r, uint64_t begin) {
+	if (n->rdpTap) {
+		n->rdpTap(n, NULL, 0);
+	}
 	if (r->renderers && r->renderers->unannounced >= WAKE_CLOCKS) {
 		wake(r->renderers);
 	}
@@ -3205,6 +3399,9 @@ void rdpRun(struct N64* n) {
 			break;
 		}
 		d->partialWords = 0;
+		if (n->rdpTap) {
+			n->rdpTap(n, w, words);
+		}
 		command(n, r, w, op, words, begin);
 	}
 	endCommands(n, r, begin);
@@ -3220,6 +3417,9 @@ void rdpCommands(struct N64* n, const uint64_t* list, size_t count) {
 		int words = commandWords(op);
 		if (i + words > count) {
 			break;
+		}
+		if (n->rdpTap) {
+			n->rdpTap(n, &list[i], words);
 		}
 		command(n, r, &list[i], op, words, begin);
 		i += words;

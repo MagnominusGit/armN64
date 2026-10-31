@@ -56,7 +56,7 @@ const int PRIM_SIZE = 24;
 // A triangle's record (rdp.c gpuTriangle): its edges, the scissor, and the shade, texture and depth
 // values at its top.
 const int T_YL = 0, T_YM = 1, T_YH = 2, T_XL = 3, T_DXL = 4, T_XH = 5, T_DXH = 6, T_XM = 7, T_DXM = 8, T_SCISSOR = 9;
-const int T_SV = 13, T_SDE = 17, T_TV = 21, T_TDE = 24, T_ZV = 27, T_ZDE = 28;
+const int T_SV = 13, T_SDE = 17, T_TV = 21, T_TDE = 24, T_ZV = 27, T_ZDE = 28, T_SDY = 29, T_ZDY = 33, T_FLIP = 34;
 const int S_OM_LO = 0, S_OM_HI = 1, S_CB_LO = 2, S_CB_HI = 3, S_CADDR = 4, S_CWIDTH = 5, S_CSIZE = 6, S_ZADDR = 7;
 const int S_FOG = 8, S_BLEND = 9, S_PRIM = 10, S_ENV = 11, S_PRIMLOD = 12, S_PRIMZ = 13, S_MINLEVEL = 14;
 const int S_K4 = 15, S_K5 = 16, S_FILL = 17, S_TMEM = 18, S_TILES = 19, TILE_SIZE = 15, S_KCONV = 19 + 8 * 15;
@@ -269,7 +269,7 @@ ivec4 readPixel(int x, int y) {
 	}
 	uint p = fbColor;
 	int cr = int(p >> 11) & 31, cg = int(p >> 6) & 31, cb = int(p >> 1) & 31;
-	return ivec4(cr << 3 | cr >> 2, cg << 3 | cg >> 2, cb << 3 | cb >> 2, int((p & 1u) << 2 | fbHidden) << 5);
+	return ivec4(cr << 3, cg << 3, cb << 3, int((p & 1u) << 2 | fbHidden) << 5);
 }
 
 void writePixel(int x, int y, ivec4 c) {
@@ -396,46 +396,80 @@ int wrapT(int t, int v, out int frac) {
 	return wrapCoord(v, tileField(t, T_SHIFTT), tileField(t, T_TL), tileField(t, T_TH), tileField(t, T_CMT), tileField(t, T_MASKT), frac);
 }
 
-// C's division by 32 (toward zero).
-ivec4 div32(ivec4 v) {
-	return (v + ((v >> 31) & 31)) >> 5;
+// rdp.c texClamp, texMask and sampleAs (after paraLLEl-RDP's texture.h, MIT).
+int texClamp(int c, bool clampIt, int lo, int hi, int shift) {
+	c = clamp(c, -0x8000, 0x7FFF);
+	c = shift < 11 ? c >> shift : (c << (32 - shift)) >> 16;
+	if (!clampIt) {
+		return c - (lo << 3);
+	}
+	if ((c >> 3) >= hi) {
+		return (((hi >> 2) - (lo >> 2)) & 0x3FF) << 5;
+	}
+	return max(c - (lo << 3), 0);
 }
 
-// The texels go through one texel() call (a loop the compiler leaves alone): the shader stays small.
+int texMask(int c, int mask, bool mirror) {
+	if (mask != 0) {
+		int m = 1 << min(mask, 10);
+		if (mirror && (c & m) != 0) {
+			c ^= m - 1;
+		}
+		c &= m - 1;
+	}
+	return c;
+}
+
+// The texels go through few texel() calls (a loop the compiler leaves alone): the shader stays small.
 ivec4 sampleTile(int t, int s, int tt, bool bilerp) {
 	t &= 7;
-	int fs, ft, f;
-	int s0 = wrapS(t, s, fs);
-	int t0 = wrapT(t, tt, ft);
-	bool bilinear = HAS_BILERP && bilerp && ((omHi >> 13) & 1u) != 0u && ((omHi >> 20) & 3u) < 2u;
-	int s1 = s0, t1 = t0;
-	if (bilinear) {
-		int shiftS = tileField(t, T_SHIFTS), shiftT = tileField(t, T_SHIFTT);
-		s1 = wrapS(t, s + (32 << (shiftS < 11 ? shiftS : 0)), f);
-		t1 = wrapT(t, tt + (32 << (shiftT < 11 ? shiftT : 0)), f);
+	bool quad = ((omHi >> 13) & 1u) != 0u, tlut = ((omHi >> 15) & 1u) != 0u, midMode = ((omHi >> 8) & 1u) != 0u;
+	bool filter = HAS_BILERP && bilerp && ((omHi >> 20) & 3u) < 2u;
+	int cmS = tileField(t, T_CMS), cmT = tileField(t, T_CMT), maskS = tileField(t, T_MASKS), maskT = tileField(t, T_MASKT);
+	int cs = texClamp(s, (cmS & 2) != 0 || maskS == 0, tileField(t, T_SL), tileField(t, T_SH), tileField(t, T_SHIFTS));
+	int ct = texClamp(tt, (cmT & 2) != 0 || maskT == 0, tileField(t, T_TL), tileField(t, T_TH), tileField(t, T_SHIFTT));
+	int fs = quad || tlut ? cs & 31 : 0, ft = quad || tlut ? ct & 31 : 0;
+	int sum = fs + ft;
+	cs >>= 5;
+	ct >>= 5;
+	int s0 = texMask(cs, maskS, (cmS & 1) != 0), s1 = texMask(cs + 1, maskS, (cmS & 1) != 0);
+	int t0 = texMask(ct, maskT, (cmT & 1) != 0), t1 = texMask(ct + 1, maskT, (cmT & 1) != 0);
+	int tdiff = max(t1 - t0, -255);
+	t1 = (t0 & 0xFF) + tdiff;
+	t0 &= 0xFF;
+	bool mid = midMode && filter && fs == 16 && ft == 16;
+	if (mid) {
+		sum = 0;
 	}
-	bool upper = bilinear && fs + ft >= 32;
-	int first = upper ? 1 : 0, end = bilinear ? (upper ? 4 : 3) : 1;
-	ivec4 c0 = ivec4(0), c1 = ivec4(0), c2 = ivec4(0), c3 = ivec4(0);
-	for (int k = first; k < end; ++k) {
-		ivec4 c = texel(t, k == 1 || k == 3 ? s1 : s0, k >= 2 ? t1 : t0);
+	if (tlut && !quad) {
+		s1 = s0, t1 = t0;
+	}
+	bool upper = sum >= 32 && quad;
+	bool lerp = filter && quad;
+	int count = mid ? 4 : lerp ? 3 : 1;
+	ivec4 b = ivec4(0), t10 = ivec4(0), t01 = ivec4(0), t11 = ivec4(0);
+	for (int k = 0; k < count; ++k) {
+		int ks = k == 0 ? (upper ? s1 : s0) : k == 1 || k == 3 ? s1 : s0;
+		int kt = k == 0 ? (upper ? t1 : t0) : k >= 2 ? t1 : t0;
+		ivec4 c = texel(t, ks, kt);
 		if (k == 0) {
-			c0 = c;
+			b = c;
 		} else if (k == 1) {
-			c1 = c;
+			t10 = c;
 		} else if (k == 2) {
-			c2 = c;
+			t01 = c;
 		} else {
-			c3 = c;
+			t11 = c;
 		}
 	}
-	if (!bilinear) {
-		return c0;
+	if (mid) {
+		return (b + t10 + t01 + t11 + 2) >> 2;
 	}
-	if (!upper) {
-		return c0 + div32((c1 - c0) * fs + (c2 - c0) * ft);
+	if (!lerp) {
+		return b;
 	}
-	return c3 + div32((c2 - c3) * (32 - fs) + (c1 - c3) * (32 - ft));
+	int fx = upper ? 32 - ft : fs, fy = upper ? 32 - fs : ft;
+	return (((t10 - b) * fx + (t01 - b) * fy + 0x10) >> 5) + b;
 }
 
 // ---- Combiner and blender
@@ -601,6 +635,22 @@ int dzEncode(int v) {
 	return ((v & 0xFF00) != 0 ? 8 : 0) | ((v & 0xF0F0) != 0 ? 4 : 0) | ((v & 0xCCCC) != 0 ? 2 : 0) | ((v & 0xAAAA) != 0 ? 1 : 0);
 }
 
+// The magic square and Bayer dither matrices (paraLLEl-RDP's dither.h, MIT). Noise dither is drawn
+// on the CPU (rdp.c usesNoise).
+const int ditherMatrix[32] = int[32](0, 6, 1, 7, 4, 2, 5, 3, 3, 5, 2, 4, 7, 1, 6, 0, 0, 4, 1, 5, 4, 0, 5, 1, 3, 7, 2, 6, 7, 3, 6, 2);
+
+void ditherAt(int x, int y, out int rgb, out int alpha) {
+	int modeRgb = int(omHi >> 6) & 3, modeAlpha = int(omHi >> 4) & 3;
+	int i = (y & 3) * 4 + (x & 3);
+	rgb = modeRgb < 2 ? ditherMatrix[modeRgb * 16 + i] * 0x49 : 0;
+	if (modeAlpha >= 2) {
+		alpha = 0;
+	} else {
+		alpha = modeRgb >= 2 ? ditherMatrix[(modeRgb & 1) * 16 + i] : rgb & 7;
+		alpha = modeAlpha == 1 ? ~alpha & 7 : alpha;
+	}
+}
+
 void shadePixel(int x, int y) {
 	int cycleType = int(omHi >> 20) & 3;
 	bool zPrim = ((omLo >> 2) & 1u) != 0u;
@@ -611,19 +661,45 @@ void shadePixel(int x, int y) {
 	// One-cycle mode runs the combiner's second-cycle equation.
 	pCombined = lastCombined;
 	ivec4 c = ivec4(0);
+	int firstAlpha = 0;
 	for (int cycle = HAS_TWO && cycleType == 1 ? 0 : 1; cycle < 2; ++cycle) {
 		c = combine(cycle);
 		pCombined = c;
+		if (cycle == 0) {
+			firstAlpha = c.a;
+			// rdp.c: the second cycle sees the pipelined texels.
+			ivec4 swap = pTex0;
+			pTex0 = pTex1;
+			pTex1 = swap;
+		}
 	}
 	lastCombined = c;
 	shaded = true;
 	c = ivec4(clamp9(c.r), clamp9(c.g), clamp9(c.b), clamp9(c.a));
 	bool antialias = ((omLo >> 3) & 1u) != 0u, cvgTimesAlpha = ((omLo >> 12) & 1u) != 0u;
 	bool imageRead = ((omLo >> 6) & 1u) != 0u, colorOnCvg = ((omLo >> 7) & 1u) != 0u, force = ((omLo >> 14) & 1u) != 0u;
-	int cvg = cvgTimesAlpha ? (((c.a * pCvg + 4) >> 3) >> 5) & 15 : pCvg;
-	if (((omLo >> 13) & 1u) != 0u) {
-		c.a = min(cvg << 5, 255);
+	bool cvgAlpha = ((omLo >> 13) & 1u) != 0u;
+	int rgbDither, alphaDither;
+	ditherAt(x, y, rgbDither, alphaDither);
+	int reference = 0;
+	if (HAS_TWO && cycleType == 1 && (omLo & 1u) != 0u) {
+		int a0 = clamp9(firstAlpha);
+		a0 += (a0 + 1) >> 8;
+		a0 = cvgAlpha ? (cvgTimesAlpha ? (a0 * pCvg + 4) >> 3 : pCvg << 5) : a0 + alphaDither;
+		reference = clamp(a0, 0, 255);
 	}
+	int alpha = c.a + ((c.a + 1) >> 8);
+	int cvg = pCvg, scaled = cvg << 5;
+	if (cvgTimesAlpha) {
+		scaled = (alpha * cvg + 4) >> 3;
+		cvg = scaled >> 5;
+	}
+	alpha = cvgAlpha ? scaled : alpha + alphaDither;
+	c.a = clamp(alpha, 0, 255);
+	if (!(HAS_TWO && cycleType == 1)) {
+		reference = c.a;
+	}
+	pShade.a = min(pShade.a + alphaDither, 255);
 	ivec4 memory = readPixel(x, y);
 	int memCvg = imageRead ? memory.a >> 5 : 7;
 	if (!imageRead) {
@@ -679,7 +755,7 @@ void shadePixel(int x, int y) {
 		blShiftB = dzEnc < 11 ? 4 : 15 - dzEnc;
 		blend = force || (!overflow && antialias);
 	}
-	if ((omLo & 1u) != 0u && c.a < gBlend.a) {
+	if ((omLo & 1u) != 0u && reference < gBlend.a) {
 		return;
 	}
 	if (antialias ? cvg == 0 : !pCvbit) {
@@ -699,6 +775,14 @@ void shadePixel(int x, int y) {
 	} else {
 		c = blendColor(inColor, memory, last, !force);
 	}
+	if (((omHi >> 6) & 3u) != 3u) {
+		for (int ch = 0; ch < 3; ++ch) {
+			int v = c[ch];
+			if (((rgbDither >> (ch * 3)) & 7) < (v & 7)) {
+				c[ch] = v > 247 ? 255 : (v & 0xF8) + 8;
+			}
+		}
+	}
 	int cvgDest = int(omLo >> 8) & 3;
 	int kept = cvgDest == 0 ? (blend ? cvg + memCvg : cvg - 1) : cvgDest == 1 ? (cvg + memCvg) & 7 : cvgDest == 2 ? 7 : memCvg;
 	c.a = ((kept & 8) != 0 ? 7 : kept & 7) << 5;
@@ -716,41 +800,43 @@ uvec2 neg64(uvec2 v) {
 	return add64(uvec2(~v.x, ~v.y), uvec2(1u, 0u));
 }
 
-// (int) (((s >> 16) * 0x8000) / w), C's 64-bit division, for 0 < w < 0x8000.
-int perspDivide(uvec2 s, int w) {
-	uvec2 t = uvec2((s.x >> 16) | (s.y << 16), uint(int(s.y) >> 16));
-	uvec2 n = uvec2(t.x << 15, (t.y << 15) | (t.x >> 17));
-	bool negative = int(n.y) < 0;
-	if (negative) {
-		n = neg64(n);
-	}
-	uint d = uint(w);
-	uint r = n.y - (n.y / d) * d;
-	uint t1 = (r << 16) | (n.x >> 16);
-	uint q1 = t1 / d, r1 = t1 - q1 * d;
-	uint t2 = (r1 << 16) | (n.x & 0xFFFFu);
-	uint q = (q1 << 16) + t2 / d;
-	return int(negative ? 0u - q : q);
-}
+const ivec2 perspectiveTable[64] = ivec2[64](
+	ivec2(0x4000, -252 * 4), ivec2(0x3f04, -244 * 4), ivec2(0x3e10, -238 * 4), ivec2(0x3d22, -230 * 4), ivec2(0x3c3c, -223 * 4), ivec2(0x3b5d, -218 * 4),
+	ivec2(0x3a83, -210 * 4), ivec2(0x39b1, -205 * 4), ivec2(0x38e4, -200 * 4), ivec2(0x381c, -194 * 4), ivec2(0x375a, -189 * 4), ivec2(0x369d, -184 * 4),
+	ivec2(0x35e5, -179 * 4), ivec2(0x3532, -175 * 4), ivec2(0x3483, -170 * 4), ivec2(0x33d9, -166 * 4), ivec2(0x3333, -162 * 4), ivec2(0x3291, -157 * 4),
+	ivec2(0x31f4, -155 * 4), ivec2(0x3159, -150 * 4), ivec2(0x30c3, -147 * 4), ivec2(0x3030, -143 * 4), ivec2(0x2fa1, -140 * 4), ivec2(0x2f15, -137 * 4),
+	ivec2(0x2e8c, -134 * 4), ivec2(0x2e06, -131 * 4), ivec2(0x2d83, -128 * 4), ivec2(0x2d03, -125 * 4), ivec2(0x2c86, -123 * 4), ivec2(0x2c0b, -120 * 4),
+	ivec2(0x2b93, -117 * 4), ivec2(0x2b1e, -115 * 4), ivec2(0x2aab, -113 * 4), ivec2(0x2a3a, -110 * 4), ivec2(0x29cc, -108 * 4), ivec2(0x2960, -106 * 4),
+	ivec2(0x28f6, -104 * 4), ivec2(0x288e, -102 * 4), ivec2(0x2828, -100 * 4), ivec2(0x27c4, -98 * 4),  ivec2(0x2762, -96 * 4),  ivec2(0x2702, -94 * 4),
+	ivec2(0x26a4, -92 * 4),  ivec2(0x2648, -91 * 4),  ivec2(0x25ed, -89 * 4),  ivec2(0x2594, -87 * 4),  ivec2(0x253d, -86 * 4),  ivec2(0x24e7, -85 * 4),
+	ivec2(0x2492, -83 * 4),  ivec2(0x243f, -81 * 4),  ivec2(0x23ee, -80 * 4),  ivec2(0x239e, -79 * 4),  ivec2(0x234f, -77 * 4),  ivec2(0x2302, -76 * 4),
+	ivec2(0x22b6, -74 * 4),  ivec2(0x226c, -74 * 4),  ivec2(0x2222, -72 * 4),  ivec2(0x21da, -71 * 4),  ivec2(0x2193, -70 * 4),  ivec2(0x214d, -69 * 4),
+	ivec2(0x2108, -67 * 4),  ivec2(0x20c5, -67 * 4),  ivec2(0x2082, -65 * 4),  ivec2(0x2041, -65 * 4));
 
-ivec2 texCoords(uvec2 sS, uvec2 sT, uvec2 sW, bool persp) {
-	if (!HAS_PERSP || !persp) {
-		return ivec2(bits64(sS, 16), bits64(sT, 16));
-	}
-	int wv = int(sW.x >> 16) & 0x7FFF;
-	if (wv == 0) {
-		wv = 1;
-	}
-	ivec2 o = ivec2(0);
-	for (int k = 0; k < 2; ++k) {
-		int v = perspDivide(k == 0 ? sS : sT, wv);
-		if (k == 0) {
-			o.x = v;
-		} else {
-			o.y = v;
+// rdp.c texCoords: s and t (the top 16 bits), with perspective times a table's reciprocal of w.
+ivec2 texCoords(int sS, int sT, int sW, bool persp) {
+	ivec2 st = ivec2(sS >> 16, sT >> 16);
+	if (HAS_PERSP && persp) {
+		int w = sW >> 16;
+		bool carry = w <= 0;
+		w &= 0x7FFF;
+		int shift = min(14 - findMSB(w), 14);
+		int norm = (w << shift) & 0x3FFF;
+		ivec2 e = perspectiveTable[norm >> 8];
+		int rcp = ((e.y * (norm & 0xFF)) >> 10) + e.x;
+		int mask = ((1 << 30) - 1) & -((1 << 29) >> shift);
+		for (int i = 0; i < 2; ++i) {
+			int prod = st[i] * rcp;
+			int outside = prod & mask;
+			int v = shift != 14 ? prod >> (13 - shift) : prod << 1;
+			if (outside != mask && outside != 0) {
+				int shifted = shift != 14 ? prod >> (13 - shift) : prod;
+				v = (shifted & (1 << 29)) == 0 ? 0x7FFF : -0x8000;
+			}
+			st[i] = carry ? 0x7FFF : v;
 		}
 	}
-	return o;
+	return clamp(st, ivec2(-0x10000), ivec2(0xFFFF));
 }
 
 bool lodFracUsed() {
@@ -850,36 +936,64 @@ void fillPixel(int x, int y) {
 	}
 }
 
-// An attribute's value at the first pixel of the row (rdp.c triangle): at the top plus the edge
-// steps down, plus the x steps from the major edge.
-uvec2 attrStart(int t, int v, int de, int dx, uvec2 dx0, int ey) {
-	return add64(add64(ext64(data[t + v]), mul64(data[t + de], ey)), shift64(mulWide(dx, dx0), 16));
+// rdp.c's span, coverage and attribute stepping (after paraLLEl-RDP, MIT).
+int snapX(int x) {
+	return (x >> 12) | ((x & 0xFFF) != 0 ? 1 : 0);
 }
 
-// A triangle's span on row y, its four sub-scanlines in eighths of a pixel, left | right << 16
-// (rdp.c span); empty ones 0.
+int edgeX(int t, int f) {
+	return bitfieldExtract(data[t + f], 0, 28) >> 1;
+}
+
+int edgeSlope(int t, int f) {
+	return bitfieldExtract(int(uint(data[t + f]) >> 2), 0, 28) >> 1;
+}
+
+// A triangle's span on row y: its four sub-scanlines' left | right << 16 in eighths of a pixel
+// (0xFFFF where it has none).
 ivec4 rowSpan(int p, int y) {
 	int t = data[p + P_TRI];
 	int yl = data[t + T_YL], ym = data[t + T_YM], yh = data[t + T_YH];
-	int xh = data[t + T_XH], dxh = data[t + T_DXH];
+	int xh0 = edgeX(t, T_XH), xm0 = edgeX(t, T_XM), xl0 = edgeX(t, T_XL);
+	int dxh = edgeSlope(t, T_DXH), dxm = edgeSlope(t, T_DXM), dxl = edgeSlope(t, T_DXL);
+	bool flip = data[t + T_FLIP] != 0;
 	ivec4 sc = ivec4(data[t + T_SCISSOR], data[t + T_SCISSOR + 1], data[t + T_SCISSOR + 2], data[t + T_SCISSOR + 3]);
-	ivec4 span = ivec4(0);
+	int ylo = max(yh, sc.y), yhi = min(yl, sc.w), loScissor = sc.x << 1, hiScissor = sc.z << 1;
+	bool allInvalid = true, allOver = true, allUnder = true;
+	ivec4 span;
 	for (int k = 0; k < 4; ++k) {
-		int q = y * 4 + k;
-		if (q < yh || q >= yl || q < sc.y || q >= sc.w) {
-			continue;
+		int q = y * 4 + k, dy = q - (yh & ~3);
+		int xh = bitfieldExtract(xh0 + dy * dxh, 0, 27);
+		int xl = q < ym ? bitfieldExtract(xm0 + dy * dxm, 0, 27) : bitfieldExtract(xl0 + (q - ym) * dxl, 0, 27);
+		int left = flip ? snapX(xh) : snapX(xl), right = flip ? snapX(xl) : snapX(xh);
+		bool invalid = (left >> 1) > (right >> 1);
+		allOver = allOver && min(left, right) >= hiScissor;
+		allUnder = allUnder && max(left, right) < loScissor;
+		left = clamp(left, loScissor, hiScissor);
+		right = clamp(right, loScissor, hiScissor);
+		if (invalid || q < ylo || q >= yhi) {
+			left = 0xFFFF, right = 0;
+		} else {
+			allInvalid = false;
 		}
-		int dy = q - (yh & ~3);
-		uvec2 major = add64(ext64(xh), quarter64(mul64(dxh, dy)));
-		uvec2 minor = q < ym ? add64(ext64(data[t + T_XM]), quarter64(mul64(data[t + T_DXM], dy)))
-		                     : add64(ext64(data[t + T_XL]), quarter64(mul64(data[t + T_DXL], q - ym)));
-		bool majorFirst = less64(major, minor);
-		int l8 = max(bits64(majorFirst ? major : minor, 13), sc.x * 2), r8 = min(bits64(majorFirst ? minor : major, 13), sc.z * 2);
-		if (l8 < r8) {
-			span[k] = l8 | r8 << 16;
-		}
+		span[k] = left | right << 16;
 	}
-	return span;
+	return allInvalid || allOver || allUnder ? ivec4(0xFFFF) : span;
+}
+
+// An attribute on the row: down the major edge a line at a time, back along x by its fraction.
+int rowAttribute(int v, int de, int dyv, int dx, int dy, int xfrac, bool doOffset) {
+	int diff = 0;
+	if (doOffset) {
+		int deh = de & ~0x1FF, dyh = dyv & ~0x1FF;
+		diff = deh - (deh >> 2) - dyh + (dyh >> 2);
+	}
+	v += dy * de;
+	return ((v & ~0x1FF) + diff - xfrac * ((dx >> 8) & ~1)) & ~0x3FF;
+}
+
+int sext16(int v) {
+	return bitfieldExtract(v, 0, 16);
 }
 
 // One primitive at the pixel: the attributes by kind, then one path for texturing, the level of
@@ -902,80 +1016,66 @@ void drawPrim(int p, int x, int y, ivec4 span) {
 	if (HAS_TRI && kind == KIND_TRIANGLE) {
 		int t = data[p + P_TRI];
 		int yh = data[t + T_YH];
-		int xh = data[t + T_XH], dxh = data[t + T_DXH];
-		int x0 = 0x7FFFFFFF, x1 = -0x7FFFFFFF - 1;
-		ivec4 left = ivec4(0), right = ivec4(0);
-		for (int k = 0; k < 4; ++k) {
-			int l8 = span[k] & 0xFFFF, r8 = span[k] >> 16;
-			if (l8 >= r8) {
-				continue;
-			}
-			left[k] = l8, right[k] = r8;
-			x0 = min(x0, l8 >> 3);
-			x1 = max(x1, (r8 - 1) >> 3);
-		}
-		if (x < x0 || x > x1) {
-			return;
-		}
-		// A pixel is drawn when any sample is covered with antialiasing, else when the first is.
 		int mask = 0;
 		for (int k = 0; k < 4; ++k) {
+			int l8 = span[k] & 0xFFFF, r8 = span[k] >> 16;
 			for (int j = 0; j < 2; ++j) {
-				int quarter = (k & 1) + j * 2;
-				int e = x * 8 + quarter * 2;
-				if (e >= left[k] && e < right[k]) {
-					mask |= 1 << ((k < 2 ? 4 : 0) + 3 - quarter);
+				int e = x * 8 + (k & 1) * 2 + j * 4;
+				if (e >= l8 && e < r8) {
+					mask |= 1 << (k * 2 + j);
 				}
 			}
 		}
-		bool cvbit = (mask & 0x80) != 0;
-		if ((data[data[p + P_STATE] + S_OM_LO] & 8) != 0 ? mask == 0 : !cvbit) {
+		// A pixel is drawn when any sample is covered with antialiasing, else when the first is.
+		if (mask == 0 || ((data[data[p + P_STATE] + S_OM_LO] & 8) == 0 && (mask & 1) == 0)) {
 			return;
 		}
 		loadState(p);
 		pCvg = bitCount(mask);
-		pCvbit = cvbit;
-		int k = x - x0;
+		pCvbit = (mask & 1) != 0;
 		int flags = data[p + P_FLAGS];
-		// Attributes at the scanline's top, from the major edge's x there.
-		int ey = y - (yh >> 2);
-		uvec2 dx0 = add64(mul64(x0, 65536), neg64(add64(ext64(xh), mul64(dxh, ey))));
+		bool flip = data[t + T_FLIP] != 0;
+		int dxh = edgeSlope(t, T_DXH);
+		bool doOffset = flip == (data[t + T_DXH] < 0);
+		int dy = y - (yh >> 2);
+		int xh = edgeX(t, T_XH) + dy * (dxh << 2) + (doOffset ? 3 * dxh : 0);
+		int xfrac = (int(omHi >> 20) & 3) == 2 ? 0 : (xh >> 7) & 0xFF;
+		int dxp = x - (xh >> 15);
+		int firstBit = findLSB(mask);
+		int yoff = firstBit >> 1, xoff = ((firstBit & 1) << 1) + (yoff & 1);
 		if (HAS_SHADE && (flags & 4) != 0) {
 			ivec4 c;
 			for (int i = 0; i < 4; ++i) {
-				int dx = data[p + P_SDX + i];
-				c[i] = bits64(add64(attrStart(t, T_SV + i, T_SDE + i, dx, dx0, ey), mul64(k, dx)), 16);
+				int dx = data[p + P_SDX + i], dyv = data[t + T_SDY + i];
+				int v = rowAttribute(data[t + T_SV + i], data[t + T_SDE + i], dyv, dx, dy, xfrac, doOffset) + (dx & ~0x1F) * dxp;
+				int snapped = sext16(sext16(v >> 14) << 2);
+				snapped = sext16(snapped + sext16(xoff * sext16(dx >> 14)) + sext16(yoff * sext16(dyv >> 14)));
+				c[i] = clamp9(snapped >> 4);
 			}
-			pShade = clamp(c, 0, 255);
+			pShade = c;
 		}
 		if (HAS_ZTRI && (flags & 1) != 0) {
-			int dz = data[p + P_ZDX];
-			pZ = bits64(add64(attrStart(t, T_ZV, T_ZDE, dz, dx0, ey), mul64(k, dz)), 13);
+			int dz = data[p + P_ZDX], dzy = data[t + T_ZDY];
+			int v = rowAttribute(data[t + T_ZV], data[t + T_ZDE], dzy, dz, dy, xfrac, doOffset) + dz * dxp;
+			int snapped = ((v >> 10) << 2) + xoff * (dz >> 10) + yoff * (dzy >> 10);
+			int z = bitfieldExtract((snapped >> 5) - 0x20000, 0, 19) + 0x20000;
+			pZ = clamp(z, 0, 0x3FFFF);
 		}
 		if (HAS_TEX && (flags & 2) != 0) {
 			tex = true;
 			lod = HAS_LOD && (((omHi >> 16) & 1u) != 0u || lodFracUsed());
 			bool persp = HAS_PERSP && ((omHi >> 19) & 1u) != 0u;
-			uvec2 sS = add64(attrStart(t, T_TV, T_TDE, data[p + P_TDX], dx0, ey), mul64(k, data[p + P_TDX]));
-			uvec2 sT = add64(attrStart(t, T_TV + 1, T_TDE + 1, data[p + P_TDX + 1], dx0, ey), mul64(k, data[p + P_TDX + 1]));
-			uvec2 sW = add64(attrStart(t, T_TV + 2, T_TDE + 2, data[p + P_TDX + 2], dx0, ey), mul64(k, data[p + P_TDX + 2]));
-			int count = lod ? 3 : 1;
-			for (int j = 0; j < count; ++j) {
-				uvec2 a = sS, b = sT, c = sW;
-				if (j > 0) {
-					int d = j == 1 ? P_TDX : P_TDY;
-					a = add64(a, ext64(data[p + d]));
-					b = add64(b, ext64(data[p + d + 1]));
-					c = add64(c, ext64(data[p + d + 2]));
-				}
-				ivec2 v = texCoords(a, b, c, persp);
-				if (j == 0) {
-					st = v;
-				} else if (j == 1) {
-					sx = v;
-				} else {
-					sy = v;
-				}
+			ivec3 stw, stwX, stwY;
+			for (int i = 0; i < 3; ++i) {
+				int step = data[p + P_TDX + i] & ~0x1F;
+				stw[i] = rowAttribute(data[t + T_TV + i], data[t + T_TDE + i], data[p + P_TDY + i], data[p + P_TDX + i], dy, xfrac, doOffset) + step * dxp;
+				stwX[i] = stw[i] + (flip ? step : -step);
+				stwY[i] = stw[i] + (data[p + P_TDY + i] & ~0x7FFF);
+			}
+			st = texCoords(stw.x, stw.y, stw.z, persp);
+			if (lod) {
+				sx = texCoords(stwX.x, stwX.y, stwX.z, persp);
+				sy = texCoords(stwY.x, stwY.y, stwY.z, persp);
 			}
 		}
 	} else if (HAS_TEXRECT && kind == KIND_TEXRECT) {

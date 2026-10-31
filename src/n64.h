@@ -370,6 +370,9 @@ struct N64 {
 	// renderer threads where that can't start.
 	bool rdpGpu;
 	bool rdpPending;
+	// Given each command before the RDP runs it, and a count of 0 after each batch (n64run's
+	// N64RDPDUMP).
+	void (*rdpTap)(struct N64*, const uint64_t* words, int count);
 	// N64_VI_GPU: the VI's filters run by a GLES 3.1 compute shader (n64.c), falling back to the CPU
 	// where that can't start.
 	bool viGpu;
