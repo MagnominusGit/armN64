@@ -8,6 +8,7 @@
 #include "libretro.h"
 #include "options.h"
 
+#include <math.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -88,6 +89,11 @@ static struct retro_core_option_v2_category optionCategories[] = {
 };
 
 static struct retro_core_option_v2_definition optionDefinitions[] = {
+	{ "armn64_rumble", "Rumble", NULL, "A Rumble Pak's motor shakes the controller (the player's pak set to Rumble Pak).",
+	  NULL, "input", { { "disabled", "Off" }, { "enabled", "On" }, { NULL, NULL } }, "disabled" },
+	{ "armn64_stick_gate", "Octagonal Stick Gate", NULL,
+	  "Shapes the stick's range like the N64 controller's octagonal gate: full right reaches 85, and the diagonals the gate's corners (69, 69) instead of a circle's.",
+	  NULL, "input", { { "disabled", "Off" }, { "enabled", "On" }, { NULL, NULL } }, "disabled" },
 	{ "armn64_accuracy", "Graphics (Restart)", NULL,
 	  "HLE draws the game's display lists without its microcode and puts speed first. MLE and LLE run the microcode on the RSP: "
 	  "LLE is the hardware cycle for cycle, MLE the middle ground that also runs hacks made on other emulators.",
@@ -566,9 +572,27 @@ void retro_reset(void) {
 	}
 }
 
-// An analog axis as the controller's stick reports it: about 80 each way.
-static int stick(unsigned port, unsigned index, unsigned axis) {
-	return inputState(port, RETRO_DEVICE_ANALOG, index, axis) * 80 / 32768;
+// The stick as the controller reports it: about 80 each way; or with the octagonal gate, the input's
+// circle stretched to the gate's octagon (85 across, corners at 69, 69) and kept inside it.
+static void stick(unsigned port, bool gate, int* x, int* y) {
+	int const ix = inputState(port, RETRO_DEVICE_ANALOG, RETRO_DEVICE_INDEX_ANALOG_LEFT, RETRO_DEVICE_ID_ANALOG_X);
+	int const iy = inputState(port, RETRO_DEVICE_ANALOG, RETRO_DEVICE_INDEX_ANALOG_LEFT, RETRO_DEVICE_ID_ANALOG_Y);
+	if (!gate) {
+		*x = ix * 80 / 32768, *y = iy * 80 / 32768;
+		return;
+	}
+	double dx = ix / 32768.0, dy = iy / 32768.0, r = sqrt(dx * dx + dy * dy);
+	if (r < 1e-6) {
+		*x = *y = 0;
+		return;
+	}
+	dx /= r, dy /= r;
+	r = r > 1 ? 1 : r;
+	// How far the octagon's edge is in this direction: the edge from (85, 0) to (69, 69) is
+	// x + y * 16 / 69 = 85.
+	double const ax = fabs(dx), ay = fabs(dy);
+	double const edge = 85 / (ax >= ay ? ax + ay * 16 / 69 : ay + ax * 16 / 69);
+	*x = (int) lround(dx * r * edge), *y = (int) lround(dy * r * edge);
 }
 
 // A controller as the PIF reads it: the buttons in the top half, then the stick's X and Y.
@@ -590,9 +614,9 @@ static uint32_t readController(unsigned port) {
 	int cx = inputState(port, RETRO_DEVICE_ANALOG, RETRO_DEVICE_INDEX_ANALOG_RIGHT, RETRO_DEVICE_ID_ANALOG_X);
 	int cy = inputState(port, RETRO_DEVICE_ANALOG, RETRO_DEVICE_INDEX_ANALOG_RIGHT, RETRO_DEVICE_ID_ANALOG_Y);
 	state |= (cy < -16384 ? 1u << 19 : 0) | (cy > 16384 ? 1u << 18 : 0) | (cx < -16384 ? 1u << 17 : 0) | (cx > 16384 ? 1u << 16 : 0);
-	int x = stick(port, RETRO_DEVICE_INDEX_ANALOG_LEFT, RETRO_DEVICE_ID_ANALOG_X);
-	int y = -stick(port, RETRO_DEVICE_INDEX_ANALOG_LEFT, RETRO_DEVICE_ID_ANALOG_Y);
-	return state | (uint32_t) (uint8_t) x << 8 | (uint8_t) y;
+	int x, y;
+	stick(port, optionIs(environment, "armn64_stick_gate", "enabled"), &x, &y);
+	return state | (uint32_t) (uint8_t) x << 8 | (uint8_t) -y;
 }
 
 // An N64 Mouse: its buttons where A and B are, and how far it moved since the last field.
@@ -615,7 +639,7 @@ static void readPorts(void) {
 		snprintf(key, sizeof(key), "armn64_pak%u", port + 1);
 		machine->pak[port] = optionIs(environment, key, "rumble") ? PAK_RUMBLE : optionIs(environment, key, "none") ? PAK_NONE : PAK_MEMORY;
 		machine->pad[port] = machine->plugged[port] == PLUG_MOUSE ? readMouse(port) : machine->plugged[port] ? readController(port) : 0;
-		bool const on = machine->pak[port] == PAK_RUMBLE && machine->rumble[port];
+		bool const on = machine->pak[port] == PAK_RUMBLE && machine->rumble[port] && optionIs(environment, "armn64_rumble", "enabled");
 		if (setRumble && on != rumbling[port]) {
 			setRumble(port, RETRO_RUMBLE_STRONG, on ? 0xFFFF : 0);
 			rumbling[port] = on;
