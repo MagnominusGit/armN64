@@ -55,6 +55,13 @@ struct Hle {
 	uint32_t geometry;
 	// F3DPD's table of vertex colours.
 	uint32_t colorBase;
+	// L3DEX and L3DEX2 (F3DEX's and F3DEX2's line microcodes: triangles as their edges) and F3DTEX/A
+	// (F3DEX with its own texture load and tile size commands), by name.
+	bool lines, texa;
+	// F3DAM (Hey You, Pikachu!'s F3DEX2): texture coordinates through a 2x2 matrix of s.15 halves
+	// (G_TEXTURE's word, then the one G_MOVEWORD sets at fog + 0x10) plus the offset at fog + 0x0C.
+	bool am;
+	uint32_t amScale[3];
 	// S2DEX: the 2D matrix (A to D, the offset in pixels, the base scales), the object render mode,
 	// the state words texture loads and G_SELECT_DL test, and G_RDPHALF_0's half of a selection.
 	float objA, objB, objC, objD, objX, objY, objBaseX, objBaseY;
@@ -307,6 +314,12 @@ static void loadVertices(struct N64* n, struct Hle* h, uint32_t a, int first, in
 			v->r = c[0] / 255.0f, v->g = c[1] / 255.0f, v->b = c[2] / 255.0f;
 		}
 		// Texture coordinates are s10.5 (generated ones texels), scaled by G_TEXTURE.
+		if (h->am && !(h->geometry & GEOM_TEXTURE_GEN)) {
+			uint32_t const s0 = (uint32_t) (int32_t) s, t0 = (uint32_t) (int32_t) t;
+			uint32_t const* k = h->amScale;
+			s = (int16_t) (((((k[0] >> 16) * s0 << 1) + ((k[0] & 0xFFFF) * t0 << 1) + 0x8000) >> 16) + (k[1] >> 16));
+			t = (int16_t) (((((k[2] >> 16) * s0 << 1) + ((k[2] & 0xFFFF) * t0 << 1) + 0x8000) >> 16) + k[1]);
+		}
 		float unit = (h->geometry & GEOM_TEXTURE_GEN) && !h->flx ? 1 : 1 / 32.0f;
 		v->s = s * h->texScaleS * unit;
 		v->t = t * h->texScaleT * unit;
@@ -562,6 +575,49 @@ static void drawTriangle(struct N64* n, struct Hle* h, int i0, int i1, int i2) {
 	}
 	for (int i = 1; i + 1 < count; ++i) {
 		triangle(n, h, &s[0], &s[i], &s[i + 1], f);
+	}
+}
+
+// A line between two vertices as L3DEX draws it (GLideN64's gSPLine3D): 1.5 + width / 2 pixels wide,
+// in the colour of the flag vertex; a quad of two triangles across it, the part behind the near
+// plane cut off.
+static void drawLine(struct N64* n, struct Hle* h, int i0, int i1, int width, int flag) {
+	if (i0 >= VERTICES || i1 >= VERTICES || flag >= VERTICES) {
+		return;
+	}
+	struct Vertex a = h->v[i0], b = h->v[i1];
+	float const da = a.z + a.w, db = b.z + b.w;
+	if (da < 0 && db < 0) {
+		return;
+	}
+	if (da < 0) {
+		a = lerp(&a, &b, da / (da - db));
+	} else if (db < 0) {
+		b = lerp(&b, &a, db / (db - da));
+	}
+	struct ScreenVertex sa = project(h, &a), sb = project(h, &b), c = project(h, &h->v[flag]);
+	float dx = sb.x - sa.x, dy = sb.y - sa.y, length = sqrtf(dx * dx + dy * dy);
+	if (!(length > 0)) {
+		return;
+	}
+	float const half = (1.5f + width * 0.5f) / 2;
+	float const px = -dy / length * half, py = dx / length * half;
+	struct ScreenVertex q[4] = { sa, sa, sb, sb };
+	q[0].x += px, q[0].y += py, q[1].x -= px, q[1].y -= py, q[2].x -= px, q[2].y -= py, q[3].x += px, q[3].y += py;
+	triangle(n, h, &q[0], &q[1], &q[2], &c);
+	triangle(n, h, &q[0], &q[2], &q[3], &c);
+}
+
+// L3DEX's triangle: its three edges, coloured by its first vertex.
+static void drawEdges(struct N64* n, struct Hle* h, int v0, int v1, int v2, int width) {
+	if (v0 != v1) {
+		drawLine(n, h, v0, v1, width, v0);
+	}
+	if (v1 != v2) {
+		drawLine(n, h, v1, v2, width, v0);
+	}
+	if (v2 != v0) {
+		drawLine(n, h, v2, v0, width, v0);
 	}
 }
 
@@ -851,6 +907,7 @@ static void reject(struct Hle* h) {
 
 static int family(struct N64* n, uint32_t data, uint32_t size);
 static bool isFlx(struct N64* n, uint32_t data, uint32_t size);
+static void ucodeFlags(struct N64* n, struct Hle* h, uint32_t data, uint32_t size);
 static void ucodeName(struct N64* n, uint32_t code, uint32_t data, uint32_t dataSize, char* out, size_t size);
 
 // G_LOAD_UCODE: the list goes on in another microcode (its data named by G_RDPHALF_1); F3DEX's takes
@@ -859,6 +916,7 @@ static void ucodeName(struct N64* n, uint32_t code, uint32_t data, uint32_t data
 static bool loadMicrocode(struct N64* n, struct Hle* h, uint32_t code, uint32_t dataSize) {
 	int f = family(n, address(h, h->half1), dataSize);
 	h->flx = isFlx(n, address(h, h->half1), dataSize);
+	ucodeFlags(n, h, address(h, h->half1), dataSize);
 	if (f == FAMILY_NONE) {
 		char name[40];
 		ucodeName(n, address(h, code), address(h, h->half1), dataSize, name, sizeof(name));
@@ -958,12 +1016,42 @@ static void runList(struct N64* n, struct Hle* h, uint32_t pc) {
 				continue;
 			}
 			bool const shared = two ? op == 0x00 || (op >= 0xDB && op <= 0xDF && op != 0xDC) || op == 0xE1 || op == 0xE2 || op == 0xE3
-			                        : op == 0x00 || op == 0x06 || op == 0xAF || op == 0xB4 || op == 0xB8 || op == 0xB9 || op == 0xBA || op == 0xBC;
+			                        : op == 0x00 || op == 0x06 || op == 0xAF || op == 0xB4 || op == 0xB8 || op == 0xB9 || op == 0xBA || op == 0xBC || op == 0xC0;
 			if (!shared) {
 				snprintf(h->why, sizeof(h->why), "S2DEX%s op %02X", two ? "2" : "", op);
 				reject(h);
 				return;
 			}
+		}
+		// The line microcodes' triangles and lines, and F3DTEX/A's own commands (as GLideN64 has them).
+		if (h->lines && (f3dex2 ? op == 0x05 || op == 0x06 || op == 0x08 : op == 0xBF || op == 0xB1 || op == 0xB5)) {
+			if (f3dex2 && op == 0x08) {
+				drawLine(n, h, (w0 >> 17) & 0x7F, (w0 >> 9) & 0x7F, (int8_t) w0, (w0 >> 17) & 0x7F);
+			} else if (!f3dex2 && op == 0xB5) {
+				drawLine(n, h, (w1 >> 17) & 0x7F, (w1 >> 9) & 0x7F, (int8_t) w1, (w1 >> 17) & 0x7F);
+			} else {
+				int const width = f3dex2 ? (int8_t) (w1 >> 24) : 0;
+				uint32_t const first = f3dex2 || op == 0xB1 ? w0 : w1;
+				drawEdges(n, h, (first >> 17) & 0x7F, (first >> 9) & 0x7F, (first >> 1) & 0x7F, width);
+				if (op == (f3dex2 ? 0x06 : 0xB1)) {
+					drawEdges(n, h, (w1 >> 17) & 0x7F, (w1 >> 9) & 0x7F, (w1 >> 1) & 0x7F, width);
+				}
+			}
+			pc = next;
+			continue;
+		}
+		if (h->texa && op == 0xB5) {
+			emit(n, h, (uint64_t) 0x3D100000 << 32 | address(h, w1));
+			emit(n, h, (uint64_t) 0x35100000 << 32 | 0x07000000);
+			emit(n, h, (uint64_t) 0x33000000 << 32 | 0x27000000 | (w0 & 0xFFFFFF));
+			pc = next;
+			continue;
+		}
+		if (h->texa && op == 0xBE) {
+			emit(n, h, (uint64_t) (0x35400000 | ((w1 >> 24) & 0xFF) << 9) << 32 | (w0 & 0xFFFFFF));
+			emit(n, h, (uint64_t) 0x32000000 << 32 | (w1 & 0xFFFFFF));
+			pc = next;
+			continue;
 		}
 		if (f3dex2) {
 			switch (op) {
@@ -993,7 +1081,12 @@ static void runList(struct N64* n, struct Hle* h, uint32_t pc) {
 				drawTriangle(n, h, ((w0 >> 16) & 0xFF) / 2, ((w0 >> 8) & 0xFF) / 2, (w0 & 0xFF) / 2);
 				break;
 			case 0xD7:
-				h->texScaleS = (w1 >> 16) / 65536.0f, h->texScaleT = (w1 & 0xFFFF) / 65536.0f;
+				if (h->am) {
+					h->amScale[0] = w1;
+					h->texScaleS = h->texScaleT = 1;
+				} else {
+					h->texScaleS = (w1 >> 16) / 65536.0f, h->texScaleT = (w1 & 0xFFFF) / 65536.0f;
+				}
 				h->texLevel = (w0 >> 11) & 7, h->texTile = (w0 >> 8) & 7, h->texOn = (w0 >> 1) & 1;
 				break;
 			case 0xD8:
@@ -1013,6 +1106,10 @@ static void runList(struct N64* n, struct Hle* h, uint32_t pc) {
 					h->lights = (int) (w1 / 24) > LIGHTS ? LIGHTS : (int) (w1 / 24);
 				} else if (index == 6) {
 					h->segments[(offset / 4) & 15] = w1 & 0xFFFFFF;
+				} else if (index == 8 && h->am && (offset & 0xFF) == 0x0C) {
+					h->amScale[1] = w1;
+				} else if (index == 8 && h->am && (offset & 0xFF) == 0x10) {
+					h->amScale[2] = w1;
 				} else if (index == 8) {
 					h->fogMul = (int16_t) (w1 >> 16), h->fogOffset = (int16_t) w1;
 				}
@@ -1293,6 +1390,15 @@ void hleUcodeName(struct N64* n, char* out, size_t size) {
 	ucodeName(n, be32(task + 0x10) & 0xFFFFFF, be32(task + 0x18) & 0xFFFFFF, be32(task + 0x1C), out, size);
 }
 
+// The line microcodes, F3DTEX/A and F3DAM, by name.
+static void ucodeFlags(struct N64* n, struct Hle* h, uint32_t data, uint32_t size) {
+	char name[48];
+	ucodeName(n, 0, data, size, name, sizeof(name));
+	h->lines = !strncmp(name, "RSP Gfx ucode L3DEX", 19);
+	h->texa = !strncmp(name, "RSP Gfx ucode F3DTEX/A", 22);
+	h->am = !strncmp(name, "RSP Gfx ucode F3DAM", 19);
+}
+
 static bool isFlx(struct N64* n, uint32_t data, uint32_t size) {
 	char name[48];
 	ucodeName(n, 0, data, size, name, sizeof(name));
@@ -1318,6 +1424,14 @@ static int family(struct N64* n, uint32_t data, uint32_t size) {
 		return FAMILY_NONE;
 	}
 	const char* name = id + 14;
+	if (!strncmp(name, "L3DEX", 5) || !strncmp(name, "F3DTEX/A", 8)) {
+		for (const char* c = name; *c && c < name + 48; ++c) {
+			if (c[0] == ' ' && c[1] >= '0' && c[1] <= '9' && c[2] == '.' && c[3] >= '0' && c[3] <= '9') {
+				return c[1] >= '2' ? FAMILY_F3DEX2 : FAMILY_F3DEX;
+			}
+		}
+		return FAMILY_F3DEX;
+	}
 	if (!strncmp(name, "S2DEX", 5) && (name[5] == ' ' || name[5] == '.' || name[5] == '_')) {
 		for (const char* c = name; *c && c < name + 48; ++c) {
 			if (c[0] == ' ' && c[1] >= '0' && c[1] <= '9' && c[2] == '.' && c[3] >= '0' && c[3] <= '9') {
@@ -1329,6 +1443,9 @@ static int family(struct N64* n, uint32_t data, uint32_t size) {
 	if ((!strncmp(name, "F3DEX2", 6) || !strncmp(name, "F3DZEX", 6) || !strncmp(name, "F3DLX2", 6) || !strncmp(name, "F3DLP2", 6) ||
 	     !strncmp(name, "F3DFLX", 6)) &&
 	    (name[6] == ' ' || name[6] == '.' || name[6] == '_')) {
+		return FAMILY_F3DEX2;
+	}
+	if (!strncmp(name, "F3DAM", 5)) {
 		return FAMILY_F3DEX2;
 	}
 	if (strncmp(name, "F3DEX", 5) && strncmp(name, "F3DLX", 5) && strncmp(name, "F3DLP", 5)) {
@@ -1392,6 +1509,8 @@ bool hleGraphics(struct N64* n, bool dry) {
 	}
 	for (int i = 0; n->hle && i < n->hle->rejectedCount; ++i) {
 		if (n->hle->rejected[i] == ucode) {
+			// Rejected before: the report keeps why.
+			n->hle->rejectedNow = true;
 			return false;
 		}
 	}
@@ -1411,6 +1530,10 @@ bool hleGraphics(struct N64* n, bool dry) {
 	if (f == FAMILY_NONE && ucode == 0xB0811E2Fu) {
 		f = FAMILY_F3DPD;
 	}
+	// Eikou no Saint Andrews' Fast3D has no name either (GLideN64 knows it by its code too).
+	if (f == FAMILY_NONE && ucode == 0xE272C977u) {
+		f = FAMILY_F3D;
+	}
 	if (f == FAMILY_NONE) {
 		return false;
 	}
@@ -1424,6 +1547,7 @@ bool hleGraphics(struct N64* n, bool dry) {
 	h->ucode = ucode;
 	h->family = f;
 	h->flx = isFlx(n, data, dataSize);
+	ucodeFlags(n, h, data, dataSize);
 	h->dry = dry;
 	memset(h->segments, 0, sizeof(h->segments));
 	static const float identity[16] = { 1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1 };
