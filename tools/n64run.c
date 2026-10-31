@@ -203,6 +203,17 @@ int main(int argc, char** argv) {
 		n->audioCapacity = 2 * 48000 * (size_t) (fields / 50 + 2);
 		n->audio = calloc(n->audioCapacity, sizeof(int16_t));
 	}
+	// N64STATEIN=path: a save state loaded before the run (made by the same build); N64STATEOUT=path:
+	// one saved after it.
+	if (getenv("N64STATEIN")) {
+		size_t stateSize;
+		uint8_t* saved = readFile(getenv("N64STATEIN"), &stateSize);
+		if (!saved || !n64StateLoad(n, saved, stateSize, false)) {
+			fprintf(stderr, "can't load the state %s\n", getenv("N64STATEIN"));
+			return 1;
+		}
+		free(saved);
+	}
 	const char* input = getenv("N64INPUT");
 	// N64STATETEST=field: a save state there, then after the run it is loaded and the rest run again;
 	// RDRAM and the picture must come out the same.
@@ -445,6 +456,15 @@ int main(int argc, char** argv) {
 			fclose(f);
 			printf("audio: %zu samples at %u Hz\n", n->audioCount / 2, n->audioRate);
 		}
+	}
+	if (getenv("N64STATEOUT")) {
+		void* out = malloc(n64StateSize());
+		FILE* f = out && n64StateSave(n, out, n64StateSize(), false) ? fopen(getenv("N64STATEOUT"), "wb") : NULL;
+		if (f) {
+			fwrite(out, 1, n64StateSize(), f);
+			fclose(f);
+		}
+		free(out);
 	}
 	if (getenv("N64RAMDUMP")) {
 		FILE* f = fopen(getenv("N64RAMDUMP"), "wb");
