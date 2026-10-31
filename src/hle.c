@@ -267,8 +267,8 @@ static void loadVertices(struct N64* n, struct Hle* h, uint32_t a, int first, in
 				float gx = e[0] * lx[0] + e[1] * lx[1] + e[2] * lx[2];
 				float gy = e[0] * ly[0] + e[1] * ly[1] + e[2] * ly[2];
 				if (h->geometry & GEOM_TEXTURE_GEN_LINEAR) {
-					s = acosf(gx < -1 ? -1 : gx > 1 ? 1 : gx) * 325.94931f;
-					t = acosf(gy < -1 ? -1 : gy > 1 ? 1 : gy) * 325.94931f;
+					s = (float) acos(gx < -1 ? -1 : gx > 1 ? 1 : gx) * 325.94931f;
+					t = (float) acos(gy < -1 ? -1 : gy > 1 ? 1 : gy) * 325.94931f;
 				} else {
 					s = (gx + 1) * 512, t = (gy + 1) * 512;
 				}
