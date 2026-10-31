@@ -344,18 +344,22 @@ static void piDma(struct N64* n, uint32_t len, bool toRdram) {
 static void siDma(struct N64* n, bool toPif) {
 	++n->stats.siDmas;
 	uint32_t dram = n->si.dramAddr & (RDRAM_SIZE - 1) & ~3u;
+	uint32_t rcp;
 	if (toPif) {
 		n64RdramRead(n, dram, 64);
 		memcpy(n->pifRam, &n->rdram[dram], 64);
+		rcp = pifDmaCycles(n, true);
 		pifRun(n);
 	} else {
+		rcp = pifDmaCycles(n, false);
+		n->pifChallenged = false;
 		pifRead(n);
 		n64RdramWrite(n, dram, 64);
 		memcpy(&n->rdram[dram], n->pifRam, 64);
 	}
 	// The PIF takes a while to run the commands; the interrupt comes when the transfer is done.
 	n->si.status |= 1;
-	n->si.busyUntil = n->cycles + SI_DMA_CYCLES;
+	n->si.busyUntil = n->cycles + (n->compat ? SI_DMA_CYCLES : rcp * 3 / 2);
 	n64Event(n, n->si.busyUntil);
 }
 
@@ -536,7 +540,7 @@ uint32_t busRead32(struct N64* n, uint32_t addr) {
 		case 0x00:
 			return n->si.dramAddr;
 		case 0x18:
-			return n->si.status;
+			return n->si.status | (n->cycles < n->si.ioUntil ? 2 : 0);
 		}
 		return 0;
 	}
@@ -566,6 +570,7 @@ void busWrite32(struct N64* n, uint32_t addr, uint32_t v) {
 	}
 	if (addr >= 0x1FC007C0 && addr < 0x1FC00800) {
 		put32(&n->pifRam[addr & 0x3C], v);
+		n->si.ioUntil = n->cycles + (n->compat ? 0 : 2158 * 3 / 2);
 		return;
 	}
 	switch (addr >> 20) {

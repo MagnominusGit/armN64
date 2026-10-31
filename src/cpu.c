@@ -14,7 +14,7 @@ enum { ST_IE = 1, ST_EXL = 2, ST_ERL = 4, ST_FR = 1 << 26, ST_CU1 = 1 << 29, ST_
 // Timing, in CPU cycles on top of one a instruction (hacktarux's n64-systembench, from hardware):
 // uncached reads of RDRAM, of RCP registers and over the PI bus; uncached writes, posted, done after
 // a while that the next uncached read waits for; another row opened in an RDRAM bank.
-enum { RDRAM_READ = 32, RCP_READ = 22, SP_MEM_READ = 27, PI_READ = 214, RDRAM_WRITE = 12, RCP_WRITE = 6, DMEM_WRITE = 6, IMEM_WRITE = 10, ROW_MISS = 8 };
+enum { RDRAM_READ = 32, RCP_READ = 22, SP_MEM_READ = 27, PI_READ = 214, PIF_READ = 2959, RDRAM_WRITE = 12, RCP_WRITE = 6, DMEM_WRITE = 6, IMEM_WRITE = 10, ROW_MISS = 8 };
 
 static uint32_t rowCost(struct CPU* c, uint32_t paddr) {
 	uint32_t const bank = (paddr >> 20) & 7, row = paddr >> 11;
@@ -38,7 +38,7 @@ static void readTiming(struct N64* n, uint32_t paddr, int size) {
 	} else if (paddr < 0x04040000) {
 		c->stall += SP_MEM_READ;
 	} else {
-		c->stall += paddr >= 0x05000000 && paddr < 0x1FC00000 ? PI_READ : RCP_READ;
+		c->stall += paddr >= 0x05000000 && paddr < 0x1FC00000 ? PI_READ : paddr >= 0x1FC00000 && paddr < 0x1FC00800 ? PIF_READ : RCP_READ;
 	}
 }
 

@@ -173,6 +173,8 @@ struct PI {
 struct SI {
 	uint32_t dramAddr, status;
 	uint64_t busyUntil;
+	// A CPU write to PIF RAM keeps the SI's I/O busy until then.
+	uint64_t ioUntil;
 };
 
 struct RDP;
@@ -234,7 +236,7 @@ struct N64 {
 	size_t romSize;
 	uint8_t pifRam[64];
 	// PIF RAM holds Joybus commands (not a CIC challenge), which run again when it is read.
-	bool pifJoybus;
+	bool pifJoybus, pifChallenged;
 	uint8_t save[0x20000];
 	uint8_t eeprom[2048];
 	bool eeprom16k;
@@ -596,6 +598,7 @@ bool cartBootChecksum(const uint8_t* rom, size_t size, int cic, uint8_t seedByte
 void pifBoot(struct N64*);
 void pifRun(struct N64*);
 void pifRead(struct N64*);
+uint32_t pifDmaCycles(struct N64*, bool write);
 
 static inline uint32_t be32(const uint8_t* p) {
 	return (uint32_t) p[0] << 24 | (uint32_t) p[1] << 16 | (uint32_t) p[2] << 8 | p[3];

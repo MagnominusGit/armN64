@@ -246,10 +246,52 @@ static void joybus(struct N64* n, bool controllersOnly) {
 	}
 }
 
+// How long an SI DMA takes in RCP cycles, from the PIF RAM it moves (hacktarux's n64-systembench, from
+// hardware): a write, and the PIF reading the Joybus commands it starts (a setup, per skipped channel
+// and per command); a read, with the PIF running the commands then (a setup, per skipped channel, per
+// command by its bytes, less for a channel with nothing plugged in); the CIC challenge's answer.
+uint32_t pifDmaCycles(struct N64* n, bool write) {
+	const uint8_t* ram = n->pifRam;
+	if (write ? ram[63] == 2 : n->pifChallenged) {
+		return write ? 4128 : 676768;
+	}
+	if (write ? !(ram[63] & 1) : !n->pifJoybus) {
+		return 4065;
+	}
+	uint32_t cycles = write ? 9180 : 15030;
+	int channel = 0, i = 0;
+	while (i < 62 && channel < 5) {
+		uint8_t tx = ram[i];
+		if (tx == 0xFE) {
+			break;
+		}
+		if (tx == 0xFF || tx == 0xFD) {
+			++i;
+			continue;
+		}
+		if (tx == 0) {
+			cycles += channel < 4 ? (write ? 1406 : 1394) : (write ? 512 : 519);
+			++channel;
+			++i;
+			continue;
+		}
+		int send = tx & 0x3F, receive = ram[i + 1] & 0x3F;
+		if (i + 2 + send + receive > 63) {
+			break;
+		}
+		bool const present = channel == 0 || channel == 4 || (n->mousePort && channel == n->mousePort - 1);
+		cycles += write ? 6529 : 13087 + 1974 * (uint32_t) (send + receive) - (present ? 0 : 2972);
+		i += 2 + send + receive;
+		++channel;
+	}
+	return cycles;
+}
+
 // A block written to PIF RAM: the CIC challenge, or Joybus commands to run.
 void pifRun(struct N64* n) {
 	uint8_t* ram = n->pifRam;
 	n->pifJoybus = false;
+	n->pifChallenged = ram[63] == 2;
 	if (ram[63] == 2) {
 		cicChallenge(ram);
 		return;
