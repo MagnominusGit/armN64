@@ -1,6 +1,7 @@
 // Runs a cartridge headless. Usage: n64run rom fields [picture.ppm]
 #define _GNU_SOURCE
 #include "n64.h"
+#include "rdp.h"
 
 #include <stdio.h>
 #include <stdlib.h>
@@ -175,8 +176,21 @@ int main(int argc, char** argv) {
 	// N64INPUT="from-to:pad,...": controller 1 holds pad (buttons and stick as the PIF reads them, in
 	// hex) for fields from to to.
 	const char* input = getenv("N64INPUT");
+	// N64STATETEST=field: a save state there, then after the run it is loaded and the rest run again;
+	// RDRAM and the picture must come out the same.
+	int stateAt = getenv("N64STATETEST") ? atoi(getenv("N64STATETEST")) : -1;
+	void* state = NULL;
+	bool again = false;
+	uint64_t firstHash = 0;
 	clock_gettime(CLOCK_MONOTONIC, &t0);
 	for (int f = 0; f < fields; ++f) {
+		if (f == stateAt && !again) {
+			state = malloc(n64StateSize());
+			if (!state || !n64StateSave(n, state, n64StateSize())) {
+				fprintf(stderr, "can't save a state\n");
+				return 1;
+			}
+		}
 		if (input) {
 			uint32_t pad = 0;
 			for (const char* p = input; p && *p; p = strchr(p, ',') ? strchr(p, ',') + 1 : NULL) {
@@ -217,6 +231,27 @@ int main(int argc, char** argv) {
 		if (n->unimplemented && n->unimplemented != reported) {
 			printf("field %d: %s (pc %08x)\n", f, n->unimplemented, (uint32_t) n->cpu.curPc);
 			reported = n->unimplemented;
+		}
+		if (f + 1 == fields && state) {
+			rdpWait(n);
+			if (n->glr) {
+				glrSync(n);
+			}
+			uint64_t hash = 1469598103934665603ull;
+			for (uint32_t i = 0; i < RDRAM_SIZE; ++i) {
+				hash = (hash ^ n->rdram[i]) * 1099511628211ull;
+			}
+			if (!again) {
+				firstHash = hash;
+				again = true;
+				if (!n64StateLoad(n, state, n64StateSize())) {
+					fprintf(stderr, "can't load the state\n");
+					return 1;
+				}
+				f = stateAt - 1;
+			} else {
+				printf("state test: RDRAM %s after loading at field %d\n", hash == firstHash ? "the same" : "DIFFERENT", stateAt);
+			}
 		}
 	}
 	clock_gettime(CLOCK_MONOTONIC, &t1);

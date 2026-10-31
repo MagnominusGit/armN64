@@ -655,15 +655,41 @@ void retro_run(void) {
 }
 
 size_t retro_serialize_size(void) {
-	return 0;
+	return n64StateSize();
 }
 
+// Save states: the GPU's pictures come back to RDRAM, and go on loading, in the core's own GL
+// context when it has one.
 bool retro_serialize(void* data, size_t size) {
-	return false;
+	if (!machine) {
+		return false;
+	}
+	bool own = hw.context_type == RETRO_HW_CONTEXT_NONE;
+	if (own) {
+		glesResume();
+	}
+	bool saved = n64StateSave(machine, data, size);
+	if (own) {
+		glesYield();
+	}
+	return saved;
 }
 
 bool retro_unserialize(const void* data, size_t size) {
-	return false;
+	if (!machine) {
+		return false;
+	}
+	bool own = hw.context_type == RETRO_HW_CONTEXT_NONE;
+	if (own) {
+		glesResume();
+	}
+	bool loaded = n64StateLoad(machine, data, size);
+	if (own) {
+		glesYield();
+	}
+	// The state's saves stand (the save file takes them on the next run).
+	saveGiven |= loaded;
+	return loaded;
 }
 
 void retro_cheat_reset(void) {

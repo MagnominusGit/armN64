@@ -21,6 +21,8 @@ struct Pixel {
 	// Samples of the pixel's 8 the primitive covers, and whether the first is one of them.
 	int cvg;
 	bool cvbit;
+	// Where it is (the combiner's noise).
+	int x, y;
 };
 
 // A combiner input for one cycle: three channel values, or with step 0 one value for all three.

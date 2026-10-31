@@ -618,6 +618,13 @@ void glrForget(struct N64*);
 bool hleWaiting(struct N64*);
 void hleResume(struct N64*);
 void rdpDestroy(struct N64*);
+void rdpStateLoad(struct N64*, const struct RDP* saved);
+void rdpStateGet(struct N64*, struct RDP* out);
+size_t hleStateSize(void);
+size_t audioHleStateSize(void);
+size_t n64StateSize(void);
+bool n64StateSave(struct N64*, void* data, size_t size);
+bool n64StateLoad(struct N64*, const void* data, size_t size);
 
 // carts.c
 bool cartEeprom16k(const uint8_t* rom);

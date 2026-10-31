@@ -1152,3 +1152,7 @@ bool hleGraphics(struct N64* n, bool dry) {
 	h->doneList = dry ? h->doneList : list;
 	return true;
 }
+
+size_t hleStateSize(void) {
+	return sizeof(struct Hle);
+}

@@ -222,3 +222,8 @@ void HleErrorMessage(void* user_defined, const char *message, ...)
     va_end(args);
     fputc('\n', stderr);
 }
+
+size_t audioHleStateSize(void)
+{
+    return sizeof(struct hle_t);
+}

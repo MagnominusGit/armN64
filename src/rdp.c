@@ -454,7 +454,13 @@ static int rgbInput(struct RDP* r, struct Pixel* p, int sel, int channel, int wh
 			return 0x100;
 		}
 		if (which == 0 && sel == 7) {
-			return rand() & 255;
+			// Noise: a hash of the pixel and the primitive (the hardware's sequence isn't known), the
+			// same however many renderers draw and after a save state.
+			uint32_t h = (uint32_t) p->x * 0x9E3779B1u ^ (uint32_t) p->y * 0x85EBCA77u ^ (uint32_t) r->seq * 0xC2B2AE3Du ^ (uint32_t) channel;
+			h ^= h >> 15;
+			h *= 0x2C1B3C6Du;
+			h ^= h >> 12;
+			return (int) (h & 255);
 		}
 		if (which == 1 && sel == 7) {
 			return r->k4;
@@ -752,6 +758,7 @@ static struct Color blendInput(struct RDP* r, struct Color pixel, struct Color m
 // The depth test (with the stored depth slope: coplanar and decal tests, and whether an
 // antialiased edge blends), then the blender, and the coverage and depth written.
 static void shadePixel(struct N64* n, struct RDP* r, int x, int y, struct Pixel* p) {
+	p->x = x, p->y = y;
 	int cycleType = r->cycleType;
 	int z = r->zPrim ? r->primZ : p->z;
 	z = z < 0 ? 0 : z > 0x3FFFF ? 0x3FFFF : z;
@@ -3201,6 +3208,42 @@ void rdpCommands(struct N64* n, const uint64_t* list, size_t count) {
 		i += words;
 	}
 	endCommands(n, r, begin);
+}
+
+// The RDP as a save state keeps it (once rdpWait has run). With renderer threads the main thread skips
+// texture loads and draws, so the state is renderer 0's, with the latest combiner output of any.
+void rdpStateGet(struct N64* n, struct RDP* out) {
+	struct RDP* r = n->rdp;
+	struct Renderers* all = r->renderers;
+	if (!all) {
+		memcpy(out, r, sizeof(*out));
+		return;
+	}
+	memcpy(out, all->renderer[0].rdp, sizeof(*out));
+	for (int i = 1; i < all->count; ++i) {
+		const struct RDP* other = all->renderer[i].rdp;
+		if (other->lastPos > out->lastPos) {
+			out->lastPos = other->lastPos;
+			out->lastCombined = other->lastCombined;
+		}
+	}
+	out->clocks = r->clocks, out->tmemGen = r->tmemGen, out->stateGen = r->stateGen;
+	out->rowIndex = r->rowIndex, out->rowCount = r->rowCount;
+	out->renderers = r->renderers, out->gpu = r->gpu, out->tmemSource = r->tmemSource;
+}
+
+// A save state's RDP (NULL for none yet): the renderer threads, GPU RDP and GL renderer go, and
+// start again from it when next drawn.
+void rdpStateLoad(struct N64* n, const struct RDP* saved) {
+	rdpDestroy(n);
+	if (saved && (n->rdp = malloc(sizeof(*n->rdp)))) {
+		memcpy(n->rdp, saved, sizeof(*n->rdp));
+		n->rdp->tmemSource = NULL;
+		n->rdp->renderers = NULL;
+		n->rdp->gpu = NULL;
+		// The combiner's inputs point into the RDP's own fields.
+		setupCombiner(n->rdp);
+	}
 }
 
 void rdpDestroy(struct N64* n) {
