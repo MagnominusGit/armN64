@@ -1,3 +1,3 @@
 [submodule "armulators"]
 	path = armulators
-	url = ../Armulators.git
+	url = https://github.com/MagnominusGit/Armulators.git
