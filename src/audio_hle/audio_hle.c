@@ -125,6 +125,7 @@ static bool audioHleRun(struct N64* n, uint8_t* dram)
     struct hle_t* hle = n->hleAudio;
     hle->dram = dram;
     hle->dram_mask = RDRAM_SIZE - 1;
+    hle->dram_dirty = n->dirtyPages;
     hle->dmem = hle->dmem_buffer;
     hle->user_defined = n;
     for (unsigned i = 0; i < 0x1000; ++i) {

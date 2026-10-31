@@ -155,6 +155,7 @@ static inline uint32_t dram_r32(struct hle_t* hle, uint32_t address)
 static inline void dram_w8(struct hle_t* hle, uint32_t address, uint8_t value)
 {
     hle->dram[address & hle->dram_mask] = value;
+    hle->dram_dirty[(address & hle->dram_mask) >> 12] = 0;
 }
 
 static inline void dram_w16(struct hle_t* hle, uint32_t address, uint16_t value)

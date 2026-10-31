@@ -221,7 +221,32 @@ int main(int argc, char** argv) {
 			n64RunField(n);
 			n64StateLoad(n, ahead, n64StateSize(), true);
 		}
+		// N64DIRTYTEST=1: every page whose bytes changed in the field must have been marked written.
+		static uint8_t* before;
+		static long unmarked;
+		bool dirtyTest = getenv("N64DIRTYTEST") != NULL;
+		if (dirtyTest) {
+			if (!before) {
+				before = malloc(RDRAM_SIZE);
+			}
+			rdpWait(n);
+			memcpy(before, n->rdram, RDRAM_SIZE);
+			memset(n->dirtyPages, 0xFF, sizeof(n->dirtyPages));
+		}
 		n64RunField(n);
+		if (dirtyTest) {
+			rdpWait(n);
+			for (uint32_t p = 0; p < (RDRAM_SIZE >> 12); ++p) {
+				if (n->dirtyPages[p] && memcmp(before + (p << 12), n->rdram + (p << 12), 4096)) {
+					if (unmarked++ < 10) {
+						printf("field %d: page %04x changed unmarked\n", f, p);
+					}
+				}
+			}
+			if (f + 1 == fields) {
+				printf("dirty test: %ld unmarked page changes\n", unmarked);
+			}
+		}
 		// N64RUMBLELOG: when controller 1's Rumble Pak motor turns on and off.
 		static bool rumbling;
 		if (getenv("N64RUMBLELOG") && n->rumble[0] != rumbling) {

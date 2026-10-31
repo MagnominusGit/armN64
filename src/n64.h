@@ -309,6 +309,10 @@ struct N64 {
 	struct Block** blockPage[RDRAM_SIZE >> 12];
 	// The entry past RDRAM has every flag set: virtual pages not yet looked up point there (vpages).
 	uint8_t pageFlags[(RDRAM_SIZE >> 12) + 1];
+	// Pages written (0) since a reader (the frontend's achievement view) last set them to 0xFF; one
+	// more for the page past RDRAM that compiled stores may name before going slow. Right after
+	// pageFlags, where compiled code finds it.
+	uint8_t dirtyPages[(RDRAM_SIZE >> 12) + 1];
 	// One bit per RDRAM word that a block holds: writes elsewhere in a page with code keep its blocks.
 	uint8_t codeWords[RDRAM_SIZE >> 5];
 	uint32_t blockGen;
@@ -548,6 +552,7 @@ static inline bool n64HoldsCode(struct N64* n, uint32_t p, uint32_t addr, uint32
 static inline void n64RdramWrite(struct N64* n, uint32_t addr, uint32_t len) {
 	uint32_t first = (addr & (RDRAM_SIZE - 1)) >> 12, last = ((addr + len - 1) & (RDRAM_SIZE - 1)) >> 12;
 	for (uint32_t p = first;; p = (p + 1) & ((RDRAM_SIZE >> 12) - 1)) {
+		n->dirtyPages[p] = 0;
 		if (n->pageFlags[p] & PAGE_RDP) {
 			rdpWaitFor(n, addr, len);
 		}

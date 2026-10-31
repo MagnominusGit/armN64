@@ -694,6 +694,7 @@ static void emitMemory(struct Jit* j, struct Slow* slow) {
 		xMovRR(e, 4, RCX, RAX);
 		xShiftI(e, X_SHR, 4, R(RCX), 12);
 		if (isStore) {
+			xStoreI(e, 1, MI(RBX, RCX, 1, (int32_t) offsetof(struct N64, dirtyPages)), 0);
 			xAluI(e, X_CMP, 1, MI(RBX, RCX, 1, (int32_t) offsetof(struct N64, pageFlags)), 0);
 			struct Miss* k = &j->codeChecks[j->codeCheckCount++];
 			k->site = xJcc(e, CC_NE, NULL);

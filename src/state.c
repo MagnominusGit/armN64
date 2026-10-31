@@ -141,6 +141,7 @@ bool n64StateLoad(struct N64* n, const void* data, size_t size, bool quick) {
 		}
 	}
 	memcpy(n->rdram, at, RDRAM_SIZE);
+	memset(n->dirtyPages, 0, sizeof(n->dirtyPages));
 	at += RDRAM_SIZE;
 	if (!keepGl) {
 		memcpy(n->hidden, at, RDRAM_SIZE / 2);

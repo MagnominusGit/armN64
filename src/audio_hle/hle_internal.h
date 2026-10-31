@@ -33,6 +33,8 @@ struct hle_t
 {
     unsigned char* dram;
     uint32_t dram_mask;
+    /* armN64: the machine's written-pages bytes (struct N64 dirtyPages) */
+    unsigned char* dram_dirty;
     unsigned char* dmem;
 
     /* for user convenience, this will be passed to "external" functions */

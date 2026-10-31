@@ -1051,6 +1051,12 @@ static void fprAddress(struct Emitter* e, int ft, int size) {
 // interpreter, it takes the low 32 bits of the address: w0 the virtual address, w6 the physical
 // one and w1 the D-cache line. A page not looked up, and a misaligned address, fail the tag check
 // and take the slow path from the miss path.
+// The page in w1 written: its byte in dirtyPages, which follows pageFlags (x26), to 0.
+static void markWritten(struct Emitter* e) {
+	aDp(e, A_ADD | W64, 2, PAGES, 1, S_LSL, 0);
+	aStrb(e, ZR, 2, N64_OFF(dirtyPages) - N64_OFF(pageFlags));
+}
+
 static void emitMemory(struct Jit* j, struct Slow* slow) {
 	struct Emitter* e = &j->e;
 	uint32_t op = slow->op;
@@ -1104,7 +1110,9 @@ static void emitMemory(struct Jit* j, struct Slow* slow) {
 	// write-backs reach memory, in C.
 	if (j->cacheData) {
 	} else if (isStore) {
+		// The page written: its byte in dirtyPages, after pageFlags.
 		aLsrImm(e, 1, 6, 12);
+		markWritten(e);
 		aLdst(e, L_LDRB, 1, PAGES, 1, L_UXTW);
 		struct Miss* k = &j->codeChecks[j->codeCheckCount++];
 		k->site = aCbnz(e, 1, NULL);
@@ -1315,6 +1323,9 @@ static uint8_t* fuseRun(struct Jit* j, const uint32_t* ops, uint32_t len, uint32
 	}
 	aDp(e, A_ADD, 6, 0, 5, S_LSL, 0);
 	aLsrImm(e, 1, 6, 12);
+	if (stores && !j->cacheData) {
+		markWritten(e);
+	}
 	aLdst(e, L_LDRB, 1, PAGES, 1, L_UXTW);
 	if (stores) {
 		out[sites++] = aCbnz(e, 1, NULL);

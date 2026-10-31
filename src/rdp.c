@@ -3079,8 +3079,25 @@ static struct RDP* beginCommands(struct N64* n, uint64_t* begin) {
 	return r;
 }
 
+// The pages of rows from to to - 1 of an image at addr written.
+static void rowsWritten(struct N64* n, uint32_t addr, int from, int to, uint32_t rowBytes) {
+	if (to > from && rowBytes) {
+		uint32_t first = addr + (uint32_t) from * rowBytes, last = addr + (uint32_t) to * rowBytes - 1;
+		for (uint32_t a = first & ~0xFFFu; a <= last; a += 0x1000) {
+			n->dirtyPages[(a & (RDRAM_SIZE - 1)) >> 12] = 0;
+		}
+	}
+}
+
 // One command: a full sync interrupts the CPU once the commands before it would be done.
 static void command(struct N64* n, struct RDP* r, const uint64_t* w, int op, int words, uint64_t begin) {
+	// A primitive writes the color image's rows within the scissor, and the depth image's.
+	if ((op >= 0x08 && op <= 0x0F) || op == 0x24 || op == 0x25 || op == 0x36) {
+		int const from = r->scissorY0 >> 2, to = (r->scissorY1 >> 2) + 1;
+		uint32_t const width = r->colorWidth;
+		rowsWritten(n, r->colorAddr, from, to, width * (r->colorSize == 3 ? 4 : r->colorSize == 2 ? 2 : 1));
+		rowsWritten(n, r->zAddr, from, to, width * 2);
+	}
 	++n->checkCounts[0][op];
 	if (n->checkLen[0] < 4096) {
 		n->checkSeq[0][n->checkLen[0]++] = w[0];

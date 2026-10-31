@@ -566,6 +566,7 @@ void busWrite32(struct N64* n, uint32_t addr, uint32_t v) {
 		if (n->pageFlags[addr >> 12]) {
 			n64RdramWrite(n, addr, 4);
 		}
+		n->dirtyPages[addr >> 12] = 0;
 		put32(&n->rdram[addr & ~3u], v);
 		return;
 	}
@@ -840,6 +841,7 @@ static uint8_t* writable(struct N64* n, uint32_t addr, uint32_t len) {
 		if (n->pageFlags[addr >> 12]) {
 			n64RdramWrite(n, addr, len);
 		}
+		n->dirtyPages[addr >> 12] = 0;
 		return &n->rdram[addr];
 	}
 	return NULL;

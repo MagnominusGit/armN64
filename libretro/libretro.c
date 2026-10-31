@@ -76,7 +76,8 @@ static uint32_t presentRgba[640 * 480];
 // first run.
 static bool saveGiven;
 // RDRAM as achievements read it: in little-endian words, as mupen64plus-next keeps it (the sets are
-// made on that). Kept up to date each run once the frontend has asked for it.
+// made on that). Once the frontend has asked for it, the pages written are brought up to date after
+// each run.
 static uint8_t* ramView;
 // What the frontend has in each port (RETRO_DEVICE_*), and the rumble each was last given.
 static unsigned devices[4] = { RETRO_DEVICE_JOYPAD, RETRO_DEVICE_JOYPAD, RETRO_DEVICE_JOYPAD, RETRO_DEVICE_JOYPAD };
@@ -744,7 +745,12 @@ void retro_run(void) {
 	}
 	diskSave();
 	if (ramView) {
-		swapWords(ramView, machine->rdram, RDRAM_SIZE);
+		for (uint32_t p = 0; p < (RDRAM_SIZE >> 12); ++p) {
+			if (!machine->dirtyPages[p]) {
+				swapWords(ramView + (p << 12), machine->rdram + (p << 12), 4096);
+				machine->dirtyPages[p] = 0xFF;
+			}
+		}
 	}
 }
 
@@ -811,6 +817,7 @@ void* retro_get_memory_data(unsigned id) {
 	if (id == RETRO_MEMORY_SYSTEM_RAM && machine) {
 		if (!ramView && (ramView = malloc(RDRAM_SIZE))) {
 			swapWords(ramView, machine->rdram, RDRAM_SIZE);
+			memset(machine->dirtyPages, 0xFF, sizeof(machine->dirtyPages));
 		}
 		return ramView;
 	}
