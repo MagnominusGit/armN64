@@ -27,6 +27,12 @@ struct N64* n64Create(void) {
 		free(n);
 		return NULL;
 	}
+	// Controller 1 plugged in; Controller Paks as they come formatted; flash erased.
+	n->plugged[0] = PLUG_CONTROLLER;
+	for (int i = 0; i < 4; ++i) {
+		pakFormat(n->paks[i]);
+	}
+	memset(n->flash, 0xFF, sizeof(n->flash));
 	// RDRAM holds noise at power-on, not zeros, and the boot code clears only what it uses. Wayne
 	// Gretzky's 3D Hockey '98 (EU) sends its first audio list empty and gets by on that noise.
 	uint32_t x = 0x2545F491u;
@@ -123,7 +129,15 @@ static void start(struct N64* n) {
 		n->isViewer = calloc(1, 0x10000);
 	}
 	const char* mouse = setting(n, "N64_MOUSE");
-	n->mousePort = mouse && *mouse >= '1' && *mouse <= '4' ? *mouse - '0' : 0;
+	if (mouse && *mouse >= '1' && *mouse <= '4') {
+		n->plugged[*mouse - '1'] = PLUG_MOUSE;
+	}
+	// N64_PAK: what is in the controllers' slots, a letter a port (m Controller Pak, r Rumble Pak).
+	const char* paks = setting(n, "N64_PAK");
+	for (int i = 0; paks && i < 4 && paks[i]; ++i) {
+		n->pak[i] = paks[i] == 'm' ? PAK_MEMORY : paks[i] == 'r' ? PAK_RUMBLE : PAK_NONE;
+	}
+	n->flashMode = n->flashStatus = 0;
 	if (n->compat) {
 		memset(n->rdram, 0, RDRAM_SIZE);
 	}

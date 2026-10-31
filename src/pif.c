@@ -127,15 +127,52 @@ void pifBoot(struct N64* n) {
 	}
 }
 
-// A controller, or an N64 Mouse (type 0x0002), which reads the same way.
-static void controller(const uint8_t* cmd, uint8_t* resp, int rx, bool mouse, uint32_t state) {
+// The CRC a controller sends after a pak's 32 bytes (polynomial 0x85, as libultra checks it).
+static uint8_t pakCrc(const uint8_t* data) {
+	uint8_t crc = 0;
+	for (int i = 0; i <= 32; ++i) {
+		for (int bit = 7; bit >= 0; --bit) {
+			uint8_t const tap = crc & 0x80 ? 0x85 : 0;
+			crc = (uint8_t) (crc << 1 | (i < 32 ? data[i] >> bit & 1 : 0));
+			crc ^= tap;
+		}
+	}
+	return crc;
+}
+
+// 32 bytes of the pak in controller port's slot at address (its low 5 bits are the address's CRC):
+// a Controller Pak's memory, or the Rumble Pak's (0x80 where it says what it is, its motor at
+// 0xC000).
+static void pakRead(struct N64* n, int port, uint32_t address, uint8_t* data) {
+	address &= 0xFFE0;
+	if (n->pak[port] == PAK_MEMORY) {
+		address < 0x8000 ? memcpy(data, &n->paks[port][address], 32) : memset(data, 0, 32);
+	} else {
+		memset(data, n->pak[port] == PAK_RUMBLE && address >= 0x8000 && address < 0x9000 ? 0x80 : 0, 32);
+	}
+}
+
+static void pakWrite(struct N64* n, int port, uint32_t address, const uint8_t* data) {
+	address &= 0xFFE0;
+	if (n->pak[port] == PAK_MEMORY && address < 0x8000) {
+		memcpy(&n->paks[port][address], data, 32);
+		n->saveDirty = true;
+	} else if (n->pak[port] == PAK_RUMBLE && address >= 0xC000) {
+		n->rumble[port] = data[31] != 0;
+	}
+}
+
+// A controller with what is in its slot, or an N64 Mouse (type 0x0002), which reads the same way.
+static void controller(struct N64* n, int port, const uint8_t* cmd, uint8_t* resp, int send, int rx) {
+	bool const mouse = n->plugged[port] == PLUG_MOUSE;
+	uint32_t const state = n->pad[port];
 	switch (cmd[0]) {
 	case 0x00:
 	case 0xFF:
 		if (rx >= 3) {
 			resp[0] = mouse ? 0x00 : 0x05;
 			resp[1] = mouse ? 0x02 : 0x00;
-			resp[2] = mouse ? 0x00 : 0x02;
+			resp[2] = mouse ? 0x00 : n->pak[port] != PAK_NONE ? 0x01 : 0x02;
 		}
 		return;
 	case 0x01:
@@ -144,6 +181,19 @@ static void controller(const uint8_t* cmd, uint8_t* resp, int rx, bool mouse, ui
 			resp[1] = state >> 16;
 			resp[2] = state >> 8;
 			resp[3] = state;
+		}
+		return;
+	case 0x02:
+		if (!mouse && send >= 3 && rx >= 33) {
+			pakRead(n, port, (uint32_t) cmd[1] << 8 | cmd[2], resp);
+			// With nothing in the slot, the CRC comes back wrong.
+			resp[32] = pakCrc(resp) ^ (n->pak[port] == PAK_NONE ? 0xFF : 0);
+		}
+		return;
+	case 0x03:
+		if (!mouse && send >= 35 && rx >= 1) {
+			pakWrite(n, port, (uint32_t) cmd[1] << 8 | cmd[2], cmd + 3);
+			resp[0] = pakCrc(cmd + 3) ^ (n->pak[port] == PAK_NONE ? 0xFF : 0);
 		}
 		return;
 	}
@@ -169,6 +219,7 @@ static void eeprom(struct N64* n, const uint8_t* cmd, uint8_t* resp, int send, i
 	case 0x05:
 		if (send >= 10) {
 			memcpy(&n->eeprom[(cmd[1] * 8u) % size], cmd + 2, 8);
+			n->saveDirty = true;
 			if (rx >= 1) {
 				resp[0] = 0x00;
 			}
@@ -204,7 +255,7 @@ static void cicChallenge(uint8_t* ram) {
 }
 
 // The Joybus commands in PIF RAM: per channel, a send length, a receive length, the command and room
-// for the reply. Controller 1 is plugged in and the cartridge's EEPROM answers on channel 4.
+// for the reply. Channels 0-3 are the controller ports, and the cartridge's EEPROM answers on 4.
 static void joybus(struct N64* n, bool controllersOnly) {
 	uint8_t* ram = n->pifRam;
 	int channel = 0;
@@ -230,10 +281,8 @@ static void joybus(struct N64* n, bool controllersOnly) {
 		}
 		uint8_t* cmd = &ram[i + 2];
 		uint8_t* resp = cmd + send;
-		if (n->mousePort && channel == n->mousePort - 1) {
-			controller(cmd, resp, receive, true, n->mouse);
-		} else if (channel == 0) {
-			controller(cmd, resp, receive, false, n->buttons);
+		if (channel < 4 && n->plugged[channel] != PLUG_NONE) {
+			controller(n, channel, cmd, resp, send, receive);
 		} else if (channel == 4) {
 			if (!controllersOnly) {
 				eeprom(n, cmd, resp, send, receive);
@@ -279,7 +328,7 @@ uint32_t pifDmaCycles(struct N64* n, bool write) {
 		if (i + 2 + send + receive > 63) {
 			break;
 		}
-		bool const present = channel == 0 || channel == 4 || (n->mousePort && channel == n->mousePort - 1);
+		bool const present = channel == 4 || n->plugged[channel] != PLUG_NONE;
 		cycles += write ? 6529 : 13087 + 1974 * (uint32_t) (send + receive) - (present ? 0 : 2972);
 		i += 2 + send + receive;
 		++channel;

@@ -16,10 +16,12 @@
 
 enum {
 	OUT_RATE = 44100,
-	// The save file: the EEPROM, then the SRAM or flash.
-	EEPROM_SIZE = sizeof(((struct N64*) 0)->eeprom),
-	CART_SAVE_SIZE = sizeof(((struct N64*) 0)->save),
-	SAVE_SIZE = EEPROM_SIZE + CART_SAVE_SIZE,
+	// The save file as mupen64plus-next lays it out, so saves go between the two: the EEPROM, the four
+	// Controller Paks, the SRAM, then the flash (these two in little-endian words).
+	FILE_PAKS = 0x800,
+	FILE_SRAM = FILE_PAKS + 4 * 0x8000,
+	FILE_FLASH = FILE_SRAM + 0x8000,
+	SAVE_SIZE = FILE_FLASH + 0x20000,
 	// A second of the fastest AI rate, left and right, and room for it from rates down to 22 kHz.
 	CAPTURE_SAMPLES = 2 * 49152,
 	OUT_FRAMES = 2 * 49152,
@@ -31,6 +33,7 @@ static retro_audio_sample_batch_t audioBatch;
 static retro_input_poll_t inputPoll;
 static retro_input_state_t inputState;
 static retro_log_printf_t logPrintf;
+static retro_set_rumble_state_t setRumble;
 
 static struct N64* machine;
 // The game as it was loaded (and the 64DD's IPL for a disk), to start again on a reset.
@@ -71,9 +74,13 @@ static uint32_t presentRgba[640 * 480];
 // RetroArch fills saveMemory from the save file after the game loads: it goes to the machine on the
 // first run.
 static bool saveGiven;
+// What the frontend has in each port (RETRO_DEVICE_*), and the rumble each was last given.
+static unsigned devices[4] = { RETRO_DEVICE_JOYPAD, RETRO_DEVICE_JOYPAD, RETRO_DEVICE_JOYPAD, RETRO_DEVICE_JOYPAD };
+static bool rumbling[4];
 
 static struct retro_core_option_v2_category optionCategories[] = {
 	{ "system", "System", "How the game is emulated." },
+	{ "input", "Input", "What is in each controller's slot." },
 	{ NULL, NULL, NULL },
 };
 
@@ -89,6 +96,14 @@ static struct retro_core_option_v2_definition optionDefinitions[] = {
 	  NULL, "system", { { "auto", "Auto" }, { "gpu", "GPU" }, { "cpu", "CPU" }, { NULL, NULL } }, "auto" },
 	{ "armn64_frameskip", "Frame Skip (Restart)", NULL, "Leaves out the drawing of frames that are never shown, as many games make more than the screen can show.",
 	  NULL, "system", { { "disabled", "Off" }, { "enabled", "On" }, { NULL, NULL } }, "disabled" },
+	{ "armn64_pak1", "Player 1 Pak", NULL, "What is in controller 1's slot: a Controller Pak for saves, or a Rumble Pak.",
+	  NULL, "input", { { "memory", "Controller Pak" }, { "rumble", "Rumble Pak" }, { "none", "None" }, { NULL, NULL } }, "memory" },
+	{ "armn64_pak2", "Player 2 Pak", NULL, "What is in controller 2's slot: a Controller Pak for saves, or a Rumble Pak.",
+	  NULL, "input", { { "memory", "Controller Pak" }, { "rumble", "Rumble Pak" }, { "none", "None" }, { NULL, NULL } }, "memory" },
+	{ "armn64_pak3", "Player 3 Pak", NULL, "What is in controller 3's slot: a Controller Pak for saves, or a Rumble Pak.",
+	  NULL, "input", { { "memory", "Controller Pak" }, { "rumble", "Rumble Pak" }, { "none", "None" }, { NULL, NULL } }, "memory" },
+	{ "armn64_pak4", "Player 4 Pak", NULL, "What is in controller 4's slot: a Controller Pak for saves, or a Rumble Pak.",
+	  NULL, "input", { { "memory", "Controller Pak" }, { "rumble", "Rumble Pak" }, { "none", "None" }, { NULL, NULL } }, "memory" },
 	{ NULL, NULL, NULL, NULL, NULL, NULL, { { NULL, NULL } }, NULL },
 };
 
@@ -183,6 +198,41 @@ void retro_deinit(void) {
 }
 
 void retro_set_controller_port_device(unsigned port, unsigned device) {
+	if (port < 4) {
+		devices[port] = device;
+	}
+}
+
+// Saves between the machine and the save file's layout. The SRAM and flash words change byte order.
+static void saveCopy(uint8_t* to, const uint8_t* from, size_t size) {
+	for (size_t i = 0; i < size; i += 4) {
+		to[i] = from[i + 3], to[i + 1] = from[i + 2], to[i + 2] = from[i + 1], to[i + 3] = from[i];
+	}
+}
+
+static void saveExport(void) {
+	memcpy(saveMemory, machine->eeprom, sizeof(machine->eeprom));
+	memcpy(saveMemory + FILE_PAKS, machine->paks, sizeof(machine->paks));
+	saveCopy(saveMemory + FILE_SRAM, machine->sram, sizeof(machine->sram));
+	saveCopy(saveMemory + FILE_FLASH, machine->flash, sizeof(machine->flash));
+}
+
+// A Controller Pak left empty (by a save file from before there were any) is formatted.
+static void saveImport(void) {
+	memcpy(machine->eeprom, saveMemory, sizeof(machine->eeprom));
+	memcpy(machine->paks, saveMemory + FILE_PAKS, sizeof(machine->paks));
+	saveCopy(machine->sram, saveMemory + FILE_SRAM, sizeof(machine->sram));
+	saveCopy(machine->flash, saveMemory + FILE_FLASH, sizeof(machine->flash));
+	for (int i = 0; i < 4; ++i) {
+		const uint8_t* pak = machine->paks[i];
+		size_t k = 0;
+		while (k < sizeof(machine->paks[i]) && !pak[k]) {
+			++k;
+		}
+		if (k == sizeof(machine->paks[i])) {
+			pakFormat(machine->paks[i]);
+		}
+	}
 }
 
 static uint8_t* readFile(const char* path, size_t* size) {
@@ -330,25 +380,44 @@ static void presentGl(unsigned framebuffer, int x, int y, int width, int height)
 	videoRefresh(RETRO_HW_FRAME_BUFFER_VALID, (unsigned) width, (unsigned) height, 0);
 }
 
+// Each port's controls, and what can be plugged in.
 static void describeInput(void) {
-	static const struct retro_input_descriptor descriptors[] = {
-		{ 0, RETRO_DEVICE_JOYPAD, 0, RETRO_DEVICE_ID_JOYPAD_B, "A" },
-		{ 0, RETRO_DEVICE_JOYPAD, 0, RETRO_DEVICE_ID_JOYPAD_Y, "B" },
-		{ 0, RETRO_DEVICE_JOYPAD, 0, RETRO_DEVICE_ID_JOYPAD_L2, "Z" },
-		{ 0, RETRO_DEVICE_JOYPAD, 0, RETRO_DEVICE_ID_JOYPAD_L, "L" },
-		{ 0, RETRO_DEVICE_JOYPAD, 0, RETRO_DEVICE_ID_JOYPAD_R, "R" },
-		{ 0, RETRO_DEVICE_JOYPAD, 0, RETRO_DEVICE_ID_JOYPAD_START, "Start" },
-		{ 0, RETRO_DEVICE_JOYPAD, 0, RETRO_DEVICE_ID_JOYPAD_UP, "D-Pad Up" },
-		{ 0, RETRO_DEVICE_JOYPAD, 0, RETRO_DEVICE_ID_JOYPAD_DOWN, "D-Pad Down" },
-		{ 0, RETRO_DEVICE_JOYPAD, 0, RETRO_DEVICE_ID_JOYPAD_LEFT, "D-Pad Left" },
-		{ 0, RETRO_DEVICE_JOYPAD, 0, RETRO_DEVICE_ID_JOYPAD_RIGHT, "D-Pad Right" },
-		{ 0, RETRO_DEVICE_ANALOG, RETRO_DEVICE_INDEX_ANALOG_LEFT, RETRO_DEVICE_ID_ANALOG_X, "Control Stick X" },
-		{ 0, RETRO_DEVICE_ANALOG, RETRO_DEVICE_INDEX_ANALOG_LEFT, RETRO_DEVICE_ID_ANALOG_Y, "Control Stick Y" },
-		{ 0, RETRO_DEVICE_ANALOG, RETRO_DEVICE_INDEX_ANALOG_RIGHT, RETRO_DEVICE_ID_ANALOG_X, "C Buttons X" },
-		{ 0, RETRO_DEVICE_ANALOG, RETRO_DEVICE_INDEX_ANALOG_RIGHT, RETRO_DEVICE_ID_ANALOG_Y, "C Buttons Y" },
-		{ 0, 0, 0, 0, NULL },
+	static const struct {
+		unsigned device, index, id;
+		const char* name;
+	} controls[] = {
+		{ RETRO_DEVICE_JOYPAD, 0, RETRO_DEVICE_ID_JOYPAD_B, "A" },
+		{ RETRO_DEVICE_JOYPAD, 0, RETRO_DEVICE_ID_JOYPAD_Y, "B" },
+		{ RETRO_DEVICE_JOYPAD, 0, RETRO_DEVICE_ID_JOYPAD_L2, "Z" },
+		{ RETRO_DEVICE_JOYPAD, 0, RETRO_DEVICE_ID_JOYPAD_L, "L" },
+		{ RETRO_DEVICE_JOYPAD, 0, RETRO_DEVICE_ID_JOYPAD_R, "R" },
+		{ RETRO_DEVICE_JOYPAD, 0, RETRO_DEVICE_ID_JOYPAD_START, "Start" },
+		{ RETRO_DEVICE_JOYPAD, 0, RETRO_DEVICE_ID_JOYPAD_UP, "D-Pad Up" },
+		{ RETRO_DEVICE_JOYPAD, 0, RETRO_DEVICE_ID_JOYPAD_DOWN, "D-Pad Down" },
+		{ RETRO_DEVICE_JOYPAD, 0, RETRO_DEVICE_ID_JOYPAD_LEFT, "D-Pad Left" },
+		{ RETRO_DEVICE_JOYPAD, 0, RETRO_DEVICE_ID_JOYPAD_RIGHT, "D-Pad Right" },
+		{ RETRO_DEVICE_ANALOG, RETRO_DEVICE_INDEX_ANALOG_LEFT, RETRO_DEVICE_ID_ANALOG_X, "Control Stick X" },
+		{ RETRO_DEVICE_ANALOG, RETRO_DEVICE_INDEX_ANALOG_LEFT, RETRO_DEVICE_ID_ANALOG_Y, "Control Stick Y" },
+		{ RETRO_DEVICE_ANALOG, RETRO_DEVICE_INDEX_ANALOG_RIGHT, RETRO_DEVICE_ID_ANALOG_X, "C Buttons X" },
+		{ RETRO_DEVICE_ANALOG, RETRO_DEVICE_INDEX_ANALOG_RIGHT, RETRO_DEVICE_ID_ANALOG_Y, "C Buttons Y" },
 	};
-	environment(RETRO_ENVIRONMENT_SET_INPUT_DESCRIPTORS, (void*) descriptors);
+	enum { CONTROLS = sizeof(controls) / sizeof(*controls) };
+	static struct retro_input_descriptor descriptors[4 * CONTROLS + 1];
+	for (unsigned port = 0; port < 4; ++port) {
+		for (unsigned i = 0; i < CONTROLS; ++i) {
+			descriptors[port * CONTROLS + i] = (struct retro_input_descriptor) { port, controls[i].device, controls[i].index, controls[i].id, controls[i].name };
+		}
+	}
+	environment(RETRO_ENVIRONMENT_SET_INPUT_DESCRIPTORS, descriptors);
+	static const struct retro_controller_description types[] = {
+		{ "Controller", RETRO_DEVICE_JOYPAD },
+		{ "N64 Mouse", RETRO_DEVICE_MOUSE },
+		{ "None", RETRO_DEVICE_NONE },
+	};
+	static const struct retro_controller_info ports[] = {
+		{ types, 3 }, { types, 3 }, { types, 3 }, { types, 3 }, { NULL, 0 },
+	};
+	environment(RETRO_ENVIRONMENT_SET_CONTROLLER_INFO, (void*) ports);
 }
 
 bool retro_load_game(const struct retro_game_info* info) {
@@ -398,9 +467,11 @@ bool retro_load_game(const struct retro_game_info* info) {
 		return false;
 	}
 	pal = machine->fieldCycles == CPU_HZ / 50;
-	memcpy(saveMemory, machine->eeprom, EEPROM_SIZE);
-	memcpy(saveMemory + EEPROM_SIZE, machine->save, CART_SAVE_SIZE);
+	saveExport();
 	saveGiven = false;
+	struct retro_rumble_interface rumble;
+	setRumble = environment(RETRO_ENVIRONMENT_GET_RUMBLE_INTERFACE, &rumble) ? rumble.set_rumble_state : NULL;
+	memset(rumbling, 0, sizeof(rumbling));
 	audioPhase = 0;
 	memset(audioLast, 0, sizeof(audioLast));
 	describeInput();
@@ -428,22 +499,17 @@ void retro_reset(void) {
 	glesYield();
 	machine = startMachine();
 	if (machine) {
-		memcpy(machine->eeprom, saveMemory, EEPROM_SIZE);
-		memcpy(machine->save, saveMemory + EEPROM_SIZE, CART_SAVE_SIZE);
+		saveImport();
 	}
 }
 
-static bool held(unsigned id) {
-	return inputState(0, RETRO_DEVICE_JOYPAD, 0, id) != 0;
-}
-
 // An analog axis as the controller's stick reports it: about 80 each way.
-static int stick(unsigned index, unsigned axis) {
-	return inputState(0, RETRO_DEVICE_ANALOG, index, axis) * 80 / 32768;
+static int stick(unsigned port, unsigned index, unsigned axis) {
+	return inputState(port, RETRO_DEVICE_ANALOG, index, axis) * 80 / 32768;
 }
 
-// Controller 1 as the PIF reads it: the buttons in the top half, then the stick's X and Y.
-static uint32_t readController(void) {
+// A controller as the PIF reads it: the buttons in the top half, then the stick's X and Y.
+static uint32_t readController(unsigned port) {
 	static const struct {
 		unsigned id;
 		uint32_t bit;
@@ -455,15 +521,43 @@ static uint32_t readController(void) {
 	};
 	uint32_t state = 0;
 	for (size_t i = 0; i < sizeof(buttons) / sizeof(*buttons); ++i) {
-		state |= held(buttons[i].id) ? buttons[i].bit : 0;
+		state |= inputState(port, RETRO_DEVICE_JOYPAD, 0, buttons[i].id) ? buttons[i].bit : 0;
 	}
 	// The C buttons from the right stick, pushed past halfway.
-	int cx = inputState(0, RETRO_DEVICE_ANALOG, RETRO_DEVICE_INDEX_ANALOG_RIGHT, RETRO_DEVICE_ID_ANALOG_X);
-	int cy = inputState(0, RETRO_DEVICE_ANALOG, RETRO_DEVICE_INDEX_ANALOG_RIGHT, RETRO_DEVICE_ID_ANALOG_Y);
+	int cx = inputState(port, RETRO_DEVICE_ANALOG, RETRO_DEVICE_INDEX_ANALOG_RIGHT, RETRO_DEVICE_ID_ANALOG_X);
+	int cy = inputState(port, RETRO_DEVICE_ANALOG, RETRO_DEVICE_INDEX_ANALOG_RIGHT, RETRO_DEVICE_ID_ANALOG_Y);
 	state |= (cy < -16384 ? 1u << 19 : 0) | (cy > 16384 ? 1u << 18 : 0) | (cx < -16384 ? 1u << 17 : 0) | (cx > 16384 ? 1u << 16 : 0);
-	int x = stick(RETRO_DEVICE_INDEX_ANALOG_LEFT, RETRO_DEVICE_ID_ANALOG_X);
-	int y = -stick(RETRO_DEVICE_INDEX_ANALOG_LEFT, RETRO_DEVICE_ID_ANALOG_Y);
+	int x = stick(port, RETRO_DEVICE_INDEX_ANALOG_LEFT, RETRO_DEVICE_ID_ANALOG_X);
+	int y = -stick(port, RETRO_DEVICE_INDEX_ANALOG_LEFT, RETRO_DEVICE_ID_ANALOG_Y);
 	return state | (uint32_t) (uint8_t) x << 8 | (uint8_t) y;
+}
+
+// An N64 Mouse: its buttons where A and B are, and how far it moved since the last field.
+static uint32_t readMouse(unsigned port) {
+	int x = inputState(port, RETRO_DEVICE_MOUSE, 0, RETRO_DEVICE_ID_MOUSE_X);
+	int y = -inputState(port, RETRO_DEVICE_MOUSE, 0, RETRO_DEVICE_ID_MOUSE_Y);
+	x = x < -128 ? -128 : x > 127 ? 127 : x;
+	y = y < -128 ? -128 : y > 127 ? 127 : y;
+	return (inputState(port, RETRO_DEVICE_MOUSE, 0, RETRO_DEVICE_ID_MOUSE_LEFT) ? 1u << 31 : 0) |
+	       (inputState(port, RETRO_DEVICE_MOUSE, 0, RETRO_DEVICE_ID_MOUSE_RIGHT) ? 1u << 30 : 0) | (uint32_t) (uint8_t) x << 8 | (uint8_t) y;
+}
+
+// The ports as the frontend has them, with the paks the options put in, and the Rumble Paks' motors
+// to the frontend.
+static void readPorts(void) {
+	for (unsigned port = 0; port < 4; ++port) {
+		unsigned const device = devices[port] & RETRO_DEVICE_MASK;
+		machine->plugged[port] = device == RETRO_DEVICE_MOUSE ? PLUG_MOUSE : device == RETRO_DEVICE_NONE ? PLUG_NONE : PLUG_CONTROLLER;
+		char key[16];
+		snprintf(key, sizeof(key), "armn64_pak%u", port + 1);
+		machine->pak[port] = optionIs(environment, key, "rumble") ? PAK_RUMBLE : optionIs(environment, key, "none") ? PAK_NONE : PAK_MEMORY;
+		machine->pad[port] = machine->plugged[port] == PLUG_MOUSE ? readMouse(port) : machine->plugged[port] ? readController(port) : 0;
+		bool const on = machine->pak[port] == PAK_RUMBLE && machine->rumble[port];
+		if (setRumble && on != rumbling[port]) {
+			setRumble(port, RETRO_RUMBLE_STRONG, on ? 0xFFFF : 0);
+			rumbling[port] = on;
+		}
+	}
 }
 
 // The field's samples, from the AI's rate to 44.1 kHz by straight lines between them.
@@ -507,8 +601,7 @@ void retro_run(void) {
 		return;
 	}
 	if (!saveGiven) {
-		memcpy(machine->eeprom, saveMemory, EEPROM_SIZE);
-		memcpy(machine->save, saveMemory + EEPROM_SIZE, CART_SAVE_SIZE);
+		saveImport();
 		saveGiven = true;
 	}
 	bool shared = hw.context_type != RETRO_HW_CONTEXT_NONE;
@@ -516,7 +609,7 @@ void retro_run(void) {
 		glesResume();
 	}
 	inputPoll();
-	machine->buttons = readController();
+	readPorts();
 	n64RunField(machine);
 	int width = 0, height = 0;
 	// The GPU RDP's picture goes from its buffer to the frontend's framebuffer without the CPU, and so
@@ -555,8 +648,10 @@ void retro_run(void) {
 		glesYield();
 	}
 	playAudio();
-	memcpy(saveMemory, machine->eeprom, EEPROM_SIZE);
-	memcpy(saveMemory + EEPROM_SIZE, machine->save, CART_SAVE_SIZE);
+	if (machine->saveDirty) {
+		saveExport();
+		machine->saveDirty = false;
+	}
 }
 
 size_t retro_serialize_size(void) {

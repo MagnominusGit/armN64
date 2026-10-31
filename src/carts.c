@@ -104,3 +104,144 @@ bool cartBootChecksum(const uint8_t* rom, size_t size, int cic, uint8_t seedByte
 	out[1] = crc2;
 	return crc1 != be32(rom + 0x10) || crc2 != be32(rom + 0x14);
 }
+
+// The cartridge's SRAM (32 KB) or FlashRAM (128 KB, a Macronix MX29L1101: a new part as libultra
+// tells them apart, pages of 128 bytes at their own addresses) at 0x08000000. Which one the game
+// has shows in its first use: a flash command, or the SRAM reached first.
+enum { FLASH_READ, FLASH_ID, FLASH_STATUS, FLASH_SECTOR_ERASE, FLASH_CHIP_ERASE, FLASH_PROGRAM };
+
+static void flashCommand(struct N64* n, uint32_t v) {
+	uint32_t const offset = (v & 0xFFFF) * 128;
+	switch (v >> 24) {
+	case 0x4B:
+		n->flashMode = FLASH_SECTOR_ERASE;
+		n->flashOffset = offset;
+		break;
+	case 0x3C:
+		n->flashMode = FLASH_CHIP_ERASE;
+		break;
+	case 0x78:
+		if (n->flashMode == FLASH_SECTOR_ERASE && n->flashOffset < sizeof(n->flash)) {
+			uint32_t size = sizeof(n->flash) - n->flashOffset < 0x4000 ? sizeof(n->flash) - n->flashOffset : 0x4000;
+			memset(&n->flash[n->flashOffset], 0xFF, size);
+		} else if (n->flashMode == FLASH_CHIP_ERASE) {
+			memset(n->flash, 0xFF, sizeof(n->flash));
+		}
+		n->flashStatus = 0x08;
+		n->flashMode = FLASH_STATUS;
+		n->saveDirty = true;
+		break;
+	case 0xA5:
+		if (offset + 128 <= sizeof(n->flash)) {
+			memcpy(&n->flash[offset], n->flashPage, 128);
+		}
+		n->flashStatus = 0x04;
+		n->flashMode = FLASH_STATUS;
+		n->saveDirty = true;
+		break;
+	case 0xB4:
+		n->flashMode = FLASH_PROGRAM;
+		break;
+	case 0xD2:
+		n->flashMode = FLASH_STATUS;
+		break;
+	case 0xE1:
+		// Pokemon Puzzle League waits for status bit 0 after asking for the ID (mupen64plus).
+		n->flashMode = FLASH_ID;
+		n->flashStatus |= 1;
+		break;
+	case 0xF0:
+		n->flashMode = FLASH_READ;
+		break;
+	}
+}
+
+// A byte the PI reads at offset in the save chip's space (a DMA to RDRAM).
+uint8_t cartSaveByte(struct N64* n, uint32_t offset) {
+	static const uint8_t flashId[8] = { 0x11, 0x11, 0x80, 0x01, 0x00, 0xC2, 0x00, 0x1D };
+	if (n->saveKind == SAVE_UNKNOWN) {
+		n->saveKind = SAVE_SRAM;
+	}
+	if (n->saveKind == SAVE_SRAM) {
+		return offset < sizeof(n->sram) ? n->sram[offset] : 0;
+	}
+	switch (n->flashMode) {
+	case FLASH_READ:
+		return n->flash[offset & (sizeof(n->flash) - 1)];
+	case FLASH_ID:
+		return offset < 8 ? flashId[offset] : 0;
+	}
+	return 0;
+}
+
+// A byte the PI writes there (a DMA from RDRAM): to the SRAM, or the flash's page buffer.
+void cartSaveStore(struct N64* n, uint32_t offset, uint8_t v) {
+	if (n->saveKind == SAVE_UNKNOWN) {
+		n->saveKind = SAVE_SRAM;
+	}
+	if (n->saveKind == SAVE_SRAM) {
+		if (offset < sizeof(n->sram)) {
+			n->sram[offset] = v;
+			n->saveDirty = true;
+		}
+	} else if (n->flashMode == FLASH_PROGRAM && offset < sizeof(n->flashPage)) {
+		n->flashPage[offset] = v;
+	}
+}
+
+// A word the CPU reads there: the flash's status, or the SRAM.
+uint32_t cartSaveRead32(struct N64* n, uint32_t offset) {
+	if (n->saveKind == SAVE_FLASH) {
+		return n->flashMode == FLASH_STATUS && offset == 0 ? n->flashStatus : 0;
+	}
+	return offset + 4 <= sizeof(n->sram) ? be32(&n->sram[offset]) : 0;
+}
+
+// A word the CPU writes there: a flash command (at 0x10000), its status, or the SRAM.
+void cartSaveWrite32(struct N64* n, uint32_t offset, uint32_t v) {
+	if (offset >= 0x10000) {
+		n->saveKind = SAVE_FLASH;
+		flashCommand(n, v);
+	} else if (n->saveKind == SAVE_FLASH) {
+		if (n->flashMode == FLASH_STATUS) {
+			n->flashStatus = (uint8_t) v;
+		}
+	} else if (offset + 4 <= sizeof(n->sram)) {
+		put32(&n->sram[offset], v);
+		n->saveDirty = true;
+	}
+}
+
+// A Controller Pak as libultra formats one: the ID block in block 1 of page 0 (and its copies in
+// blocks 3, 4 and 6), the index table in page 1 (and its copy in page 2) with every page free, and
+// no notes.
+void pakFormat(uint8_t* pak) {
+	memset(pak, 0, 0x8000);
+	// Repaired, a random number, the serial number, the device ID (bit 0: a Controller Pak), one bank
+	// and version 0, then the sums of the first 14 halfwords and of their complements.
+	uint8_t id[32] = {
+		0xFF, 0xFF, 0xFF, 0xFF, 0x05, 0x1A, 0x5F, 0x13, 0, 0, 0, 0, 0, 0, 0, 0,
+		0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0x00, 0x01, 0x01, 0x00,
+	};
+	uint16_t sum = 0, isum = 0;
+	for (int i = 0; i < 28; i += 2) {
+		uint16_t h = (uint16_t) (id[i] << 8 | id[i + 1]);
+		sum = (uint16_t) (sum + h);
+		isum = (uint16_t) (isum + (uint16_t) ~h);
+	}
+	id[28] = (uint8_t) (sum >> 8), id[29] = (uint8_t) sum, id[30] = (uint8_t) (isum >> 8), id[31] = (uint8_t) isum;
+	static const int blocks[4] = { 1, 3, 4, 6 };
+	for (int i = 0; i < 4; ++i) {
+		memcpy(&pak[blocks[i] * 32], id, 32);
+	}
+	// The index table: pages 0-4 the system's, the rest free (3), and byte 1 the sum of the bytes
+	// from entry 5 on.
+	uint8_t* table = &pak[0x100];
+	uint8_t check = 0;
+	for (int i = 5; i < 128; ++i) {
+		table[2 * i + 1] = 3;
+		check = (uint8_t) (check + 3);
+	}
+	table[1] = check;
+	memcpy(&pak[0x200], table, 0x100);
+}

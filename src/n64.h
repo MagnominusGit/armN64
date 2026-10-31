@@ -238,9 +238,18 @@ struct N64 {
 	uint8_t pifRam[64];
 	// PIF RAM holds Joybus commands (not a CIC challenge), which run again when it is read.
 	bool pifJoybus, pifChallenged;
-	uint8_t save[0x20000];
 	uint8_t eeprom[2048];
 	bool eeprom16k;
+	// The cartridge's SRAM or FlashRAM (carts.c), whichever the game turns out to use. The flash's
+	// mode (FLASH_*), status, and the page buffer it programs from.
+	enum { SAVE_UNKNOWN, SAVE_SRAM, SAVE_FLASH } saveKind;
+	uint8_t sram[0x8000];
+	uint8_t flash[0x20000];
+	uint8_t flashMode, flashStatus;
+	uint32_t flashOffset;
+	uint8_t flashPage[128];
+	// A save (EEPROM, SRAM, flash or a Controller Pak) written since saveDirty was last cleared.
+	bool saveDirty;
 	int cic;
 
 	struct CPU cpu;
@@ -380,12 +389,14 @@ struct N64 {
 	int16_t* audio;
 	size_t audioCount, audioCapacity;
 	uint32_t audioRate;
-	// Controller 1: buttons in the top half, stick (or with a mouse, the X and Y movement) below.
-	uint32_t buttons;
-	// The port (1-4) with an N64 Mouse (N64_MOUSE=port), 0 for none, and its buttons and movement in
-	// the same layout.
-	int mousePort;
-	uint32_t mouse;
+	// What is in each controller port (PLUG_*) and each controller's slot (PAK_*); the port's buttons
+	// in the top half and stick (a mouse's movement) below; whether a Rumble Pak's motor is on; the
+	// Controller Paks' memory.
+	enum { PLUG_NONE, PLUG_CONTROLLER, PLUG_MOUSE } plugged[4];
+	enum { PAK_NONE, PAK_MEMORY, PAK_RUMBLE } pak[4];
+	uint32_t pad[4];
+	bool rumble[4];
+	uint8_t paks[4][0x8000];
 	const char* unimplemented;
 	// Activity counts for diagnostics.
 	struct {
@@ -610,6 +621,11 @@ void rdpDestroy(struct N64*);
 
 // carts.c
 bool cartEeprom16k(const uint8_t* rom);
+uint8_t cartSaveByte(struct N64* n, uint32_t offset);
+void cartSaveStore(struct N64* n, uint32_t offset, uint8_t v);
+uint32_t cartSaveRead32(struct N64* n, uint32_t offset);
+void cartSaveWrite32(struct N64* n, uint32_t offset, uint32_t v);
+void pakFormat(uint8_t* pak);
 bool cartBootChecksum(const uint8_t* rom, size_t size, int cic, uint8_t seedByte, uint32_t out[2]);
 
 // pif.c

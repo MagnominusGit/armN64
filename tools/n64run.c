@@ -155,8 +155,39 @@ int main(int argc, char** argv) {
 	if (getenv("N64SAMPLE")) {
 		sampleStart();
 	}
+	// N64SAVELOAD / N64SAVEDUMP=path: the saves before the run and after it, as the machine holds them
+	// (the EEPROM, the four Controller Paks, the SRAM, the flash).
+	struct {
+		uint8_t* at;
+		size_t size;
+	} const saves[] = { { n->eeprom, sizeof(n->eeprom) }, { &n->paks[0][0], sizeof(n->paks) }, { n->sram, sizeof(n->sram) }, { n->flash, sizeof(n->flash) } };
+	if (getenv("N64SAVELOAD")) {
+		FILE* f = fopen(getenv("N64SAVELOAD"), "rb");
+		for (size_t i = 0; f && i < sizeof(saves) / sizeof(*saves); ++i) {
+			if (fread(saves[i].at, 1, saves[i].size, f) != saves[i].size) {
+				break;
+			}
+		}
+		if (f) {
+			fclose(f);
+		}
+	}
+	// N64INPUT="from-to:pad,...": controller 1 holds pad (buttons and stick as the PIF reads them, in
+	// hex) for fields from to to.
+	const char* input = getenv("N64INPUT");
 	clock_gettime(CLOCK_MONOTONIC, &t0);
 	for (int f = 0; f < fields; ++f) {
+		if (input) {
+			uint32_t pad = 0;
+			for (const char* p = input; p && *p; p = strchr(p, ',') ? strchr(p, ',') + 1 : NULL) {
+				int from, to;
+				unsigned held;
+				if (sscanf(p, "%d-%d:%x", &from, &to, &held) == 3 && f >= from && f < to) {
+					pad |= held;
+				}
+			}
+			n->pad[0] = pad;
+		}
 		n64RunField(n);
 		if (pics) {
 			struct timespec a, b;
@@ -235,6 +266,16 @@ int main(int argc, char** argv) {
 		}
 	}
 	rdpWait(n);
+	if (getenv("N64SAVEDUMP")) {
+		FILE* f = fopen(getenv("N64SAVEDUMP"), "wb");
+		for (size_t i = 0; f && i < sizeof(saves) / sizeof(*saves); ++i) {
+			fwrite(saves[i].at, 1, saves[i].size, f);
+		}
+		if (f) {
+			fclose(f);
+		}
+		printf("save chip %s\n", n->saveKind == SAVE_SRAM ? "sram" : n->saveKind == SAVE_FLASH ? "flash" : "unused");
+	}
 	if (getenv("N64RAMDUMP")) {
 		FILE* f = fopen(getenv("N64RAMDUMP"), "wb");
 		if (f) {

@@ -215,7 +215,7 @@ static uint8_t cartByte(struct N64* n, uint32_t c) {
 		return n->rom[c - 0x10000000];
 	}
 	if (c >= 0x08000000 && c < 0x08020000) {
-		return n->save[c - 0x08000000];
+		return cartSaveByte(n, c - 0x08000000);
 	}
 	if (c >= 0x05000000 && c < 0x06400000) {
 		return ddReadByte(n, c);
@@ -327,7 +327,7 @@ static void piDma(struct N64* n, uint32_t len, bool toRdram) {
 		for (uint32_t i = 0; i < len; ++i) {
 			uint32_t c = cart + i;
 			if (c >= 0x08000000 && c < 0x08020000) {
-				n->save[c - 0x08000000] = n->rdram[(dram + i) & (RDRAM_SIZE - 1)];
+				cartSaveStore(n, c - 0x08000000, n->rdram[(dram + i) & (RDRAM_SIZE - 1)]);
 			} else if (c >= 0x05000000 && c < 0x06000000) {
 				ddWriteByte(n, c, n->rdram[(dram + i) & (RDRAM_SIZE - 1)]);
 			}
@@ -404,6 +404,9 @@ uint32_t busRead32(struct N64* n, uint32_t addr) {
 	}
 	if (addr >= 0x04000000 && addr < 0x04040000) {
 		return be32(&n->sp.mem[addr & 0x1FFC]);
+	}
+	if (addr >= 0x08000000 && addr < 0x08020000) {
+		return cartSaveRead32(n, addr & 0x1FFFC);
 	}
 	if (addr >= 0x10000000 && addr < 0x1FC00000) {
 		// The PI's address counter moves past the word the CPU reads.
@@ -783,7 +786,7 @@ void busWrite32(struct N64* n, uint32_t addr, uint32_t v) {
 		return;
 	}
 	if (addr >= 0x08000000 && addr < 0x08020000) {
-		put32(&n->save[addr & 0x1FFFC], v);
+		cartSaveWrite32(n, addr & 0x1FFFC, v);
 	} else if (n->isViewer && addr >= 0x13FF0000 && addr < 0x14000000) {
 		put32(&n->isViewer[addr & 0xFFFC], v);
 		if ((addr & 0xFFFC) == 0x14) {
