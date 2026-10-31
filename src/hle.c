@@ -53,6 +53,12 @@ struct Hle {
 	uint32_t geometry;
 	// F3DPD's table of vertex colours.
 	uint32_t colorBase;
+	// F3DFLX (F-Zero X's F3DEX2): light k in slot k + 1, slot 1 its alpha light, a direction whose
+	// angle to the normal picks each vertex's alpha from a table at the G_DMA_IO address (in place of
+	// generated texture coordinates).
+	bool flx;
+	float flxDir[3];
+	uint32_t dmaIo;
 	float texScaleS, texScaleT;
 	int texTile, texLevel;
 	bool texOn;
@@ -75,6 +81,8 @@ struct Hle {
 	uint32_t ucode, rejected[8];
 	int rejectedCount;
 	bool rejectedNow;
+	// Why the list was left to the RSP (for the frontend).
+	char why[48];
 	// Counting the commands instead of drawing them (N64HLECHECK).
 	bool dry;
 	uint64_t list[LIST_MAX];
@@ -270,7 +278,15 @@ static void loadVertices(struct N64* n, struct Hle* h, uint32_t a, int first, in
 			} else {
 				v->r = c[0] / 255.0f, v->g = c[1] / 255.0f, v->b = c[2] / 255.0f;
 			}
-			if (h->geometry & GEOM_TEXTURE_GEN) {
+			if ((h->geometry & GEOM_TEXTURE_GEN) && h->flx) {
+				float d[3];
+				for (int k = 0; k < 3; ++k) {
+					d[k] = mv[k * 4] * h->flxDir[0] + mv[k * 4 + 1] * h->flxDir[1] + mv[k * 4 + 2] * h->flxDir[2];
+				}
+				normalize(d);
+				int index = (int16_t) ((e[0] * d[0] + e[1] * d[1] + e[2] * d[2]) * 128);
+				v->a = n->rdram[(h->dmaIo + 128 + (uint32_t) index) & (RDRAM_SIZE - 1)] / 255.0f;
+			} else if (h->geometry & GEOM_TEXTURE_GEN) {
 				const float* lx = dirs[h->lights], * ly = dirs[h->lights + 1];
 				float gx = e[0] * lx[0] + e[1] * lx[1] + e[2] * lx[2];
 				float gy = e[0] * ly[0] + e[1] * ly[1] + e[2] * ly[2];
@@ -285,7 +301,7 @@ static void loadVertices(struct N64* n, struct Hle* h, uint32_t a, int first, in
 			v->r = c[0] / 255.0f, v->g = c[1] / 255.0f, v->b = c[2] / 255.0f;
 		}
 		// Texture coordinates are s10.5 (generated ones texels), scaled by G_TEXTURE.
-		float unit = h->geometry & GEOM_TEXTURE_GEN ? 1 : 1 / 32.0f;
+		float unit = (h->geometry & GEOM_TEXTURE_GEN) && !h->flx ? 1 : 1 / 32.0f;
 		v->s = s * h->texScaleS * unit;
 		v->t = t * h->texScaleT * unit;
 		if (h->geometry & GEOM_FOG) {
@@ -705,13 +721,19 @@ static void reject(struct Hle* h) {
 }
 
 static int family(struct N64* n, uint32_t data, uint32_t size);
+static bool isFlx(struct N64* n, uint32_t data, uint32_t size);
+static void ucodeName(struct N64* n, uint32_t code, uint32_t data, uint32_t dataSize, char* out, size_t size);
 
 // G_LOAD_UCODE: the list goes on in another microcode (its data named by G_RDPHALF_1); F3DEX's takes
 // the new data's other modes with it, F3DEX2's keeps its own. One of no family here leaves the task
 // to the RSP.
-static bool loadMicrocode(struct N64* n, struct Hle* h, uint32_t dataSize) {
+static bool loadMicrocode(struct N64* n, struct Hle* h, uint32_t code, uint32_t dataSize) {
 	int f = family(n, address(h, h->half1), dataSize);
+	h->flx = isFlx(n, address(h, h->half1), dataSize);
 	if (f == FAMILY_NONE) {
+		char name[40];
+		ucodeName(n, address(h, code), address(h, h->half1), dataSize, name, sizeof(name));
+		snprintf(h->why, sizeof(h->why), "to %s", name);
 		reject(h);
 		return false;
 	}
@@ -806,7 +828,17 @@ static void runList(struct N64* n, struct Hle* h, uint32_t pc) {
 					readMatrix(n, a, h->mvp);
 				} else if (index == 10) {
 					int l = offset / 24;
-					if (l < 2) {
+					if (h->flx) {
+						// The alpha light (its direction s7.8 at 8), then the lights.
+						if (l == 1) {
+							for (int k = 0; k < 3; ++k) {
+								h->flxDir[k] = rd16(n, a + 8 + 2 * (uint32_t) k) / 256.0f;
+							}
+							normalize(h->flxDir);
+						} else if (l > 1) {
+							readLight(n, h, a, l - 1);
+						}
+					} else if (l < 2) {
 						readLookat(n, h, a, l);
 					} else {
 						readLight(n, h, a, l - 2);
@@ -814,6 +846,9 @@ static void runList(struct N64* n, struct Hle* h, uint32_t pc) {
 				}
 				break;
 			}
+			case 0xD6:
+				h->dmaIo = address(h, w1);
+				break;
 			case 0xDE:
 				if (!((w0 >> 16) & 0xFF) && sp < DL_DEPTH) {
 					stack[sp++] = next;
@@ -840,7 +875,7 @@ static void runList(struct N64* n, struct Hle* h, uint32_t pc) {
 				h->half1 = w1;
 				break;
 			case 0xDD:
-				if (!loadMicrocode(n, h, (w0 & 0xFFFF) + 1)) {
+				if (!loadMicrocode(n, h, w1, (w0 & 0xFFFF) + 1)) {
 					return;
 				}
 				f3dex2 = h->family == FAMILY_F3DEX2, f3dex = h->family == FAMILY_F3DEX;
@@ -942,7 +977,7 @@ static void runList(struct N64* n, struct Hle* h, uint32_t pc) {
 				}
 				break;
 			case 0xAF:
-				if (!loadMicrocode(n, h, (w0 & 0xFFFF) + 1)) {
+				if (!loadMicrocode(n, h, w1, (w0 & 0xFFFF) + 1)) {
 					return;
 				}
 				f3dex2 = h->family == FAMILY_F3DEX2, f3dex = h->family == FAMILY_F3DEX;
@@ -1005,6 +1040,7 @@ static void runList(struct N64* n, struct Hle* h, uint32_t pc) {
 			case 0xBF:
 				// Fast3D's indices are vertex numbers times 10: other ones are another microcode's.
 				if (!f3dex && (((w1 >> 16) & 0xFF) % 10 || ((w1 >> 8) & 0xFF) % 10 || (w1 & 0xFF) % 10)) {
+					snprintf(h->why, sizeof(h->why), "Fast3D-like %08x", h->ucode);
 					reject(h);
 					return;
 				}
@@ -1024,11 +1060,9 @@ static void runList(struct N64* n, struct Hle* h, uint32_t pc) {
 
 // The microcode family from the first ID string in its data (the block may run on into the next
 // microcode's data, and its string).
-// The graphics task's microcode by the name its data gives (a Fast3D or F3DEX family line), else
-// by the hash of its first code.
-void hleUcodeName(struct N64* n, char* out, size_t size) {
-	const uint8_t* task = &n->sp.mem[0xFC0];
-	uint32_t data = be32(task + 0x18) & 0xFFFFFF, dataSize = be32(task + 0x1C), code = be32(task + 0x10) & 0xFFFFFF;
+// A microcode by the name its data gives (a Fast3D or F3DEX family line), else by the hash of its
+// first code.
+static void ucodeName(struct N64* n, uint32_t code, uint32_t data, uint32_t dataSize, char* out, size_t size) {
 	char text[0x1001];
 	uint32_t length = dataSize < 0x1000 ? dataSize : 0x1000;
 	for (uint32_t i = 0; i < length; ++i) {
@@ -1047,6 +1081,22 @@ void hleUcodeName(struct N64* n, char* out, size_t size) {
 		hash = (hash ^ n->rdram[(code + i) & (RDRAM_SIZE - 1)]) * 16777619u;
 	}
 	snprintf(out, size, "unnamed %08x", hash);
+}
+
+// The graphics task's microcode, and why HLE left it to the RSP when it did.
+void hleUcodeName(struct N64* n, char* out, size_t size) {
+	const uint8_t* task = &n->sp.mem[0xFC0];
+	if (n->hle && n->hle->rejectedNow && n->hle->why[0]) {
+		snprintf(out, size, "%s", n->hle->why);
+		return;
+	}
+	ucodeName(n, be32(task + 0x10) & 0xFFFFFF, be32(task + 0x18) & 0xFFFFFF, be32(task + 0x1C), out, size);
+}
+
+static bool isFlx(struct N64* n, uint32_t data, uint32_t size) {
+	char name[48];
+	ucodeName(n, 0, data, size, name, sizeof(name));
+	return !strncmp(name, "RSP Gfx ucode F3DFLX", 20);
 }
 
 static int family(struct N64* n, uint32_t data, uint32_t size) {
@@ -1068,7 +1118,8 @@ static int family(struct N64* n, uint32_t data, uint32_t size) {
 		return FAMILY_NONE;
 	}
 	const char* name = id + 14;
-	if ((!strncmp(name, "F3DEX2", 6) || !strncmp(name, "F3DZEX", 6) || !strncmp(name, "F3DLX2", 6) || !strncmp(name, "F3DLP2", 6)) &&
+	if ((!strncmp(name, "F3DEX2", 6) || !strncmp(name, "F3DZEX", 6) || !strncmp(name, "F3DLX2", 6) || !strncmp(name, "F3DLP2", 6) ||
+	     !strncmp(name, "F3DFLX", 6)) &&
 	    (name[6] == ' ' || name[6] == '.' || name[6] == '_')) {
 		return FAMILY_F3DEX2;
 	}
@@ -1164,6 +1215,7 @@ bool hleGraphics(struct N64* n, bool dry) {
 	struct Hle* h = n->hle;
 	h->ucode = ucode;
 	h->family = f;
+	h->flx = isFlx(n, data, dataSize);
 	h->dry = dry;
 	memset(h->segments, 0, sizeof(h->segments));
 	static const float identity[16] = { 1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1 };
@@ -1188,6 +1240,7 @@ bool hleGraphics(struct N64* n, bool dry) {
 	h->fifoEnd = fifo ? fifoEnd & ~7u : 0;
 	h->sp = 0;
 	h->rejectedNow = false;
+	h->why[0] = 0;
 	runList(n, h, address(h, be32(task + 0x30)));
 	if (h->rejectedNow) {
 		// The RSP runs this task from the start (what the list made so far goes).
