@@ -12,7 +12,9 @@
 
 // F3DPD is Perfect Dark's Fast3D (as GLideN64 has it, GPL-2.0): 12-byte vertices whose colour or
 // normal comes from a table (0x07 sets its base), and TRIX (0xB1) for up to eight triangles.
-enum { FAMILY_NONE, FAMILY_F3D, FAMILY_F3DEX, FAMILY_F3DEX2, FAMILY_F3DPD };
+// S2DEX and S2DEX2 are the 2D microcodes (F3DEX's and F3DEX2's command numbers for what they share):
+// backgrounds so far, other commands leave the task to the RSP.
+enum { FAMILY_NONE, FAMILY_F3D, FAMILY_F3DEX, FAMILY_F3DEX2, FAMILY_F3DPD, FAMILY_S2DEX, FAMILY_S2DEX2 };
 
 // Geometry mode bits, kept in the F3DEX2 layout.
 enum {
@@ -712,6 +714,63 @@ static void spriteDraw(struct N64* n, struct Hle* h, int s0, int t0, int x, int 
 	}
 }
 
+// An S2DEX background (uObjBg at a): the image from (imageX, imageY) into the frame, wrapping round at
+// the image's height; copy mode, or scaled (one cycle, scaleW and scaleH texels a pixel, 5.10). Rows
+// of the image go through TMEM in bands, each drawn with a texture rectangle.
+static void bgDraw(struct N64* n, struct Hle* h, uint32_t a, bool scaled) {
+	a = address(h, a);
+	int const imageX = (uint16_t) rd16(n, a), imageW = (uint16_t) rd16(n, a + 2), frameX = rd16(n, a + 4), frameW = (uint16_t) rd16(n, a + 6);
+	int const imageY = (uint16_t) rd16(n, a + 8), imageH = (uint16_t) rd16(n, a + 10), frameY = rd16(n, a + 12), frameH = (uint16_t) rd16(n, a + 14);
+	uint32_t const image = address(h, rd32(n, a + 16));
+	int const format = (uint8_t) rd8(n, a + 22), size = (uint8_t) rd8(n, a + 23), pal = (uint16_t) rd16(n, a + 24) & 15;
+	bool const flipS = rd16(n, a + 26) & 1;
+	int const scaleW = scaled ? (uint16_t) rd16(n, a + 28) : 1024, scaleH = scaled ? (uint16_t) rd16(n, a + 30) : 1024;
+	// Texels (the image's 10.2 sizes, its 10.5 position) and pixels (the frame's 10.2).
+	int const width = imageW >> 2, height = imageH >> 2, cols = frameW >> 2, lines = frameH >> 2, s0 = imageX >> 5;
+	if (width <= 0 || height <= 0 || cols <= 0 || lines <= 0 || format > 4 || size > 3 || !scaleW || !scaleH || s0 >= width) {
+		return;
+	}
+	int texCols = (int) (((int64_t) cols * scaleW + 1023) >> 10) + (scaled ? 1 : 0);
+	texCols = s0 + texCols > width ? width - s0 : texCols;
+	// 4-bit texels load as 8-bit pairs; 32-bit and color-indexed ones have half of TMEM.
+	int const loadSize = size ? size : 1, loadStride = size ? width : width / 2;
+	int const loadS0 = size ? s0 : s0 / 2, loadS1 = size ? s0 + texCols - 1 : (s0 + texCols - 1) / 2;
+	uint32_t const line = (uint32_t) ((loadS1 - loadS0 + 1) * (size == 3 ? 2 : 1 << (loadSize - 1)) + 7) / 8;
+	int const band = (int) ((format == 2 || size == 3 ? 256u : 512u) / line);
+	if (band < 1) {
+		return;
+	}
+	bool const copy = ((h->modeH >> 20) & 3) == 2;
+	int const dsdx = copy ? 4 << 10 : scaleW;
+	// Down the frame: each band of image rows from where the frame has got to, up to the image's end.
+	int64_t t = (int64_t) imageY << 5;
+	for (int y = 0; y < lines;) {
+		int64_t const tWrapped = t % ((int64_t) height << 10);
+		int const row = (int) (tWrapped >> 10);
+		int rows = height - row < band ? height - row : band;
+		// The pixels this band covers (the next band takes over at its first row).
+		int screen = (int) ((((int64_t) rows << 10) - (tWrapped & 1023) + scaleH - 1) / scaleH);
+		screen = screen < 1 ? 1 : y + screen > lines ? lines - y : screen;
+		emit(n, h, (uint64_t) 0x3D << 56 | (uint64_t) format << 53 | (uint64_t) loadSize << 51 | (uint64_t) (loadStride - 1) << 32 | image);
+		emit(n, h, (uint64_t) 0x35 << 56 | (uint64_t) format << 53 | (uint64_t) loadSize << 51 | (uint64_t) line << 41 | (uint64_t) 7 << 24 | 2 << 18 | 2 << 8);
+		int const sl = size ? loadS0 << 2 : s0 * 2, sh = size ? loadS1 << 2 : (s0 + texCols - 1) * 2;
+		int const rowsLoaded = rows + (scaled && row + rows < height ? 1 : 0);
+		emit(n, h, (uint64_t) 0x34 << 56 | (uint64_t) sl << 44 | (uint64_t) (row << 2) << 32 | (uint64_t) 7 << 24 | (uint64_t) sh << 12 |
+		           (uint64_t) ((row + rowsLoaded - 1) << 2));
+		emit(n, h, (uint64_t) 0x35 << 56 | (uint64_t) format << 53 | (uint64_t) size << 51 | (uint64_t) line << 41 | (uint64_t) pal << 20 | 2 << 18 | 2 << 8);
+		emit(n, h, (uint64_t) 0x32 << 56 | (uint64_t) ((texCols - 1) << 2) << 12 | (uint64_t) ((rowsLoaded - 1) << 2));
+		int const first = size ? 0 : s0 & 1;
+		int const xh = frameX, xl = frameX + (cols << 2) - (copy ? 4 : 0);
+		int const yh = frameY + (y << 2), yl = frameY + ((y + screen) << 2) - (copy ? 4 : 0);
+		int const s = (flipS ? first + texCols - 1 : first) << 5, tt = (int) ((tWrapped & 1023) >> 5);
+		int const ds = flipS ? -dsdx : dsdx;
+		emit(n, h, (uint64_t) 0x24 << 56 | (uint64_t) (xl & 0xFFF) << 44 | (uint64_t) (yl & 0xFFF) << 32 | (uint64_t) (xh & 0xFFF) << 12 | (uint64_t) (yh & 0xFFF));
+		emit(n, h, (uint64_t) (s & 0xFFFF) << 48 | (uint64_t) (tt & 0xFFFF) << 32 | (uint64_t) (ds & 0xFFFF) << 16 | (uint64_t) ((copy ? 1 << 10 : scaleH) & 0xFFFF));
+		y += screen;
+		t += (int64_t) screen * (copy ? 1024 : scaleH);
+	}
+}
+
 // The task's microcode left to the RSP, this task (from the start) and later ones.
 static void reject(struct Hle* h) {
 	if (h->rejectedCount < 8) {
@@ -748,7 +807,7 @@ static void runList(struct N64* n, struct Hle* h, uint32_t pc) {
 	uint32_t* stack = h->stack;
 	int sp = h->sp;
 	h->waiting = false;
-	bool f3dex2 = h->family == FAMILY_F3DEX2, f3dex = h->family == FAMILY_F3DEX;
+	bool f3dex2 = h->family == FAMILY_F3DEX2 || h->family == FAMILY_S2DEX2, f3dex = h->family == FAMILY_F3DEX || h->family == FAMILY_S2DEX;
 	// F3DEX2's 0xD5: so many commands from an address, then back.
 	int counted = -1;
 	uint32_t countedReturn = 0;
@@ -764,6 +823,22 @@ static void runList(struct N64* n, struct Hle* h, uint32_t pc) {
 		if (op >= 0xE4 && !(f3dex2 && op == 0xF1)) {
 			pc = rdpCommand(n, h, pc, w0, w1);
 			continue;
+		}
+		// S2DEX's own commands (backgrounds), what it shares with F3DEX or F3DEX2 as they have it.
+		if (h->family == FAMILY_S2DEX || h->family == FAMILY_S2DEX2) {
+			bool const two = h->family == FAMILY_S2DEX2;
+			if (op == (two ? 0x0A : 0x02) || op == (two ? 0x09 : 0x01)) {
+				bgDraw(n, h, w1, op == (two ? 0x09 : 0x01));
+				pc = next;
+				continue;
+			}
+			bool const shared = two ? op == 0x00 || (op >= 0xDB && op <= 0xDF && op != 0xDC) || op == 0xE1 || op == 0xE2 || op == 0xE3
+			                        : op == 0x00 || op == 0x06 || op == 0xAF || op == 0xB4 || op == 0xB8 || op == 0xB9 || op == 0xBA || op == 0xBC;
+			if (!shared) {
+				snprintf(h->why, sizeof(h->why), "S2DEX%s op %02X", two ? "2" : "", op);
+				reject(h);
+				return;
+			}
 		}
 		if (f3dex2) {
 			switch (op) {
@@ -878,7 +953,7 @@ static void runList(struct N64* n, struct Hle* h, uint32_t pc) {
 				if (!loadMicrocode(n, h, w1, (w0 & 0xFFFF) + 1)) {
 					return;
 				}
-				f3dex2 = h->family == FAMILY_F3DEX2, f3dex = h->family == FAMILY_F3DEX;
+				f3dex2 = h->family == FAMILY_F3DEX2 || h->family == FAMILY_S2DEX2, f3dex = h->family == FAMILY_F3DEX || h->family == FAMILY_S2DEX;
 				break;
 			case 0xE2:
 			case 0xE3:
@@ -980,7 +1055,7 @@ static void runList(struct N64* n, struct Hle* h, uint32_t pc) {
 				if (!loadMicrocode(n, h, w1, (w0 & 0xFFFF) + 1)) {
 					return;
 				}
-				f3dex2 = h->family == FAMILY_F3DEX2, f3dex = h->family == FAMILY_F3DEX;
+				f3dex2 = h->family == FAMILY_F3DEX2 || h->family == FAMILY_S2DEX2, f3dex = h->family == FAMILY_F3DEX || h->family == FAMILY_S2DEX;
 				break;
 			case 0xB5:
 				if (f3dex) {
@@ -1118,6 +1193,14 @@ static int family(struct N64* n, uint32_t data, uint32_t size) {
 		return FAMILY_NONE;
 	}
 	const char* name = id + 14;
+	if (!strncmp(name, "S2DEX", 5) && (name[5] == ' ' || name[5] == '.' || name[5] == '_')) {
+		for (const char* c = name; *c && c < name + 48; ++c) {
+			if (c[0] == ' ' && c[1] >= '0' && c[1] <= '9' && c[2] == '.' && c[3] >= '0' && c[3] <= '9') {
+				return c[1] >= '2' ? FAMILY_S2DEX2 : FAMILY_S2DEX;
+			}
+		}
+		return FAMILY_S2DEX;
+	}
 	if ((!strncmp(name, "F3DEX2", 6) || !strncmp(name, "F3DZEX", 6) || !strncmp(name, "F3DLX2", 6) || !strncmp(name, "F3DLP2", 6) ||
 	     !strncmp(name, "F3DFLX", 6)) &&
 	    (name[6] == ' ' || name[6] == '.' || name[6] == '_')) {
