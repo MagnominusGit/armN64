@@ -281,7 +281,16 @@ static bool askHardwareContext(void) {
 	hw.context_destroy = hwDestroy;
 	hw.bottom_left_origin = true;
 	if (!environment(RETRO_ENVIRONMENT_SET_HW_RENDER, &hw)) {
-		return false;
+		// A frontend built for GLES can still say it prefers OpenGL (RetroArch's gl driver on ROCKNIX).
+		if (es) {
+			return false;
+		}
+		hw.context_type = RETRO_HW_CONTEXT_OPENGLES_VERSION;
+		hw.version_major = 3;
+		hw.version_minor = 1;
+		if (!environment(RETRO_ENVIRONMENT_SET_HW_RENDER, &hw)) {
+			return false;
+		}
 	}
 	environment(RETRO_ENVIRONMENT_SET_HW_SHARED_CONTEXT, NULL);
 	return true;
