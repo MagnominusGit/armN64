@@ -917,9 +917,10 @@ static void runList(struct N64* n, struct Hle* h, uint32_t pc) {
 				objLoad(n, h, w1);
 				drawn = objDraw(n, h, w1 + 24, op == (two ? 0x07 : 0xC3) ? 0 : op == (two ? 0x06 : 0xC2) ? 2 : 1);
 			} else if (op == (two ? 0xDC : 0x05)) {
-				// The 2D matrix (index 0) or its offset and base scales alone (2).
+				// The 2D matrix (index 0, in the low half; the size above it) or its offset and base
+				// scales alone (2).
 				uint32_t const m = address(h, w1);
-				if (((w0 >> 16) & 0xFF) == 0) {
+				if ((w0 & 0xFFFF) == 0) {
 					h->objA = (int32_t) rd32(n, m) / 65536.0f, h->objB = (int32_t) rd32(n, m + 4) / 65536.0f;
 					h->objC = (int32_t) rd32(n, m + 8) / 65536.0f, h->objD = (int32_t) rd32(n, m + 12) / 65536.0f;
 					h->objX = rd16(n, m + 16) / 4.0f, h->objY = rd16(n, m + 18) / 4.0f;
