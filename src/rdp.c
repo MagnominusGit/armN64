@@ -3074,6 +3074,7 @@ static void command(struct N64* n, struct RDP* r, const uint64_t* w, int op, int
 		n->checkSeq[0][n->checkLen[0]++] = w[0];
 	}
 	if (op == 0x29) {
+		n->dp.status &= ~DP_RUNNING;
 		if (r->gpu) {
 			gpuSubmit(n, r);
 		}
@@ -3155,6 +3156,7 @@ void rdpRun(struct N64* n) {
 	if (n->dp.status & 2) {
 		return;
 	}
+	n->dp.status |= DP_RUNNING;
 	uint64_t begin;
 	struct RDP* r = beginCommands(n, &begin);
 	struct DP* d = &n->dp;
@@ -3181,6 +3183,7 @@ void rdpRun(struct N64* n) {
 
 // Runs a list of commands made outside RDRAM (hle.c).
 void rdpCommands(struct N64* n, const uint64_t* list, size_t count) {
+	n->dp.status |= DP_RUNNING;
 	uint64_t begin;
 	struct RDP* r = beginCommands(n, &begin);
 	for (size_t i = 0; i < count;) {

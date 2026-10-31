@@ -103,6 +103,10 @@ struct RSP {
 	bool inDelay;
 };
 
+// DP_STATUS's pipe busy and start gclk: set when the RDP is given commands, until a full sync (ares);
+// start valid: START written, not yet taken by a write to END.
+enum { DP_RUNNING = 0x28, DP_START_VALID = 0x400 };
+
 struct DP {
 	uint32_t start, end, current, status;
 	// A command the buffer ended inside: its words so far, the rest from the next buffer's start.
@@ -151,6 +155,8 @@ struct AI {
 
 struct PI {
 	uint32_t dramAddr, cartAddr, status;
+	// PI_WR_LEN as it reads after a transfer.
+	uint32_t writeLength;
 	uint64_t busyUntil;
 	uint32_t timing[8];
 	uint32_t romLatch;

@@ -218,9 +218,7 @@ static void piRdramByte(struct N64* n, uint32_t addr, uint8_t v) {
 }
 
 // Cartridge to RDRAM goes through the RCP's 128-byte buffer, a block at a time, never crossing a
-// 2 KiB RDRAM page. Odd blocks fetch a byte more. An unaligned RDRAM address starts the first block
-// part way into the buffer, which then writes back only up to the block length counted from the
-// buffer's start; the address continues 8-byte aligned (n64brew, Peter Lemon's PI tests).
+// 2 KiB RDRAM page.
 static void piDmaToRdram(struct N64* n, uint32_t len) {
 	if (n->compat) {
 		for (uint32_t i = 0; i < len; ++i) {
@@ -230,34 +228,36 @@ static void piDmaToRdram(struct N64* n, uint32_t len) {
 		n->pi.cartAddr += len;
 		return;
 	}
-	uint32_t dram = n->pi.dramAddr & 0xFFFFFE, cart = n->pi.cartAddr & ~1u;
-	uint8_t buf[128];
+	// As ares has it from hardware tests: the first block written from the buffer's start (byte by
+	// byte when short), the address going on 8-byte aligned.
+	uint32_t dram = n->pi.dramAddr, cart = n->pi.cartAddr;
+	uint8_t mem[128];
+	int32_t length = (int32_t) len, maxBlock = 128;
 	bool first = true;
-	while (len > 0) {
-		uint32_t mis = first ? dram & 7 : 0;
-		uint32_t pageLeft = 0x800 - (dram & 0x7FF);
-		uint32_t block = len < 128 - mis ? len : 128 - mis;
-		block = block < pageLeft ? block : pageLeft;
-		uint32_t fetched = (block + 1) & ~1u;
-		for (uint32_t i = 0; i < fetched && mis + i < 128; ++i) {
-			buf[mis + i] = cartByte(n, cart + i);
+	while (length > 0) {
+		int32_t const mis = (int32_t) (dram & 7), toRow = 0x800 - (int32_t) (dram & 0x7FF);
+		int32_t const block = maxBlock - mis < toRow ? maxBlock - mis : toRow;
+		int32_t const cur = length < block ? length : block;
+		for (int32_t i = 0; i < cur; i += 2) {
+			mem[i] = cartByte(n, cart);
+			mem[i + 1] = cartByte(n, cart + 1);
+			cart += 2;
+			length -= 2;
 		}
-		uint32_t base = dram & ~7u;
-		if (first) {
-			uint32_t end = mis == 0 && fetched == 128 ? 128 : block;
-			for (uint32_t i = mis; i < end; ++i) {
-				piRdramByte(n, base + i, buf[i]);
+		if (first && cur < 127 - mis) {
+			for (int32_t i = 0; i < cur - mis; ++i) {
+				piRdramByte(n, dram++, mem[i]);
 			}
-			dram = (dram + block + 7) & ~7u;
 		} else {
-			for (uint32_t i = 0; i < fetched; ++i) {
-				piRdramByte(n, dram + i, buf[i]);
+			for (int32_t i = 0; i < cur - mis; i += 2) {
+				piRdramByte(n, dram++, mem[i]);
+				piRdramByte(n, dram++, mem[i + 1]);
 			}
-			dram += fetched;
 		}
-		cart += fetched;
-		len -= block;
+		dram = (dram + 7) & ~7u;
+		n->pi.writeLength = cur <= 8 ? (uint32_t) (127 - mis) : 127;
 		first = false;
+		maxBlock = toRow < 8 ? 128 - mis : 128;
 	}
 	n->pi.dramAddr = dram & 0xFFFFFF;
 	n->pi.cartAddr = cart;
@@ -462,8 +462,9 @@ uint32_t busRead32(struct N64* n, uint32_t addr) {
 			return n->pi.cartAddr;
 		// The length registers read back 0x7F once a transfer is done (n64brew).
 		case 0x08:
-		case 0x0C:
 			return 0x7F;
+		case 0x0C:
+			return n->pi.writeLength ? n->pi.writeLength : 0x7F;
 		// IO busy while a write to cartridge space is on the bus.
 		case 0x10:
 			return n->pi.status | (n->miIntr & MI_PI ? 8 : 0) | (n->pi.romLatched && n->cycles < n->pi.romLatchUntil ? 2 : 0);
@@ -553,11 +554,19 @@ void busWrite32(struct N64* n, uint32_t addr, uint32_t v) {
 		return;
 	case 0x041:
 		switch (addr & 0x1F) {
+		// START is taken once until END moves it to CURRENT (ares, nemu64-test).
 		case 0x00:
-			n->dp.start = n->dp.current = v & 0xFFFFF8;
+			if (!(n->dp.status & DP_START_VALID)) {
+				n->dp.start = v & 0xFFFFF8;
+				n->dp.status |= DP_START_VALID;
+			}
 			break;
 		case 0x04:
 			n->dp.end = v & 0xFFFFF8;
+			if (n->dp.status & DP_START_VALID) {
+				n->dp.current = n->dp.start;
+				n->dp.status &= ~DP_START_VALID;
+			}
 			rdpRun(n);
 			break;
 		case 0x0C:
@@ -678,6 +687,7 @@ void busWrite32(struct N64* n, uint32_t addr, uint32_t v) {
 			piDma(n, (v & 0xFFFFFF) + 1, false);
 			break;
 		case 0x0C:
+			n->pi.writeLength = 0x7F;
 			piDma(n, (v & 0xFFFFFF) + 1, true);
 			break;
 		case 0x10:
