@@ -352,6 +352,8 @@ struct N64 {
 	// N64_VI_GPU: the VI's filters run by a GLES 3.1 compute shader (n64.c), falling back to the CPU
 	// where that can't start.
 	bool viGpu;
+	// The VI's antialiasing, divot and dither filters (N64_VI_FILTERS; off in hle unless asked for).
+	bool viFilters;
 	struct Gles* viGles;
 	// With the GPU RDP, the VI runs in its context on its copy of RDRAM (the program's index + 1, -1
 	// when it doesn't build); where the last GPU picture is.

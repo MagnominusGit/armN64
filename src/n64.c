@@ -177,6 +177,8 @@ static void start(struct N64* n) {
 	}
 	const char* viGpu = setting(n, "N64_VI_GPU");
 	n->viGpu = viGpu && viGpu[0] == '1';
+	const char* filters = setting(n, "N64_VI_FILTERS");
+	n->viFilters = filters ? filters[0] == '1' : n->accuracy != ACCURACY_HLE;
 	rspJitFree(n);
 	++n->rspCodeGen;
 }
@@ -473,6 +475,9 @@ static bool viSetup(struct N64* n, struct ViSetup* s) {
 	s->w = w > 640 ? 640 : w;
 	s->h = h > 480 ? 480 : h;
 	s->gammaOn = v[0] & 8, s->divot = v[0] & 16, s->dither = v[0] & 0x10000, s->aa = ((v[0] >> 8) & 3) <= 1, s->wide = type == 3;
+	if (!n->viFilters) {
+		s->divot = s->dither = s->aa = false;
+	}
 	return true;
 }
 

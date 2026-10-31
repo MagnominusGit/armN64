@@ -101,7 +101,7 @@ bool n64StateLoad(struct N64* n, const void* data, size_t size) {
 	memcpy(n->rspVariants, was->rspVariants, sizeof(n->rspVariants));
 	n->rdpThreads = was->rdpThreads, n->rdpThreadsAsked = was->rdpThreadsAsked, n->rdpGpu = was->rdpGpu, n->rdpGl = was->rdpGl;
 	n->glr = was->glr, n->glrStop = was->glrStop, n->glTasks = was->glTasks, n->glRspTasks = was->glRspTasks;
-	n->viGpu = was->viGpu, n->viGles = was->viGles, n->viSharedProgram = was->viSharedProgram;
+	n->viGpu = was->viGpu, n->viFilters = was->viFilters, n->viGles = was->viGles, n->viSharedProgram = was->viSharedProgram;
 	n->pictureGles = was->pictureGles, n->pictureBinding = was->pictureBinding, n->pictureRgba = was->pictureRgba;
 	n->skip.on = was->skip.on;
 	n->lastPicture = was->lastPicture, n->viKept = was->viKept, n->viPool = was->viPool;

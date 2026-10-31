@@ -97,6 +97,9 @@ static struct retro_core_option_v2_definition optionDefinitions[] = {
 	{ "armn64_renderer", "Renderer (Restart)", NULL,
 	  "GPU draws with OpenGL ES 3.1: HLE with the GL renderer, MLE and LLE with the RDP in compute shaders (exact, but slower than the renderer threads on most handhelds). CPU draws with the renderer threads. Auto takes the GPU for HLE and the CPU otherwise.",
 	  NULL, "system", { { "auto", "Auto" }, { "gpu", "GPU" }, { "cpu", "CPU" }, { NULL, NULL } }, "auto" },
+	{ "armn64_vi_filters", "VI Filters", NULL,
+	  "The video interface's antialiasing, divot and dither filters, which soften edges and smooth 16-bit colour as a TV showed it. Auto turns them on for MLE and LLE and off for HLE, where they cost speed.",
+	  NULL, "system", { { "auto", "Auto" }, { "on", "On" }, { "off", "Off" }, { NULL, NULL } }, "auto" },
 	{ "armn64_frameskip", "Frame Skip (Restart)", NULL, "Leaves out the drawing of frames that are never shown, as many games make more than the screen can show.",
 	  NULL, "system", { { "disabled", "Off" }, { "enabled", "On" }, { NULL, NULL } }, "disabled" },
 	{ "armn64_pak1", "Player 1 Pak", NULL, "What is in controller 1's slot: a Controller Pak for saves, or a Rumble Pak.",
@@ -620,6 +623,8 @@ void retro_run(void) {
 	}
 	inputPoll();
 	readPorts();
+	machine->viFilters = optionIs(environment, "armn64_vi_filters", "on") ||
+	                     (!optionIs(environment, "armn64_vi_filters", "off") && machine->accuracy != ACCURACY_HLE);
 	n64RunField(machine);
 	int width = 0, height = 0;
 	// The GPU RDP's picture goes from its buffer to the frontend's framebuffer without the CPU, and so
