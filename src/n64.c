@@ -127,6 +127,8 @@ static void start(struct N64* n) {
 	// emulators hacks were made on.
 	n->compat = n->accuracy == ACCURACY_MLE;
 	n->emulatorLike = n->accuracy != ACCURACY_LLE;
+	const char* armlet = setting(n, "N64_ARMLET");
+	n->armlet = n->accuracy != ACCURACY_LLE && armlet && armlet[0] == '1';
 	n->fast = n->accuracy == ACCURACY_HLE;
 	const char* idleSkip = setting(n, "N64_IDLESKIP");
 	n->idle.enabled = n->accuracy == ACCURACY_HLE && !(idleSkip && idleSkip[0] == '0');
@@ -276,6 +278,15 @@ void n64RunField(struct N64* n) {
 		}
 		if (n->sp.hleDoneAt && n->cycles >= n->sp.hleDoneAt && hleWaiting(n)) {
 			hleResume(n);
+		} else if (n->sp.hleDoneAt && n->cycles >= n->sp.hleDoneAt && n->sp.doneSet) {
+			// One armlet.c ran: the status bits its microcode changed (the CPU's own changes since
+			// stay).
+			n->sp.hleDoneAt = 0;
+			n->sp.status = (n->sp.status & ~n->sp.doneClear) | n->sp.doneSet;
+			n->sp.doneSet = n->sp.doneClear = 0;
+			if (n->sp.doneIrq) {
+				n64Interrupt(n, MI_SP, true);
+			}
 		} else if (n->sp.hleDoneAt && n->cycles >= n->sp.hleDoneAt) {
 			// A task run at high level ends as its microcode would: halted at a break with the
 			// task-done signal.

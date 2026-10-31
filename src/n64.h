@@ -83,6 +83,10 @@ struct SP {
 	uint64_t dmaUntil, dmaFullUntil;
 	// A task hleGraphics ran: the RSP shows it running (doing nothing) until then.
 	uint64_t hleDoneAt;
+	// A task armlet.c ran: the status bits its microcode set and cleared (with HALT and BROKE in the
+	// set), and whether it raised the SP interrupt.
+	uint32_t doneSet, doneClear;
+	bool doneIrq;
 };
 
 struct RSP {
@@ -319,6 +323,9 @@ struct N64 {
 	bool emulatorLike;
 	// HLE accuracy puts speed first: the host's FPU arithmetic, and no cache tags or data.
 	bool fast;
+	// N64_ARMLET=1 (mle and hle): graphics tasks of the microcode builds arMLEt has front-ends for
+	// run on them (armlet.c).
+	bool armlet;
 	// The RSP is being caught up: its own accesses to the shared registers must not catch it up again.
 	bool catchingUp;
 	uint64_t nextVi;
@@ -448,6 +455,9 @@ struct N64 {
 		uint64_t piDmas, piBytes, rspTasks, audioHleTasks, dpSyncs, aiBuffers, siDmas, glSyncs, glRows, idleSlices, idleCycles, glTextures, glTargetRows, glBatches, gfxHle, gfxRsp;
 		// The microcode of the last graphics task left to the RSP (hle accuracy): its name, or its hash.
 		char gfxRspUcode[48];
+		// Graphics tasks arMLEt's front-ends ran (armlet.c), and gave back to the RSP with the last reason.
+		uint64_t gfxArmlet, gfxArmletDeclined;
+		char gfxArmletWhy[96];
 	} stats;
 	struct DD dd;
 	// hle: a CPU loop that only waits is skipped to the end of each slice (blocks.c idleRun). Its
@@ -517,6 +527,9 @@ bool cpuCodeCoherent(struct N64*, uint32_t vaddr, uint32_t paddr, uint32_t count
 // rsp.c
 void rspInitTables(void);
 void rspStep(struct N64*);
+bool armletTask(struct N64*);
+void armletVerifyEnd(struct N64*);
+void rspReciprocalRom(uint16_t* out);
 void rspTimingStep(struct N64*, uint32_t op, uint32_t pc);
 uint16_t rspTimingDesc(uint32_t op);
 bool rspPairable(uint32_t first, uint32_t firstPc, uint32_t op);
@@ -532,6 +545,11 @@ RspVectorFn* rspVectorFn(uint32_t op);
 const uint8_t* rspElementMask(uint32_t op);
 void rspVectorLoad(struct N64*, uint32_t op);
 void rspVectorStore(struct N64*, uint32_t op);
+// The vector loads and stores and the COP2 moves on a register file of their own, the loads and
+// stores on a DMEM image of host words (armlet.c's).
+void rspVectorLoadSwapped(struct RSP*, uint8_t* mem, uint32_t op);
+void rspVectorStoreSwapped(struct RSP*, uint8_t* mem, uint32_t op);
+void rspCop2Regs(struct RSP*, uint32_t op);
 void rspCop0(struct N64*, uint32_t op);
 void rspBreak(struct N64*);
 // rsp_jit.c, and a code generator for the host (rsp_jit_x64.c, rsp_jit_a64.c)

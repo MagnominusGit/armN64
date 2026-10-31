@@ -12,6 +12,10 @@ static uint8_t* dmem(struct N64* n, uint32_t addr) {
 	return &n->sp.mem[addr & 0xFFF];
 }
 
+static inline uint8_t* memAt(uint8_t* mem, uint32_t swap, uint32_t addr) {
+	return &mem[(addr & 0xFFF) ^ swap];
+}
+
 // A vector register as its 16 big-endian bytes.
 static uint8_t vbyte(struct RSP* r, int reg, int k) {
 	uint16_t v = (uint16_t) r->vr[reg][(k >> 1) & 7];
@@ -33,8 +37,9 @@ static void branch(struct RSP* r, bool taken, uint32_t target) {
 	}
 }
 
-static void vectorLoad(struct N64* n, uint32_t op) {
-	struct RSP* r = &n->rsp;
+// The vector loads and stores on a DMEM image whose byte a is at a ^ swap: 0 for the RSP's own
+// (big-endian), 3 for one of host words (armlet.c).
+static inline __attribute__((always_inline)) void vectorLoadIn(struct RSP* r, uint8_t* mem, uint32_t swap, uint32_t op) {
 	int vt = RT, e = (op >> 7) & 15, kind = RD;
 	int32_t offset = (int32_t) ((op & 0x7F) << 25) >> 25;
 	static const int scale[12] = { 1, 2, 4, 8, 16, 16, 8, 8, 16, 16, 16, 16 };
@@ -45,8 +50,8 @@ static void vectorLoad(struct N64* n, uint32_t op) {
 	// Whole lanes from DMEM without wrapping: LSV, LLV, LDV and LQV at even elements and in-range
 	// addresses, LQV from a 16-byte boundary.
 	int size = scale[kind];
-	if (kind >= 1 && kind <= 4 && !(e & 1) && e + size <= 16 && addr + size <= 0x1000 && (kind < 4 || !(addr & 15))) {
-		const uint8_t* m = &n->sp.mem[addr];
+	if (!swap && kind >= 1 && kind <= 4 && !(e & 1) && e + size <= 16 && addr + size <= 0x1000 && (kind < 4 || !(addr & 15))) {
+		const uint8_t* m = &mem[addr];
 		for (int i = 0; i < size / 2; ++i) {
 			r->vr[vt][e / 2 + i] = (int16_t) (m[2 * i] << 8 | m[2 * i + 1]);
 		}
@@ -58,13 +63,13 @@ static void vectorLoad(struct N64* n, uint32_t op) {
 	case 2:
 	case 3:
 		for (int i = 0; i < scale[kind] && e + i < 16; ++i) {
-			setVbyte(r, vt, e + i, *dmem(n, addr + i));
+			setVbyte(r, vt, e + i, *memAt(mem, swap, addr + i));
 		}
 		return;
 	case 4: {
 		uint32_t end = (addr & ~15u) + 16;
 		for (int i = e; i < 16 && addr + (i - e) < end; ++i) {
-			setVbyte(r, vt, i, *dmem(n, addr + (i - e)));
+			setVbyte(r, vt, i, *memAt(mem, swap, addr + (i - e)));
 		}
 		return;
 	}
@@ -74,7 +79,7 @@ static void vectorLoad(struct N64* n, uint32_t op) {
 		for (int k = 0; k < count; ++k) {
 			int i = e + 16 - count + k;
 			if (i < 16) {
-				setVbyte(r, vt, i, *dmem(n, start + k));
+				setVbyte(r, vt, i, *memAt(mem, swap, start + k));
 			}
 		}
 		return;
@@ -84,7 +89,7 @@ static void vectorLoad(struct N64* n, uint32_t op) {
 		int index = (int) (addr & 7) - e;
 		addr &= ~7u;
 		for (int i = 0; i < 8; ++i) {
-			uint16_t b = *dmem(n, addr + ((index + i) & 15));
+			uint16_t b = *memAt(mem, swap, addr + ((index + i) & 15));
 			r->vr[vt][i] = (int16_t) (kind == 6 ? b << 8 : b << 7);
 		}
 		return;
@@ -93,7 +98,7 @@ static void vectorLoad(struct N64* n, uint32_t op) {
 		int index = (int) (addr & 7) - e;
 		addr &= ~7u;
 		for (int i = 0; i < 8; ++i) {
-			r->vr[vt][i] = (int16_t) (*dmem(n, addr + ((index + i * 2) & 15)) << 7);
+			r->vr[vt][i] = (int16_t) (*memAt(mem, swap, addr + ((index + i * 2) & 15)) << 7);
 		}
 		return;
 	}
@@ -102,8 +107,8 @@ static void vectorLoad(struct N64* n, uint32_t op) {
 		addr &= ~7u;
 		int16_t tmp[8];
 		for (int i = 0; i < 4; ++i) {
-			tmp[i] = (int16_t) (*dmem(n, addr + ((index + i * 4) & 15)) << 7);
-			tmp[i + 4] = (int16_t) (*dmem(n, addr + ((index + i * 4 + 8) & 15)) << 7);
+			tmp[i] = (int16_t) (*memAt(mem, swap, addr + ((index + i * 4) & 15)) << 7);
+			tmp[i + 4] = (int16_t) (*memAt(mem, swap, addr + ((index + i * 4 + 8) & 15)) << 7);
 		}
 		for (int i = e; i < e + 8 && i < 16; ++i) {
 			uint16_t v = (uint16_t) tmp[i >> 1];
@@ -120,7 +125,7 @@ static void vectorLoad(struct N64* n, uint32_t op) {
 		int base = vt & ~7, reg = e >> 1;
 		for (int i = 0; i < 8; ++i) {
 			for (int half = 0; half < 2; ++half) {
-				setVbyte(r, base + reg, i * 2 + half, *dmem(n, addr));
+				setVbyte(r, base + reg, i * 2 + half, *memAt(mem, swap, addr));
 				addr = addr + 1 == begin + 16 ? begin : addr + 1;
 			}
 			reg = (reg + 1) & 7;
@@ -130,8 +135,7 @@ static void vectorLoad(struct N64* n, uint32_t op) {
 	}
 }
 
-static void vectorStore(struct N64* n, uint32_t op) {
-	struct RSP* r = &n->rsp;
+static inline __attribute__((always_inline)) void vectorStoreIn(struct RSP* r, uint8_t* mem, uint32_t swap, uint32_t op) {
 	int vt = RT, e = (op >> 7) & 15, kind = RD;
 	int32_t offset = (int32_t) ((op & 0x7F) << 25) >> 25;
 	static const int scale[12] = { 1, 2, 4, 8, 16, 16, 8, 8, 16, 16, 16, 16 };
@@ -141,8 +145,8 @@ static void vectorStore(struct N64* n, uint32_t op) {
 	uint32_t addr = (r->r[RS] + (uint32_t) (offset * scale[kind])) & 0xFFF;
 	// Whole lanes to DMEM without wrapping, as for loads.
 	int size = scale[kind];
-	if (kind >= 1 && kind <= 4 && !(e & 1) && e + size <= 16 && addr + size <= 0x1000 && (kind < 4 || !(addr & 15))) {
-		uint8_t* m = &n->sp.mem[addr];
+	if (!swap && kind >= 1 && kind <= 4 && !(e & 1) && e + size <= 16 && addr + size <= 0x1000 && (kind < 4 || !(addr & 15))) {
+		uint8_t* m = &mem[addr];
 		for (int i = 0; i < size / 2; ++i) {
 			uint16_t v = (uint16_t) r->vr[vt][e / 2 + i];
 			m[2 * i] = (uint8_t) (v >> 8);
@@ -156,13 +160,13 @@ static void vectorStore(struct N64* n, uint32_t op) {
 	case 2:
 	case 3:
 		for (int i = 0; i < scale[kind]; ++i) {
-			*dmem(n, addr + i) = vbyte(r, vt, (e + i) & 15);
+			*memAt(mem, swap, addr + i) = vbyte(r, vt, (e + i) & 15);
 		}
 		return;
 	case 4: {
 		uint32_t end = (addr & ~15u) + 16;
 		for (int i = 0; addr + i < end; ++i) {
-			*dmem(n, addr + i) = vbyte(r, vt, (e + i) & 15);
+			*memAt(mem, swap, addr + i) = vbyte(r, vt, (e + i) & 15);
 		}
 		return;
 	}
@@ -170,7 +174,7 @@ static void vectorStore(struct N64* n, uint32_t op) {
 		int count = addr & 15;
 		uint32_t start = addr & ~15u;
 		for (int k = 0; k < count; ++k) {
-			*dmem(n, start + k) = vbyte(r, vt, (e + 16 - count + k) & 15);
+			*memAt(mem, swap, start + k) = vbyte(r, vt, (e + 16 - count + k) & 15);
 		}
 		return;
 	}
@@ -179,7 +183,7 @@ static void vectorStore(struct N64* n, uint32_t op) {
 		for (int i = e; i < e + 8; ++i) {
 			bool low = (i & 15) < 8;
 			uint8_t b = low == (kind == 6) ? vbyte(r, vt, (i & 7) << 1) : (uint8_t) ((uint16_t) r->vr[vt][i & 7] >> 7);
-			*dmem(n, addr++) = b;
+			*memAt(mem, swap, addr++) = b;
 		}
 		return;
 	case 8: {
@@ -188,7 +192,7 @@ static void vectorStore(struct N64* n, uint32_t op) {
 		for (int i = 0; i < 8; ++i) {
 			int b = e + i * 2;
 			uint8_t v = (uint8_t) (vbyte(r, vt, b & 15) << 1 | vbyte(r, vt, (b + 1) & 15) >> 7);
-			*dmem(n, addr + ((index + i * 2) & 15)) = v;
+			*memAt(mem, swap, addr + ((index + i * 2) & 15)) = v;
 		}
 		return;
 	}
@@ -202,7 +206,7 @@ static void vectorStore(struct N64* n, uint32_t op) {
 		for (int k = 0; k < 4; ++k) {
 			int lane = lanes[e][0] < 0 ? -1 : lanes[e][k];
 			uint8_t v = lane < 0 ? 0 : (uint8_t) ((uint16_t) r->vr[vt][lane] >> 7);
-			*dmem(n, addr + ((base + k * 4) & 15)) = v;
+			*memAt(mem, swap, addr + ((base + k * 4) & 15)) = v;
 		}
 		return;
 	}
@@ -210,7 +214,7 @@ static void vectorStore(struct N64* n, uint32_t op) {
 		int base = addr & 7;
 		addr &= ~7u;
 		for (int i = e; i < e + 16; ++i) {
-			*dmem(n, addr + (base++ & 15)) = vbyte(r, vt, i & 15);
+			*memAt(mem, swap, addr + (base++ & 15)) = vbyte(r, vt, i & 15);
 		}
 		return;
 	}
@@ -220,16 +224,31 @@ static void vectorStore(struct N64* n, uint32_t op) {
 		int base = (int) (addr & 7) - (e & ~1);
 		addr &= ~7u;
 		for (int reg = start; reg < start + 8; ++reg) {
-			*dmem(n, addr + (base++ & 15)) = vbyte(r, reg, element++ & 15);
-			*dmem(n, addr + (base++ & 15)) = vbyte(r, reg, element++ & 15);
+			*memAt(mem, swap, addr + (base++ & 15)) = vbyte(r, reg, element++ & 15);
+			*memAt(mem, swap, addr + (base++ & 15)) = vbyte(r, reg, element++ & 15);
 		}
 		return;
 	}
 	}
 }
 
-static void cop2(struct N64* n, uint32_t op) {
-	struct RSP* r = &n->rsp;
+static void vectorLoad(struct N64* n, uint32_t op) {
+	vectorLoadIn(&n->rsp, n->sp.mem, 0, op);
+}
+
+static void vectorStore(struct N64* n, uint32_t op) {
+	vectorStoreIn(&n->rsp, n->sp.mem, 0, op);
+}
+
+void rspVectorLoadSwapped(struct RSP* r, uint8_t* mem, uint32_t op) {
+	vectorLoadIn(r, mem, 3, op);
+}
+
+void rspVectorStoreSwapped(struct RSP* r, uint8_t* mem, uint32_t op) {
+	vectorStoreIn(r, mem, 3, op);
+}
+
+static inline __attribute__((always_inline)) void cop2In(struct RSP* r, uint32_t op) {
 	if (op & (1 << 25)) {
 		rspVectorOp(r, op);
 		return;
@@ -265,6 +284,14 @@ static void cop2(struct N64* n, uint32_t op) {
 		}
 		return;
 	}
+}
+
+static void cop2(struct N64* n, uint32_t op) {
+	cop2In(&n->rsp, op);
+}
+
+void rspCop2Regs(struct RSP* r, uint32_t op) {
+	cop2In(r, op);
 }
 
 static uint32_t load(struct N64* n, uint32_t addr, int size) {
@@ -565,6 +592,7 @@ void rspCop0(struct N64* n, uint32_t op) {
 
 void rspBreak(struct N64* n) {
 	halt(n);
+	armletVerifyEnd(n);
 }
 
 void rspStep(struct N64* n) {
@@ -610,7 +638,7 @@ void rspStep(struct N64* n) {
 			branch(r, true, s);
 			break;
 		case 0x0D:
-			halt(n);
+			rspBreak(n);
 			dest = -1;
 			break;
 		case 0x20:

@@ -19,6 +19,12 @@ typedef int32_t w8 __attribute__((vector_size(32)));
 static uint16_t reciprocals[512];
 static uint16_t inverseRoots[512];
 
+// The RSP's reciprocal ROM as the hardware lays it out: the reciprocals, then the inverse roots.
+void rspReciprocalRom(uint16_t* out) {
+	memcpy(out, reciprocals, sizeof(reciprocals));
+	memcpy(out + 512, inverseRoots, sizeof(inverseRoots));
+}
+
 void rspInitTables(void) {
 	for (uint32_t i = 0; i < 512; ++i) {
 		uint64_t a = i + 512;

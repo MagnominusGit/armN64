@@ -434,6 +434,8 @@ int main(int argc, char** argv) {
 	if (getenv("N64GFXREPORT")) {
 		printf("GFX hle %llu rsp %llu ucode %s\n", (unsigned long long) n->stats.gfxHle, (unsigned long long) n->stats.gfxRsp,
 		       n->stats.gfxRsp ? n->stats.gfxRspUcode : "-");
+		printf("ARMLET native %llu declined %llu (last: %s)\n", (unsigned long long) n->stats.gfxArmlet, (unsigned long long) n->stats.gfxArmletDeclined,
+		       n->stats.gfxArmletWhy[0] ? n->stats.gfxArmletWhy : "-");
 	}
 	if (getenv("N64STATE")) {
 		struct CPU* c = &n->cpu;

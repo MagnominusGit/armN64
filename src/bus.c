@@ -63,8 +63,20 @@ static void spDma(struct N64* n, uint32_t lenReg, bool toRdram) {
 }
 
 // Each flag has a clear and a set bit; written together they change nothing.
+// A graphics task left to the RSP, counted.
+static void rspGraphicsTask(struct N64* n) {
+	if (n->accuracy == ACCURACY_HLE) {
+		++n->stats.gfxRsp;
+		hleUcodeName(n, n->stats.gfxRspUcode, sizeof(n->stats.gfxRspUcode));
+	}
+	if (n->rdpGl) {
+		++n->glRspTasks;
+	}
+}
+
 static void spWriteStatus(struct N64* n, uint32_t v) {
 	uint32_t* s = &n->sp.status;
+	bool armletStart = false;
 	uint32_t const clear = v & ~(v >> 1) & 0x00AAAAA9u, set = v & ~(v << 1) & 0x01555552u;
 	v = clear | set | (v & 4);
 	if ((v & 1) && (*s & 1)) {
@@ -111,15 +123,14 @@ static void spWriteStatus(struct N64* n, uint32_t v) {
 		if (n->accuracy == ACCURACY_HLE && (hleGraphics(n, false) || audioHle(n))) {
 			n64Event(n, n->sp.hleDoneAt);
 			n->stats.gfxHle += graphics;
+		} else if (graphics && n->armlet) {
+			// Tried on arMLEt's front-ends once the rest of this write is taken.
+			armletStart = true;
 		} else {
-			if (n->accuracy == ACCURACY_HLE && graphics) {
-				++n->stats.gfxRsp;
-				hleUcodeName(n, n->stats.gfxRspUcode, sizeof(n->stats.gfxRspUcode));
+			if (graphics) {
+				rspGraphicsTask(n);
 			}
 			audioCheckStart(n);
-			if (n->rdpGl && graphics) {
-				++n->glRspTasks;
-			}
 		}
 		if (n->rdpGl && graphics && ++n->glTasks == 64) {
 			if (n->glRspTasks * 2 > n->glTasks) {
@@ -175,6 +186,13 @@ static void spWriteStatus(struct N64* n, uint32_t v) {
 		}
 		if (v & (1u << (10 + sig * 2))) {
 			*s |= 0x80u << sig;
+		}
+	}
+	if (armletStart) {
+		if (armletTask(n)) {
+			n64Event(n, n->sp.hleDoneAt);
+		} else {
+			rspGraphicsTask(n);
 		}
 	}
 }
