@@ -249,6 +249,8 @@ struct N64 {
 	struct DP dp;
 	struct RDP* rdp;
 	struct Hle* hle;
+	// The audio tasks run at high level (audio_hle/), with HLE accuracy.
+	struct hle_t* hleAudio;
 	// N64HLECHECK=1: each graphics task also runs at high level without drawing, and the RDP commands
 	// it would send are counted against those the microcode sends ([0] microcode, [1] high level).
 	bool hleCheck;
@@ -380,7 +382,7 @@ struct N64 {
 	const char* unimplemented;
 	// Activity counts for diagnostics.
 	struct {
-		uint64_t piDmas, piBytes, rspTasks, dpSyncs, aiBuffers, siDmas, glSyncs, glRows, idleSlices, idleCycles, glTextures, glTargetRows;
+		uint64_t piDmas, piBytes, rspTasks, audioHleTasks, dpSyncs, aiBuffers, siDmas, glSyncs, glRows, idleSlices, idleCycles, glTextures, glTargetRows;
 	} stats;
 	struct DD dd;
 	// hle: a CPU loop that only waits is skipped to the end of each slice (blocks.c idleRun). Its
@@ -584,6 +586,10 @@ void rdpCommands(struct N64*, const uint64_t* list, size_t count);
 
 // hle.c
 bool hleGraphics(struct N64*, bool dry);
+// audio_hle/audio_hle.c
+bool audioHle(struct N64*);
+void audioCheckStart(struct N64*);
+void audioCheckEnd(struct N64*);
 void glrEnd(struct N64*);
 // The GL state the renderer last set is unknown (the frontend drew in its context).
 void glrForget(struct N64*);

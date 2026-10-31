@@ -58,6 +58,7 @@ void n64Destroy(struct N64* n) {
 		viPoolStop(n->viPool);
 		free(n->isViewer);
 		free(n->hle);
+		free(n->hleAudio);
 		free(n->rdram);
 		free(n->hidden);
 		free(n->vpages);
