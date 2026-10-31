@@ -856,6 +856,33 @@ void busWrite16(struct N64* n, uint32_t addr, uint64_t v) {
 	}
 }
 
+void busReadLine(struct N64* n, uint32_t addr, uint8_t* out, int len) {
+	addr &= 0x1FFFFFFF;
+	if (addr < RDRAM_SIZE) {
+		n64RdramRead(n, addr, (uint32_t) len);
+		memcpy(out, &n->rdram[addr], (size_t) len);
+		return;
+	}
+	for (int k = 0; k < len; k += 4) {
+		uint32_t w = busRead32(n, addr + (uint32_t) k);
+		out[k] = (uint8_t) (w >> 24);
+		out[k + 1] = (uint8_t) (w >> 16);
+		out[k + 2] = (uint8_t) (w >> 8);
+		out[k + 3] = (uint8_t) w;
+	}
+}
+
+void busWriteLine(struct N64* n, uint32_t addr, const uint8_t* in, int len) {
+	uint8_t* p = writable(n, addr, (uint32_t) len);
+	if (p) {
+		memcpy(p, in, (size_t) len);
+		return;
+	}
+	for (int k = 0; k < len; k += 4) {
+		busWrite32(n, (addr & 0x1FFFFFFF) + (uint32_t) k, (uint32_t) in[k] << 24 | (uint32_t) in[k + 1] << 16 | (uint32_t) in[k + 2] << 8 | in[k + 3]);
+	}
+}
+
 void busWrite64(struct N64* n, uint32_t addr, uint64_t v) {
 	busWrite32(n, addr, v >> 32);
 	if ((addr & 0x1FFFFFFF) < RDRAM_SIZE) {

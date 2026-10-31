@@ -132,6 +132,8 @@ struct Miss {
 	int size;
 	// A load that, with the GL renderer, waits for the GPU's pages when the line comes in.
 	bool glLoad;
+	// The guest registers held where the fast path resumes, to load again after a call.
+	struct Cache cache;
 };
 
 struct Jit {
@@ -155,6 +157,8 @@ struct Jit {
 	int codeCheckCount;
 	uint8_t* leave;
 	bool rdpThreads, rdpGl;
+	// Outside lle-compatible the D-cache holds the data cached accesses use.
+	bool cacheData;
 	// Status.FR as the block was compiled: with it clear, odd 32-bit FPU registers are the high
 	// halves of even ones.
 	bool fr;
@@ -292,31 +296,18 @@ static void needCop1(struct Jit* j) {
 	j->slow->site[j->slow->sites++] = aTbz(&j->e, 16, 29, NULL);
 }
 
-// Whether fpuExecute runs op without raising an exception (it only raises RI).
+// Whether fpuExecute runs op without raising an exception: the moves (MFC1, DMFC1, CFC1, MTC1,
+// DMTC1).
 static bool fpuOpValid(uint32_t op) {
-	int fmt = (op >> 21) & 31, func = op & 0x3F;
-	if (fmt <= 6) {
-		return fmt != 3;
-	}
-	if (fmt != 16 && fmt != 17 && fmt != 20 && fmt != 21) {
-		return false;
-	}
-	return func <= 15 || func == 32 || func == 33 || func == 36 || func == 37 || func >= 0x30;
+	int fmt = (op >> 21) & 31;
+	return fmt <= 5 && fmt != 3;
 }
 
-// Single-precision instructions on s registers.
-enum { F_MUL = 0x1E200800, F_DIV = 0x1E201800, F_ADD = 0x1E202800, F_SUB = 0x1E203800, F_ABS = 0x1E20C000, F_NEG = 0x1E214000 };
-
-static void aFop(struct Emitter* e, uint32_t op, int d, int n, int m) {
-	emit32(e, op | m << 16 | n << 5 | d);
-}
-
-static void aFldr(struct Emitter* e, int t, int n, unsigned offset) {
-	emit32(e, 0xBD400000 | (offset / 4) << 10 | n << 5 | t);
-}
-
-static void aFstr(struct Emitter* e, int t, int n, unsigned offset) {
-	emit32(e, 0xBD000000 | (offset / 4) << 10 | n << 5 | t);
+// What fpuProbe runs: CTC1 and the S, D, W and L operations. One that would raise an exception leaves
+// for the interpreter, which takes it.
+static bool fpuProbed(uint32_t op) {
+	int fmt = (op >> 21) & 31;
+	return fmt == 6 || fmt == 16 || fmt == 17 || fmt == 20 || fmt == 21;
 }
 
 // A 32-bit FPU register, as get32 and set32 find it.
@@ -324,31 +315,11 @@ static unsigned fprOff(const struct Jit* j, int r) {
 	return j->fr ? CPU_OFF(fpr) + 8 * r : CPU_OFF(fpr) + 8 * (r & ~1) + 4 * (r & 1);
 }
 
-// A single-precision result in w0 as setS stores it: flushed to zero when subnormal with FCR31.FS
-// set, and the host's default NaN made the VR4300's.
-static void storeSingle(struct Jit* j, int fd) {
-	struct Emitter* e = &j->e;
-	aLdr(e, 17, CPU, CPU_OFF(fcr31));
-	uint8_t* keep = aTbz(e, 17, 24, NULL);
-	aLogicImm(e, A_ANDS_IMM, ZR, 0, 0x7F800000);
-	uint8_t* normal = aBcond(e, C_NE, NULL);
-	aLogicImm(e, A_AND_IMM, 0, 0, 0x80000000);
-	patchHere(e, keep);
-	patchHere(e, normal);
-	aLogicImm(e, A_AND_IMM, 1, 0, 0x7FFFFFFF);
-	aMovImm(e, 2, 0x7FC00000);
-	aDp(e, A_SUBS, ZR, 1, 2, S_LSL, 0);
-	aMovImm(e, 2, 0x7FBFFFFF);
-	aCsel(e, 0, 2, 0, C_EQ);
-	aStr(e, 0, CPU, fprOff(j, fd));
-}
-
-// The FPU instructions most code runs, inline for the Status.FR the block was compiled with.
+// The FPU's moves inline for the Status.FR the block was compiled with.
 static bool emitFpu(struct Jit* j, uint32_t op) {
 	struct Emitter* e = &j->e;
-	int fmt = (op >> 21) & 31, func = op & 0x3F, ft = (op >> 16) & 31, fs = (op >> 11) & 31, fd = (op >> 6) & 31;
-	bool single = fmt == 16 && (func <= 3 || (func >= 5 && func <= 7) || func == 13 || func >= 0x30);
-	if (!(fmt == 0 || fmt == 2 || fmt == 4 || single || (fmt == 20 && func == 32))) {
+	int fmt = (op >> 21) & 31, ft = (op >> 16) & 31, fs = (op >> 11) & 31;
+	if (fmt != 0 && fmt != 2 && fmt != 4) {
 		return false;
 	}
 	needCop1(j);
@@ -372,62 +343,10 @@ static bool emitFpu(struct Jit* j, uint32_t op) {
 			setConst(j, ft, fs == 0 ? 0xA00 : 0);
 		}
 		return true;
-	case 4:
+	default:
 		aStr(e, readReg(j, ft), CPU, fprOff(j, fs));
 		return true;
-	case 20:
-		aLdr(e, 0, CPU, fprOff(j, fs));
-		emit32(e, 0x1E220000 | 0 << 5 | 0);
-		aFstr(e, 0, CPU, fprOff(j, fd));
-		j->extraCycles = (int) fpuCycles(fmt, func);
-		return true;
 	}
-	j->extraCycles = (int) fpuCycles(fmt, func);
-	aFldr(e, 0, CPU, fprOff(j, fs));
-	if (func >= 0x30) {
-		// c.cond.s: FCMP gives N for less, Z for equal and V for unordered.
-		aFldr(e, 1, CPU, fprOff(j, ft));
-		emit32(e, 0x1E202000 | 1 << 16 | 0 << 5);
-		aMovImm(e, 0, 0);
-		static const int conds[3] = { C_VS, C_EQ, C_MI };
-		for (int k = 0; k < 3; ++k) {
-			if (func & (1 << k)) {
-				aCset(e, 1, conds[k]);
-				aDp(e, A_ORR, 0, 0, 1, S_LSL, 0);
-			}
-		}
-		aLdr(e, 1, CPU, CPU_OFF(fcr31));
-		aBfi(e, 1, 0, 23, 1);
-		aStr(e, 1, CPU, CPU_OFF(fcr31));
-		return true;
-	}
-	switch (func) {
-	case 6:
-		aFstr(e, 0, CPU, fprOff(j, fd));
-		return true;
-	case 13:
-		// trunc.w.s: out of range or NaN gives the most negative word, as toWord.
-		emit32(e, 0x9E380000 | 0 << 5 | 0);
-		aSxtw(e, 1, 0);
-		aMovImm(e, 2, 0x80000000);
-		aDp(e, A_SUBS | W64, ZR, 1, 0, S_LSL, 0);
-		aCsel(e, 0, 0, 2, C_EQ);
-		emit32(e, 0x1E202000 | 0 << 16 | 0 << 5);
-		aCsel(e, 0, 0, 2, C_VC);
-		aStr(e, 0, CPU, fprOff(j, fd));
-		return true;
-	case 5:
-	case 7:
-		aFop(e, func == 5 ? F_ABS : F_NEG, 0, 0, 0);
-		break;
-	default:
-		aFldr(e, 1, CPU, fprOff(j, ft));
-		aFop(e, (const uint32_t[]) { F_ADD, F_SUB, F_MUL, F_DIV }[func], 0, 0, 1);
-		break;
-	}
-	emit32(e, 0x1E260000 | 0 << 5 | 0);
-	storeSingle(j, fd);
-	return true;
 }
 
 // MFC0 and DMFC0 of anything but Random and the registers that read the latch; MTC0 and DMTC0 of EPC
@@ -731,21 +650,27 @@ static bool emitInline(struct Jit* j, uint32_t op, uint64_t pc, enum Kind* kind)
 		return emitCop0(j, op);
 	case 0x11:
 		if (((op >> 21) & 31) == 0x08) {
+			if (rt >= 4) {
+				return false;
+			}
 			break;
 		}
-		if (!fpuOpValid(op)) {
+		if (!fpuOpValid(op) && !fpuProbed(op)) {
 			return false;
 		}
 		if (emitFpu(j, op)) {
 			return true;
 		}
-		// The FPU's own code, called directly: it raises nothing once CU1 is on. Its stall counts.
+		// The FPU's own code, called directly. Its stall counts.
 		needCop1(j);
 		aMovX(e, 0, N);
 		aMovImm(e, 1, op);
-		aMovImm64(e, IP, (uint64_t) (uintptr_t) fpuExecute);
+		aMovImm64(e, IP, (uint64_t) (uintptr_t) (fpuProbed(op) ? (void*) fpuProbe : (void*) fpuExecute));
 		aBlr(e, IP);
 		forgetCallerSaved(&j->cache);
+		if (fpuProbed(op)) {
+			j->slow->site[j->slow->sites++] = aTbz(e, 0, 0, NULL);
+		}
 		aLdr(e, 0, CPU, CPU_OFF(stall));
 		aDp(e, A_SUB | W64, LEFT, LEFT, 0, S_LSL, 0);
 		aStr(e, ZR, CPU, CPU_OFF(stall));
@@ -758,34 +683,37 @@ static bool emitInline(struct Jit* j, uint32_t op, uint64_t pc, enum Kind* kind)
 		}
 		return true;
 	case 0x2F: {
-		// CACHE on the D-cache, as cacheOp: the line the address indexes is written back if dirty
-		// (not for action 3) and emptied by actions 0, 4 and 5. I-cache ones leave the block through
-		// the interpreter; the secondary cache isn't there.
-		int which = (op >> 16) & 3, action = (op >> 18) & 7;
-		if (which == 0) {
+		// CACHE on the D-cache (and the secondary cache, which isn't there) at an aligned kseg0
+		// address, through cacheOp; I-cache ones, others and a write-back over code leave the block
+		// through the interpreter.
+		if (((op >> 16) & 3) == 0) {
 			return false;
-		}
-		if (which != 1) {
-			return true;
 		}
 		int base = readReg(j, rs);
 		if (base == ZR) {
 			aMovImm(e, 0, (uint32_t) imm);
 		} else {
-			aAddImm(e, 0, base, imm, 1);
+			aMovImm(e, 1, (uint32_t) imm);
+			aSxtw(e, 1, 1);
+			aDp(e, A_ADD | W64, 0, base, 1, S_LSL, 0);
+			aSxtw(e, 1, 0);
+			aDp(e, A_SUBS | W64, ZR, 0, 1, S_LSL, 0);
+			slowIf(j, C_NE);
 		}
-		aUbfx(e, 1, 0, 4, 9);
-		if (action != 3) {
-			aLdst(e, L_LDRB, 3, DIRTY, 1, L_UXTW);
-			uint8_t* clean = aCbz(e, 3, NULL);
-			aLdst(e, L_STRB, ZR, DIRTY, 1, L_UXTW);
-			aDpImm(e, A_SUB_IMM | W64, LEFT, LEFT, DCACHE_WRITEBACK);
-			patchHere(e, clean);
-		}
-		if (action == 0 || action == 4 || action == 5) {
-			aMovImm(e, 2, DCACHE_NONE);
-			aLdst(e, L_STR, 2, DTAG, 1, L_UXTW | 0x1000);
-		}
+		aMovImm(e, 1, 0xE0000003u);
+		aDp(e, A_AND, 1, 0, 1, S_LSL, 0);
+		aMovImm(e, 2, 0x80000000u);
+		aDp(e, A_SUBS, ZR, 1, 2, S_LSL, 0);
+		slowIf(j, C_NE);
+		aMov(e, 2, 0);
+		aMovX(e, 0, N);
+		aMovImm(e, 1, op);
+		aMovImm64(e, IP, (uint64_t) (uintptr_t) cpuCacheOp);
+		aBlr(e, IP);
+		forgetCallerSaved(&j->cache);
+		aDpImm(e, A_ADDS_IMM, ZR, 0, 1);
+		slowIf(j, C_EQ);
+		aDp(e, A_SUB | W64, LEFT, LEFT, 0, S_LSL, 0);
 		return true;
 	}
 	case 0x20: case 0x21: case 0x23: case 0x24: case 0x25: case 0x27: case 0x37:
@@ -802,9 +730,11 @@ static bool emitInline(struct Jit* j, uint32_t op, uint64_t pc, enum Kind* kind)
 	bool likely = (op >> 26) >= 0x14 || ((op >> 26) == 0x01 && (rt & 2)) || ((op >> 26) == 0x11 && (rt & 2));
 	int cc;
 	if (op >> 26 == 0x11) {
-		// BC1F, BC1T and the likely ones: FCR31's condition bit.
+		// BC1F, BC1T and the likely ones: FCR31's condition bit, the causes cleared first.
 		needCop1(j);
 		aLdr(e, 0, CPU, CPU_OFF(fcr31));
+		aLogicImm(e, A_AND_IMM, 0, 0, ~0x3F000u);
+		aStr(e, 0, CPU, CPU_OFF(fcr31));
 		aLogicImm(e, A_ANDS_IMM, ZR, 0, 1u << 23);
 		cc = rt & 1 ? C_NE : C_EQ;
 	} else {
@@ -835,21 +765,38 @@ static void delayPrologue(struct Emitter* e) {
 	aStrX(e, 0, CPU, CPU_OFF(nextPc));
 }
 
-// The I-cache line holding pc, as fetchTiming checks it.
-static void icacheCheck(struct Emitter* e, uint32_t vaddr, uint32_t paddr, bool toStall) {
-	unsigned tag = CPU_OFF(icacheTag) + 4 * ((vaddr >> 5) & 511);
-	aLdr(e, 0, CPU, tag);
-	aMovImm(e, 1, paddr >> 5 | 0x80000000u);
+// The guest registers a cache holds, loaded again after a call.
+static void reloadPool(struct Emitter* e, const struct Cache* c) {
+	for (int k = 0; k < POOL; ++k) {
+		if (c->guest[k] >= 0) {
+			aLdrX(e, pool[k], CPU, gprOff(c->guest[k]));
+		}
+	}
+}
+
+// The I-cache line holding pc, as fetch checks it; a miss fills it in C (w2 kept for an interrupt
+// check).
+static void icacheCheck(struct Jit* j, uint32_t vaddr, uint32_t paddr, bool toStall) {
+	struct Emitter* e = &j->e;
+	aLdr(e, 0, CPU, CPU_OFF(icacheTag) + 4 * ((vaddr >> 5) & 511));
+	aMovImm(e, 1, paddr & ~31u);
 	aDp(e, A_SUBS, ZR, 0, 1, S_LSL, 0);
 	uint8_t* hit = aBcond(e, C_EQ, NULL);
-	aStr(e, 1, CPU, tag);
+	aPush(e, 2, 3, 16);
+	aMovX(e, 0, N);
+	aMovImm(e, 1, vaddr);
+	aMovImm(e, 2, paddr);
+	aMovImm64(e, IP, (uint64_t) (uintptr_t) cpuIcacheMiss);
+	aBlr(e, IP);
 	if (toStall) {
-		aLdr(e, 0, CPU, CPU_OFF(stall));
-		aDpImm(e, A_ADD_IMM, 0, 0, ICACHE_FILL);
-		aStr(e, 0, CPU, CPU_OFF(stall));
+		aLdr(e, 1, CPU, CPU_OFF(stall));
+		aDp(e, A_ADD, 1, 1, 0, S_LSL, 0);
+		aStr(e, 1, CPU, CPU_OFF(stall));
 	} else {
-		aDpImm(e, A_SUB_IMM | W64, LEFT, LEFT, ICACHE_FILL);
+		aDp(e, A_SUB | W64, LEFT, LEFT, 0, S_LSL, 0);
 	}
+	aPop(e, 2, 3, 16);
+	reloadPool(e, &j->cache);
 	patchHere(e, hit);
 }
 
@@ -862,7 +809,7 @@ static void skipIdle(struct Emitter* e, uint32_t vaddr, uint32_t paddr) {
 	for (int i = 0; i < lines; ++i) {
 		uint32_t v = vaddr + 4 * i, p = paddr + 4 * i;
 		aLdr(e, 0, CPU, CPU_OFF(icacheTag) + 4 * ((v >> 5) & 511));
-		aMovImm(e, 1, p >> 5 | 0x80000000u);
+		aMovImm(e, 1, p & ~31u);
 		aDp(e, A_SUBS, ZR, 0, 1, S_LSL, 0);
 		skip[sites++] = aBcond(e, C_NE, NULL);
 	}
@@ -898,7 +845,7 @@ static void chain(struct Jit* j);
 static void emitHelper(struct Jit* j, uint32_t op, uint64_t pc, uint32_t paddr, bool delay, bool lineStart, bool last) {
 	struct Emitter* e = &j->e;
 	if (lineStart) {
-		icacheCheck(e, (uint32_t) pc, paddr, true);
+		icacheCheck(j, (uint32_t) pc, paddr, true);
 	}
 	if (delay) {
 		delayPrologue(e);
@@ -1006,8 +953,10 @@ static void emitMemory(struct Jit* j, struct Slow* slow) {
 	}
 	aDp(e, A_ADD, 6, 0, 5, S_LSL, 0);
 	// Stores go slow on any flag (code, RDP) unless the page has only code that they miss; loads
-	// on pages the RDP may still be drawing to.
-	if (isStore) {
+	// on pages the RDP may still be drawing to. With the D-cache's data only its fills and
+	// write-backs reach memory, in C.
+	if (j->cacheData) {
+	} else if (isStore) {
 		aLsrImm(e, 1, 6, 12);
 		aLdst(e, L_LDRB, 1, PAGES, 1, L_UXTW);
 		struct Miss* k = &j->codeChecks[j->codeCheckCount++];
@@ -1034,35 +983,44 @@ static void emitMemory(struct Jit* j, struct Slow* slow) {
 	m->slow = slow;
 	m->size = size;
 	m->glLoad = j->rdpGl && !isStore;
+	m->cache = j->cache;
 	slow->keep = true;
 	if (isStore) {
 		aMovImm(e, 3, 1);
 		aLdst(e, L_STRB, 3, DIRTY, 1, L_UXTW);
+	}
+	// The data: RDRAM at w6, or the line's at x2 + w3.
+	int mb = RAM, mi = 6;
+	if (j->cacheData) {
+		aAddImmX(e, 2, CPU, CPU_OFF(dcacheData));
+		aLogicImm(e, A_AND_IMM, 3, 0, 0x1FFF);
+		mb = 2;
+		mi = 3;
 	}
 
 	if (isStore && !fpu) {
 		int t = readReg(j, rt);
 		switch (op >> 26) {
 		case 0x28:
-			aLdst(e, L_STRB, t, RAM, 6, L_UXTW);
+			aLdst(e, L_STRB, t, mb, mi, L_UXTW);
 			return;
 		case 0x29:
 			aRev16(e, 4, t);
-			aLdst(e, L_STRH, 4, RAM, 6, L_UXTW);
+			aLdst(e, L_STRH, 4, mb, mi, L_UXTW);
 			return;
 		case 0x2B:
 			aRev(e, 4, t);
-			aLdst(e, L_STR, 4, RAM, 6, L_UXTW);
+			aLdst(e, L_STR, 4, mb, mi, L_UXTW);
 			return;
 		default:
 			aRevX(e, 4, t);
-			aLdst(e, L_STRX, 4, RAM, 6, L_UXTW);
+			aLdst(e, L_STRX, 4, mb, mi, L_UXTW);
 			return;
 		}
 	}
 	switch (op >> 26) {
 	case 0x31: case 0x35:
-		aLdst(e, size == 4 ? L_LDR : L_LDRX, 4, RAM, 6, L_UXTW);
+		aLdst(e, size == 4 ? L_LDR : L_LDRX, 4, mb, mi, L_UXTW);
 		if (size == 4) {
 			aRev(e, 4, 4);
 		} else {
@@ -1084,34 +1042,34 @@ static void emitMemory(struct Jit* j, struct Slow* slow) {
 			aLdrX(e, 4, 5, 0);
 			aRevX(e, 4, 4);
 		}
-		aLdst(e, size == 4 ? L_STR : L_STRX, 4, RAM, 6, L_UXTW);
+		aLdst(e, size == 4 ? L_STR : L_STRX, 4, mb, mi, L_UXTW);
 		return;
 	}
 	int d = writeReg(j, rt);
 	switch (op >> 26) {
 	case 0x20:
-		aLdst(e, L_LDRB, d, RAM, 6, L_UXTW);
+		aLdst(e, L_LDRB, d, mb, mi, L_UXTW);
 		aSxtbX(e, d, d);
 		break;
 	case 0x24:
-		aLdst(e, L_LDRB, d, RAM, 6, L_UXTW);
+		aLdst(e, L_LDRB, d, mb, mi, L_UXTW);
 		break;
 	case 0x21: case 0x25:
-		aLdst(e, L_LDRH, d, RAM, 6, L_UXTW);
+		aLdst(e, L_LDRH, d, mb, mi, L_UXTW);
 		aRev16(e, d, d);
 		if (op >> 26 == 0x21) {
 			aSxthX(e, d, d);
 		}
 		break;
 	case 0x23: case 0x27:
-		aLdst(e, L_LDR, d, RAM, 6, L_UXTW);
+		aLdst(e, L_LDR, d, mb, mi, L_UXTW);
 		aRev(e, d, d);
 		if (op >> 26 == 0x23) {
 			aSxtw(e, d, d);
 		}
 		break;
 	default:
-		aLdst(e, L_LDRX, d, RAM, 6, L_UXTW);
+		aLdst(e, L_LDRX, d, mb, mi, L_UXTW);
 		aRevX(e, d, d);
 		break;
 	}
@@ -1175,7 +1133,7 @@ static uint8_t* fuseRun(struct Jit* j, const uint32_t* ops, uint32_t len, uint32
 	for (uint32_t p = paddr & ~31u; p < paddr + 4 * len; p += 32) {
 		uint32_t v = vaddr + (p - paddr);
 		aLdr(e, 0, CPU, CPU_OFF(icacheTag) + 4 * ((v >> 5) & 511));
-		aMovImm(e, 1, p >> 5 | 0x80000000u);
+		aMovImm(e, 1, p & ~31u);
 		aDp(e, A_SUBS, ZR, 0, 1, S_LSL, 0);
 		out[sites++] = aBcond(e, C_NE, NULL);
 	}
@@ -1229,11 +1187,25 @@ static uint8_t* fuseRun(struct Jit* j, const uint32_t* ops, uint32_t len, uint32
 	// x7 = the host address of the base's physical address less lo rounded down to 8, so every
 	// access is at a positive offset that is a multiple of its size.
 	int32_t floor8 = lo & ~7;
-	aMov(e, 7, 6);
-	if (lo - floor8) {
-		aDpImm(e, A_SUB_IMM | W64, 7, 7, (unsigned) (lo - floor8));
+	if (j->cacheData) {
+		// The lines' data, by virtual address, when the run doesn't wrap round the D-cache.
+		aMov(e, 2, 0);
+		if (lo - floor8) {
+			aDpImm(e, A_SUB_IMM, 2, 2, (unsigned) (lo - floor8));
+		}
+		aLogicImm(e, A_AND_IMM, 2, 2, 0x1FFF);
+		aAddImm(e, 4, 2, hi - floor8, 5);
+		aLsrImm(e, 4, 4, 13);
+		out[sites++] = aCbnz(e, 4, NULL);
+		aAddImmX(e, 4, CPU, CPU_OFF(dcacheData));
+		aDp(e, A_ADD | W64, 7, 4, 2, S_LSL, 0);
+	} else {
+		aMov(e, 7, 6);
+		if (lo - floor8) {
+			aDpImm(e, A_SUB_IMM | W64, 7, 7, (unsigned) (lo - floor8));
+		}
+		aDp(e, A_ADD | W64, 7, RAM, 7, S_LSL, 0);
 	}
-	aDp(e, A_ADD | W64, 7, RAM, 7, S_LSL, 0);
 	if (stores) {
 		aMovImm(e, 3, 1);
 	}
@@ -1303,7 +1275,7 @@ static void pollSkip(struct Jit* j, const uint32_t* ops, uint32_t count, uint32_
 	for (uint32_t p = paddr & ~31u; p < paddr + 4 * count; p += 32) {
 		uint32_t v = vaddr + (p - paddr);
 		aLdr(e, 0, CPU, CPU_OFF(icacheTag) + 4 * ((v >> 5) & 511));
-		aMovImm(e, 1, p >> 5 | 0x80000000u);
+		aMovImm(e, 1, p & ~31u);
 		aDp(e, A_SUBS, ZR, 0, 1, S_LSL, 0);
 		out[sites++] = aBcond(e, C_NE, NULL);
 	}
@@ -1435,6 +1407,7 @@ void* jitCompile(struct N64* n, const uint32_t* ops, uint32_t count, uint32_t va
 	j->exitCount = j->slowCount = j->missCount = j->codeCheckCount = 0;
 	j->rdpThreads = n->rdpThreads > 0;
 	j->rdpGl = n->rdpGl;
+	j->cacheData = !n->compat;
 	j->fr = n->cpu.cop0[CP0_STATUS] & (1 << 26);
 	struct Emitter* e = &j->e;
 	j->leave = e->p;
@@ -1499,11 +1472,11 @@ void* jitCompile(struct N64* n, const uint32_t* ops, uint32_t count, uint32_t va
 		// A branch's I-cache check comes first (a likely branch not taken leaves inside it); the rest
 		// check after, so slow paths and Count reads see the cycles before this fetch.
 		if (lineStart && branch && !delay) {
-			icacheCheck(e, (uint32_t) pc, p, false);
+			icacheCheck(j, (uint32_t) pc, p, false);
 		}
 		if (!(delay && branch) && emitInline(j, op, pc, &kind)) {
 			if (lineStart && !branch) {
-				icacheCheck(e, (uint32_t) pc, p, false);
+				icacheCheck(j, (uint32_t) pc, p, false);
 			}
 			aDpImm(e, A_SUBS_IMM | W64, LEFT, LEFT, 1 + j->extraCycles);
 			if (j->interruptCheck) {
@@ -1555,8 +1528,8 @@ void* jitCompile(struct N64* n, const uint32_t* ops, uint32_t count, uint32_t va
 		aB(e, k->resume);
 	}
 
-	// D-cache line fills, as dataTiming: the fill, the write-back of a dirty line, the new tag. A
-	// misaligned address, or one past RDRAM, takes the slow path instead.
+	// D-cache misses, filled (and a dirty line written back) in C. A misaligned address, one past
+	// RDRAM, or a write-back over code, takes the slow path instead.
 	for (int i = 0; i < j->missCount; ++i) {
 		struct Miss* m = &j->misses[i];
 		patchHere(e, m->site);
@@ -1573,14 +1546,19 @@ void* jitCompile(struct N64* n, const uint32_t* ops, uint32_t count, uint32_t va
 			aLdst(e, L_LDRB, 3, PAGES, 3, L_UXTW);
 			m->slow->site[m->slow->sites++] = aTbnz(e, 3, 1, NULL);
 		}
-		aLogicImm(e, A_AND_IMM, 2, 6, ~0xFu);
-		aDpImm(e, A_SUB_IMM | W64, LEFT, LEFT, DCACHE_FILL);
-		aLdst(e, L_LDRB, 3, DIRTY, 1, L_UXTW);
-		uint8_t* clean = aCbz(e, 3, NULL);
-		aDpImm(e, A_SUB_IMM | W64, LEFT, LEFT, DCACHE_WRITEBACK);
-		patchHere(e, clean);
-		aLdst(e, L_STR, 2, DTAG, 1, L_UXTW | 0x1000);
-		aLdst(e, L_STRB, ZR, DIRTY, 1, L_UXTW);
+		aPush(e, 0, 6, 16);
+		aMov(e, 1, 0);
+		aMov(e, 2, 6);
+		aMovX(e, 0, N);
+		aMovImm64(e, IP, (uint64_t) (uintptr_t) cpuDcacheMiss);
+		aBlr(e, IP);
+		aMov(e, 4, 0);
+		aPop(e, 0, 6, 16);
+		aDpImm(e, A_ADDS_IMM, ZR, 4, 1);
+		m->slow->site[m->slow->sites++] = aBcond(e, C_EQ, NULL);
+		aDp(e, A_SUB | W64, LEFT, LEFT, 4, S_LSL, 0);
+		reloadPool(e, &m->cache);
+		aUbfx(e, 1, 0, 4, 9);
 		aB(e, m->resume);
 	}
 	for (int i = 0; i < j->slowCount; ++i) {

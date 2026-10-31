@@ -178,7 +178,8 @@ static struct Block* compile(struct N64* n, uint32_t vaddr, uint32_t paddr) {
 	b->vaddr = vaddr;
 	b->code = NULL;
 	size_t before = n->jitUsed;
-	if (n->useJit && !(b->code = jitCompile(n, b->ops, count, vaddr, paddr))) {
+	// Code the I-cache holds otherwise than memory is run by the interpreter, from the I-cache.
+	if (n->useJit && cpuCodeCoherent(n, vaddr, paddr, count) && !(b->code = jitCompile(n, b->ops, count, vaddr, paddr))) {
 		// The code arena is full: start it again, and run this instruction on its own.
 		free(b);
 		blocksFree(n);

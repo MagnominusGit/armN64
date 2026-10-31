@@ -112,6 +112,8 @@ struct Jit {
 	bool jumped;
 	uint8_t* leave;
 	bool rdpThreads, rdpGl;
+	// Outside lle-compatible the D-cache holds the data cached accesses use.
+	bool cacheData;
 };
 
 static void exitAt(struct Jit* j, uint8_t* site, uint64_t pc, enum Kind kind, bool delay, bool skip) {
@@ -154,16 +156,18 @@ static void needCop1(struct Jit* j) {
 	slowIf(j, CC_E);
 }
 
-// Whether fpuExecute runs op without raising an exception (it only raises RI).
+// Whether fpuExecute runs op without raising an exception: the moves (MFC1, DMFC1, CFC1, MTC1,
+// DMTC1).
 static bool fpuOpValid(uint32_t op) {
-	int fmt = (op >> 21) & 31, func = op & 0x3F;
-	if (fmt <= 6) {
-		return fmt != 3;
-	}
-	if (fmt != 16 && fmt != 17 && fmt != 20 && fmt != 21) {
-		return false;
-	}
-	return func <= 15 || func == 32 || func == 33 || func == 36 || func == 37 || func >= 0x30;
+	int fmt = (op >> 21) & 31;
+	return fmt <= 5 && fmt != 3;
+}
+
+// What fpuProbe runs: CTC1 and the S, D, W and L operations. One that would raise an exception leaves
+// for the interpreter, which takes it.
+static bool fpuProbed(uint32_t op) {
+	int fmt = (op >> 21) & 31;
+	return fmt == 6 || fmt == 16 || fmt == 17 || fmt == 20 || fmt == 21;
 }
 
 // MFC0 and DMFC0 of anything but Random and the registers that read the latch; MTC0 and DMTC0 of EPC
@@ -434,17 +438,24 @@ static bool emitInline(struct Jit* j, uint32_t op, uint64_t pc, enum Kind* kind)
 		return emitCop0(j, op);
 	case 0x11:
 		if (((op >> 21) & 31) == 0x08) {
+			if (rt >= 4) {
+				return false;
+			}
 			break;
 		}
-		if (!fpuOpValid(op)) {
+		if (!fpuOpValid(op) && !fpuProbed(op)) {
 			return false;
 		}
-		// The FPU's own code, called directly: it raises nothing once CU1 is on. Its stall counts.
+		// The FPU's own code, called directly. Its stall counts.
 		needCop1(j);
 		xMovRR(e, 8, RDI, RBX);
 		xMovIKeepFlags(e, RSI, op);
-		xMovI64(e, RAX, (uint64_t) (uintptr_t) fpuExecute);
+		xMovI64(e, RAX, (uint64_t) (uintptr_t) (fpuProbed(op) ? (void*) fpuProbe : (void*) fpuExecute));
 		xCallR(e, RAX);
+		if (fpuProbed(op)) {
+			xTest(e, 1, R(RAX), RAX);
+			slowIf(j, CC_E);
+		}
 		xLoad(e, 4, RAX, CPU_AT(stall));
 		xAluRR(e, X_ADD, 8, R(R13), RAX);
 		xStoreI(e, 4, CPU_AT(stall), 0);
@@ -474,8 +485,9 @@ static bool emitInline(struct Jit* j, uint32_t op, uint64_t pc, enum Kind* kind)
 	bool likely = (op >> 26) >= 0x14 || ((op >> 26) == 0x01 && (rt & 2)) || ((op >> 26) == 0x11 && (rt & 2));
 	int cc;
 	if (op >> 26 == 0x11) {
-		// BC1F, BC1T and the likely ones: FCR31's condition bit.
+		// BC1F, BC1T and the likely ones: FCR31's condition bit, the causes cleared first.
 		needCop1(j);
+		xAluI(e, X_AND, 4, CPU_AT(fcr31), (int32_t) ~0x3F000u);
 		xTestI(e, 4, CPU_AT(fcr31), 1u << 23);
 		cc = rt & 1 ? CC_NE : CC_E;
 	} else {
@@ -506,18 +518,26 @@ static void delayPrologue(struct Emitter* e) {
 	xStore(e, 8, CPU_AT(nextPc), RAX);
 }
 
-// The I-cache line holding pc, as fetchTiming checks it.
+// The I-cache line holding pc, as fetch checks it; a miss fills it in C (ecx kept for an interrupt
+// check).
 static void icacheCheck(struct Emitter* e, uint32_t vaddr, uint32_t paddr, bool toStall) {
 	struct Opnd tag = M(R12, (int32_t) (offsetof(struct CPU, icacheTag) + 4 * ((vaddr >> 5) & 511)));
-	uint32_t want = paddr >> 5 | 0x80000000u;
-	xAluI(e, X_CMP, 4, tag, (int32_t) want);
+	xAluI(e, X_CMP, 4, tag, (int32_t) (paddr & ~31u));
 	uint8_t* hit = xJcc(e, CC_E, NULL);
-	xStoreI(e, 4, tag, want);
+	xPush(e, RAX);
+	xPush(e, RCX);
+	xMovRR(e, 8, RDI, RBX);
+	xMovI(e, RSI, vaddr);
+	xMovI(e, RDX, paddr);
+	xMovI64(e, RAX, (uint64_t) (uintptr_t) cpuIcacheMiss);
+	xCallR(e, RAX);
 	if (toStall) {
-		xAluI(e, X_ADD, 4, CPU_AT(stall), ICACHE_FILL);
+		xAluRR(e, X_ADD, 4, CPU_AT(stall), RAX);
 	} else {
-		xAluI(e, X_ADD, 8, R(R13), ICACHE_FILL);
+		xAluRR(e, X_ADD, 8, R(R13), RAX);
 	}
+	xPop(e, RCX);
+	xPop(e, RAX);
 	patchHere(e, hit);
 }
 
@@ -530,7 +550,7 @@ static void skipIdle(struct Emitter* e, uint32_t vaddr, uint32_t paddr) {
 	for (int i = 0; i < lines; ++i) {
 		uint32_t v = vaddr + 4 * i, p = paddr + 4 * i;
 		struct Opnd tag = M(R12, (int32_t) (offsetof(struct CPU, icacheTag) + 4 * ((v >> 5) & 511)));
-		xAluI(e, X_CMP, 4, tag, (int32_t) (p >> 5 | 0x80000000u));
+		xAluI(e, X_CMP, 4, tag, (int32_t) (p & ~31u));
 		skip[sites++] = xJcc(e, CC_NE, NULL);
 	}
 	xMovRR(e, 8, RAX, R14);
@@ -640,7 +660,7 @@ static void emitMemory(struct Jit* j, struct Slow* slow) {
 	int code = op >> 26;
 	bool fpu = code == 0x31 || code == 0x35 || code == 0x39 || code == 0x3D;
 	bool isStore = code >= 0x28 && code != 0x37 && code != 0x31 && code != 0x35;
-	struct Opnd ram = MI(R15, RAX, 1, 0);
+	struct Opnd ram = j->cacheData ? MI(R12, RCX, 1, (int32_t) offsetof(struct CPU, dcacheData)) : MI(R15, RAX, 1, 0);
 	if (fpu) {
 		needCop1(j);
 	}
@@ -661,8 +681,9 @@ static void emitMemory(struct Jit* j, struct Slow* slow) {
 	xLoad(e, 8, RDX, N64_AT(vpages));
 	xAluRM(e, X_ADD, 4, RAX, MI(RDX, RCX, 4, isStore ? VPAGES * 4 : 0));
 	// Stores go slow on any flag (code, RDP) unless the page has only code that they miss; loads
-	// on pages the RDP may still be drawing to.
-	if (isStore || j->rdpThreads) {
+	// on pages the RDP may still be drawing to. With the D-cache's data only its fills and
+	// write-backs reach memory, in C.
+	if (!j->cacheData && (isStore || j->rdpThreads)) {
 		xMovRR(e, 4, RCX, RAX);
 		xShiftI(e, X_SHR, 4, R(RCX), 12);
 		if (isStore) {
@@ -696,6 +717,10 @@ static void emitMemory(struct Jit* j, struct Slow* slow) {
 	slow->keep = true;
 	if (isStore) {
 		xStoreI(e, 1, MI(R12, RCX, 1, (int32_t) offsetof(struct CPU, dcacheDirty)), 1);
+	}
+	if (j->cacheData) {
+		xMovRR(e, 4, RCX, R8);
+		xAluI(e, X_AND, 4, R(RCX), 0x1FFF);
 	}
 
 	switch (op >> 26) {
@@ -782,7 +807,7 @@ static void pollSkip(struct Jit* j, const uint32_t* ops, uint32_t count, uint32_
 	for (uint32_t p = paddr & ~31u; p < paddr + 4 * count; p += 32) {
 		uint32_t v = vaddr + (p - paddr);
 		struct Opnd tag = M(R12, (int32_t) (offsetof(struct CPU, icacheTag) + 4 * ((v >> 5) & 511)));
-		xAluI(e, X_CMP, 4, tag, (int32_t) (p >> 5 | 0x80000000u));
+		xAluI(e, X_CMP, 4, tag, (int32_t) (p & ~31u));
 		out[sites++] = xJcc(e, CC_NE, NULL);
 	}
 	for (uint32_t k = 0; k < count; ++k) {
@@ -906,6 +931,7 @@ void* jitCompile(struct N64* n, const uint32_t* ops, uint32_t count, uint32_t va
 	j->leave = n->jitLeave;
 	j->rdpThreads = n->rdpThreads > 0;
 	j->rdpGl = n->rdpGl;
+	j->cacheData = !n->compat;
 	struct Emitter* e = &j->e;
 
 	if (blockIsIdleLoop(ops, count, vaddr)) {
@@ -989,8 +1015,8 @@ void* jitCompile(struct N64* n, const uint32_t* ops, uint32_t count, uint32_t va
 		xJmp(e, k->resume);
 	}
 
-	// D-cache line fills, as dataTiming: the fill, the write-back of a dirty line, the new tag. A
-	// misaligned address, or one past RDRAM, takes the slow path instead.
+	// D-cache misses, filled (and a dirty line written back) in C. A misaligned address, one past
+	// RDRAM, or a write-back over code, takes the slow path instead.
 	for (int i = 0; i < j->missCount; ++i) {
 		struct Miss* m = &j->misses[i];
 		patchHere(e, m->site);
@@ -1008,16 +1034,22 @@ void* jitCompile(struct N64* n, const uint32_t* ops, uint32_t count, uint32_t va
 			xTestI(e, 1, MI(RBX, RDX, 1, (int32_t) offsetof(struct N64, pageFlags)), PAGE_RDP_WRITES);
 			m->slow->site[m->slow->sites++] = xJcc(e, CC_NE, NULL);
 		}
+		xPush(e, RAX);
+		xPush(e, R8);
+		xMovRR(e, 8, RDI, RBX);
+		xMovRR(e, 4, RSI, R8);
 		xMovRR(e, 4, RDX, RAX);
-		xAluI(e, X_AND, 4, R(RDX), ~0xF);
-		struct Opnd dirty = MI(R12, RCX, 1, (int32_t) offsetof(struct CPU, dcacheDirty));
-		xAluI(e, X_ADD, 8, R(R13), DCACHE_FILL);
-		xAluI(e, X_CMP, 1, dirty, 0);
-		uint8_t* clean = xJcc(e, CC_E, NULL);
-		xAluI(e, X_ADD, 8, R(R13), DCACHE_WRITEBACK);
-		patchHere(e, clean);
-		xStore(e, 4, MI(R12, RCX, 4, (int32_t) offsetof(struct CPU, dcacheTag)), RDX);
-		xStoreI(e, 1, dirty, 0);
+		xMovI64(e, RAX, (uint64_t) (uintptr_t) cpuDcacheMiss);
+		xCallR(e, RAX);
+		xMovRR(e, 4, RDX, RAX);
+		xPop(e, R8);
+		xPop(e, RAX);
+		xAluI(e, X_CMP, 4, R(RDX), -1);
+		m->slow->site[m->slow->sites++] = xJcc(e, CC_E, NULL);
+		xAluRR(e, X_ADD, 8, R(R13), RDX);
+		xMovRR(e, 4, RCX, R8);
+		xShiftI(e, X_SHR, 4, R(RCX), 4);
+		xAluI(e, X_AND, 4, R(RCX), 511);
 		xJmp(e, m->resume);
 	}
 	for (int i = 0; i < j->slowCount; ++i) {

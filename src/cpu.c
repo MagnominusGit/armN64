@@ -16,58 +16,237 @@ enum { ST_IE = 1, ST_EXL = 2, ST_ERL = 4, ST_FR = 1 << 26, ST_CU1 = 1 << 29, ST_
 // pdrome's instruction timing ROM, which counts loop iterations per field on hardware).
 enum { RCP_READ = 22 };
 
-static bool cached(uint64_t vaddr) {
-	return ((uint32_t) vaddr & 0xE0000000) != 0xA0000000;
+static bool address(struct N64* n, uint64_t vaddr, int align, bool store, uint32_t* paddr);
+
+// The caches (VR4300 manual, as ares has them): 512 D-cache lines of 16 bytes and 512 I-cache lines
+// of 32, picked by the virtual address and tagged with the physical one (bits 12 and up; the line
+// supplies the rest). Outside lle-compatible the lines hold their own data: stores stay in the
+// D-cache until a line is written back, and instructions come from the I-cache. lle-compatible keeps
+// memory up to date, the tags only costing the misses.
+static uint32_t dcacheAddress(const struct CPU* c, uint32_t i) {
+	return c->dcachePtag[i] | (i << 4 & 0xFF0);
 }
 
-static void fetchTiming(struct CPU* c, uint64_t vaddr, uint32_t paddr) {
-	if (!cached(vaddr)) {
-		c->stall += paddr >= RDRAM_SIZE ? RCP_READ : 0;
-		return;
-	}
-	uint32_t i = ((uint32_t) vaddr >> 5) & 511, tag = paddr >> 5 | 0x80000000u;
-	if (c->icacheTag[i] != tag) {
-		c->icacheTag[i] = tag;
-		c->stall += ICACHE_FILL;
-	}
+static uint32_t icacheAddress(const struct CPU* c, uint32_t i) {
+	return c->icachePtag[i] | (i << 5 & 0xFE0);
 }
 
-static void dataTiming(struct CPU* c, uint64_t vaddr, uint32_t paddr, bool store) {
-	if (paddr >= RDRAM_SIZE) {
-		c->stall += store ? 0 : RCP_READ;
-		return;
-	}
-	if (!cached(vaddr)) {
-		return;
-	}
-	uint32_t i = ((uint32_t) vaddr >> 4) & 511, tag = paddr & ~0xFu;
-	if (c->dcacheTag[i] != tag) {
-		c->stall += DCACHE_FILL + (c->dcacheDirty[i] ? DCACHE_WRITEBACK : 0);
-		c->dcacheTag[i] = tag;
-		c->dcacheDirty[i] = false;
-	}
-	if (store) {
-		c->dcacheDirty[i] = true;
+static void dcacheSet(struct CPU* c, uint32_t i, uint32_t ptag, bool valid) {
+	c->dcachePtag[i] = ptag & ~0xFFFu;
+	c->dcacheTag[i] = valid ? dcacheAddress(c, i) : DCACHE_NONE;
+}
+
+static void icacheSet(struct CPU* c, uint32_t i, uint32_t ptag, bool valid) {
+	c->icachePtag[i] = ptag & ~0xFFFu;
+	c->icacheTag[i] = valid ? icacheAddress(c, i) : DCACHE_NONE;
+}
+
+static void dcacheWriteBack(struct N64* n, uint32_t i) {
+	n->cpu.stall += DCACHE_WRITEBACK;
+	if (!n->compat) {
+		busWriteLine(n, dcacheAddress(&n->cpu, i), n->cpu.dcacheData[i], 16);
 	}
 }
 
-// CACHE: invalidates or writes back the line an address selects (only the timing state changes).
-static void cacheOp(struct CPU* c, uint32_t op, uint64_t vaddr) {
-	int which = (op >> 16) & 3, action = (op >> 18) & 7;
-	if (which == 0) {
-		c->icacheTag[((uint32_t) vaddr >> 5) & 511] = 0;
-		return;
+static void dcacheFill(struct N64* n, uint32_t i, uint32_t paddr) {
+	struct CPU* c = &n->cpu;
+	c->stall += DCACHE_FILL;
+	dcacheSet(c, i, paddr, true);
+	c->dcacheDirty[i] = false;
+	if (!n->compat) {
+		busReadLine(n, dcacheAddress(c, i), c->dcacheData[i], 16);
 	}
-	if (which != 1) {
-		return;
+}
+
+static void icacheFill(struct N64* n, uint32_t i, uint32_t paddr) {
+	struct CPU* c = &n->cpu;
+	c->stall += ICACHE_FILL;
+	icacheSet(c, i, paddr, true);
+	if (!n->compat) {
+		busReadLine(n, icacheAddress(c, i), c->icacheData[i], 32);
 	}
+}
+
+// The D-cache line a cached access uses, written back if dirty and filled when it misses.
+static uint32_t dcacheLine(struct N64* n, uint64_t vaddr, uint32_t paddr) {
+	struct CPU* c = &n->cpu;
 	uint32_t i = ((uint32_t) vaddr >> 4) & 511;
-	if (action != 3 && c->dcacheDirty[i]) {
-		c->stall += DCACHE_WRITEBACK;
-		c->dcacheDirty[i] = false;
+	if (c->dcacheTag[i] != (paddr & ~0xFu)) {
+		if (c->dcacheTag[i] != DCACHE_NONE && c->dcacheDirty[i]) {
+			dcacheWriteBack(n, i);
+		}
+		dcacheFill(n, i, paddr);
 	}
-	if (action == 0 || action == 4 || action == 5) {
-		c->dcacheTag[i] = DCACHE_NONE;
+	return i;
+}
+
+// For compiled code: a D-cache miss as dcacheLine has it; the cycles it costs. UINT32_MAX, with
+// nothing done, when writing the old line back could throw compiled code away (or reach the RCP): the
+// interpreter then runs the access.
+uint32_t cpuDcacheMiss(struct N64* n, uint32_t vaddr, uint32_t paddr) {
+	struct CPU* c = &n->cpu;
+	uint32_t const i = (vaddr >> 4) & 511, back = dcacheAddress(c, i);
+	if (!n->compat && c->dcacheTag[i] != DCACHE_NONE && c->dcacheDirty[i] && (back >= RDRAM_SIZE || (n->pageFlags[back >> 12] & PAGE_CODE))) {
+		return UINT32_MAX;
+	}
+	dcacheLine(n, vaddr, paddr);
+	uint32_t stall = n->cpu.stall;
+	n->cpu.stall = 0;
+	return stall;
+}
+
+static void cacheOp(struct N64* n, uint32_t op, uint64_t vaddr);
+
+// For compiled code: a D-cache or secondary cache CACHE at an aligned kseg0 address (which can't
+// fault); the cycles it costs, or UINT32_MAX as cpuDcacheMiss.
+uint32_t cpuCacheOp(struct N64* n, uint32_t op, uint32_t vaddr) {
+	struct CPU* c = &n->cpu;
+	uint32_t const i = (vaddr >> 4) & 511, back = dcacheAddress(c, i);
+	if (!n->compat && c->dcacheTag[i] != DCACHE_NONE && c->dcacheDirty[i] && (back >= RDRAM_SIZE || (n->pageFlags[back >> 12] & PAGE_CODE))) {
+		return UINT32_MAX;
+	}
+	cacheOp(n, op, sext32(vaddr));
+	uint32_t stall = c->stall;
+	c->stall = 0;
+	return stall;
+}
+
+// For compiled code: an I-cache miss; the cycles it costs.
+uint32_t cpuIcacheMiss(struct N64* n, uint32_t vaddr, uint32_t paddr) {
+	icacheFill(n, (vaddr >> 5) & 511, paddr);
+	uint32_t stall = n->cpu.stall;
+	n->cpu.stall = 0;
+	return stall;
+}
+
+// Whether a block compiled from RDRAM runs what the I-cache would: no line it touches holds other
+// words than memory has.
+bool cpuCodeCoherent(struct N64* n, uint32_t vaddr, uint32_t paddr, uint32_t count) {
+	struct CPU* c = &n->cpu;
+	if (n->compat) {
+		return true;
+	}
+	for (uint32_t p = paddr & ~31u; p < paddr + 4 * count; p += 32) {
+		uint32_t i = ((vaddr + (p - paddr)) >> 5) & 511;
+		if (c->icacheTag[i] == p && memcmp(c->icacheData[i], &n->rdram[p], 32)) {
+			return false;
+		}
+	}
+	return true;
+}
+
+// An instruction word at a translated address.
+static uint32_t fetch(struct N64* n, uint64_t vaddr, uint32_t paddr) {
+	struct CPU* c = &n->cpu;
+	if (!c->cachedAccess) {
+		c->stall += paddr >= RDRAM_SIZE ? RCP_READ : 0;
+		return busRead32(n, paddr);
+	}
+	uint32_t i = ((uint32_t) vaddr >> 5) & 511;
+	if (c->icacheTag[i] != (paddr & ~31u)) {
+		icacheFill(n, i, paddr);
+	}
+	if (n->compat) {
+		return busRead32(n, paddr);
+	}
+	const uint8_t* w = &c->icacheData[i][paddr & 28];
+	return (uint32_t) w[0] << 24 | (uint32_t) w[1] << 16 | (uint32_t) w[2] << 8 | w[3];
+}
+
+// A line's tag for CACHE Index Store Tag: compiled code holding the words it now claims runs again
+// from what the line has.
+static void icacheStoreTag(struct N64* n, uint32_t i) {
+	struct CPU* c = &n->cpu;
+	uint32_t const tl = (uint32_t) c->cop0[CP0_TAGLO];
+	icacheSet(c, i, (tl >> 8 & 0xFFFFF) << 12, tl & 0x80);
+	uint32_t const p = icacheAddress(c, i), page = p >> 12;
+	if (c->icacheTag[i] != DCACHE_NONE && p < RDRAM_SIZE && (n->pageFlags[page] & PAGE_CODE) && n64HoldsCode(n, page, p, 32)) {
+		blocksInvalidatePage(n, page);
+	}
+}
+
+// CACHE: the address translated as a word load's (address errors, TLB exceptions); the line the
+// virtual address picks; the hit operations only when it holds the physical one. The secondary
+// cache isn't there.
+static void cacheOp(struct N64* n, uint32_t op, uint64_t vaddr) {
+	struct CPU* c = &n->cpu;
+	uint32_t p;
+	if (!address(n, vaddr, 4, false, &p)) {
+		return;
+	}
+	uint32_t const di = ((uint32_t) vaddr >> 4) & 511, ii = ((uint32_t) vaddr >> 5) & 511;
+	bool const dvalid = c->dcacheTag[di] != DCACHE_NONE, dhit = c->dcacheTag[di] == (p & ~0xFu);
+	bool const ihit = c->icacheTag[ii] == (p & ~31u);
+	switch ((op >> 16) & 31) {
+	case 0x00:
+		icacheSet(c, ii, p, false);
+		break;
+	case 0x04:
+		c->cop0[CP0_TAGLO] = (c->icachePtag[ii] >> 12) << 8 | (c->icacheTag[ii] != DCACHE_NONE ? 0x80 : 0);
+		break;
+	case 0x08:
+		icacheStoreTag(n, ii);
+		break;
+	case 0x10:
+		if (ihit) {
+			icacheSet(c, ii, c->icachePtag[ii], false);
+		}
+		break;
+	case 0x14:
+		icacheFill(n, ii, p);
+		break;
+	case 0x18:
+		if (ihit) {
+			c->stall += ICACHE_FILL;
+			if (!n->compat) {
+				busWriteLine(n, icacheAddress(c, ii), c->icacheData[ii], 32);
+			}
+		}
+		break;
+	case 0x01:
+		if (dvalid) {
+			if (c->dcacheDirty[di]) {
+				dcacheWriteBack(n, di);
+			}
+			dcacheSet(c, di, p, false);
+		}
+		break;
+	case 0x05:
+		c->cop0[CP0_TAGLO] = (c->dcachePtag[di] >> 12) << 8 | (dvalid ? 0xC0 : 0);
+		break;
+	case 0x09: {
+		uint32_t const tl = (uint32_t) c->cop0[CP0_TAGLO];
+		dcacheSet(c, di, (tl >> 8 & 0xFFFFF) << 12, tl & 0x80);
+		break;
+	}
+	case 0x0D:
+		if (!dhit) {
+			if (dvalid && c->dcacheDirty[di]) {
+				dcacheWriteBack(n, di);
+			}
+			c->dcacheDirty[di] = false;
+		}
+		dcacheSet(c, di, p, true);
+		break;
+	case 0x11:
+		if (dhit) {
+			dcacheSet(c, di, c->dcachePtag[di], false);
+		}
+		break;
+	case 0x15:
+		if (dhit) {
+			if (c->dcacheDirty[di]) {
+				dcacheWriteBack(n, di);
+			}
+			dcacheSet(c, di, c->dcachePtag[di], false);
+		}
+		break;
+	case 0x19:
+		if (dhit && c->dcacheDirty[di]) {
+			dcacheWriteBack(n, di);
+			c->dcacheDirty[di] = false;
+		}
+		break;
 	}
 }
 
@@ -75,6 +254,7 @@ void cpuReset(struct N64* n) {
 	struct CPU* c = &n->cpu;
 	memset(c, 0, sizeof(*c));
 	memset(c->dcacheTag, 0xFF, sizeof(c->dcacheTag));
+	memset(c->icacheTag, 0xFF, sizeof(c->icacheTag));
 	cpuTlbChanged(n);
 	c->cop0[CP0_STATUS] = 0x34000000;
 	c->cop0[CP0_CONFIG] = 0x7006E463;
@@ -267,6 +447,7 @@ static bool translate(struct N64* n, uint64_t vaddr, bool store, uint32_t* paddr
 	uint32_t v = (uint32_t) vaddr;
 	int const seg = segmentOf(c, vaddr, paddr);
 	if (seg == SEG_CACHED || seg == SEG_DIRECT) {
+		c->cachedAccess = seg == SEG_CACHED;
 		return true;
 	}
 	if (seg == SEG_UNUSED) {
@@ -290,8 +471,9 @@ static bool translate(struct N64* n, uint64_t vaddr, bool store, uint32_t* paddr
 		return false;
 	}
 	*paddr = ((uint32_t) (lo >> 6) << 12 & ~offsetMask) | (v & offsetMask);
-	// Compiled code finds the pages through vpages, by 32-bit kernel addresses only.
-	if ((*paddr & ~0xFFFu) < RDRAM_SIZE && cpuPlainMode(n) && (uint64_t) (int64_t) (int32_t) v == vaddr) {
+	c->cachedAccess = ((lo >> 3) & 7) != 2;
+	// Compiled code finds the cached pages through vpages, by 32-bit kernel addresses only.
+	if ((*paddr & ~0xFFFu) < RDRAM_SIZE && c->cachedAccess && cpuPlainMode(n) && (uint64_t) (int64_t) (int32_t) v == vaddr) {
 		uint32_t delta = (*paddr & ~0xFFFu) - (v & ~0xFFFu);
 		uint32_t page = v >> 12, writes = lo & 4 ? delta : vpageUnknown(page);
 		if (n->vpages[page] != delta || n->vpages[VPAGES + page] != writes) {
@@ -567,17 +749,59 @@ static bool nullAccess(struct N64* n, uint64_t vaddr) {
 	return n->compat && (v < 0x10000 || v >= 0xFFFF0000u) && !cpuPeekAddress(n, vaddr, &p);
 }
 
-static bool load(struct N64* n, uint64_t vaddr, int size, uint64_t* out) {
-	uint32_t p;
+// Big-endian bytes, as RDRAM and the cache lines hold them.
+static uint64_t bytesBE(const uint8_t* b, int size) {
+	uint64_t v = 0;
+	for (int k = 0; k < size; ++k) {
+		v = v << 8 | b[k];
+	}
+	return v;
+}
+
+static void putBE(uint8_t* b, int size, uint64_t v) {
+	switch (size) {
+	case 8:
+		b[7] = (uint8_t) v, b[6] = (uint8_t) (v >> 8), b[5] = (uint8_t) (v >> 16), b[4] = (uint8_t) (v >> 24);
+		v >>= 32;
+		// fall through
+	case 4:
+		b[3] = (uint8_t) v, b[2] = (uint8_t) (v >> 8);
+		v >>= 16;
+		// fall through
+	case 2:
+		b[1] = (uint8_t) v;
+		v >>= 8;
+		// fall through
+	default:
+		b[0] = (uint8_t) v;
+	}
+}
+
+static bool loadAt(struct N64* n, uint64_t vaddr, int size, uint64_t* out, uint32_t* paddr) {
+	struct CPU* c = &n->cpu;
+	uint32_t p = 0;
 	if (nullAccess(n, vaddr)) {
 		*out = 0;
+		*paddr = 0;
 		return true;
 	}
 	if (!address(n, vaddr, size, false, &p)) {
 		return false;
 	}
-	p ^= endianLanes(&n->cpu, size);
-	dataTiming(&n->cpu, vaddr, p, false);
+	p ^= endianLanes(c, size);
+	*paddr = p;
+	if (p >= RDRAM_SIZE) {
+		c->stall += RCP_READ;
+	} else if (c->cachedAccess) {
+		uint32_t i = dcacheLine(n, vaddr, p);
+		if (!n->compat) {
+			*out = bytesBE(&c->dcacheData[i][p & (16 - size)], size);
+			if (n->idle.tracing) {
+				idleLoad(n, p, size, *out);
+			}
+			return true;
+		}
+	}
 	switch (size) {
 	case 1:
 		*out = busRead8(n, p);
@@ -597,7 +821,13 @@ static bool load(struct N64* n, uint64_t vaddr, int size, uint64_t* out) {
 	return true;
 }
 
+static bool load(struct N64* n, uint64_t vaddr, int size, uint64_t* out) {
+	uint32_t p;
+	return loadAt(n, vaddr, size, out, &p);
+}
+
 static bool store(struct N64* n, uint64_t vaddr, int size, uint64_t v) {
+	struct CPU* c = &n->cpu;
 	uint32_t p;
 	if (nullAccess(n, vaddr)) {
 		return true;
@@ -605,12 +835,19 @@ static bool store(struct N64* n, uint64_t vaddr, int size, uint64_t v) {
 	if (!address(n, vaddr, size, true, &p)) {
 		return false;
 	}
-	p ^= endianLanes(&n->cpu, size);
-	dataTiming(&n->cpu, vaddr, p, true);
+	p ^= endianLanes(c, size);
 	if (n->idle.tracing) {
 		idleStore(n, p, size, v);
 	}
-	if (!cached(vaddr) && p < 0x04000000 && busRepeatWrite(n, p, size, v)) {
+	if (p < RDRAM_SIZE && c->cachedAccess) {
+		uint32_t i = dcacheLine(n, vaddr, p);
+		c->dcacheDirty[i] = true;
+		if (!n->compat) {
+			putBE(&c->dcacheData[i][p & (16 - size)], size, v);
+			return true;
+		}
+	}
+	if (!c->cachedAccess && p < 0x04000000 && busRepeatWrite(n, p, size, v)) {
 		return true;
 	}
 	switch (size) {
@@ -1088,11 +1325,11 @@ static void loadStore(struct N64* n, uint32_t op) {
 	case 0x34: {
 		int size = (op >> 26) == 0x30 ? 4 : 8;
 		uint32_t p;
-		if (!address(n, vaddr, size, false, &p)) {
+		uint64_t v;
+		if (!loadAt(n, vaddr, size, &v, &p)) {
 			return;
 		}
-		p ^= endianLanes(c, size);
-		r[RT] = size == 4 ? sext32(busRead32(n, p)) : busRead64(n, p);
+		r[RT] = size == 4 ? sext32((uint32_t) v) : v;
 		n->idle.fatal = true;
 		c->llBit = true;
 		c->cop0[CP0_LLADDR] = p >> 4;
@@ -1243,7 +1480,14 @@ static void execute(struct N64* n, uint32_t op) {
 			cpuException(n, EXC_CPU, 1);
 			return;
 		}
+		// BC1 (the unimplemented operation past its four forms) starts with the FPU's causes clear.
 		if (RS == 0x08) {
+			fpuClearCauses(n);
+			if (RT >= 4) {
+				c->fcr31 |= 1u << 17;
+				cpuException(n, EXC_FPE, 0);
+				return;
+			}
 			bool cond = (c->fcr31 >> 23) & 1;
 			bool taken = RT & 1 ? cond : !cond;
 			if (RT & 2) {
@@ -1301,7 +1545,7 @@ static void execute(struct N64* n, uint32_t op) {
 		r[RT] = s + IMM;
 		return;
 	case 0x2F:
-		cacheOp(c, op, s + IMM);
+		cacheOp(n, op, s + IMM);
 		return;
 	case 0x31:
 	case 0x35:
@@ -1360,15 +1604,20 @@ void cpuStepOp(struct N64* n, uint32_t op, uint32_t paddr) {
 	c->inDelay = c->nextInDelay;
 	c->nextInDelay = false;
 	c->curPc = c->pc;
-	if (interruptPending(n)) {
+	bool const taken = interruptPending(n);
+	if (taken) {
 		cpuException(n, EXC_INT, 0);
 		c->curPc = c->pc;
 		if (!address(n, c->curPc, 4, false, &paddr)) {
 			return;
 		}
-		op = busRead32(n, paddr);
+	} else {
+		c->cachedAccess = true;
 	}
-	fetchTiming(c, c->curPc, paddr);
+	uint32_t const fetched = fetch(n, c->curPc, paddr);
+	if (taken || !n->compat) {
+		op = fetched;
+	}
 #ifdef N64_TRACE
 	traceInstruction(n);
 #endif
@@ -1413,8 +1662,8 @@ static bool uncachedWord(struct N64* n, uint32_t op) {
 		return false;
 	}
 	uint32_t p = (uint32_t) vaddr & 0x1FFFFFFF;
-	dataTiming(c, vaddr, p, op >> 26 == 0x2B);
 	if (op >> 26 == 0x23) {
+		c->stall += p >= RDRAM_SIZE ? RCP_READ : 0;
 		c->gpr[RT] = sext32(busRead32(n, p));
 	} else {
 		busWrite32(n, p, (uint32_t) c->gpr[RT]);
@@ -1457,8 +1706,7 @@ void cpuStep(struct N64* n) {
 		return;
 	}
 	p ^= endianLanes(c, 4);
-	fetchTiming(c, c->curPc, p);
-	uint32_t op = busRead32(n, p);
+	uint32_t op = fetch(n, c->curPc, p);
 #ifdef N64_TRACE
 	traceInstruction(n);
 #endif

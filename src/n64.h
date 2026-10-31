@@ -57,10 +57,14 @@ struct CPU {
 	uint64_t fpr[32];
 	uint32_t fcr31;
 	bool exception;
-	// Timing: cache tags (only to cost misses; the data lives in memory) and cycles owed by this step.
-	// D-cache tags are line addresses, DCACHE_NONE for an empty line.
+	// The caches (cpu.c): tags, the line's physical address while it is valid, else DCACHE_NONE; the
+	// tags as CACHE reads them back; dirty D-cache lines; the lines' data, in RDRAM's byte order.
 	uint32_t icacheTag[512], dcacheTag[512];
+	uint32_t icachePtag[512], dcachePtag[512];
 	bool dcacheDirty[512];
+	uint8_t icacheData[512][32], dcacheData[512][16];
+	// The last address translated goes through the caches.
+	bool cachedAccess;
 	uint32_t stall;
 	// Count when the timer was last checked, so a Compare value passed during a stall still fires.
 	uint32_t lastCount;
@@ -422,6 +426,10 @@ uint32_t cpuCount(struct N64*);
 bool cpuPeekAddress(struct N64*, uint64_t vaddr, uint32_t* paddr);
 // Kernel mode with 32-bit addressing, the only mode compiled code runs in.
 bool cpuPlainMode(const struct N64*);
+uint32_t cpuDcacheMiss(struct N64*, uint32_t vaddr, uint32_t paddr);
+uint32_t cpuIcacheMiss(struct N64*, uint32_t vaddr, uint32_t paddr);
+uint32_t cpuCacheOp(struct N64*, uint32_t op, uint32_t vaddr);
+bool cpuCodeCoherent(struct N64*, uint32_t vaddr, uint32_t paddr, uint32_t count);
 
 // rsp.c
 void rspInitTables(void);
@@ -531,6 +539,8 @@ static inline void n64Event(struct N64* n, uint64_t at) {
 
 // fpu.c
 void fpuExecute(struct N64*, uint32_t op);
+void fpuClearCauses(struct N64*);
+bool fpuProbe(struct N64*, uint32_t op);
 uint32_t fpuCycles(int fmt, int func);
 
 // bus.c
@@ -548,6 +558,9 @@ void busWrite64(struct N64*, uint32_t addr, uint64_t value);
 // MI repeat mode, set: the CPU's uncached write to RDRAM, spread as the MI does it; false when the
 // mode is off.
 bool busRepeatWrite(struct N64*, uint32_t addr, int size, uint64_t value);
+// A cache line's burst to or from addr.
+void busReadLine(struct N64*, uint32_t addr, uint8_t* out, int len);
+void busWriteLine(struct N64*, uint32_t addr, const uint8_t* in, int len);
 
 // rdp.c
 void rdpRun(struct N64*);
