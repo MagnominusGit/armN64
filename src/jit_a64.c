@@ -16,7 +16,7 @@
 // x17 are scratch. Each block starts with a branch to the way out, for the conditional branches that
 // can't reach it.
 
-enum { ARENA_SIZE = 64 << 20, BLOCK_CODE_MAX = 32 << 10, SHARED_SIZE = 256 };
+enum { ARENA_SIZE = 128 << 20, BLOCK_CODE_MAX = 32 << 10, SHARED_SIZE = 256 };
 
 enum { N = 19, CPU = 20, LEFT = 21, LIMIT = 22, RAM = 23, TLB = 25, PAGES = 26, DTAG = 27, DIRTY = 28, IP = 16, IP1 = 17 };
 

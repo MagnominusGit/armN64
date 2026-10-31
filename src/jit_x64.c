@@ -11,7 +11,7 @@
 // Registers: rbx = n, r12 = &n->cpu, r13 = n->cycles, r14 = the limit, r15 = RDRAM. A block that ends below the
 // limit goes on to the next through n->jitTable without returning to C.
 
-enum { ARENA_SIZE = 32 << 20, BLOCK_CODE_MAX = 32 << 10, SHARED_SIZE = 256 };
+enum { ARENA_SIZE = 256 << 20, BLOCK_CODE_MAX = 32 << 10, SHARED_SIZE = 256 };
 
 #define CPU_AT(f) M(R12, (int32_t) offsetof(struct CPU, f))
 #define N64_AT(f) M(RBX, (int32_t) offsetof(struct N64, f))
