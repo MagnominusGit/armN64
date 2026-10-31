@@ -53,3 +53,11 @@ add_library(armn64_libretro SHARED libretro/libretro.c)
 target_link_libraries(armn64_libretro n64 armulators-libretro)
 set_target_properties(armn64_libretro PROPERTIES PREFIX "")
 target_link_options(armn64_libretro PRIVATE -Wl,--version-script=${ARMULATORS_LINK_SCRIPT} -Wl,--no-undefined)
+
+# armn64, the standalone app: Armulators' (armulators/app) with the core linked in, named by
+# app.cmake, with its own rules from app/.
+option(ARMN64_APP "Build armn64, the standalone SDL2 app" OFF)
+if(ARMN64_APP)
+	armulators_app(armn64-app DESCRIPTOR ${CMAKE_CURRENT_SOURCE_DIR}/app.cmake
+		SOURCES libretro/libretro.c app/hooks.c INCLUDES ${CMAKE_CURRENT_SOURCE_DIR}/libretro LIBS n64)
+endif()

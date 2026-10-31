@@ -34,7 +34,17 @@ A lean, low-level Nintendo 64 emulator for x86-64 and ARM handhelds.
 - `tools/n64run.c` runs a ROM headless and writes the last picture.
 - `libretro/` the libretro core (`armn64_libretro`): a field each run, the VI's picture, the AI's
   samples at 44.1 kHz, controller 1 and the cartridge's save memory (EEPROM, then SRAM or flash).
-- `armulators/` the code shared with armGBA (submodule): the code generators and the libretro
-  core's helpers.
+- `armulators/` the code shared with armGBA (submodule): the code generators, the libretro
+  core's helpers and the standalone app.
+- `app.cmake` and `app/` armN64's standalone app: Armulators' app with the core linked in, its
+  names, systems and icons, and its hooks (the CPU renderer until the app shares its GL context).
+
+The app, and its AppImages and APK (into `build-appimage/` and `build-android/`):
+
+    git submodule update --init
+    cmake -S . -B build -G Ninja -DARMN64_APP=ON
+    ninja -C build armn64-app
+    armulators/package/appimage/build.sh && armulators/package/appimage/package.sh
+    armulators/package/android/build.sh
 
 Licensed under the GNU General Public License, version 3 (`LICENSE`).
