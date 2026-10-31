@@ -36,3 +36,5 @@ A lean, low-level Nintendo 64 emulator for x86-64 and ARM handhelds.
   samples at 44.1 kHz, controller 1 and the cartridge's save memory (EEPROM, then SRAM or flash).
 - `armulators/` the code shared with armGBA (submodule): the code generators and the libretro
   core's helpers.
+
+Licensed under the GNU General Public License, version 3 (`LICENSE`).
