@@ -12,7 +12,7 @@
 // Registers: rbx = n, r12 = &n->rsp, r13 = clock, r14 = the limit, r15 = lastStart,
 // ebp = lastAlone.
 
-enum { ARENA_SIZE = 4 << 20, BLOCK_CODE_MAX = 32 << 10, SHARED_SIZE = 256, BLOCK_MAX = 64 };
+enum { ARENA_SIZE = 32 << 20, BLOCK_CODE_MAX = 32 << 10, SHARED_SIZE = 256, BLOCK_MAX = 64 };
 
 #define RSP_AT(f) M(R12, (int32_t) offsetof(struct RSP, f))
 #define N64_AT(f) M(RBX, (int32_t) offsetof(struct N64, f))
@@ -72,7 +72,14 @@ static void loadTiming(struct Emitter* e) {
 
 // rspTimingStep for an instruction whose predecessor (prev, at pc - 4) is in the same block, which
 // issued alone or paired as ebp says. Paired when it may and all it reads was ready at lastStart.
+// rspPlainTiming, for the block being compiled.
+static bool plainTiming;
+
 static void emitTiming(struct Emitter* e, uint32_t op, uint32_t prev, uint32_t pc) {
+	if (plainTiming) {
+		xLea(e, 8, R13, M(R13, 1 + rspIsBranch(op)));
+		return;
+	}
 	int scalar[8], vector[16], nv, written[16], latency[16], nw;
 	int ns = rspTimingRegs(op, scalar, vector, &nv, written, latency, &nw);
 	bool pairable = rspPairable(prev, (pc - 4) & 0xFFC, op);
@@ -467,6 +474,7 @@ static void chain(struct Jit* j) {
 
 // Code for count instructions (as IMEM holds them) from start, or NULL when the arena is full.
 void* rspCompile(struct N64* n, const uint8_t* ops, uint32_t count, uint32_t start) {
+	plainTiming = n->rspPlainTiming;
 	uint8_t* arena = arenaGet(n);
 	if (!arena || n->rspUsed + BLOCK_CODE_MAX > ARENA_SIZE) {
 		return NULL;

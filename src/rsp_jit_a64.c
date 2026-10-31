@@ -12,7 +12,7 @@
 // w24 = lastAlone, x25 = DMEM, w26 = IMEM's generation before a call, x27 = the vector registers
 // (vr, then the accumulator, VCO, VCC and VCE), x28 = vectorConstants.
 
-enum { ARENA_SIZE = 4 << 20, BLOCK_CODE_MAX = 32 << 10, SHARED_SIZE = 256, BLOCK_MAX = 64 };
+enum { ARENA_SIZE = 32 << 20, BLOCK_CODE_MAX = 32 << 10, SHARED_SIZE = 256, BLOCK_MAX = 64 };
 
 enum { N = 19, RSP = 20, CLOCK = 21, LIMIT = 22, START = 23, ALONE = 24, DMEM = 25, GEN = 26, VR = 27, VCONST = 28, IP = 16 };
 
@@ -86,7 +86,14 @@ static void exitAt(struct Jit* j, uint8_t* site, uint32_t op, uint32_t pc, enum 
 
 // rspTimingStep for an instruction whose predecessor (prev, at pc - 4) is in the same block, which
 // issued alone or paired as w24 says. Paired when it may and all it reads was ready at lastStart.
+// rspPlainTiming, for the block being compiled.
+static bool plainTiming;
+
 static void emitTimingAs(struct Emitter* e, uint32_t op, bool pairable) {
+	if (plainTiming) {
+		aDpImm(e, A_ADD_IMM | W64, CLOCK, CLOCK, 1 + rspIsBranch(op));
+		return;
+	}
 	int scalar[8], vector[16], nv, written[16], latency[16], nw;
 	int ns = rspTimingRegs(op, scalar, vector, &nv, written, latency, &nw);
 	if (pairable) {
@@ -1059,6 +1066,7 @@ static void chain(struct Jit* j) {
 
 // Code for count instructions (as IMEM holds them) from start, or NULL when the arena is full.
 void* rspCompile(struct N64* n, const uint8_t* ops, uint32_t count, uint32_t start) {
+	plainTiming = n->rspPlainTiming;
 	uint8_t* arena = arenaGet(n);
 	if (!arena || n->rspUsed + BLOCK_CODE_MAX > ARENA_SIZE) {
 		return NULL;

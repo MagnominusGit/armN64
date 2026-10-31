@@ -127,6 +127,7 @@ static void start(struct N64* n) {
 	// emulators hacks were made on.
 	n->compat = n->accuracy == ACCURACY_MLE;
 	n->emulatorLike = n->accuracy != ACCURACY_LLE;
+	n->rspPlainTiming = n->accuracy != ACCURACY_LLE;
 	n->fast = n->accuracy == ACCURACY_HLE;
 	const char* idleSkip = setting(n, "N64_IDLESKIP");
 	n->idle.enabled = n->accuracy == ACCURACY_HLE && !(idleSkip && idleSkip[0] == '0');

@@ -319,6 +319,9 @@ struct N64 {
 	bool emulatorLike;
 	// HLE accuracy puts speed first: the host's FPU arithmetic, and no cache tags or data.
 	bool fast;
+	// mle and hle: the RSP takes a cycle an instruction (two for a branch), without lle's dual
+	// issue and pipeline stalls.
+	bool rspPlainTiming;
 	// The RSP is being caught up: its own accesses to the shared registers must not catch it up again.
 	bool catchingUp;
 	uint64_t nextVi;

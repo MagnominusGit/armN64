@@ -417,6 +417,10 @@ static bool pairs(struct RSP* r, uint32_t op) {
 // its results are ready.
 void rspTimingStep(struct N64* n, uint32_t op, uint32_t pc) {
 	struct RSP* r = &n->rsp;
+	if (n->rspPlainTiming) {
+		r->clock += 1 + isBranch(op);
+		return;
+	}
 	uint64_t start = issueTime(r, op);
 	if (pairs(r, op)) {
 		uint64_t clock = r->clock;
