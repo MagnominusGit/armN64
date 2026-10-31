@@ -126,6 +126,7 @@ static void start(struct N64* n) {
 	// HLE draws at high level with the hardware's own timing; only mle behaves like the
 	// emulators hacks were made on.
 	n->compat = n->accuracy == ACCURACY_MLE;
+	n->emulatorLike = n->accuracy != ACCURACY_LLE;
 	n->fast = n->accuracy == ACCURACY_HLE;
 	const char* idleSkip = setting(n, "N64_IDLESKIP");
 	n->idle.enabled = n->accuracy == ACCURACY_HLE && !(idleSkip && idleSkip[0] == '0');
@@ -477,7 +478,7 @@ static bool viSetup(struct N64* n, struct ViSetup* s) {
 	uint32_t xScale = v[12] & 0xFFF, yScale = v[13] & 0xFFF;
 	// In mle accuracy, an empty window (osViBlack) shows the picture anyway in the TV type's
 	// usual one, as emulators that draw the RDP's image directly do.
-	if (n->compat && (hEnd <= hStart || vEnd <= vStart)) {
+	if (n->emulatorLike && (hEnd <= hStart || vEnd <= vStart)) {
 		bool pal = n->fieldCycles == hwCycles(n, CPU_HZ / 50);
 		hStart = pal ? 0x80 : 0x6C, hEnd = pal ? 0x300 : 0x2EC;
 		vStart = pal ? 0x5F : 0x25, vEnd = pal ? 0x239 : 0x1FF;

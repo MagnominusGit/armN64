@@ -308,11 +308,15 @@ struct N64 {
 	// N64_ACCURACY: lle (the default) is the hardware, cycle for cycle. mle, the middle ground, also
 	// runs hacks made on emulators: RDRAM starts zeroed, misaligned CPU accesses align down instead of
 	// raising address errors, unmapped null-pointer accesses read zero, PI DMA copies between the
-	// exact addresses and takes a quarter cycle a byte, SP DMA keeps the RDRAM address's low bits, and
-	// a blanked VI window still shows the picture. hle puts speed first: high-level graphics (hle.c)
-	// for the microcodes it knows. compat is true for mle only.
+	// exact addresses and takes a quarter cycle a byte, and a blanked VI window still shows the
+	// picture. hle puts speed first: high-level graphics (hle.c) for the microcodes it knows, which
+	// also reads display lists hacks left at addresses the RSP's DMA can't (SP DMA is 8-byte aligned
+	// in every mode). compat is true for mle only; emulatorLike for mle and hle.
 	int accuracy;
 	bool compat;
+	// mle and hle behave like the emulators hacks were made on where retail games can't tell: PI DMA
+	// copies between the exact addresses (odd ones too), and a blanked VI window shows the picture.
+	bool emulatorLike;
 	// HLE accuracy puts speed first: the host's FPU arithmetic, and no cache tags or data.
 	bool fast;
 	// The RSP is being caught up: its own accesses to the shared registers must not catch it up again.

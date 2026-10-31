@@ -28,7 +28,7 @@ static void spDma(struct N64* n, uint32_t lenReg, bool toRdram) {
 	n->sp.dmaUntil = start + 26 + row + (count - 1) * (row > least ? row : least);
 	uint32_t mem = n->sp.memAddr & 0x1FF8;
 	uint32_t base = mem & 0x1000;
-	uint32_t dram = n->sp.dramAddr & (n->compat ? 0xFFFFFF : 0xFFFFF8);
+	uint32_t dram = n->sp.dramAddr & 0xFFFFF8;
 	for (uint32_t row = 0; row < count; ++row) {
 		if (toRdram) {
 			n64RdramWrite(n, dram, len);
@@ -242,7 +242,7 @@ static void piRdramByte(struct N64* n, uint32_t addr, uint8_t v) {
 // Cartridge to RDRAM goes through the RCP's 128-byte buffer, a block at a time, never crossing a
 // 2 KiB RDRAM page.
 static void piDmaToRdram(struct N64* n, uint32_t len) {
-	if (n->compat) {
+	if (n->emulatorLike) {
 		for (uint32_t i = 0; i < len; ++i) {
 			piRdramByte(n, n->pi.dramAddr + i, cartByte(n, n->pi.cartAddr + i));
 		}
@@ -600,7 +600,7 @@ void busWrite32(struct N64* n, uint32_t addr, uint32_t v) {
 			n->sp.memAddr = v & 0x1FF8;
 			break;
 		case 0x04:
-			n->sp.dramAddr = v & (n->compat ? 0xFFFFFF : 0xFFFFF8);
+			n->sp.dramAddr = v & 0xFFFFF8;
 			break;
 		case 0x08:
 			spDma(n, v, false);
@@ -742,10 +742,10 @@ void busWrite32(struct N64* n, uint32_t addr, uint32_t v) {
 	case 0x046:
 		switch (addr & 0x3F) {
 		case 0x00:
-			n->pi.dramAddr = v & (n->compat ? 0xFFFFFF : 0xFFFFFE);
+			n->pi.dramAddr = v & (n->emulatorLike ? 0xFFFFFF : 0xFFFFFE);
 			break;
 		case 0x04:
-			n->pi.cartAddr = n->compat ? v : v & ~1u;
+			n->pi.cartAddr = n->emulatorLike ? v : v & ~1u;
 			break;
 		case 0x08:
 			piDma(n, (v & 0xFFFFFF) + 1, false);
