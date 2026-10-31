@@ -159,7 +159,7 @@ struct Jit {
 	bool rdpThreads, rdpGl;
 	// Outside mle the D-cache holds the data cached accesses use; with HLE accuracy (fast)
 	// there are no caches.
-	bool cacheData, fast;
+	bool cacheData, fast, plainCount;
 	// Status.FR as the block was compiled: with it clear, odd 32-bit FPU registers are the high
 	// halves of even ones.
 	bool fr;
@@ -503,6 +503,9 @@ static bool emitCop0(struct Jit* j, uint32_t op) {
 		}
 		if (rt) {
 			int d = writeReg(j, rt);
+			if (rd == CP0_COUNT && !j->plainCount) {
+				return false;
+			}
 			if (rd == CP0_COUNT) {
 				// Count: half the cycles before this instruction, from countBase.
 				aDp(e, A_SUB | W64, 0, LIMIT, LEFT, S_LSL, 0);
@@ -1670,6 +1673,7 @@ void* jitCompile(struct N64* n, const uint32_t* ops, uint32_t count, uint32_t va
 	j->rdpThreads = n->rdpThreads > 0;
 	j->rdpGl = n->rdpGl;
 	j->fast = n->fast;
+	j->plainCount = n->countCycles == 2;
 	j->cacheData = !n->compat && !n->fast;
 	j->fr = n->cpu.cop0[CP0_STATUS] & (1 << 26);
 	struct Emitter* e = &j->e;

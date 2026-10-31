@@ -97,6 +97,9 @@ static struct retro_core_option_v2_definition optionDefinitions[] = {
 	{ "armn64_renderer", "Renderer (Restart)", NULL,
 	  "GPU draws with OpenGL ES 3.1: HLE with the GL renderer, MLE and LLE with the RDP in compute shaders (exact, but slower than the renderer threads on most handhelds). CPU draws with the renderer threads. Auto takes the GPU for HLE and the CPU otherwise.",
 	  NULL, "system", { { "auto", "Auto" }, { "gpu", "GPU" }, { "cpu", "CPU" }, { NULL, NULL } }, "auto" },
+	{ "armn64_overclock", "Overclock (Restart)", NULL,
+	  "Runs the CPU, RSP and RDP faster than the hardware while video, audio and the game's timers keep real time: less slowdown, and room for ROM hacks made on emulators. Some games depend on the hardware's timing. MLE and HLE only.",
+	  NULL, "system", { { "1", "Off" }, { "1.5", "1.5x" }, { "2", "2x" }, { "2.5", "2.5x" }, { "3", "3x" }, { "4", "4x" }, { NULL, NULL } }, "1" },
 	{ "armn64_resolution", "Resolution (Restart)", NULL,
 	  "HLE's GL renderer draws at this many times the game's resolution: sharper edges and textures, at a GPU cost. What the game reads back from its framebuffer stays at its own resolution.",
 	  NULL, "system", { { "1", "Native" }, { "2", "2x" }, { "3", "3x" }, { "4", "4x" }, { NULL, NULL } }, "1" },
@@ -129,6 +132,9 @@ static const char* settings(const char* name) {
 	static char threads[4];
 	if (!strcmp(name, "N64_ACCURACY")) {
 		return optionValue(environment, "armn64_accuracy");
+	}
+	if (!strcmp(name, "N64_OVERCLOCK")) {
+		return optionValue(environment, "armn64_overclock");
 	}
 	if (!strcmp(name, "N64_GL_SCALE")) {
 		return optionValue(environment, "armn64_resolution");
@@ -486,7 +492,7 @@ bool retro_load_game(const struct retro_game_info* info) {
 		logMessage(RETRO_LOG_ERROR, "this game can't be loaded");
 		return false;
 	}
-	pal = machine->fieldCycles == CPU_HZ / 50;
+	pal = machine->fieldCycles == hwCycles(machine, CPU_HZ / 50);
 	saveExport();
 	saveGiven = false;
 	struct retro_rumble_interface rumble;

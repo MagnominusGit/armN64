@@ -192,7 +192,7 @@ static void motorActive(struct DD* d) {
 }
 
 static void schedule(struct N64* n, uint64_t* at, uint64_t delay) {
-	*at = n->cycles + delay;
+	*at = n->cycles + hwCycles(n, delay);
 	n64Event(n, *at);
 }
 
@@ -244,7 +244,7 @@ static uint8_t bcd(unsigned v) {
 }
 
 static void rtcNow(const struct N64* n, uint8_t out[6]) {
-	uint64_t secs = n->cycles / CPU_HZ;
+	uint64_t secs = n->cycles / hwCycles(n, CPU_HZ);
 	unsigned second = secs % 60, minute = secs / 60 % 60, hour = secs / 3600 % 24;
 	unsigned day = (unsigned) (secs / 86400), month = 1, year = 0;
 	static const uint8_t days[12] = { 31, 29, 31, 30, 31, 30, 31, 31, 30, 31, 30, 31 };

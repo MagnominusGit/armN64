@@ -203,6 +203,17 @@ int main(int argc, char** argv) {
 			n->pad[0] = pad;
 		}
 		n64RunField(n);
+		// The game's frames: how often the VI starts showing another framebuffer.
+		static uint32_t lastOrigin;
+		static int flips;
+		if (n->vi.reg[1] != lastOrigin) {
+			lastOrigin = n->vi.reg[1];
+			++flips;
+		}
+		if (getenv("N64FPS") && (f + 1) % 300 == 0) {
+			printf("fields %d-%d: %.1f game frames a second\n", f - 298, f + 1, flips / 5.0);
+			flips = 0;
+		}
 		if (pics) {
 			struct timespec a, b;
 			int pw, ph;

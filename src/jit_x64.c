@@ -114,7 +114,7 @@ struct Jit {
 	bool rdpThreads, rdpGl;
 	// Outside mle the D-cache holds the data cached accesses use; with HLE accuracy (fast)
 	// there are no caches.
-	bool cacheData, fast;
+	bool cacheData, fast, plainCount;
 };
 
 static void exitAt(struct Jit* j, uint8_t* site, uint64_t pc, enum Kind kind, bool delay, bool skip) {
@@ -200,6 +200,9 @@ static bool emitCop0(struct Jit* j, uint32_t op) {
 	if (rs == 0x00 || rs == 0x01) {
 		// Random, and the unused registers that read the write latch, in C.
 		if (rd == CP0_RANDOM || (rd >= 21 && rd <= 25) || rd == 31) {
+			return false;
+		}
+		if (rt && rd == CP0_COUNT && !j->plainCount) {
 			return false;
 		}
 		if (rt) {
@@ -955,6 +958,7 @@ void* jitCompile(struct N64* n, const uint32_t* ops, uint32_t count, uint32_t va
 	j->rdpThreads = n->rdpThreads > 0;
 	j->rdpGl = n->rdpGl;
 	j->fast = n->fast;
+	j->plainCount = n->countCycles == 2;
 	j->cacheData = !n->compat && !n->fast;
 	struct Emitter* e = &j->e;
 

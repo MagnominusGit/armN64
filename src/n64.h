@@ -384,6 +384,10 @@ struct N64 {
 	int lastWidth, lastHeight;
 	// CPU cycles per video field: 60 fields a second for NTSC and MPAL, 50 for PAL.
 	uint64_t fieldCycles;
+	// Overclocking (N64_OVERCLOCK, MLE and HLE): the CPU, RSP and RDP run ocNum / ocDen times the
+	// hardware's clock, so the VI, AI, PI, SI, 64DD and Count, which keep real time, take that many
+	// more cycles; countCycles cycles a Count tick (2 at the hardware's clock).
+	uint32_t ocNum, ocDen, countCycles;
 	uint64_t fields;
 	// Where the settings (N64_ACCURACY and the others) come from when the machine starts: the
 	// environment unless a frontend gives its own lookup.
@@ -644,6 +648,16 @@ void pifBoot(struct N64*);
 void pifRun(struct N64*);
 void pifRead(struct N64*);
 uint32_t pifDmaCycles(struct N64*, bool write);
+
+// A real time in the hardware's cycles (93.75 MHz) in the CPU's, which overclocking makes more of.
+static inline uint64_t hwCycles(const struct N64* n, uint64_t cycles) {
+	return cycles * n->ocNum / n->ocDen;
+}
+
+// The RSP's clock now: two thirds of the CPU's.
+static inline uint64_t rspCycles(const struct N64* n) {
+	return n->cycles * 2 / 3;
+}
 
 static inline uint32_t be32(const uint8_t* p) {
 	return (uint32_t) p[0] << 24 | (uint32_t) p[1] << 16 | (uint32_t) p[2] << 8 | p[3];

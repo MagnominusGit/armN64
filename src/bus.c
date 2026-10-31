@@ -13,7 +13,7 @@ static inline uint32_t* reg(uint32_t* regs, uint32_t addr, int count) {
 // RDRAM there is (no mirror): it reads zeros and takes no writes (libdragon's IPL3 clears IMEM so).
 // The RCP's time: the RSP's while it is being caught up, else the CPU's.
 static uint64_t rcpNow(struct N64* n) {
-	return n->catchingUp ? n->rsp.clock : n->cycles * 2 / 3;
+	return n->catchingUp ? n->rsp.clock : rspCycles(n);
 }
 
 static void spDma(struct N64* n, uint32_t lenReg, bool toRdram) {
@@ -174,7 +174,7 @@ static void spWriteStatus(struct N64* n, uint32_t v) {
 // Playing time of a buffer: four bytes per stereo sample at the VI clock over (dacrate + 1).
 static uint64_t aiDuration(struct N64* n, uint32_t len) {
 	uint64_t rate = 48681812ull / (n->ai.dacrate + 1);
-	return rate ? (uint64_t) (len / 4) * CPU_HZ / rate : 0;
+	return rate ? hwCycles(n, (uint64_t) (len / 4) * CPU_HZ / rate) : 0;
 }
 
 // A buffer the game queued, kept for a frontend as it is now in RDRAM.
@@ -339,7 +339,7 @@ static void piDma(struct N64* n, uint32_t len, bool toRdram) {
 	n->stats.piBytes += len;
 	uint64_t rcp = piDmaCycles(n, cart, len);
 	// Emulators that hacks were made on finish a DMA in a quarter cycle a byte (mle accuracy).
-	n->pi.busyUntil = n->cycles + (n->compat ? len / 4 + 1 : rcp * 3 / 2);
+	n->pi.busyUntil = n->cycles + hwCycles(n, n->compat ? len / 4 + 1 : rcp * 3 / 2);
 	n64Event(n, n->pi.busyUntil);
 	n->pi.status |= 1;
 }
@@ -362,7 +362,7 @@ static void siDma(struct N64* n, bool toPif) {
 	}
 	// The PIF takes a while to run the commands; the interrupt comes when the transfer is done.
 	n->si.status |= 1;
-	n->si.busyUntil = n->cycles + (n->compat ? SI_DMA_CYCLES : rcp * 3 / 2);
+	n->si.busyUntil = n->cycles + hwCycles(n, n->compat ? SI_DMA_CYCLES : rcp * 3 / 2);
 	n64Event(n, n->si.busyUntil);
 }
 
@@ -576,7 +576,7 @@ void busWrite32(struct N64* n, uint32_t addr, uint32_t v) {
 	}
 	if (addr >= 0x1FC007C0 && addr < 0x1FC00800) {
 		put32(&n->pifRam[addr & 0x3C], v);
-		n->si.ioUntil = n->cycles + (n->compat ? 0 : 2158 * 3 / 2);
+		n->si.ioUntil = n->cycles + hwCycles(n, n->compat ? 0 : 2158 * 3 / 2);
 		return;
 	}
 	switch (addr >> 20) {
@@ -803,7 +803,7 @@ void busWrite32(struct N64* n, uint32_t addr, uint32_t v) {
 		// Domain 1 timing for one word: a setup, the latency, then two halfwords of pulse and release
 		// (the setup from hacktarux's n64-systembench).
 		const uint32_t* t = n->pi.timing;
-		n->pi.romLatchUntil = n->cycles + (10 + (t[0] + 1) + 2 * ((t[1] + 1) + (t[3] + 1))) * 3 / 2;
+		n->pi.romLatchUntil = n->cycles + hwCycles(n, (10 + (t[0] + 1) + 2 * ((t[1] + 1) + (t[3] + 1))) * 3 / 2);
 	}
 }
 

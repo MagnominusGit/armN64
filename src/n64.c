@@ -27,8 +27,10 @@ struct N64* n64Create(void) {
 		free(n);
 		return NULL;
 	}
-	// Controller 1 plugged in; Controller Paks as they come formatted; flash erased.
+	// Controller 1 plugged in; Controller Paks as they come formatted; flash erased; the hardware's clock.
 	n->plugged[0] = PLUG_CONTROLLER;
+	n->ocNum = n->ocDen = 1;
+	n->countCycles = 2;
 	for (int i = 0; i < 4; ++i) {
 		pakFormat(n->paks[i]);
 	}
@@ -146,7 +148,16 @@ static void start(struct N64* n) {
 	pifBoot(n);
 	n->eeprom16k = n->rom ? cartEeprom16k(n->rom) : false;
 	memset(n->eeprom, 0xFF, sizeof(n->eeprom));
-	n->fieldCycles = CPU_HZ / (n->cpu.gpr[20] == 0 ? 50 : 60);
+	// 1, 1.5, 2, 2.5, 3 or 4 times the CPU's clock; LLE is always the hardware's.
+	const char* overclock = setting(n, "N64_OVERCLOCK");
+	double factor = overclock && n->accuracy != ACCURACY_LLE ? strtod(overclock, NULL) : 1;
+	n->ocDen = 2;
+	n->ocNum = factor >= 1 && factor <= 4 ? (uint32_t) (factor * 2 + 0.5) : 2;
+	if (n->ocNum % 2 == 0) {
+		n->ocNum /= 2, n->ocDen = 1;
+	}
+	n->countCycles = 2 * n->ocNum / n->ocDen;
+	n->fieldCycles = hwCycles(n, CPU_HZ / (n->cpu.gpr[20] == 0 ? 50 : 60));
 	n->vi.reg[6] = n->cpu.gpr[20] == 0 ? 0x271 : 0x20D;
 	n->nextVi = n->fieldCycles;
 	n->eventAt = 0;
@@ -207,7 +218,7 @@ void rspCatchUp(struct N64* n) {
 		return;
 	}
 	// The RSP runs at two thirds of the CPU clock, on its own cycle count.
-	uint64_t rspNow = n->cycles * 2 / 3;
+	uint64_t rspNow = rspCycles(n);
 	if ((n->sp.status & 1) || n->sp.hleDoneAt) {
 		n->rsp.clock = rspNow;
 		return;
@@ -463,7 +474,7 @@ static bool viSetup(struct N64* n, struct ViSetup* s) {
 	// In mle accuracy, an empty window (osViBlack) shows the picture anyway in the TV type's
 	// usual one, as emulators that draw the RDP's image directly do.
 	if (n->compat && (hEnd <= hStart || vEnd <= vStart)) {
-		bool pal = n->fieldCycles == CPU_HZ / 50;
+		bool pal = n->fieldCycles == hwCycles(n, CPU_HZ / 50);
 		hStart = pal ? 0x80 : 0x6C, hEnd = pal ? 0x300 : 0x2EC;
 		vStart = pal ? 0x5F : 0x25, vEnd = pal ? 0x239 : 0x1FF;
 	}

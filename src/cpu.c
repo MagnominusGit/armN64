@@ -305,9 +305,10 @@ void cpuReset(struct N64* n) {
 	c->nextPc = c->pc + 4;
 }
 
-// Count runs at half the CPU clock, from the cycle countBase (a write starts it on an edge, ares).
+// Count runs at half the hardware's clock (countCycles CPU cycles a tick), from the cycle countBase (a
+// write starts it on an edge, ares).
 uint32_t cpuCount(struct N64* n) {
-	return (uint32_t) ((n->cycles - n->cpu.countBase) >> 1);
+	return (uint32_t) ((n->cycles - n->cpu.countBase) / n->countCycles);
 }
 
 static bool cpuWide(const struct CPU* c);
@@ -663,7 +664,7 @@ static void cop0Write(struct N64* n, int r, uint64_t v) {
 		cop0[r] = (uint32_t) v;
 		return;
 	case CP0_COUNT:
-		n->cpu.countBase = n->cycles - 2 * (uint64_t) (uint32_t) v;
+		n->cpu.countBase = n->cycles - n->countCycles * (uint64_t) (uint32_t) v;
 		n->cpu.lastCount = (uint32_t) v;
 		return;
 	// The timer is checked from the Count at the write on, as each instruction checks it (compiled
@@ -1693,7 +1694,7 @@ bool cpuJitReady(struct N64* n) {
 		return false;
 	}
 	uint32_t delta = (uint32_t) c->cop0[CP0_COMPARE] - now;
-	n->jitFire = n->cycles - ((n->cycles - c->countBase) & 1) + 2 * (delta ? delta : 1ull << 32);
+	n->jitFire = c->countBase + ((n->cycles - c->countBase) / n->countCycles + (delta ? delta : 1ull << 32)) * n->countCycles;
 	n->jitLimit = n->eventAt < n->jitFire ? n->eventAt : n->jitFire;
 	return true;
 }
