@@ -75,6 +75,8 @@ struct RDP {
 	// P, A, M and B inputs for each cycle.
 	int cycleType, zMode, cvgDest;
 	bool antialias, imageRead, colorOnCvg, zCompare, zUpdate, zPrim, alphaCompare, cvgAlpha, cvgTimesAlpha, forceBlend, texConvert;
+	// The dither modes for colour and alpha (other modes' rgb_dither_sel and alpha_dither_sel).
+	int ditherRgb, ditherAlpha;
 	uint8_t blendSel[2][4];
 	// The rows this renderer draws: y % rowCount == rowIndex (rowCount 0: none).
 	int rowIndex, rowCount;

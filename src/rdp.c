@@ -78,8 +78,12 @@ static bool usesNoise(const struct RDP* r) {
 }
 
 // A pixel's dither: three bits for each colour channel (red lowest) and alpha's.
-static void ditherAt(const struct RDP* r, int x, int y, int* rgb, int* alpha) {
-	int modeRgb = (int) (r->otherModes >> 38) & 3, modeAlpha = (int) (r->otherModes >> 36) & 3;
+static inline void ditherAt(const struct RDP* r, int x, int y, int* rgb, int* alpha) {
+	int const modeRgb = r->ditherRgb, modeAlpha = r->ditherAlpha;
+	if (modeRgb == 3 && modeAlpha == 3) {
+		*rgb = *alpha = 0;
+		return;
+	}
 	int i = (y & 3) * 4 + (x & 3);
 	*rgb = modeRgb < 2 ? ditherMatrix[modeRgb][i] * 0x49 : modeRgb == 2 ? (int) (pixelNoise(r, x, y, 4) & 0x1FF) : 0;
 	if (modeAlpha == 3) {
@@ -750,6 +754,7 @@ static void setupModes(struct RDP* r) {
 	r->cvgTimesAlpha = (m >> 12) & 1;
 	r->texConvert = r->cycleType < 2 && (!((m >> 43) & 1) || (r->cycleType == 1 && (!((m >> 42) & 1) || ((m >> 41) & 1))));
 	r->forceBlend = (m >> 14) & 1;
+	r->ditherRgb = (m >> 38) & 3, r->ditherAlpha = (m >> 36) & 3;
 	for (int cycle = 0; cycle < 2; ++cycle) {
 		for (int i = 0; i < 4; ++i) {
 			r->blendSel[cycle][i] = (m >> (30 - cycle * 2 - i * 4)) & 3;
@@ -960,7 +965,7 @@ static void shadePixel(struct N64* n, struct RDP* r, int x, int y, struct Pixel*
 	}
 	// The image keeps the coverage (the alpha bit of 16-bit pixels with two hidden bits, the top 3
 	// alpha bits of 32-bit ones), as cvg_dest says.
-	if (((r->otherModes >> 38) & 3) != 3) {
+	if (r->ditherRgb != 3) {
 		int* o = &out.r;
 		for (int ch = 0; ch < 3; ++ch) {
 			if (((rgbDither >> (ch * 3)) & 7) < (o[ch] & 7)) {
@@ -1325,7 +1330,7 @@ static const int16_t perspectiveTable[64][2] = {
 
 // Texture coordinates from s, t and w (each the top 16 bits): with perspective, s and t times a
 // table's reciprocal of w (the RDP's divide), saturating; 17 bits signed.
-static void texCoords(int32_t sS, int32_t sT, int32_t sW, bool persp, int* s, int* t) {
+static inline __attribute__((always_inline)) void texCoords(int32_t sS, int32_t sT, int32_t sW, bool persp, int* s, int* t) {
 	int32_t st[2] = { sS >> 16, sT >> 16 };
 	if (persp) {
 		int32_t w = sW >> 16;
@@ -1425,8 +1430,14 @@ static void triangle(struct N64* n, struct RDP* r, const uint64_t* w, int op) {
 		int32_t row[8];
 		int baseX;
 		rowAttributes(&e, &a, y, r->cycleType == 2, row, &baseX);
+		// Pixels whose samples (eighths 0 to 6) are inside all four sub-scanlines are covered whole.
+		int32_t inLeft = 0, inRight = INT32_MAX;
+		for (int k = 0; k < 4; ++k) {
+			inLeft = sp.left[k] > inLeft ? sp.left[k] : inLeft;
+			inRight = sp.right[k] < inRight ? sp.right[k] : inRight;
+		}
 		for (int x = sp.x0; x <= sp.x1; ++x) {
-			int mask = coverageMask(&sp, x);
+			int mask = x * 8 >= inLeft && x * 8 + 6 < inRight ? 0xFF : coverageMask(&sp, x);
 			// A pixel is drawn when any sample is covered with antialiasing, else when the first is.
 			if (!mask || (!r->antialias && !(mask & 1))) {
 				continue;
