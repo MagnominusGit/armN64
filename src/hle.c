@@ -55,6 +55,10 @@ struct Hle {
 	uint32_t geometry;
 	// F3DPD's table of vertex colours.
 	uint32_t colorBase;
+	// S2DEX: the 2D matrix (A to D, the offset in pixels, the base scales), the object render mode,
+	// the state words texture loads and G_SELECT_DL test, and G_RDPHALF_0's half of a selection.
+	float objA, objB, objC, objD, objX, objY, objBaseX, objBaseY;
+	uint32_t objMode, objStatus[4], half0w0, half0w1;
 	// F3DFLX (F-Zero X's F3DEX2): light k in slot k + 1, slot 1 its alpha light, a direction whose
 	// angle to the normal picks each vertex's alpha from a table at the G_DMA_IO address (in place of
 	// generated texture coordinates).
@@ -771,6 +775,72 @@ static void bgDraw(struct N64* n, struct Hle* h, uint32_t a, bool scaled) {
 	}
 }
 
+// S2DEX's texture load (uObjTxtr at a): a block, tile or palette into TMEM, unless the state word says
+// it is there already.
+static void objLoad(struct N64* n, struct Hle* h, uint32_t a) {
+	a = address(h, a);
+	uint32_t const type = rd32(n, a), image = address(h, rd32(n, a + 4)), sid = (uint16_t) rd16(n, a + 14) & 12;
+	uint32_t const flag = rd32(n, a + 16), mask = rd32(n, a + 20), w8 = (uint16_t) rd16(n, a + 8);
+	uint32_t const w10 = (uint16_t) rd16(n, a + 10), w12 = (uint16_t) rd16(n, a + 12);
+	uint32_t* status = &h->objStatus[sid >> 2];
+	if ((*status & mask) == flag) {
+		return;
+	}
+	if (type == 0x1033) {
+		emit(n, h, (uint64_t) 0x3D << 56 | (uint64_t) 2 << 51 | (uint64_t) w10 << 32 | image);
+		emit(n, h, (uint64_t) 0x35 << 56 | (uint64_t) 2 << 51 | (uint64_t) w8 << 32 | (uint64_t) 7 << 24);
+		emit(n, h, (uint64_t) 0x33 << 56 | (uint64_t) 7 << 24 | (uint64_t) (w10 & 0xFFF) << 12 | (w12 & 0xFFF));
+	} else if (type == 0xFC1034) {
+		emit(n, h, (uint64_t) 0x3D << 56 | (uint64_t) 2 << 51 | (uint64_t) ((w10 + 1) >> 2) << 32 | image);
+		emit(n, h, (uint64_t) 0x35 << 56 | (uint64_t) 2 << 51 | (uint64_t) ((w10 + 1) >> 4) << 41 | (uint64_t) w8 << 32 | (uint64_t) 7 << 24);
+		emit(n, h, (uint64_t) 0x34 << 56 | (uint64_t) 7 << 24 | (uint64_t) (w10 & 0xFFF) << 12 | (w12 & 0xFFF));
+	} else if (type == 0x30) {
+		emit(n, h, (uint64_t) 0x3D << 56 | (uint64_t) 2 << 51 | image);
+		emit(n, h, (uint64_t) 0x35 << 56 | (uint64_t) w8 << 32 | (uint64_t) 7 << 24);
+		emit(n, h, (uint64_t) 0x30 << 56 | (uint64_t) 7 << 24 | (uint64_t) ((w10 << 2) & 0xFFF) << 12);
+	}
+	*status = (*status & ~mask) | (flag & mask);
+}
+
+// An S2DEX object (uObjSprite at a) drawn from TMEM with a texture rectangle: at its place and scale,
+// or through the 2D matrix (sub: its offset and base scales; full: also A and D, when it doesn't
+// rotate). False for a rotated one.
+static bool objDraw(struct N64* n, struct Hle* h, uint32_t a, int matrix) {
+	a = address(h, a);
+	float const objX = rd16(n, a) / 4.0f, objY = rd16(n, a + 8) / 4.0f;
+	int const scaleW = (uint16_t) rd16(n, a + 2) ? (uint16_t) rd16(n, a + 2) : 1, scaleH = (uint16_t) rd16(n, a + 10) ? (uint16_t) rd16(n, a + 10) : 1;
+	int const width = (uint16_t) rd16(n, a + 4) >> 5, height = (uint16_t) rd16(n, a + 12) >> 5;
+	int const stride = (uint16_t) rd16(n, a + 16), tmem = (uint16_t) rd16(n, a + 18);
+	int const format = (uint8_t) rd8(n, a + 20), size = (uint8_t) rd8(n, a + 21), pal = (uint8_t) rd8(n, a + 22) & 15, flags = (uint8_t) rd8(n, a + 23);
+	if (width <= 0 || height <= 0) {
+		return true;
+	}
+	// Texels a pixel (5.10) and the upper-left corner in pixels.
+	float dsdx = scaleW / 1024.0f, dtdy = scaleH / 1024.0f, x = objX, y = objY;
+	if (matrix == 1) {
+		x = objX * 1024.0f / h->objBaseX + h->objX, y = objY * 1024.0f / h->objBaseY + h->objY;
+		dsdx *= h->objBaseX / 1024.0f, dtdy *= h->objBaseY / 1024.0f;
+	} else if (matrix == 2) {
+		if (h->objB != 0 || h->objC != 0 || h->objA <= 0 || h->objD <= 0) {
+			return false;
+		}
+		x = objX * h->objA + h->objX, y = objY * h->objD + h->objY;
+		dsdx /= h->objA, dtdy /= h->objD;
+	}
+	bool const clamp = !(h->objMode & 0x01), copy = ((h->modeH >> 20) & 3) == 2;
+	emit(n, h, (uint64_t) 0x35 << 56 | (uint64_t) format << 53 | (uint64_t) size << 51 | (uint64_t) stride << 41 | (uint64_t) tmem << 32 |
+	           (uint64_t) pal << 20 | (uint64_t) clamp << 19 | (uint64_t) clamp << 9);
+	emit(n, h, (uint64_t) 0x32 << 56 | (uint64_t) ((width - 1) << 2) << 12 | (uint64_t) ((height - 1) << 2));
+	int const xh = (int) (x * 4), yh = (int) (y * 4);
+	int const xl = (int) ((x + width / dsdx) * 4) - (copy ? 4 : 0), yl = (int) ((y + height / dtdy) * 4) - (copy ? 4 : 0);
+	bool const flipS = flags & 0x01, flipT = flags & 0x10;
+	int const s = flipS ? (width - 1) << 5 : 0, t = flipT ? (height - 1) << 5 : 0;
+	int const ds = (int) ((copy ? 4 : dsdx) * 1024) * (flipS ? -1 : 1), dt = (int) ((copy ? 1 : dtdy) * 1024) * (flipT ? -1 : 1);
+	emit(n, h, (uint64_t) 0x24 << 56 | (uint64_t) (xl & 0xFFF) << 44 | (uint64_t) (yl & 0xFFF) << 32 | (uint64_t) (xh & 0xFFF) << 12 | (uint64_t) (yh & 0xFFF));
+	emit(n, h, (uint64_t) (s & 0xFFFF) << 48 | (uint64_t) (t & 0xFFFF) << 32 | (uint64_t) (ds & 0xFFFF) << 16 | (uint64_t) (dt & 0xFFFF));
+	return true;
+}
+
 // The task's microcode left to the RSP, this task (from the start) and later ones.
 static void reject(struct Hle* h) {
 	if (h->rejectedCount < 8) {
@@ -820,15 +890,69 @@ static void runList(struct N64* n, struct Hle* h, uint32_t pc) {
 		int op = w0 >> 24;
 		uint32_t next = pc + 8;
 		bool end = false;
+		bool const s2dex = h->family == FAMILY_S2DEX || h->family == FAMILY_S2DEX2, two = h->family == FAMILY_S2DEX2;
+		// S2DEX's G_RDPHALF_0, half of a G_SELECT_DL (0xE4, otherwise a texture rectangle).
+		if (s2dex && op == 0xE4 && rd32(n, next) >> 24 == (two ? 0x04u : 0xB0u)) {
+			h->half0w0 = w0, h->half0w1 = w1;
+			pc = next;
+			continue;
+		}
 		if (op >= 0xE4 && !(f3dex2 && op == 0xF1)) {
 			pc = rdpCommand(n, h, pc, w0, w1);
 			continue;
 		}
-		// S2DEX's own commands (backgrounds), what it shares with F3DEX or F3DEX2 as they have it.
-		if (h->family == FAMILY_S2DEX || h->family == FAMILY_S2DEX2) {
-			bool const two = h->family == FAMILY_S2DEX2;
+		// S2DEX's own commands, what it shares with F3DEX or F3DEX2 as they have it.
+		if (s2dex) {
+			bool handled = true, drawn = true;
 			if (op == (two ? 0x0A : 0x02) || op == (two ? 0x09 : 0x01)) {
 				bgDraw(n, h, w1, op == (two ? 0x09 : 0x01));
+			} else if (op == (two ? 0x0B : 0xB1)) {
+				h->objMode = w1;
+			} else if (op == (two ? 0x05 : 0xC1)) {
+				objLoad(n, h, w1);
+			} else if (op == (two ? 0x01 : 0x03) || op == (two ? 0xDA : 0xB2) || op == (two ? 0x02 : 0x04)) {
+				drawn = objDraw(n, h, w1, op == (two ? 0x01 : 0x03) ? 0 : op == (two ? 0x02 : 0x04) ? 2 : 1);
+			} else if (op == (two ? 0x07 : 0xC3) || op == (two ? 0x08 : 0xC4) || op == (two ? 0x06 : 0xC2)) {
+				// A texture load, then the object after it (uObjTxtr is 24 bytes).
+				objLoad(n, h, w1);
+				drawn = objDraw(n, h, w1 + 24, op == (two ? 0x07 : 0xC3) ? 0 : op == (two ? 0x06 : 0xC2) ? 2 : 1);
+			} else if (op == (two ? 0xDC : 0x05)) {
+				// The 2D matrix (index 0) or its offset and base scales alone (2).
+				uint32_t const m = address(h, w1);
+				if (((w0 >> 16) & 0xFF) == 0) {
+					h->objA = (int32_t) rd32(n, m) / 65536.0f, h->objB = (int32_t) rd32(n, m + 4) / 65536.0f;
+					h->objC = (int32_t) rd32(n, m + 8) / 65536.0f, h->objD = (int32_t) rd32(n, m + 12) / 65536.0f;
+					h->objX = rd16(n, m + 16) / 4.0f, h->objY = rd16(n, m + 18) / 4.0f;
+					h->objBaseX = (uint16_t) rd16(n, m + 20), h->objBaseY = (uint16_t) rd16(n, m + 22);
+				} else {
+					h->objX = rd16(n, m) / 4.0f, h->objY = rd16(n, m + 2) / 4.0f;
+					h->objBaseX = (uint16_t) rd16(n, m + 4), h->objBaseY = (uint16_t) rd16(n, m + 6);
+				}
+				h->objBaseX = h->objBaseX ? h->objBaseX : 1024, h->objBaseY = h->objBaseY ? h->objBaseY : 1024;
+			} else if (op == (two ? 0x04 : 0xB0)) {
+				// G_SELECT_DL: the list (its halves in both commands) runs when the state word doesn't
+				// already hold flag, which it then does.
+				uint32_t const sid = (h->half0w0 >> 16) & 12, flag = h->half0w1, mask = w1;
+				uint32_t* status = &h->objStatus[sid >> 2];
+				if ((*status & mask) != flag) {
+					*status = (*status & ~mask) | (flag & mask);
+					if (!((w0 >> 16) & 0xFF) && sp < DL_DEPTH) {
+						stack[sp++] = next;
+					}
+					next = address(h, (w0 & 0xFFFF) << 16 | (h->half0w0 & 0xFFFF));
+				}
+			} else if ((two ? op == 0xDB && ((w0 >> 16) & 0xFF) == 8 : op == 0xBC && (w0 & 0xFF) == 8)) {
+				// G_MW_GENSTAT: a state word set.
+				h->objStatus[((two ? w0 & 0xFFFF : (w0 >> 8) & 0xFFFF) >> 2) & 3] = w1;
+			} else {
+				handled = false;
+			}
+			if (!drawn) {
+				snprintf(h->why, sizeof(h->why), "S2DEX%s rotated sprite", two ? "2" : "");
+				reject(h);
+				return;
+			}
+			if (handled) {
 				pc = next;
 				continue;
 			}
@@ -1324,6 +1448,7 @@ bool hleGraphics(struct N64* n, bool dry) {
 	h->sp = 0;
 	h->rejectedNow = false;
 	h->why[0] = 0;
+	h->objBaseX = h->objBaseY = 1024, h->objA = h->objD = 1, h->objB = h->objC = 0, h->objX = h->objY = 0;
 	runList(n, h, address(h, be32(task + 0x30)));
 	if (h->rejectedNow) {
 		// The RSP runs this task from the start (what the list made so far goes).
