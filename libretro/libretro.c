@@ -107,7 +107,7 @@ static const char* settings(const char* name) {
 		return optionValue(environment, "armn64_accuracy");
 	}
 	if (!strcmp(name, "N64_SLICE")) {
-		return "1024";
+		return optionIs(environment, "armn64_accuracy", "hle") ? "8192" : "1024";
 	}
 	if (!strcmp(name, "N64_JIT") || !strcmp(name, "N64_RSPJIT")) {
 		return "1";
