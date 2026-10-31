@@ -25,6 +25,8 @@ void glesResume(void);
 void glesFrontend(void* (*getProc)(const char* name));
 void glesDestroy(struct Gles*);
 const char* glesRenderer(struct Gles*);
+// Whether contexts are the frontend's (glesFrontend).
+bool glesInFrontend(void);
 // Gives a buffer new storage of size bytes (data may be NULL).
 void glesData(struct Gles*, int binding, const void* data, size_t size);
 void glesSubData(struct Gles*, int binding, size_t offset, const void* data, size_t size);

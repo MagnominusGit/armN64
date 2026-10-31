@@ -306,10 +306,12 @@ struct N64 {
 	bool viGpu;
 	struct Gles* viGles;
 	// With the GPU RDP, the VI runs in its context on its copy of RDRAM (the program's index + 1, -1
-	// when it doesn't build); where the last GPU picture is (RGBA there, 0x00RRGGBB in viGles).
+	// when it doesn't build); where the last GPU picture is.
 	int viSharedProgram;
 	struct Gles* pictureGles;
 	int pictureBinding;
+	// The picture is RGBA bytes for a texture (in the frontend's context), else 0x00RRGGBB.
+	bool pictureRgba;
 	// N64_RDP_GL (with hle): the GL renderer draws what the HLE makes (glr.c).
 	bool rdpGl;
 	struct Glr* glr;

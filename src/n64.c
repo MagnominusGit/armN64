@@ -477,13 +477,16 @@ static bool viGpuStart(struct N64* n, const struct ViSetup* s) {
 		             s->aa | s->dither << 1 | s->divot << 2 | s->gammaOn << 3 };
 		glesUniforms(shared, u, 8);
 		glesDispatch(shared, (unsigned) (s->w + 15) / 16, (unsigned) (s->h + 15) / 16);
-		n->pictureGles = shared, n->pictureBinding = 4;
+		n->pictureGles = shared, n->pictureBinding = 4, n->pictureRgba = true;
 		return true;
 	}
 	viWait(n, s);
 	if (!n->viGles) {
 		char error[512];
-		n->viGles = glesCreate(viGpuSource, error, sizeof(error));
+		// In the frontend's context the picture goes to a texture there: RGBA bytes.
+		static char source[1 << 16];
+		snprintf(source, sizeof(source), "#version 310 es\n#define VI_RGBA 1\n%s", strchr(viGpuSource, '\n') + 1);
+		n->viGles = glesCreate(glesInFrontend() ? source : viGpuSource, error, sizeof(error));
 		if (!n->viGles) {
 			fprintf(stderr, "GPU VI unavailable (%s), using the CPU\n", error);
 			n->viGpu = false;
@@ -503,12 +506,12 @@ static bool viGpuStart(struct N64* n, const struct ViSetup* s) {
 	             s->aa | s->dither << 1 | s->divot << 2 | s->gammaOn << 3 };
 	glesUniforms(n->viGles, u, 8);
 	glesDispatch(n->viGles, (unsigned) (s->w + 15) / 16, (unsigned) (s->h + 15) / 16);
-	n->pictureGles = n->viGles, n->pictureBinding = 2;
+	n->pictureGles = n->viGles, n->pictureBinding = 2, n->pictureRgba = glesInFrontend();
 	return true;
 }
 
 unsigned n64PictureBuffer(struct N64* n) {
-	return n->pictureGles && n->pictureBinding == 4 ? glesBuffer(n->pictureGles, 4) : 0;
+	return n->pictureGles && n->pictureRgba ? glesBuffer(n->pictureGles, n->pictureBinding) : 0;
 }
 
 bool n64PictureStart(struct N64* n, int* width, int* height) {
@@ -553,7 +556,7 @@ static int viPicture(struct N64* n, uint32_t* out, int* width, int* height) {
 		if (picture) {
 			for (int i = 0; i < w * h; ++i) {
 				uint32_t p = picture[i];
-				out[i] = n->pictureBinding == 4 ? (p & 0xFF) << 16 | (p & 0xFF00) | (p >> 16 & 0xFF) : p;
+				out[i] = n->pictureRgba ? (p & 0xFF) << 16 | (p & 0xFF00) | (p >> 16 & 0xFF) : p;
 			}
 			glesUnmap(n->pictureGles, n->pictureBinding);
 			return w * h;

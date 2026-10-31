@@ -146,7 +146,7 @@ void main() {
 	if ((u[7] & 8) != 0) {
 		v = ivec3(gamma(v.r), gamma(v.g), gamma(v.b));
 	}
-#ifdef VI_SHARED
+#if defined(VI_SHARED) || defined(VI_RGBA)
 	picture[y * u[3] + x] = uint(v.r) | uint(v.g) << 8 | uint(v.b) << 16 | 0xFF000000u;
 #else
 	picture[y * u[3] + x] = uint(v.r) << 16 | uint(v.g) << 8 | uint(v.b);

@@ -429,6 +429,10 @@ const char* glesRenderer(struct Gles* g) {
 	return g->renderer;
 }
 
+bool glesInFrontend(void) {
+	return frontendProc != NULL;
+}
+
 void glesData(struct Gles* g, int binding, const void* data, size_t size) {
 	use(g);
 	g->glBindBuffer(GL_SHADER_STORAGE_BUFFER, g->buffer[binding]);

@@ -50,7 +50,7 @@ static int16_t audioLast[2];
 static uint8_t saveMemory[SAVE_SIZE];
 // The frontend's GL context for the GPU renderer, and what puts the picture in its framebuffer.
 static struct retro_hw_render_callback hw;
-static bool hwWanted, hwReady;
+static bool hwWanted, hwReady, viInContext;
 static struct {
 	void (*GenTextures)(int, unsigned*);
 	void (*DeleteTextures)(int, const unsigned*);
@@ -115,9 +115,10 @@ static const char* settings(const char* name) {
 	if (!strcmp(name, "N64_RDP_GL") || !strcmp(name, "N64_RDP_GPU")) {
 		return hwWanted ? "1" : "0";
 	}
-	// The GPU RDP's pictures stay on the GPU (the VI in its context).
+	// The GPU RDP's pictures stay on the GPU (the VI in its context); beside the renderer threads the
+	// VI runs in the frontend's context.
 	if (!strcmp(name, "N64_VI_GPU")) {
-		return hwWanted && !optionIs(environment, "armn64_accuracy", "hle") ? "1" : "0";
+		return (hwWanted && !optionIs(environment, "armn64_accuracy", "hle")) || viInContext ? "1" : "0";
 	}
 	if (!strcmp(name, "N64_FRAMESKIP")) {
 		return optionIs(environment, "armn64_frameskip", "enabled") ? "1" : "0";
@@ -344,10 +345,12 @@ bool retro_load_game(const struct retro_game_info* info) {
 		return false;
 	}
 	// The GPU renderers, in the frontend's GL context if it has one, else in the core's own (beside a
-	// Vulkan frontend, say).
+	// Vulkan frontend, say). With the renderer threads, the VI's filters use the GL context.
 	hwWanted = optionIs(environment, "armn64_renderer", "gpu") ||
 	           (!optionIs(environment, "armn64_renderer", "cpu") && optionIs(environment, "armn64_accuracy", "hle"));
-	if (hwWanted && !askHardwareContext()) {
+	bool context = askHardwareContext();
+	viInContext = context && !hwWanted;
+	if (hwWanted && !context) {
 		unsigned preferred = RETRO_HW_CONTEXT_NONE;
 		environment(RETRO_ENVIRONMENT_GET_PREFERRED_HW_RENDER, &preferred);
 		hwWanted = preferred == RETRO_HW_CONTEXT_VULKAN || preferred == RETRO_HW_CONTEXT_NONE;
