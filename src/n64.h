@@ -389,7 +389,7 @@ struct N64 {
 	const char* unimplemented;
 	// Activity counts for diagnostics.
 	struct {
-		uint64_t piDmas, piBytes, rspTasks, audioHleTasks, dpSyncs, aiBuffers, siDmas, glSyncs, glRows, idleSlices, idleCycles, glTextures, glTargetRows;
+		uint64_t piDmas, piBytes, rspTasks, audioHleTasks, dpSyncs, aiBuffers, siDmas, glSyncs, glRows, idleSlices, idleCycles, glTextures, glTargetRows, glBatches;
 	} stats;
 	struct DD dd;
 	// hle: a CPU loop that only waits is skipped to the end of each slice (blocks.c idleRun). Its

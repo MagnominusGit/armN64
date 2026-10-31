@@ -967,6 +967,7 @@ static void flushBatch(struct N64* n, struct Glr* g) {
 		memcpy(to, g->batch, bytes);
 		gl->UnmapBuffer(GL_ARRAY_BUFFER);
 		gl->DrawArrays(GL_TRIANGLES, (GLint) (g->vertexOffset / (VERTEX_FLOATS * 4)), g->batchCount);
+		++n->stats.glBatches;
 		g->vertexOffset += bytes;
 	}
 	g->batchCount = 0;

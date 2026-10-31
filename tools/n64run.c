@@ -45,11 +45,26 @@ static void sampleStart(void) {
 	timer_settime(timer, 0, &every, NULL);
 }
 
+// The samples, and beside them (path.maps) where the libraries were loaded.
 static void sampleWrite(const char* path) {
 	FILE* f = fopen(path, "wb");
 	if (f) {
 		fwrite(samples, sizeof(*samples), sampleCount, f);
 		fclose(f);
+	}
+	char mapsPath[512];
+	snprintf(mapsPath, sizeof(mapsPath), "%s.maps", path);
+	FILE* in = fopen("/proc/self/maps", "r");
+	FILE* out = fopen(mapsPath, "w");
+	char line[512];
+	while (in && out && fgets(line, sizeof(line), in)) {
+		fputs(line, out);
+	}
+	if (in) {
+		fclose(in);
+	}
+	if (out) {
+		fclose(out);
 	}
 }
 
@@ -183,10 +198,10 @@ int main(int argc, char** argv) {
 	if (getenv("N64PROF")) {
 		struct timespec mc;
 		clock_gettime(CLOCK_THREAD_CPUTIME_ID, &mc);
-		printf("PROF wall %.3f main_cpu %.3f pictures %.3f gl_syncs %llu gl_rows %llu gl_textures %llu gl_loads %llu idle %llu%% block_gens %u\n", secs, mc.tv_sec + mc.tv_nsec / 1e9, picSecs,
+		printf("PROF wall %.3f main_cpu %.3f pictures %.3f gl_syncs %llu gl_rows %llu gl_textures %llu gl_loads %llu idle %llu%% block_gens %u gl_batches %llu\n", secs, mc.tv_sec + mc.tv_nsec / 1e9, picSecs,
 		       (unsigned long long) n->stats.glSyncs, (unsigned long long) n->stats.glRows, (unsigned long long) n->stats.glTextures,
 		       (unsigned long long) n->stats.glTargetRows,
-		       (unsigned long long) (n->cycles ? n->stats.idleCycles * 100 / n->cycles : 0), n->blockGen);
+		       (unsigned long long) (n->cycles ? n->stats.idleCycles * 100 / n->cycles : 0), n->blockGen, (unsigned long long) n->stats.glBatches);
 	}
 	if (getenv("N64STATE")) {
 		struct CPU* c = &n->cpu;
