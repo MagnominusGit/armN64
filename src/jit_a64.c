@@ -1604,9 +1604,10 @@ void* jitCompile(struct N64* n, const uint32_t* ops, uint32_t count, uint32_t va
 	for (int i = 0; i < j->exitCount; ++i) {
 		struct Exit* x = &j->exits[i];
 		patchHere(e, x->site);
-		if (loopsBack && x->last && x->delay && !x->skip) {
+		if (loopsBack && !pollPass && x->last && x->delay && !x->skip) {
 			// A loop going round again with cycles left: straight back to the start, before the
-			// state for leaving, which the next pass writes anew.
+			// state for leaving, which the next pass writes anew (a poll loop goes on to skip its
+			// passes).
 			aLdrX(e, 0, CPU, CPU_OFF(nextPc));
 			movConst(e, 1, sext32(vaddr));
 			aDp(e, A_SUBS | W64, ZR, 0, 1, S_LSL, 0);
