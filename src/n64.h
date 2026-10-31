@@ -62,7 +62,6 @@ struct CPU {
 	uint32_t icacheTag[512], dcacheTag[512];
 	uint32_t icachePtag[512], dcachePtag[512];
 	bool dcacheDirty[512];
-	uint8_t icacheData[512][32], dcacheData[512][16];
 	// The last address translated goes through the caches.
 	bool cachedAccess;
 	uint32_t stall;
@@ -71,6 +70,8 @@ struct CPU {
 	// The row each RDRAM bank has open, and when the CPU's posted uncached writes are done.
 	uint32_t openRow[8];
 	uint64_t writesDone;
+	// Last, past the offsets compiled code reaches with an immediate.
+	uint8_t icacheData[512][32], dcacheData[512][16];
 };
 
 struct SP {
