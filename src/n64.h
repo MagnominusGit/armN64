@@ -43,6 +43,8 @@ struct CPU {
 	bool inDelay;
 	bool nextInDelay;
 	bool llBit;
+	// COP2's moves read and write one 64-bit latch, whatever register they name.
+	uint64_t cop2Latch;
 	// A compiled poll loop tried to skip its passes since it was entered (a64).
 	bool pollTried;
 	uint64_t cop0[32];

@@ -9,7 +9,7 @@
 #define IMM ((uint64_t) (int64_t) (int16_t) op)
 #define UIMM ((uint64_t) (uint16_t) op)
 
-enum { ST_IE = 1, ST_EXL = 2, ST_ERL = 4, ST_FR = 1 << 26, ST_CU1 = 1 << 29, ST_BEV = 1 << 22 };
+enum { ST_IE = 1, ST_EXL = 2, ST_ERL = 4, ST_FR = 1 << 26, ST_CU1 = 1 << 29, ST_CU2 = 1 << 30, ST_BEV = 1 << 22 };
 
 // Timing, in CPU cycles on top of one a instruction: cache line fills and write-backs, and reads of
 // RCP registers (cache figures as in the VR4300 manual and ares; the RCP read cost is fitted to
@@ -1067,8 +1067,26 @@ static void execute(struct N64* n, uint32_t op) {
 		}
 		fpuExecute(n, op);
 		return;
+	// COP2: unusable unless enabled; its moves go through the latch, anything else is reserved.
 	case 0x12:
-		cpuException(n, EXC_CPU, 2);
+		if (!(c->cop0[CP0_STATUS] & ST_CU2)) {
+			cpuException(n, EXC_CPU, 2);
+		} else if (RS == 0x00 || RS == 0x02) {
+			r[RT] = sext32((uint32_t) c->cop2Latch);
+		} else if (RS == 0x01) {
+			r[RT] = c->cop2Latch;
+		} else if (RS == 0x04 || RS == 0x05 || RS == 0x06) {
+			c->cop2Latch = r[RT];
+		} else {
+			cpuException(n, EXC_RI, 2);
+		}
+		return;
+	// LWC2, LDC2, SWC2 and SDC2.
+	case 0x32:
+	case 0x36:
+	case 0x3A:
+	case 0x3E:
+		cpuException(n, c->cop0[CP0_STATUS] & ST_CU2 ? EXC_RI : EXC_CPU, 2);
 		return;
 	case 0x14:
 		branchLikely(c, s == r[RT], target);

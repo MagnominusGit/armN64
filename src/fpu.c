@@ -176,6 +176,12 @@ void fpuExecute(struct N64* n, uint32_t op) {
 		}
 		return;
 	}
+	// DCFC1 and DCTC1: the unimplemented operation exception.
+	if (fmt == 3 || fmt == 7) {
+		c->fcr31 = (c->fcr31 & ~0x3F000u) | 1u << 17;
+		cpuException(n, EXC_FPE, 0);
+		return;
+	}
 	if (fmt != 16 && fmt != 17 && fmt != 20 && fmt != 21) {
 		cpuException(n, EXC_RI, 0);
 		return;
