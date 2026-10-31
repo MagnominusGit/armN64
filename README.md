@@ -48,4 +48,4 @@ The app, and its AppImages and APK (into `build-appimage/` and `build-android/`)
     armulators/package/appimage/build.sh && armulators/package/appimage/package.sh
     armulators/package/android/build.sh
 
-Licensed under the GNU General Public License, version 3 (`LICENSE`).
+Licensed under the GNU General Public License, version 2 or (at your option) any later version (`LICENSE`).
