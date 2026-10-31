@@ -9,7 +9,8 @@ static inline uint32_t* reg(uint32_t* regs, uint32_t addr, int count) {
 	return i < (unsigned) count ? &regs[i] : NULL;
 }
 
-// SP DMA: rows of len+1 bytes (rounded to 8), count+1 rows, skipping between rows in RDRAM.
+// SP DMA: rows of len+1 bytes (rounded to 8), count+1 rows, skipping between rows in RDRAM. Past the
+// RDRAM there is (no mirror): it reads zeros and takes no writes (libdragon's IPL3 clears IMEM so).
 static void spDma(struct N64* n, uint32_t lenReg, bool toRdram) {
 	uint32_t len = ((lenReg & 0xFFF) | 7) + 1;
 	uint32_t count = ((lenReg >> 12) & 0xFF) + 1;
@@ -23,18 +24,20 @@ static void spDma(struct N64* n, uint32_t lenReg, bool toRdram) {
 		} else {
 			n64RdramRead(n, dram, len);
 		}
-		if ((mem & 0xFFF) + len <= 0x1000 && (dram & (RDRAM_SIZE - 1)) + len <= RDRAM_SIZE) {
+		if ((mem & 0xFFF) + len <= 0x1000 && (dram & 0xFFFFFF) + len <= RDRAM_SIZE) {
 			// The row wraps neither memory.
 			uint8_t* sp = &n->sp.mem[base | (mem & 0xFFF)];
-			uint8_t* d = &n->rdram[dram & (RDRAM_SIZE - 1)];
+			uint8_t* d = &n->rdram[dram & 0xFFFFFF];
 			memcpy(toRdram ? d : sp, toRdram ? sp : d, len);
 		} else for (uint32_t i = 0; i < len; ++i) {
 			uint8_t* sp = &n->sp.mem[base | ((mem + i) & 0xFFF)];
-			uint32_t d = (dram + i) & (RDRAM_SIZE - 1);
+			uint32_t d = (dram + i) & 0xFFFFFF;
 			if (toRdram) {
-				n->rdram[d] = *sp;
+				if (d < RDRAM_SIZE) {
+					n->rdram[d] = *sp;
+				}
 			} else {
-				*sp = n->rdram[d];
+				*sp = d < RDRAM_SIZE ? n->rdram[d] : 0;
 			}
 		}
 		mem = base | ((mem + len) & 0xFFF);
@@ -348,6 +351,9 @@ uint32_t busRead32(struct N64* n, uint32_t addr) {
 		if (n->pi.romLatched && n->cycles < n->pi.romLatchUntil) {
 			n->pi.romLatched = false;
 			return n->pi.romLatch;
+		}
+		if (n->isViewer && addr >= 0x13FF0000 && addr < 0x14000000) {
+			return be32(&n->isViewer[addr & 0xFFFC]);
 		}
 		uint32_t off = (addr - 0x10000000) & ~3u;
 		if (n->bootChecksumReads && (off == 0x10 || off == 0x14) && (n->bootChecksumReads & (off == 0x10 ? 1 : 2))) {
@@ -701,6 +707,12 @@ void busWrite32(struct N64* n, uint32_t addr, uint32_t v) {
 	}
 	if (addr >= 0x08000000 && addr < 0x08020000) {
 		put32(&n->save[addr & 0x1FFFC], v);
+	} else if (n->isViewer && addr >= 0x13FF0000 && addr < 0x14000000) {
+		put32(&n->isViewer[addr & 0xFFFC], v);
+		if ((addr & 0xFFFC) == 0x14) {
+			fwrite(n->isViewer + 0x20, 1, v < 0x10000 - 0x20 ? v : 0x10000 - 0x20, stdout);
+			fflush(stdout);
+		}
 	} else if (addr >= 0x10000000 && addr < 0x1FC00000) {
 		n->pi.romLatch = v;
 		n->pi.romLatched = true;

@@ -50,6 +50,7 @@ void n64Destroy(struct N64* n) {
 		rdpDestroy(n);
 		glesDestroy(n->viGles);
 		free(n->lastPicture);
+		free(n->isViewer);
 		free(n->hle);
 		free(n->rdram);
 		free(n->hidden);
@@ -109,6 +110,9 @@ static void start(struct N64* n) {
 	const char* idleSkip = setting(n, "N64_IDLESKIP");
 	n->idle.enabled = n->accuracy == ACCURACY_HLE && !(idleSkip && idleSkip[0] == '0');
 	n->hleCheck = setting(n, "N64HLECHECK") != NULL;
+	if (setting(n, "N64ISVIEWER") && !n->isViewer) {
+		n->isViewer = calloc(1, 0x10000);
+	}
 	const char* mouse = setting(n, "N64_MOUSE");
 	n->mousePort = mouse && *mouse >= '1' && *mouse <= '4' ? *mouse - '0' : 0;
 	if (n->compat) {

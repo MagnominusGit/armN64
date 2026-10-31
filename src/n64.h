@@ -244,6 +244,8 @@ struct N64 {
 	// checksum it works out (bits 0 and 1 of bootChecksumReads); the game sees the header as it is.
 	uint32_t bootChecksum[2];
 	uint8_t bootChecksumReads;
+	// N64ISVIEWER (test ROMs): the IS-Viewer's 64 KiB at 0x13FF0000, its text printed as it's written.
+	uint8_t* isViewer;
 
 	uint64_t cycles;
 	// The earliest pending event (AI, PI, SI, DP sync): the CPU runs no further before it is handled.
