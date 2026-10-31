@@ -358,6 +358,11 @@ static void cop0Execute(struct N64* n, uint32_t op) {
 	case 0x05:
 		cop0Write(n, RD, c->gpr[RT]);
 		return;
+	// CFC0, CTC0 and BC0 do nothing.
+	case 0x02:
+	case 0x06:
+	case 0x08:
+		return;
 	}
 	if (!(RS & 0x10)) {
 		cpuException(n, EXC_RI, 0);
@@ -402,8 +407,11 @@ static void cop0Execute(struct N64* n, uint32_t op) {
 		c->nextPc = c->pc + 4;
 		c->llBit = false;
 		return;
+	// RFE, the R3000's; the other functions do nothing (nemu64-test's emulator probes).
+	case 0x10:
+		cpuException(n, EXC_RI, 0);
+		return;
 	}
-	cpuException(n, EXC_RI, 0);
 }
 
 // In lle-compatible accuracy, an unmapped access within 64 KiB of address zero (a null pointer) reads
