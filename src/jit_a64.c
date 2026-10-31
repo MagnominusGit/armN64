@@ -1296,17 +1296,20 @@ static uint8_t* fuseRun(struct Jit* j, const uint32_t* ops, uint32_t len, uint32
 	return done;
 }
 
-// A poll loop (blockPollPass) about to go round again, pc back at its start, skips the whole passes
-// of pass cycles that fit before the limit when all its I-cache and D-cache lines are in: every pass
-// then reads the same memory, takes the same branch and costs the same.
-static void pollSkip(struct Jit* j, const uint32_t* ops, uint32_t count, uint32_t vaddr, uint32_t paddr, uint32_t pass, int reload) {
+// A poll loop (blockPollPass) about to go round again, pc back at its start (checked unless the
+// caller knows it is), skips the whole passes of pass cycles that fit before the limit when all its
+// I-cache and D-cache lines are in: every pass then reads the same memory, takes the same branch and
+// costs the same.
+static void pollSkip(struct Jit* j, const uint32_t* ops, uint32_t count, uint32_t vaddr, uint32_t paddr, uint32_t pass, int reload, bool checkPc) {
 	struct Emitter* e = &j->e;
 	uint8_t* out[64];
 	int sites = 0;
-	aLdrX(e, 0, CPU, CPU_OFF(pc));
-	movConst(e, 1, sext32(vaddr));
-	aDp(e, A_SUBS | W64, ZR, 0, 1, S_LSL, 0);
-	out[sites++] = aBcond(e, C_NE, NULL);
+	if (checkPc) {
+		aLdrX(e, 0, CPU, CPU_OFF(pc));
+		movConst(e, 1, sext32(vaddr));
+		aDp(e, A_SUBS | W64, ZR, 0, 1, S_LSL, 0);
+		out[sites++] = aBcond(e, C_NE, NULL);
+	}
 	if (reload) {
 		aLdrX(e, 0, CPU, gprOff(reload & 31));
 		aDp(e, A_SUBS | W64, ZR, 0, ZR, S_LSL, 0);
@@ -1452,12 +1455,18 @@ void* jitCompile(struct N64* n, const uint32_t* ops, uint32_t count, uint32_t va
 	j->leave = e->p;
 	aB(e, n->jitLeave);
 	uint8_t* entry = e->p;
+	int reload;
+	uint32_t pollPass = blockPollPass(ops, count, vaddr, &reload);
+	// A poll loop going round in here tries its skip once a time it is entered: where it can't, the
+	// tries would cost more than the passes.
+	if (pollPass) {
+		storeByte(e, CPU_OFF(pollTried), 0);
+	}
+	uint8_t* again = e->p;
 
 	if (blockIsIdleLoop(ops, count, vaddr)) {
 		skipIdle(e, vaddr, paddr);
 	}
-	int reload;
-	uint32_t pollPass = blockPollPass(ops, count, vaddr, &reload);
 	// A conditional branch or jump at the end back to the start.
 	bool loopsBack = false;
 	if (count >= 2) {
@@ -1610,17 +1619,26 @@ void* jitCompile(struct N64* n, const uint32_t* ops, uint32_t count, uint32_t va
 	for (int i = 0; i < j->exitCount; ++i) {
 		struct Exit* x = &j->exits[i];
 		patchHere(e, x->site);
-		if (loopsBack && !pollPass && x->last && x->delay && !x->skip) {
+		if (loopsBack && x->last && x->delay && !x->skip) {
 			// A loop going round again with cycles left: straight back to the start, before the
-			// state for leaving, which the next pass writes anew (a poll loop goes on to skip its
-			// passes).
+			// state for leaving, which the next pass writes anew (a poll loop skipping what passes
+			// it can first).
 			aLdrX(e, 0, CPU, CPU_OFF(nextPc));
 			movConst(e, 1, sext32(vaddr));
 			aDp(e, A_SUBS | W64, ZR, 0, 1, S_LSL, 0);
 			uint8_t* away = aBcond(e, C_NE, NULL);
 			aDp(e, A_SUBS | W64, ZR, LEFT, ZR, S_LSL, 0);
-			aBcond(e, C_GT, entry);
+			uint8_t* spent = aBcond(e, C_LE, NULL);
+			if (pollPass) {
+				aLdrb(e, 0, CPU, CPU_OFF(pollTried));
+				uint8_t* tried = aCbnz(e, 0, NULL);
+				storeByte(e, CPU_OFF(pollTried), 1);
+				pollSkip(j, ops, count, vaddr, paddr, pollPass, reload, false);
+				patchHere(e, tried);
+			}
+			aB(e, again);
 			patchHere(e, away);
+			patchHere(e, spent);
 		}
 		storeConst(e, CPU_OFF(curPc), x->pc);
 		storeByte(e, CPU_OFF(inDelay), x->delay);
@@ -1645,7 +1663,7 @@ void* jitCompile(struct N64* n, const uint32_t* ops, uint32_t count, uint32_t va
 			aDp(e, A_SUBS | W64, ZR, LEFT, ZR, S_LSL, 0);
 			aBcond(e, C_LE, j->leave);
 			if (pollPass) {
-				pollSkip(j, ops, count, vaddr, paddr, pollPass, reload);
+				pollSkip(j, ops, count, vaddr, paddr, pollPass, reload, true);
 			}
 			chain(j);
 		} else {

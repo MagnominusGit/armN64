@@ -43,6 +43,8 @@ struct CPU {
 	bool inDelay;
 	bool nextInDelay;
 	bool llBit;
+	// A compiled poll loop tried to skip its passes since it was entered (a64).
+	bool pollTried;
 	uint64_t cop0[32];
 	struct TLBEntry tlb[32];
 	uint64_t countBase;
