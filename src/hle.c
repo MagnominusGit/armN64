@@ -2,6 +2,7 @@
 #include "rdp.h"
 
 #include <math.h>
+#include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 
@@ -9,7 +10,9 @@
 // microcode, for the Fast3D family (Fast3D, F3DEX, F3DEX2), with the triangles and other commands
 // it makes drawn by the RDP as usual. Microcodes it doesn't know run on the RSP.
 
-enum { FAMILY_NONE, FAMILY_F3D, FAMILY_F3DEX, FAMILY_F3DEX2 };
+// F3DPD is Perfect Dark's Fast3D (as GLideN64 has it, GPL-2.0): 12-byte vertices whose colour or
+// normal comes from a table (0x07 sets its base), and TRIX (0xB1) for up to eight triangles.
+enum { FAMILY_NONE, FAMILY_F3D, FAMILY_F3DEX, FAMILY_F3DEX2, FAMILY_F3DPD };
 
 // Geometry mode bits, kept in the F3DEX2 layout.
 enum {
@@ -48,6 +51,8 @@ struct Hle {
 	int lights;
 	float lightColor[LIGHTS + 1][3], lightDir[LIGHTS + 1][3], lookat[2][3];
 	uint32_t geometry;
+	// F3DPD's table of vertex colours.
+	uint32_t colorBase;
 	float texScaleS, texScaleT;
 	int texTile, texLevel;
 	bool texOn;
@@ -234,8 +239,11 @@ static void loadVertices(struct N64* n, struct Hle* h, uint32_t a, int first, in
 			normalize(dirs[l]);
 		}
 	}
-	for (int i = 0; i < count && first + i < VERTICES; ++i, a += 16) {
+	bool const pd = h->family == FAMILY_F3DPD;
+	for (int i = 0; i < count && first + i < VERTICES; ++i, a += pd ? 12 : 16) {
 		struct Vertex* v = &h->v[first + i];
+		// The colour (or normal): in the vertex, or for F3DPD in the table at its index.
+		uint32_t const ca = pd ? h->colorBase + (rd16(n, a + 6) & 0xFF) : a + 12;
 		float x = rd16(n, a), y = rd16(n, a + 2), z = rd16(n, a + 4);
 		const float* m = h->mvp;
 		v->x = x * m[0] + y * m[4] + z * m[8] + m[12];
@@ -243,10 +251,10 @@ static void loadVertices(struct N64* n, struct Hle* h, uint32_t a, int first, in
 		v->z = x * m[2] + y * m[6] + z * m[10] + m[14];
 		v->w = x * m[3] + y * m[7] + z * m[11] + m[15];
 		float s = rd16(n, a + 8), t = rd16(n, a + 10);
-		uint8_t c[4] = { n->rdram[(a + 12) & (RDRAM_SIZE - 1)], n->rdram[(a + 13) & (RDRAM_SIZE - 1)], n->rdram[(a + 14) & (RDRAM_SIZE - 1)], n->rdram[(a + 15) & (RDRAM_SIZE - 1)] };
+		uint8_t c[4] = { n->rdram[ca & (RDRAM_SIZE - 1)], n->rdram[(ca + 1) & (RDRAM_SIZE - 1)], n->rdram[(ca + 2) & (RDRAM_SIZE - 1)], n->rdram[(ca + 3) & (RDRAM_SIZE - 1)] };
 		v->a = c[3] / 255.0f;
 		if (h->geometry & (GEOM_LIGHTING | GEOM_TEXTURE_GEN)) {
-			float e[3] = { rd8(n, a + 12), rd8(n, a + 13), rd8(n, a + 14) };
+			float e[3] = { rd8(n, ca), rd8(n, ca + 1), rd8(n, ca + 2) };
 			normalize(e);
 			if (h->geometry & GEOM_LIGHTING) {
 				float rgb[3] = { h->lightColor[h->lights][0], h->lightColor[h->lights][1], h->lightColor[h->lights][2] };
@@ -912,6 +920,16 @@ static void runList(struct N64* n, struct Hle* h, uint32_t pc) {
 				if (f3dex) {
 					drawTriangle(n, h, ((w0 >> 16) & 0xFF) / 2, ((w0 >> 8) & 0xFF) / 2, (w0 & 0xFF) / 2);
 					drawTriangle(n, h, ((w1 >> 16) & 0xFF) / 2, ((w1 >> 8) & 0xFF) / 2, (w1 & 0xFF) / 2);
+				} else if (h->family == FAMILY_F3DPD) {
+					// TRIX: each triangle's first two vertices from w1's nibbles, its third from w0's.
+					for (uint32_t a1 = w1, a0 = w0; a1; a1 >>= 8, a0 >>= 4) {
+						drawTriangle(n, h, a1 & 15, (a1 >> 4) & 15, a0 & 15);
+					}
+				}
+				break;
+			case 0x07:
+				if (h->family == FAMILY_F3DPD) {
+					h->colorBase = address(h, w1);
 				}
 				break;
 			case 0xB4:
@@ -1006,6 +1024,31 @@ static void runList(struct N64* n, struct Hle* h, uint32_t pc) {
 
 // The microcode family from the first ID string in its data (the block may run on into the next
 // microcode's data, and its string).
+// The graphics task's microcode by the name its data gives (a Fast3D or F3DEX family line), else
+// by the hash of its first code.
+void hleUcodeName(struct N64* n, char* out, size_t size) {
+	const uint8_t* task = &n->sp.mem[0xFC0];
+	uint32_t data = be32(task + 0x18) & 0xFFFFFF, dataSize = be32(task + 0x1C), code = be32(task + 0x10) & 0xFFFFFF;
+	char text[0x1001];
+	uint32_t length = dataSize < 0x1000 ? dataSize : 0x1000;
+	for (uint32_t i = 0; i < length; ++i) {
+		uint8_t c = n->rdram[(data + i) & (RDRAM_SIZE - 1)];
+		text[i] = c >= 32 && c < 127 ? (char) c : ' ';
+	}
+	text[length] = 0;
+	const char* name = strstr(text, "RSP Gfx ucode ");
+	name = name ? name : strstr(text, "RSP SW Version");
+	if (name) {
+		snprintf(out, size, "%.*s", (int) (size - 1), name);
+		return;
+	}
+	uint32_t hash = 2166136261u;
+	for (uint32_t i = 0; i < 1024; ++i) {
+		hash = (hash ^ n->rdram[(code + i) & (RDRAM_SIZE - 1)]) * 16777619u;
+	}
+	snprintf(out, size, "unnamed %08x", hash);
+}
+
 static int family(struct N64* n, uint32_t data, uint32_t size) {
 	if (size > 0x1000) {
 		size = 0x1000;
@@ -1105,6 +1148,10 @@ bool hleGraphics(struct N64* n, bool dry) {
 	}
 	uint32_t data = be32(task + 0x18) & 0xFFFFFF, dataSize = be32(task + 0x1C);
 	int f = family(n, data, dataSize);
+	// Perfect Dark's microcode has no name: it is known by its code.
+	if (f == FAMILY_NONE && ucode == 0xB0811E2Fu) {
+		f = FAMILY_F3DPD;
+	}
 	if (f == FAMILY_NONE) {
 		return false;
 	}

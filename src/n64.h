@@ -395,6 +395,8 @@ struct N64 {
 	// know): mostly those, and the RDP threads take over (the GPU would only add syncs).
 	uint32_t glTasks, glRspTasks;
 	bool glrStop;
+	// Why the GL renderer stopped, for the frontend to say.
+	const char* glrStopReason;
 	struct FrameSkip skip;
 	// The last picture made, shown again for a skipped frame.
 	uint32_t* lastPicture;
@@ -436,7 +438,9 @@ struct N64 {
 	const char* unimplemented;
 	// Activity counts for diagnostics.
 	struct {
-		uint64_t piDmas, piBytes, rspTasks, audioHleTasks, dpSyncs, aiBuffers, siDmas, glSyncs, glRows, idleSlices, idleCycles, glTextures, glTargetRows, glBatches;
+		uint64_t piDmas, piBytes, rspTasks, audioHleTasks, dpSyncs, aiBuffers, siDmas, glSyncs, glRows, idleSlices, idleCycles, glTextures, glTargetRows, glBatches, gfxHle, gfxRsp;
+		// The microcode of the last graphics task left to the RSP (hle accuracy): its name, or its hash.
+		char gfxRspUcode[48];
 	} stats;
 	struct DD dd;
 	// hle: a CPU loop that only waits is skipped to the end of each slice (blocks.c idleRun). Its
@@ -643,6 +647,7 @@ void rdpCommands(struct N64*, const uint64_t* list, size_t count);
 
 // hle.c
 bool hleGraphics(struct N64*, bool dry);
+void hleUcodeName(struct N64*, char* out, size_t size);
 // audio_hle/audio_hle.c
 bool audioHle(struct N64*);
 void audioCheckStart(struct N64*);

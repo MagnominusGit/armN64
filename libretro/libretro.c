@@ -506,6 +506,36 @@ static void presentGl(unsigned framebuffer, int x, int y, int width, int height)
 	videoRefresh(RETRO_HW_FRAME_BUFFER_VALID, (unsigned) width, (unsigned) height, 0);
 }
 
+// A notice on screen for a few seconds.
+static void notify(const char* text) {
+	struct retro_message_ext ext = { text, 5000, 1, RETRO_LOG_WARN, RETRO_MESSAGE_TARGET_ALL, RETRO_MESSAGE_TYPE_NOTIFICATION, -1 };
+	if (!environment(RETRO_ENVIRONMENT_SET_MESSAGE_EXT, &ext)) {
+		struct retro_message message = { text, 300 };
+		environment(RETRO_ENVIRONMENT_SET_MESSAGE, &message);
+	}
+	logMessage(RETRO_LOG_WARN, text);
+}
+
+// What HLE gave up for this game, said once: a graphics microcode it doesn't know (run on the RSP),
+// and the GL renderer stopping (the CPU renderer drawing from then on).
+static bool toldRsp, toldGl, hadGl;
+
+static void tellFallbacks(void) {
+	char text[160];
+	if (!toldRsp && machine->accuracy == ACCURACY_HLE && machine->stats.gfxRsp) {
+		snprintf(text, sizeof(text), "HLE doesn't know this graphics microcode (%s): it runs on the RSP, slower.", machine->stats.gfxRspUcode);
+		notify(text);
+		toldRsp = true;
+	}
+	if (!toldGl && hadGl && !machine->rdpGl) {
+		snprintf(text, sizeof(text), "The GL renderer stopped (%s): the CPU renderer draws from here.",
+		         machine->glrStopReason ? machine->glrStopReason : "unknown reason");
+		notify(text);
+		toldGl = true;
+	}
+	hadGl = machine->rdpGl;
+}
+
 // Each port's controls, and what can be plugged in.
 static void describeInput(void) {
 	static const struct {
@@ -601,6 +631,7 @@ bool retro_load_game(const struct retro_game_info* info) {
 	pal = machine->fieldCycles == hwCycles(machine, CPU_HZ / 50);
 	saveExport();
 	saveGiven = false;
+	toldRsp = toldGl = hadGl = false;
 	struct retro_rumble_interface rumble;
 	setRumble = environment(RETRO_ENVIRONMENT_GET_RUMBLE_INTERFACE, &rumble) ? rumble.set_rumble_state : NULL;
 	memset(rumbling, 0, sizeof(rumbling));
@@ -810,6 +841,7 @@ void retro_run(void) {
 		glesYield();
 	}
 	playAudio();
+	tellFallbacks();
 	if (machine->saveDirty) {
 		saveExport();
 		machine->saveDirty = false;

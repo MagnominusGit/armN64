@@ -1214,7 +1214,10 @@ void glrDraw(struct N64* n, struct RDP* r, const uint64_t* w, int op) {
 			g->rawField = n->fields;
 			g->rawTriangles = 0;
 		}
-		n->glrStop |= ++g->rawTriangles > 100;
+		if (++g->rawTriangles > 100) {
+			n->glrStop = true;
+			n->glrStopReason = "the microcode sends the RDP its own triangles";
+		}
 		glrSync(n);
 		rdpDrawSoftware(n, r, w, op);
 		for (int i = 0; i < TARGETS; ++i) {

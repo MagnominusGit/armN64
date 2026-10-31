@@ -351,6 +351,11 @@ int main(int argc, char** argv) {
 		       (unsigned long long) n->stats.glTargetRows,
 		       (unsigned long long) (n->cycles ? n->stats.idleCycles * 100 / n->cycles : 0), n->blockGen, (unsigned long long) n->stats.glBatches);
 	}
+	// N64GFXREPORT=1: graphics tasks run at high level and on the RSP, and the last microcode there.
+	if (getenv("N64GFXREPORT")) {
+		printf("GFX hle %llu rsp %llu ucode %s\n", (unsigned long long) n->stats.gfxHle, (unsigned long long) n->stats.gfxRsp,
+		       n->stats.gfxRsp ? n->stats.gfxRspUcode : "-");
+	}
 	if (getenv("N64STATE")) {
 		struct CPU* c = &n->cpu;
 		printf("sp status %04x pc %03x, dp status %x, mi intr %02x mask %02x, pi status %x, vi intr %d\n",

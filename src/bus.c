@@ -110,14 +110,22 @@ static void spWriteStatus(struct N64* n, uint32_t v) {
 		bool graphics = be32(&n->sp.mem[0xFC0]) == 1;
 		if (n->accuracy == ACCURACY_HLE && (hleGraphics(n, false) || audioHle(n))) {
 			n64Event(n, n->sp.hleDoneAt);
+			n->stats.gfxHle += graphics;
 		} else {
+			if (n->accuracy == ACCURACY_HLE && graphics) {
+				++n->stats.gfxRsp;
+				hleUcodeName(n, n->stats.gfxRspUcode, sizeof(n->stats.gfxRspUcode));
+			}
 			audioCheckStart(n);
 			if (n->rdpGl && graphics) {
 				++n->glRspTasks;
 			}
 		}
 		if (n->rdpGl && graphics && ++n->glTasks == 64) {
-			n->glrStop |= n->glRspTasks * 2 > n->glTasks;
+			if (n->glRspTasks * 2 > n->glTasks) {
+				n->glrStop = true;
+				n->glrStopReason = "most graphics tasks run on the RSP";
+			}
 			n->glTasks = n->glRspTasks = 0;
 		}
 		*s &= ~1u;
