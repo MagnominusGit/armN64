@@ -57,8 +57,8 @@ static bool address(struct N64* n, uint64_t vaddr, int align, bool store, uint32
 
 // The caches (VR4300 manual, as ares has them): 512 D-cache lines of 16 bytes and 512 I-cache lines
 // of 32, picked by the virtual address and tagged with the physical one (bits 12 and up; the line
-// supplies the rest). Outside lle-compatible the lines hold their own data: stores stay in the
-// D-cache until a line is written back, and instructions come from the I-cache. lle-compatible keeps
+// supplies the rest). Outside mle the lines hold their own data: stores stay in the
+// D-cache until a line is written back, and instructions come from the I-cache. mle keeps
 // memory up to date, the tags only costing the misses.
 static uint32_t dcacheAddress(const struct CPU* c, uint32_t i) {
 	return c->dcachePtag[i] | (i << 4 & 0xFF0);
@@ -160,7 +160,7 @@ uint32_t cpuIcacheMiss(struct N64* n, uint32_t vaddr, uint32_t paddr) {
 // words than memory has.
 bool cpuCodeCoherent(struct N64* n, uint32_t vaddr, uint32_t paddr, uint32_t count) {
 	struct CPU* c = &n->cpu;
-	if (n->compat) {
+	if (n->compat || n->fast) {
 		return true;
 	}
 	for (uint32_t p = paddr & ~31u; p < paddr + 4 * count; p += 32) {
@@ -175,8 +175,10 @@ bool cpuCodeCoherent(struct N64* n, uint32_t vaddr, uint32_t paddr, uint32_t cou
 // An instruction word at a translated address.
 static uint32_t fetch(struct N64* n, uint64_t vaddr, uint32_t paddr) {
 	struct CPU* c = &n->cpu;
-	if (!c->cachedAccess) {
-		readTiming(n, paddr, 4);
+	if (!c->cachedAccess || n->fast) {
+		if (!c->cachedAccess) {
+			readTiming(n, paddr, 4);
+		}
 		return busRead32(n, paddr);
 	}
 	uint32_t i = ((uint32_t) vaddr >> 5) & 511;
@@ -208,7 +210,7 @@ static void icacheStoreTag(struct N64* n, uint32_t i) {
 static void cacheOp(struct N64* n, uint32_t op, uint64_t vaddr) {
 	struct CPU* c = &n->cpu;
 	uint32_t p;
-	if (!address(n, vaddr, 4, false, &p)) {
+	if (!address(n, vaddr, 4, false, &p) || n->fast) {
 		return;
 	}
 	uint32_t const di = ((uint32_t) vaddr >> 4) & 511, ii = ((uint32_t) vaddr >> 5) & 511;
@@ -780,7 +782,7 @@ static void cop0Execute(struct N64* n, uint32_t op) {
 	}
 }
 
-// In lle-compatible accuracy, an unmapped access within 64 KiB of address zero (a null pointer) reads
+// In mle accuracy, an unmapped access within 64 KiB of address zero (a null pointer) reads
 // zero and writes nothing instead of missing the TLB.
 static bool nullAccess(struct N64* n, uint64_t vaddr) {
 	uint32_t v = (uint32_t) vaddr, p;
@@ -830,7 +832,7 @@ static bool loadAt(struct N64* n, uint64_t vaddr, int size, uint64_t* out, uint3
 	*paddr = p;
 	if (p >= RDRAM_SIZE || !c->cachedAccess) {
 		readTiming(n, p, size);
-	} else {
+	} else if (!n->fast) {
 		uint32_t i = dcacheLine(n, vaddr, p);
 		if (!n->compat) {
 			*out = bytesBE(&c->dcacheData[i][p & (16 - size)], size);
@@ -877,7 +879,7 @@ static bool store(struct N64* n, uint64_t vaddr, int size, uint64_t v) {
 	if (n->idle.tracing) {
 		idleStore(n, p, size, v);
 	}
-	if (p < RDRAM_SIZE && c->cachedAccess) {
+	if (p < RDRAM_SIZE && c->cachedAccess && !n->fast) {
 		uint32_t i = dcacheLine(n, vaddr, p);
 		c->dcacheDirty[i] = true;
 		if (!n->compat) {
@@ -1538,7 +1540,11 @@ static void execute(struct N64* n, uint32_t op) {
 			}
 			return;
 		}
-		fpuExecute(n, op);
+		if (n->fast) {
+			fpuExecuteFast(n, op);
+		} else {
+			fpuExecute(n, op);
+		}
 		return;
 	// COP2: unusable unless enabled; its moves go through the latch, anything else is reserved.
 	case 0x12:

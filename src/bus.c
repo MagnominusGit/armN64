@@ -335,7 +335,7 @@ static void piDma(struct N64* n, uint32_t len, bool toRdram) {
 	++n->stats.piDmas;
 	n->stats.piBytes += len;
 	uint64_t rcp = piDmaCycles(n, cart, len);
-	// Emulators that hacks were made on finish a DMA in a quarter cycle a byte (lle-compatible accuracy).
+	// Emulators that hacks were made on finish a DMA in a quarter cycle a byte (mle accuracy).
 	n->pi.busyUntil = n->cycles + (n->compat ? len / 4 + 1 : rcp * 3 / 2);
 	n64Event(n, n->pi.busyUntil);
 	n->pi.status |= 1;

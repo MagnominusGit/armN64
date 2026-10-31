@@ -181,7 +181,7 @@ struct SI {
 struct RDP;
 
 // The N64_ACCURACY levels.
-enum { ACCURACY_LLE_ACCURATE, ACCURACY_LLE_COMPATIBLE, ACCURACY_HLE };
+enum { ACCURACY_LLE, ACCURACY_MLE, ACCURACY_HLE };
 
 // CPU cycles for cache line fills and the write-back of a dirty data line (cpu.c and both code
 // generators).
@@ -277,15 +277,16 @@ struct N64 {
 	uint64_t eventAt;
 	// CPU cycles the CPU may run ahead of the RSP before it catches up.
 	uint64_t slice;
-	// N64_ACCURACY: lle-accurate (the default) is the hardware. lle-compatible is for hacks made on
-	// emulators: RDRAM starts zeroed, misaligned CPU accesses align down instead of raising address
-	// errors, unmapped null-pointer accesses read zero, PI DMA copies between the exact addresses
-	// and takes a quarter cycle a byte, SP DMA keeps the RDRAM address's low bits, and a blanked VI
-	// window still shows the picture. hle is the
-	// hardware with high-level graphics (hle.c) for the microcodes it knows. compat is true for
-	// lle-compatible only.
+	// N64_ACCURACY: lle (the default) is the hardware, cycle for cycle. mle, the middle ground, also
+	// runs hacks made on emulators: RDRAM starts zeroed, misaligned CPU accesses align down instead of
+	// raising address errors, unmapped null-pointer accesses read zero, PI DMA copies between the
+	// exact addresses and takes a quarter cycle a byte, SP DMA keeps the RDRAM address's low bits, and
+	// a blanked VI window still shows the picture. hle puts speed first: high-level graphics (hle.c)
+	// for the microcodes it knows. compat is true for mle only.
 	int accuracy;
 	bool compat;
+	// HLE accuracy puts speed first: the host's FPU arithmetic, and no cache tags or data.
+	bool fast;
 	// The RSP is being caught up: its own accesses to the shared registers must not catch it up again.
 	bool catchingUp;
 	uint64_t nextVi;
@@ -554,6 +555,7 @@ static inline void n64Event(struct N64* n, uint64_t at) {
 // fpu.c
 void fpuExecute(struct N64*, uint32_t op);
 void fpuClearCauses(struct N64*);
+void fpuExecuteFast(struct N64*, uint32_t op);
 bool fpuProbe(struct N64*, uint32_t op);
 uint32_t fpuCycles(int fmt, int func);
 

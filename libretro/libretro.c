@@ -79,13 +79,13 @@ static struct retro_core_option_v2_category optionCategories[] = {
 
 static struct retro_core_option_v2_definition optionDefinitions[] = {
 	{ "armn64_accuracy", "Graphics (Restart)", NULL,
-	  "High Level draws the game's display lists without its microcode and is the fastest. Compatible and Accurate run the microcode on the RSP; "
-	  "Accurate keeps the hardware's own behaviour where Compatible follows what other emulators do.",
-	  NULL, "system", { { "hle", "High Level" }, { "lle-compatible", "Compatible" }, { "lle-accurate", "Accurate" }, { NULL, NULL } }, "hle" },
+	  "HLE draws the game's display lists without its microcode and puts speed first. MLE and LLE run the microcode on the RSP: "
+	  "LLE is the hardware cycle for cycle, MLE the middle ground that also runs hacks made on other emulators.",
+	  NULL, "system", { { "hle", "HLE" }, { "mle", "MLE" }, { "lle", "LLE" }, { NULL, NULL } }, "hle" },
 	{ "armn64_rdp_threads", "Renderer Threads (Restart)", NULL, "Threads beside the emulation that draw the RDP's pictures. Auto takes the cores there are, up to 3.",
 	  NULL, "system", { { "auto", "Auto" }, { "0", "None" }, { "1", "1" }, { "2", "2" }, { "3", "3" }, { NULL, NULL } }, "auto" },
 	{ "armn64_renderer", "Renderer (Restart)", NULL,
-	  "GPU draws with OpenGL ES 3.1: High Level graphics with the GL renderer, Compatible and Accurate with the RDP in compute shaders (exact, but slower than the renderer threads on most handhelds). CPU draws with the renderer threads. Auto takes the GPU for High Level and the CPU otherwise.",
+	  "GPU draws with OpenGL ES 3.1: HLE with the GL renderer, MLE and LLE with the RDP in compute shaders (exact, but slower than the renderer threads on most handhelds). CPU draws with the renderer threads. Auto takes the GPU for HLE and the CPU otherwise.",
 	  NULL, "system", { { "auto", "Auto" }, { "gpu", "GPU" }, { "cpu", "CPU" }, { NULL, NULL } }, "auto" },
 	{ "armn64_frameskip", "Frame Skip (Restart)", NULL, "Leaves out the drawing of frames that are never shown, as many games make more than the screen can show.",
 	  NULL, "system", { { "disabled", "Off" }, { "enabled", "On" }, { NULL, NULL } }, "disabled" },

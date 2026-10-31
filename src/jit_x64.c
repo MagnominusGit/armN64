@@ -112,8 +112,9 @@ struct Jit {
 	bool jumped;
 	uint8_t* leave;
 	bool rdpThreads, rdpGl;
-	// Outside lle-compatible the D-cache holds the data cached accesses use.
-	bool cacheData;
+	// Outside mle the D-cache holds the data cached accesses use; with HLE accuracy (fast)
+	// there are no caches.
+	bool cacheData, fast;
 };
 
 static void exitAt(struct Jit* j, uint8_t* site, uint64_t pc, enum Kind kind, bool delay, bool skip) {
@@ -446,13 +447,14 @@ static bool emitInline(struct Jit* j, uint32_t op, uint64_t pc, enum Kind* kind)
 		if (!fpuOpValid(op) && !fpuProbed(op)) {
 			return false;
 		}
-		// The FPU's own code, called directly. Its stall counts.
+		// The FPU's own code, called directly. Its stall counts. With HLE accuracy it raises nothing.
+		bool const probe = fpuProbed(op) && !j->fast;
 		needCop1(j);
 		xMovRR(e, 8, RDI, RBX);
 		xMovIKeepFlags(e, RSI, op);
-		xMovI64(e, RAX, (uint64_t) (uintptr_t) (fpuProbed(op) ? (void*) fpuProbe : (void*) fpuExecute));
+		xMovI64(e, RAX, (uint64_t) (uintptr_t) (j->fast ? (void*) fpuExecuteFast : probe ? (void*) fpuProbe : (void*) fpuExecute));
 		xCallR(e, RAX);
-		if (fpuProbed(op)) {
+		if (probe) {
 			xTest(e, 1, R(RAX), RAX);
 			slowIf(j, CC_E);
 		}
@@ -543,10 +545,10 @@ static void icacheCheck(struct Emitter* e, uint32_t vaddr, uint32_t paddr, bool 
 
 // The idle loop at vaddr, when its I-cache lines are in: whole passes of two cycles up to one or two
 // cycles short of the limit, leaving the last instructions to run as usual.
-static void skipIdle(struct Emitter* e, uint32_t vaddr, uint32_t paddr) {
+static void skipIdle(struct Emitter* e, uint32_t vaddr, uint32_t paddr, bool fast) {
 	uint8_t* skip[3];
 	int sites = 0;
-	int lines = (paddr + 4) & 31 ? 1 : 2;
+	int lines = fast ? 0 : (paddr + 4) & 31 ? 1 : 2;
 	for (int i = 0; i < lines; ++i) {
 		uint32_t v = vaddr + 4 * i, p = paddr + 4 * i;
 		struct Opnd tag = M(R12, (int32_t) (offsetof(struct CPU, icacheTag) + 4 * ((v >> 5) & 511)));
@@ -587,7 +589,9 @@ static void chain(struct Jit* j);
 static void emitHelper(struct Jit* j, uint32_t op, uint64_t pc, uint32_t paddr, bool delay, bool lineStart, bool last) {
 	struct Emitter* e = &j->e;
 	if (lineStart) {
-		icacheCheck(e, (uint32_t) pc, paddr, true);
+		if (!j->fast) {
+			icacheCheck(e, (uint32_t) pc, paddr, true);
+		}
 	}
 	if (delay) {
 		delayPrologue(e);
@@ -700,6 +704,15 @@ static void emitMemory(struct Jit* j, struct Slow* slow) {
 		}
 	}
 
+	if (j->fast) {
+		// Aligned and in RDRAM.
+		xTestI(e, 4, R(RAX), ~(uint32_t) (RDRAM_SIZE - 1));
+		slow->site[slow->sites++] = xJcc(e, CC_NE, NULL);
+		if (size > 1) {
+			xTestI(e, 4, R(R8), (uint32_t) (size - 1));
+			slow->site[slow->sites++] = xJcc(e, CC_NE, NULL);
+		}
+	} else {
 	// The line index from the virtual address; a hit when its tag is this physical line and the
 	// address is aligned.
 	xMovRR(e, 4, RCX, R8);
@@ -717,6 +730,7 @@ static void emitMemory(struct Jit* j, struct Slow* slow) {
 	slow->keep = true;
 	if (isStore) {
 		xStoreI(e, 1, MI(R12, RCX, 1, (int32_t) offsetof(struct CPU, dcacheDirty)), 1);
+	}
 	}
 	if (j->cacheData) {
 		xMovRR(e, 4, RCX, R8);
@@ -804,7 +818,7 @@ static void pollSkip(struct Jit* j, const uint32_t* ops, uint32_t count, uint32_
 		xAluI(e, X_CMP, 8, R(RDX), 0);
 		out[sites++] = xJcc(e, reload & 32 ? CC_NE : CC_E, NULL);
 	}
-	for (uint32_t p = paddr & ~31u; p < paddr + 4 * count; p += 32) {
+	for (uint32_t p = paddr & ~31u; p < paddr + 4 * count && !j->fast; p += 32) {
 		uint32_t v = vaddr + (p - paddr);
 		struct Opnd tag = M(R12, (int32_t) (offsetof(struct CPU, icacheTag) + 4 * ((v >> 5) & 511)));
 		xAluI(e, X_CMP, 4, tag, (int32_t) (p & ~31u));
@@ -828,6 +842,11 @@ static void pollSkip(struct Jit* j, const uint32_t* ops, uint32_t count, uint32_
 			xShiftI(e, X_SHR, 4, R(RCX), 12);
 			xTestI(e, 1, MI(RBX, RCX, 1, (int32_t) offsetof(struct N64, pageFlags)), PAGE_RDP_WRITES);
 			out[sites++] = xJcc(e, CC_NE, NULL);
+		}
+		if (j->fast) {
+			xTestI(e, 4, R(RAX), ~(uint32_t) (RDRAM_SIZE - 1) | (uint32_t) (size - 1));
+			out[sites++] = xJcc(e, CC_NE, NULL);
+			continue;
 		}
 		xMovRR(e, 4, RCX, R8);
 		xShiftI(e, X_SHR, 4, R(RCX), 4);
@@ -931,11 +950,12 @@ void* jitCompile(struct N64* n, const uint32_t* ops, uint32_t count, uint32_t va
 	j->leave = n->jitLeave;
 	j->rdpThreads = n->rdpThreads > 0;
 	j->rdpGl = n->rdpGl;
-	j->cacheData = !n->compat;
+	j->fast = n->fast;
+	j->cacheData = !n->compat && !n->fast;
 	struct Emitter* e = &j->e;
 
 	if (blockIsIdleLoop(ops, count, vaddr)) {
-		skipIdle(e, vaddr, paddr);
+		skipIdle(e, vaddr, paddr, j->fast);
 	}
 	int reload;
 	uint32_t pollPass = blockPollPass(ops, count, vaddr, &reload);
@@ -958,11 +978,11 @@ void* jitCompile(struct N64* n, const uint32_t* ops, uint32_t count, uint32_t va
 		j->jumped = false;
 		// A branch's I-cache check comes first (a likely branch not taken leaves inside it); the rest
 		// check after, so slow paths and Count reads see the cycles before this fetch.
-		if (lineStart && branch && !delay) {
+		if (lineStart && branch && !delay && !j->fast) {
 			icacheCheck(e, (uint32_t) pc, p, false);
 		}
 		if (!(delay && branch) && emitInline(j, op, pc, &kind)) {
-			if (lineStart && !branch) {
+			if (lineStart && !branch && !j->fast) {
 				icacheCheck(e, (uint32_t) pc, p, false);
 			}
 			xAluI(e, X_ADD, 8, R(R13), 1 + j->extraCycles);

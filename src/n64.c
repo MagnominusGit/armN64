@@ -108,11 +108,13 @@ static const char* setting(struct N64* n, const char* name) {
 // From power-on: the PIF's boot from the cartridge, or from the 64DD's IPL without one.
 static void start(struct N64* n) {
 	const char* accuracy = setting(n, "N64_ACCURACY");
-	n->accuracy = !accuracy ? ACCURACY_LLE_ACCURATE : !strcmp(accuracy, "lle-compatible") ? ACCURACY_LLE_COMPATIBLE :
-	              !strcmp(accuracy, "hle") ? ACCURACY_HLE : ACCURACY_LLE_ACCURATE;
-	// HLE draws at high level with the hardware's own timing; only lle-compatible behaves like the
+	// The modes' old names, lle-compatible and lle-accurate, still work.
+	n->accuracy = !accuracy ? ACCURACY_LLE : !strcmp(accuracy, "mle") || !strcmp(accuracy, "lle-compatible") ? ACCURACY_MLE :
+	              !strcmp(accuracy, "hle") ? ACCURACY_HLE : ACCURACY_LLE;
+	// HLE draws at high level with the hardware's own timing; only mle behaves like the
 	// emulators hacks were made on.
-	n->compat = n->accuracy == ACCURACY_LLE_COMPATIBLE;
+	n->compat = n->accuracy == ACCURACY_MLE;
+	n->fast = n->accuracy == ACCURACY_HLE;
 	const char* idleSkip = setting(n, "N64_IDLESKIP");
 	n->idle.enabled = n->accuracy == ACCURACY_HLE && !(idleSkip && idleSkip[0] == '0');
 	n->hleCheck = setting(n, "N64HLECHECK") != NULL;
@@ -441,7 +443,7 @@ static bool viSetup(struct N64* n, struct ViSetup* s) {
 	int hStart = (v[9] >> 16) & 0x3FF, hEnd = v[9] & 0x3FF;
 	int vStart = (v[10] >> 16) & 0x3FF, vEnd = v[10] & 0x3FF;
 	uint32_t xScale = v[12] & 0xFFF, yScale = v[13] & 0xFFF;
-	// In lle-compatible accuracy, an empty window (osViBlack) shows the picture anyway in the TV type's
+	// In mle accuracy, an empty window (osViBlack) shows the picture anyway in the TV type's
 	// usual one, as emulators that draw the RDP's image directly do.
 	if (n->compat && (hEnd <= hStart || vEnd <= vStart)) {
 		bool pal = n->fieldCycles == CPU_HZ / 50;
