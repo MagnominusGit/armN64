@@ -310,6 +310,13 @@ struct N64 {
 	void (*jitEnter)(struct N64*, void* code);
 	void* jitLeave;
 	struct JitEntry jitTable[JIT_TABLE_SIZE];
+	// Direct jumps made between compiled blocks (jit_a64.c), each site with what it held before:
+	// good while blockGen is linkGen.
+	struct JitLink {
+		uint32_t* site;
+		uint32_t was;
+	}* links;
+	uint32_t linkCount, linkCap, linkGen;
 	// Pages for compiled loads and stores: what to add to an address in each 4 KB virtual page for
 	// the physical one, 1 << 20 entries for loads, then as many for stores. A page not looked up
 	// since the TLB last changed, or not writable for stores, adds up to the page past RDRAM. The
@@ -490,6 +497,7 @@ uint32_t blockPollPass(const uint32_t* ops, uint32_t count, uint32_t vaddr, int*
 // jit_x64.c
 void* jitCompile(struct N64*, const uint32_t* ops, uint32_t count, uint32_t vaddr, uint32_t paddr);
 void jitReset(struct N64*);
+void jitUnlink(struct N64*);
 void jitFree(struct N64*);
 // rdp.c: waits for RDP commands still being drawn by other threads.
 void rdpWait(struct N64*);

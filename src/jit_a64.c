@@ -1079,7 +1079,10 @@ static void emitMemory(struct Jit* j, struct Slow* slow) {
 		aDp(e, A_SUBS | W64, ZR, 0, 1, S_LSL, 0);
 		slowIf(j, C_NE);
 	}
-	// The physical page from vpages: one not looked up lands past RDRAM.
+	// kseg0's RDRAM directly; other pages from vpages, where one not looked up lands past RDRAM.
+	aLogicImm(e, A_EOR_IMM, 6, 0, 0x80000000);
+	aLsrImm(e, 2, 6, 23);
+	uint8_t* kseg0 = aCbz(e, 2, NULL);
 	aLsrImm(e, 1, 0, 12);
 	if (isStore) {
 		aDpImm(e, A_ADD_IMM | W64, 3, TLB, VPAGES * 4);
@@ -1088,6 +1091,11 @@ static void emitMemory(struct Jit* j, struct Slow* slow) {
 		aLdst(e, L_LDR, 5, TLB, 1, L_UXTW | 0x1000);
 	}
 	aDp(e, A_ADD, 6, 0, 5, S_LSL, 0);
+	if (j->fast) {
+		aLsrImm(e, 2, 6, 23);
+		slow->site[slow->sites++] = aCbnz(e, 2, NULL);
+	}
+	patchHere(e, kseg0);
 	// Stores go slow on any flag (code, RDP) unless the page has only code that they miss; loads
 	// on pages the RDP may still be drawing to. With the D-cache's data only its fills and
 	// write-backs reach memory, in C.
@@ -1108,9 +1116,7 @@ static void emitMemory(struct Jit* j, struct Slow* slow) {
 	}
 
 	if (j->fast) {
-		// Aligned and in RDRAM.
-		aLsrImm(e, 2, 6, 23);
-		slow->site[slow->sites++] = aCbnz(e, 2, NULL);
+		// Aligned (and in RDRAM, from above).
 		if (size > 1) {
 			aLogicImm(e, A_ANDS_IMM, ZR, 0, size - 1);
 			slowIf(j, C_NE);
@@ -1474,24 +1480,86 @@ static void pollSkip(struct Jit* j, const uint32_t* ops, uint32_t count, uint32_
 	}
 }
 
+void* jitLink(struct N64* n, uint32_t* site, uint32_t vaddr);
+
+// To the block at target when the pc is there: a jump that jitLink makes a direct one.
+static void linkTo(struct Jit* j, uint64_t target) {
+	struct Emitter* e = &j->e;
+	aLdrX(e, 0, CPU, CPU_OFF(pc));
+	movConst(e, 1, target);
+	aDp(e, A_SUBS | W64, ZR, 0, 1, S_LSL, 0);
+	uint8_t* other = aBcond(e, C_NE, NULL);
+	uint8_t* site = aB(e, NULL);
+	patchHere(e, site);
+	aMovX(e, 0, N);
+	aMovImm64(e, 1, (uint64_t) (uintptr_t) site);
+	aMovImm(e, 2, (uint32_t) target);
+	aMovImm64(e, IP, (uint64_t) (uintptr_t) jitLink);
+	aBlr(e, IP);
+	uint8_t* found = aCbnzX(e, 0, NULL);
+	aB(e, j->leave);
+	patchHere(e, found);
+	aBr(e, 0);
+	patchHere(e, other);
+}
+
+// To the block at the pc: through the two entries kept after this code ({vaddr, gen, code}, the
+// latest first), else the jitTable (whose hit goes into the first entry), else the way out.
 static void chain(struct Jit* j) {
 	struct Emitter* e = &j->e;
 	aLdrX(e, 0, CPU, CPU_OFF(pc));
 	aSxtw(e, 1, 0);
 	aDp(e, A_SUBS | W64, ZR, 1, 0, S_LSL, 0);
 	aBcond(e, C_NE, j->leave);
+	loadN(e, 4, N64_OFF(blockGen), 4);
+	uint8_t* adr = e->p;
+	emit32(e, 0);
+	uint8_t* miss[4];
+	for (int i = 0; i < 2; ++i) {
+		aLdpW(e, 3, 6, 2, 16 * i);
+		aDp(e, A_SUBS, ZR, 3, 0, S_LSL, 0);
+		miss[2 * i] = aBcond(e, C_NE, NULL);
+		aDp(e, A_SUBS, ZR, 6, 4, S_LSL, 0);
+		miss[2 * i + 1] = aBcond(e, C_NE, NULL);
+		aLdrX(e, 5, 2, 16 * i + 8);
+		aBr(e, 5);
+		if (i == 0) {
+			patchHere(e, miss[0]);
+		}
+	}
+	for (int i = 1; i < 4; ++i) {
+		patchHere(e, miss[i]);
+	}
 	aUbfx(e, 1, 0, 2, 14);
-	aAddImmX(e, 2, N, N64_OFF(jitTable));
-	aDp(e, A_ADD | W64, 2, 2, 1, S_LSL, 4);
-	aLdr(e, 3, 2, (unsigned) offsetof(struct JitEntry, vaddr));
+	aAddImmX(e, 7, N, N64_OFF(jitTable));
+	aDp(e, A_ADD | W64, 7, 7, 1, S_LSL, 4);
+	aLdpW(e, 3, 6, 7, (unsigned) offsetof(struct JitEntry, vaddr));
 	aDp(e, A_SUBS, ZR, 3, 0, S_LSL, 0);
 	aBcond(e, C_NE, j->leave);
-	aLdr(e, 3, 2, (unsigned) offsetof(struct JitEntry, gen));
-	loadN(e, 4, N64_OFF(blockGen), 4);
-	aDp(e, A_SUBS, ZR, 3, 4, S_LSL, 0);
+	aDp(e, A_SUBS, ZR, 6, 4, S_LSL, 0);
 	aBcond(e, C_NE, j->leave);
-	aLdrX(e, 5, 2, (unsigned) offsetof(struct JitEntry, code));
+	aLdrX(e, 5, 7, (unsigned) offsetof(struct JitEntry, code));
+	aLdrX(e, 3, 2, 0);
+	aLdrX(e, 6, 2, 8);
+	aStrX(e, 3, 2, 16);
+	aStrX(e, 6, 2, 24);
+	aStpW(e, 0, 4, 2, 0);
+	aStrX(e, 5, 2, 8);
 	aBr(e, 5);
+	if ((uintptr_t) e->p & 7) {
+		emit32(e, 0xD503201F);
+	}
+	if (e->p + 32 <= e->end) {
+		int32_t d = (int32_t) (e->p - adr);
+		uint32_t op = 0x10000000 | (uint32_t) (d & 3) << 29 | (uint32_t) ((d >> 2) & 0x7FFFF) << 5 | 2;
+		memcpy(adr, &op, 4);
+	}
+	for (int i = 0; i < 2; ++i) {
+		emit32(e, 0);
+		emit32(e, UINT32_MAX);
+		emit32(e, 0);
+		emit32(e, 0);
+	}
 }
 
 // The arena starts with the way in, jitEnter(n, code), and the way out back to C.
@@ -1539,10 +1607,45 @@ static uint8_t* arenaGet(struct N64* n) {
 
 void jitReset(struct N64* n) {
 	n->jitUsed = SHARED_SIZE;
+	n->linkCount = 0;
 	++n->blockGen;
 }
 
+void jitUnlink(struct N64* n) {
+	for (uint32_t i = 0; i < n->linkCount; ++i) {
+		*n->links[i].site = n->links[i].was;
+		__builtin___clear_cache((char*) n->links[i].site, (char*) (n->links[i].site + 1));
+	}
+	n->linkCount = 0;
+	n->linkGen = n->blockGen;
+}
+
+// From a block's jump to vaddr (see linkTo): its code, and the jump at site made a direct one to it;
+// NULL to leave.
+void* jitLink(struct N64* n, uint32_t* site, uint32_t vaddr) {
+	struct JitEntry* je = &n->jitTable[(vaddr >> 2) & (JIT_TABLE_SIZE - 1)];
+	if (je->vaddr != vaddr || je->gen != n->blockGen || n->linkGen != n->blockGen) {
+		return NULL;
+	}
+	if (n->linkCount == n->linkCap) {
+		uint32_t cap = n->linkCap ? 2 * n->linkCap : 1024;
+		struct JitLink* links = realloc(n->links, cap * sizeof(*links));
+		if (!links) {
+			return je->code;
+		}
+		n->links = links;
+		n->linkCap = cap;
+	}
+	n->links[n->linkCount++] = (struct JitLink) { site, *site };
+	*site = 0x14000000 | ((uint32_t) (((uint8_t*) je->code - (uint8_t*) site) >> 2) & 0x03FFFFFF);
+	__builtin___clear_cache((char*) site, (char*) (site + 1));
+	return je->code;
+}
+
 void jitFree(struct N64* n) {
+	free(n->links);
+	n->links = NULL;
+	n->linkCount = n->linkCap = 0;
 	if (n->jitArena) {
 		munmap(n->jitArena, ARENA_SIZE);
 		n->jitArena = NULL;
@@ -1598,6 +1701,20 @@ void* jitCompile(struct N64* n, const uint32_t* ops, uint32_t count, uint32_t va
 		}
 	}
 
+	// Where the block goes on to at its end, for direct jumps: a branch's target and past its delay
+	// slot (not known for JR and JALR).
+	uint64_t ends[2];
+	int endCount = 0;
+	uint32_t endOp = count >= 2 ? ops[count - 2] : 0, endAt = vaddr + 4 * (count - 2);
+	if (count < 2 || !isBranchOp(endOp)) {
+		ends[endCount++] = sext32(vaddr + 4 * count);
+	} else if (endOp >> 26 == 0x02 || endOp >> 26 == 0x03) {
+		ends[endCount++] = sext32(((endAt + 4) & 0xF0000000) | ((endOp & 0x03FFFFFF) << 2));
+	} else if (endOp >> 26) {
+		ends[endCount++] = sext32(endAt + 4 + ((uint32_t) (int16_t) endOp << 2));
+		ends[endCount++] = sext32(vaddr + 4 * count);
+	}
+
 	cacheClear(&j->cache);
 	bool delay = false;
 	// A fused run's end, where its fast path joins the instructions one by one.
@@ -1649,7 +1766,8 @@ void* jitCompile(struct N64* n, const uint32_t* ops, uint32_t count, uint32_t va
 			} else if (last) {
 				exitAt(j, aB(e, NULL), pc, kind, delay, false);
 				j->exits[j->exitCount - 1].last = true;
-			} else {
+			} else if (!j->fast) {
+				// hle checks the limit at the block's end only.
 				exitAt(j, aBcond(e, C_LE, NULL), pc, kind, delay, false);
 			}
 			if (slow->sites || slow->keep) {
@@ -1788,6 +1906,14 @@ void* jitCompile(struct N64* n, const uint32_t* ops, uint32_t count, uint32_t va
 			if (pollPass) {
 				pollSkip(j, ops, count, vaddr, paddr, pollPass, reload, true);
 			}
+			for (int k = 0; k < endCount; ++k) {
+				linkTo(j, ends[k]);
+			}
+			chain(j);
+		} else if (x->skip) {
+			aDp(e, A_SUBS | W64, ZR, LEFT, ZR, S_LSL, 0);
+			aBcond(e, C_LE, j->leave);
+			linkTo(j, x->pc + 8);
 			chain(j);
 		} else {
 			aB(e, j->leave);

@@ -926,6 +926,10 @@ void jitReset(struct N64* n) {
 	++n->blockGen;
 }
 
+void jitUnlink(struct N64* n) {
+	n->linkGen = n->blockGen;
+}
+
 void jitFree(struct N64* n) {
 	if (n->jitArena) {
 		munmap(n->jitArena, ARENA_SIZE);
@@ -997,7 +1001,8 @@ void* jitCompile(struct N64* n, const uint32_t* ops, uint32_t count, uint32_t va
 			} else if (last) {
 				exitAt(j, xJmp(e, NULL), pc, kind, delay, false);
 				j->exits[j->exitCount - 1].last = true;
-			} else {
+			} else if (!j->fast) {
+				// hle checks the limit at the block's end only.
 				xAluRR(e, X_CMP, 8, R(R13), R14);
 				exitAt(j, xJcc(e, CC_AE, NULL), pc, kind, delay, false);
 			}

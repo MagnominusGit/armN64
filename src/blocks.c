@@ -140,21 +140,31 @@ void blocksFree(struct N64* n) {
 }
 
 // From paddr to a branch's delay slot, the end of the page or BLOCK_MAX instructions.
-// N64_PERFMAP=1: compiled blocks named by guest address in /tmp/perf-<pid>.map for perf.
+// N64_PERFMAP=1: compiled blocks named by guest address in /tmp/perf-<pid>.map for perf; =2 also
+// their code, one after another, in /tmp/perf-<pid>.code.
 void perfMapAdd(const void* code, size_t size, const char* kind, uint32_t address) {
-	static FILE* perfMap;
+	static FILE *perfMap, *perfCode;
 	static int perfMapState;
 	if (perfMapState == 0) {
-		perfMapState = getenv("N64_PERFMAP") ? 1 : -1;
+		const char* map = getenv("N64_PERFMAP");
+		perfMapState = map ? 1 : -1;
 		if (perfMapState == 1) {
 			char path[64];
 			snprintf(path, sizeof(path), "/tmp/perf-%d.map", (int) getpid());
 			perfMap = fopen(path, "w");
+			if (map[0] == '2') {
+				snprintf(path, sizeof(path), "/tmp/perf-%d.code", (int) getpid());
+				perfCode = fopen(path, "wb");
+			}
 		}
 	}
 	if (perfMap) {
 		fprintf(perfMap, "%lx %lx %s_%08x\n", (unsigned long) (uintptr_t) code, (unsigned long) size, kind, address);
 		fflush(perfMap);
+	}
+	if (perfCode) {
+		fwrite(code, 1, size, perfCode);
+		fflush(perfCode);
 	}
 }
 
@@ -192,6 +202,9 @@ static struct Block* compile(struct N64* n, uint32_t vaddr, uint32_t paddr) {
 }
 
 static void jitRun(struct N64* n, void* code) {
+	if (n->linkGen != n->blockGen) {
+		jitUnlink(n);
+	}
 	if (cpuJitReady(n)) {
 		n->jitEnter(n, code);
 	} else {

@@ -10,6 +10,10 @@ void jitReset(struct N64* n) {
 	++n->blockGen;
 }
 
+void jitUnlink(struct N64* n) {
+	n->linkGen = n->blockGen;
+}
+
 void jitFree(struct N64* n) {
 }
 
