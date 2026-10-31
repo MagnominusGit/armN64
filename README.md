@@ -37,7 +37,8 @@ A lean, low-level Nintendo 64 emulator for x86-64 and ARM handhelds.
 - `armulators/` the code shared with armGBA (submodule): the code generators, the libretro
   core's helpers and the standalone app.
 - `app.cmake` and `app/` armN64's standalone app: Armulators' app with the core linked in, its
-  names, systems and icons, and its hooks (the CPU renderer until the app shares its GL context).
+  names, systems, keys and icons, and its hooks. The GPU renderers draw in a GL context the app
+  makes for the core, as RetroArch does.
 
 The app, and its AppImages and APK (into `build-appimage/` and `build-android/`):
 

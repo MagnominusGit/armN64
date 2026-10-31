@@ -9,24 +9,10 @@
 #include "app-hooks.h"
 #include "rc_consoles.h"
 
-#include <string.h>
-
-// The GPU renderers draw in the frontend's GL context, which the app doesn't share yet: the CPU
-// renderer, and no row for it.
-static const char* optionRead(const struct Option* option) {
-	return !strcmp(option->key, "armn64_renderer") ? "cpu" : NULL;
-}
-
-static bool optionShown(const struct Option* option, bool shown) {
-	return shown && strcmp(option->key, "armn64_renderer");
-}
-
 static uint32_t cheevosConsole(const uint8_t* data, size_t size) {
 	return RC_CONSOLE_NINTENDO_64;
 }
 
 const struct AppHooks appHooks = {
-	.optionRead = optionRead,
-	.optionShown = optionShown,
 	.cheevosConsole = cheevosConsole,
 };
