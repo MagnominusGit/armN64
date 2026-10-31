@@ -47,9 +47,36 @@ static void storeN32(struct Emitter* e, int rt, unsigned off) {
 	aStr(e, rt, base, at);
 }
 
-static void callC(struct Emitter* e, const void* f) {
+// The accumulator stays in v3-v5 between the block's vector instructions: loaded when one first
+// wants it, written back where something else may read it (a C call, the block's exits), and not at
+// all where it is dead: the instructions after overwrite all of it before any reads it.
+static struct {
+	bool cached, dirty;
+	// For each instruction of the block: whether it may read the accumulator, and whether the
+	// accumulator may be read after it (before something overwrites all of it).
+	bool reads[64], liveAfter[64];
+	int k;
+} acc;
+
+static void vStoreAcc(struct Emitter* e);
+
+// Before a C call: the accumulator back in memory if anything may read it there; the call takes
+// v3-v5.
+static void accBeforeCall(struct Emitter* e) {
+	if (acc.dirty && (acc.reads[acc.k] || acc.liveAfter[acc.k])) {
+		vStoreAcc(e);
+	}
+	acc.cached = acc.dirty = false;
+}
+
+static void callRaw(struct Emitter* e, const void* f) {
 	aMovImm64(e, IP, (uint64_t) (uintptr_t) f);
 	aBlr(e, IP);
+}
+
+static void callC(struct Emitter* e, const void* f) {
+	accBeforeCall(e);
+	callRaw(e, f);
 }
 
 static void storeTiming(struct Emitter* e) {
@@ -70,7 +97,7 @@ struct Exit {
 	uint8_t* site;
 	uint32_t op, pc;
 	enum Kind kind;
-	bool delay, last, halt, pcsStored;
+	bool delay, last, halt, pcsStored, accDirty;
 };
 
 struct Jit {
@@ -81,7 +108,7 @@ struct Jit {
 };
 
 static void exitAt(struct Jit* j, uint8_t* site, uint32_t op, uint32_t pc, enum Kind kind, bool delay) {
-	j->exits[j->exitCount++] = (struct Exit) { site, op, pc, kind, delay, false, false, false };
+	j->exits[j->exitCount++] = (struct Exit) { site, op, pc, kind, delay, false, false, false, acc.dirty };
 }
 
 // rspTimingStep for an instruction whose predecessor (prev, at pc - 4) is in the same block, which
@@ -389,6 +416,26 @@ static void vStoreAcc(struct Emitter* e) {
 	vStore(e, 5, VR, VR_ACCL);
 }
 
+// The accumulator in v3-v5 for an instruction that reads it.
+static void accWant(struct Emitter* e) {
+	if (!acc.cached) {
+		vLoadAcc(e);
+		acc.cached = true;
+	}
+}
+
+// The accumulator's low slice set from vector register v.
+static void accSetLow(struct Emitter* e, int v) {
+	if (acc.cached) {
+		if (v != 5) {
+			v3(e, V_ORR, 5, v, v);
+		}
+		acc.dirty = true;
+	} else {
+		vStore(e, v, VR, VR_ACCL);
+	}
+}
+
 // The vector instructions compiled to NEON; false for the rest, which call their C functions.
 static bool emitVectorOp(struct Emitter* e, uint32_t op) {
 	int el = (op >> 21) & 15, vt = (op >> 16) & 31, vs = (op >> 11) & 31, vd = (op >> 6) & 31;
@@ -399,7 +446,9 @@ static bool emitVectorOp(struct Emitter* e, uint32_t op) {
 		return false;
 	}
 	if (func == 0x1D) {
-		if (el >= 8 && el <= 10) {
+		if (el >= 8 && el <= 10 && acc.cached) {
+			v3(e, V_ORR, 2, 3 + el - 8, 3 + el - 8);
+		} else if (el >= 8 && el <= 10) {
 			vLoad(e, 2, VR, VR_ACCH + 16 * (el - 8));
 		} else {
 			vZero(e, 2);
@@ -437,12 +486,12 @@ static bool emitVectorOp(struct Emitter* e, uint32_t op) {
 			vSshr(e, 3, 4, 15);
 			v3(e, V_BIC, 3, 3, 21);
 		} else {
-			vLoadAcc(e);
+			accWant(e);
 			vSshr(e, 28, 19, 15);
 			v3(e, V_BIC, 28, 28, 21);
 			vAccAdd(e, 28, 19, 18);
 		}
-		vStoreAcc(e);
+		acc.cached = acc.dirty = true;
 		if (func & 1) {
 			vClampUnsigned(e, 2);
 		} else {
@@ -453,7 +502,7 @@ static bool emitVectorOp(struct Emitter* e, uint32_t op) {
 		vMulhi(e, 5, 0, 1, false, false);
 		vZero(e, 3);
 		vZero(e, 4);
-		vStoreAcc(e);
+		acc.cached = acc.dirty = true;
 		v3(e, V_ORR, 2, 5, 5);
 		break;
 	case 0x05: case 0x06:
@@ -461,31 +510,31 @@ static bool emitVectorOp(struct Emitter* e, uint32_t op) {
 		vMulhi(e, 4, 0, 1, func == 0x05, func == 0x06);
 		v3(e, V_MUL, 5, 0, 1);
 		vSshr(e, 3, 4, 15);
-		vStoreAcc(e);
+		acc.cached = acc.dirty = true;
 		v3(e, V_ORR, 2, func == 0x05 ? 4 : 5, func == 0x05 ? 4 : 5);
 		break;
 	case 0x07:
 		vMulhi(e, 3, 0, 1, true, true);
 		v3(e, V_MUL, 4, 0, 1);
 		vZero(e, 5);
-		vStoreAcc(e);
+		acc.cached = acc.dirty = true;
 		vClampSigned(e, 2);
 		break;
 	case 0x0C:
-		vLoadAcc(e);
+		accWant(e);
 		vMulhi(e, 28, 0, 1, false, false);
 		vZero(e, 29);
 		vAccAdd(e, 29, 29, 28);
-		vStoreAcc(e);
+		acc.cached = acc.dirty = true;
 		vClampLow(e, 2);
 		break;
 	case 0x0D: case 0x0E:
-		vLoadAcc(e);
+		accWant(e);
 		vMulhi(e, 28, 0, 1, func == 0x0D, func == 0x0E);
 		v3(e, V_MUL, 29, 0, 1);
 		vSshr(e, 30, 28, 15);
 		vAccAdd(e, 30, 28, 29);
-		vStoreAcc(e);
+		acc.cached = acc.dirty = true;
 		if (func == 0x0D) {
 			vClampSigned(e, 2);
 		} else {
@@ -493,12 +542,12 @@ static bool emitVectorOp(struct Emitter* e, uint32_t op) {
 		}
 		break;
 	case 0x0F:
-		vLoadAcc(e);
+		accWant(e);
 		vMulhi(e, 28, 0, 1, true, true);
 		v3(e, V_MUL, 29, 0, 1);
 		vZero(e, 30);
 		vAccAdd(e, 28, 29, 30);
-		vStoreAcc(e);
+		acc.cached = acc.dirty = true;
 		vClampSigned(e, 2);
 		break;
 	case 0x10: case 0x11: {
@@ -509,7 +558,7 @@ static bool emitVectorOp(struct Emitter* e, uint32_t op) {
 		vUshr(e, 16, 16, 15);
 		v3(e, sub ? V_SUB : V_ADD, 5, 0, 1);
 		v3(e, sub ? V_SUB : V_ADD, 5, 5, 16);
-		vStore(e, 5, VR, VR_ACCL);
+		accSetLow(e, 5);
 		v3(e, sub ? V_SSUBL : V_SADDL, 17, 0, 1);
 		v3(e, sub ? V_SSUBL2 : V_SADDL2, 18, 0, 1);
 		v3(e, sub ? V_SSUBW : V_SADDW, 17, 17, 16);
@@ -524,7 +573,7 @@ static bool emitVectorOp(struct Emitter* e, uint32_t op) {
 		v3(e, V_CMHI, 16, 0, 2);
 		vBits(e, 0, 16, 17);
 		aStrh(e, 0, VR, VR_VCO);
-		vStore(e, 2, VR, VR_ACCL);
+		accSetLow(e, 2);
 		break;
 	case 0x15:
 		v3(e, V_SUB, 2, 0, 1);
@@ -535,7 +584,7 @@ static bool emitVectorOp(struct Emitter* e, uint32_t op) {
 		vBits(e, 1, 16, 17);
 		aDp(e, A_ORR, 0, 0, 1, S_LSL, 8);
 		aStrh(e, 0, VR, VR_VCO);
-		vStore(e, 2, VR, VR_ACCL);
+		accSetLow(e, 2);
 		break;
 	case 0x20: case 0x21: case 0x22: case 0x23: {
 		// VLT, VEQ, VNE, VGE: VCC from the comparison, with VCO's carries and not-equals.
@@ -572,7 +621,7 @@ static bool emitVectorOp(struct Emitter* e, uint32_t op) {
 		vBits(e, 0, 20, 17);
 		aStrh(e, 0, VR, VR_VCC);
 		aStrh(e, ZR, VR, VR_VCO);
-		vStore(e, 2, VR, VR_ACCL);
+		accSetLow(e, 2);
 		break;
 	}
 	case 0x24: {
@@ -611,7 +660,7 @@ static bool emitVectorOp(struct Emitter* e, uint32_t op) {
 		aStrh(e, 0, VR, VR_VCC);
 		aStrh(e, ZR, VR, VR_VCO);
 		aStrb(e, ZR, VR, VR_VCE);
-		vStore(e, 2, VR, VR_ACCL);
+		accSetLow(e, 2);
 		break;
 	}
 	case 0x25: {
@@ -653,7 +702,7 @@ static bool emitVectorOp(struct Emitter* e, uint32_t op) {
 		v3(e, V_AND, 29, 29, 20);
 		vBits(e, 0, 29, 17);
 		aStrb(e, 0, VR, VR_VCE);
-		vStore(e, 2, VR, VR_ACCL);
+		accSetLow(e, 2);
 		break;
 	}
 	case 0x27:
@@ -662,7 +711,7 @@ static bool emitVectorOp(struct Emitter* e, uint32_t op) {
 		v3(e, V_ORR, 2, 1, 1);
 		v3(e, V_BIT, 2, 0, 16);
 		aStrh(e, ZR, VR, VR_VCO);
-		vStore(e, 2, VR, VR_ACCL);
+		accSetLow(e, 2);
 		break;
 	default:
 		// VAND, VNAND, VOR, VNOR, VXOR, VNXOR.
@@ -670,7 +719,7 @@ static bool emitVectorOp(struct Emitter* e, uint32_t op) {
 		if (func & 1) {
 			v2(e, V_NOT, 2, 2);
 		}
-		vStore(e, 2, VR, VR_ACCL);
+		accSetLow(e, 2);
 	}
 	vStore(e, 2, VR, 16 * vd);
 	return true;
@@ -712,6 +761,11 @@ static bool emitVectorMemory(struct Emitter* e, uint32_t op, bool store) {
 	}
 	int size = 1 << kind;
 	int32_t offset = ((int32_t) ((op & 0x7F) << 25) >> 25) * size;
+	// The C path below takes v3-v5: the accumulator goes back to memory first where it is live.
+	if (acc.dirty && acc.liveAfter[acc.k]) {
+		vStoreAcc(e);
+	}
+	acc.dirty = false;
 	uint8_t* wraps = dmemAddress(e, (op >> 21) & 31, offset, size);
 	uint8_t* unaligned = NULL;
 	if (size == 16) {
@@ -736,7 +790,10 @@ static bool emitVectorMemory(struct Emitter* e, uint32_t op, bool store) {
 	}
 	aMovX(e, 0, N);
 	aMovImm(e, 1, op);
-	callC(e, store ? (const void*) rspVectorStore : (const void*) rspVectorLoad);
+	callRaw(e, store ? (const void*) rspVectorStore : (const void*) rspVectorLoad);
+	if (acc.cached) {
+		vLoadAcc(e);
+	}
 	patchHere(e, done);
 	return true;
 }
@@ -1065,6 +1122,37 @@ static void chain(struct Jit* j) {
 }
 
 // Code for count instructions (as IMEM holds them) from start, or NULL when the arena is full.
+// What an instruction does to the accumulator: 1 it may read it (C calls count as reading it), 2 it
+// overwrites all of it first.
+static int accUse(uint32_t op) {
+	if ((op >> 26) != 0x12 || !(op & (1 << 25))) {
+		return 0;
+	}
+	int f = op & 0x3F;
+	if (f == 0x00 || f == 0x01 || (f >= 0x04 && f <= 0x07)) {
+		return 2;
+	}
+	bool lowOnly = f == 0x10 || f == 0x11 || f == 0x14 || f == 0x15 || (f >= 0x20 && f <= 0x25) || (f >= 0x27 && f <= 0x2D);
+	return lowOnly ? 0 : 1;
+}
+
+// Whether the block may leave after the instruction: the last, a halt or a rewritten IMEM after a
+// COP0 write or BREAK, and in lle every instruction (the clock's limit).
+static bool exitsAfter(uint32_t op, bool last) {
+	return last || !plainTiming || ((op >> 26) == 0x10 && ((op >> 21) & 31) == 0x04) || ((op >> 26) == 0x00 && (op & 0x3F) == 0x0D);
+}
+
+static void accLiveness(const uint8_t* ops, uint32_t count) {
+	bool live = true;
+	for (uint32_t k = count; k-- > 0;) {
+		uint32_t op = be32(&ops[k * 4]);
+		acc.liveAfter[k] = exitsAfter(op, k + 1 == count) || live;
+		int use = accUse(op);
+		acc.reads[k] = use & 1;
+		live = (use & 1) || (!(use & 2) && acc.liveAfter[k]);
+	}
+}
+
 void* rspCompile(struct N64* n, const uint8_t* ops, uint32_t count, uint32_t start) {
 	plainTiming = n->rspPlainTiming;
 	uint8_t* arena = arenaGet(n);
@@ -1081,11 +1169,14 @@ void* rspCompile(struct N64* n, const uint8_t* ops, uint32_t count, uint32_t sta
 	aB(e, n->rspLeave);
 	uint8_t* entry = e->p;
 
+	accLiveness(ops, count);
+	acc.cached = acc.dirty = false;
 	bool delay = false;
 	uint32_t prev = 0;
 	for (uint32_t k = 0; k < count; ++k) {
 		uint32_t op = be32(&ops[k * 4]), pc = start + k * 4;
 		bool last = k + 1 == count;
+		acc.k = (int) k;
 		if (k == 0) {
 			emitEntryTiming(e, op);
 		} else {
@@ -1105,11 +1196,13 @@ void* rspCompile(struct N64* n, const uint8_t* ops, uint32_t count, uint32_t sta
 		if (last) {
 			exitAt(j, aB(e, NULL), op, pc, kind, delay);
 			j->exits[j->exitCount - 1].last = true;
-		} else {
+			j->exits[j->exitCount - 1].pcsStored = pcsStored;
+		} else if (!plainTiming) {
+			// lle stops at the instruction that reaches the limit; mle and hle at the block's end.
 			aDp(e, A_SUBS | W64, ZR, CLOCK, LIMIT, S_LSL, 0);
 			exitAt(j, aBcond(e, C_HS, NULL), op, pc, kind, delay);
+			j->exits[j->exitCount - 1].pcsStored = pcsStored;
 		}
-		j->exits[j->exitCount - 1].pcsStored = pcsStored;
 		if (check) {
 			// Halted or IMEM rewritten: leave whatever the clock says.
 			uint8_t* over = aB(e, NULL);
@@ -1128,6 +1221,9 @@ void* rspCompile(struct N64* n, const uint8_t* ops, uint32_t count, uint32_t sta
 	for (int i = 0; i < j->exitCount; ++i) {
 		struct Exit* x = &j->exits[i];
 		patchHere(e, x->site);
+		if (x->accDirty) {
+			vStoreAcc(e);
+		}
 		// A COP0 or BREAK instruction stored the pcs before its call.
 		if (x->delay && !x->pcsStored) {
 			storePcs(e, x->pc, true);
