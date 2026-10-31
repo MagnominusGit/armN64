@@ -748,6 +748,14 @@ void retro_run(void) {
 	}
 }
 
+// Run-ahead and rollback states, taken many times a second, leave the GL renderer's pictures on the
+// GPU.
+static bool quickState(void) {
+	int context = RETRO_SAVESTATE_CONTEXT_NORMAL;
+	return environment(RETRO_ENVIRONMENT_GET_SAVESTATE_CONTEXT, &context) &&
+	       (context == RETRO_SAVESTATE_CONTEXT_RUNAHEAD_SAME_INSTANCE || context == RETRO_SAVESTATE_CONTEXT_ROLLBACK_NETPLAY);
+}
+
 size_t retro_serialize_size(void) {
 	return n64StateSize();
 }
@@ -762,7 +770,7 @@ bool retro_serialize(void* data, size_t size) {
 	if (own) {
 		glesResume();
 	}
-	bool saved = n64StateSave(machine, data, size);
+	bool saved = n64StateSave(machine, data, size, quickState());
 	if (own) {
 		glesYield();
 	}
@@ -777,7 +785,7 @@ bool retro_unserialize(const void* data, size_t size) {
 	if (own) {
 		glesResume();
 	}
-	bool loaded = n64StateLoad(machine, data, size);
+	bool loaded = n64StateLoad(machine, data, size, quickState());
 	if (own) {
 		glesYield();
 	}

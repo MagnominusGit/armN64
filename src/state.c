@@ -7,8 +7,12 @@
 // Save states, taken between fields: struct N64 as one block, then RDRAM and its hidden bits, the
 // RDP's state and the HLE renderer's and audio HLE's (zeros where there is none yet). Loading keeps
 // the running machine's host pointers, caches and settings, throws its compiled code away, and the
-// renderer threads, GPU RDP and GL renderer start again from the loaded RDP. Only the build that
-// made a state loads it: the header holds the sizes.
+// renderer threads, GPU RDP and GL renderer start again from the loaded RDP. Compiled code stays
+// where the state's code is the same. Only the build that
+// made a state loads it: the header holds the sizes. Quick states (run-ahead and rollback, many a
+// second) leave the GL renderer's pictures on the GPU and the renderer as it is: the machine is
+// exact, a picture not yet given back to RDRAM may not be. They leave out RDRAM's hidden bits, which
+// only the RDP's own drawing and the VI's filters read, when the GL renderer draws.
 
 enum { STATE_VERSION = 1, HAS_RDP = 1, HAS_HLE = 2, HAS_AUDIO = 4 };
 
@@ -32,14 +36,14 @@ static void put(uint8_t** at, const void* from, size_t size) {
 	*at += size;
 }
 
-bool n64StateSave(struct N64* n, void* data, size_t size) {
+bool n64StateSave(struct N64* n, void* data, size_t size, bool quick) {
 	if (size < n64StateSize()) {
 		return false;
 	}
 	// What the renderers and the GPU drew goes to RDRAM first.
-	rdpWait(n);
-	if (n->glr) {
-		glrSync(n);
+	bool const keepGl = quick && n->glr;
+	if (!keepGl) {
+		rdpWait(n);
 	}
 	uint8_t* at = data;
 	struct StateHeader h;
@@ -47,7 +51,7 @@ bool n64StateSave(struct N64* n, void* data, size_t size) {
 	put(&at, &h, sizeof(h));
 	put(&at, n, sizeof(*n));
 	put(&at, n->rdram, RDRAM_SIZE);
-	put(&at, n->hidden, RDRAM_SIZE / 2);
+	put(&at, keepGl ? NULL : n->hidden, RDRAM_SIZE / 2);
 	struct RDP* rdp = n->rdp ? malloc(sizeof(*rdp)) : NULL;
 	if (rdp) {
 		rdpStateGet(n, rdp);
@@ -59,7 +63,7 @@ bool n64StateSave(struct N64* n, void* data, size_t size) {
 	return true;
 }
 
-bool n64StateLoad(struct N64* n, const void* data, size_t size) {
+bool n64StateLoad(struct N64* n, const void* data, size_t size, bool quick) {
 	struct StateHeader h, want;
 	if (size < n64StateSize()) {
 		return false;
@@ -73,8 +77,10 @@ bool n64StateLoad(struct N64* n, const void* data, size_t size) {
 	if (!was) {
 		return false;
 	}
-	rdpWait(n);
-	blocksFree(n);
+	bool const keepGl = quick && n->glr;
+	if (!keepGl) {
+		rdpWait(n);
+	}
 	memcpy(was, n, sizeof(*was));
 	const uint8_t* at = (const uint8_t*) data + sizeof(h);
 	memcpy(n, at, sizeof(*n));
@@ -86,9 +92,17 @@ bool n64StateLoad(struct N64* n, const void* data, size_t size) {
 	n->hleCheck = was->hleCheck, n->slice = was->slice, n->accuracy = was->accuracy, n->compat = was->compat, n->fast = was->fast;
 	memcpy(n->blockPage, was->blockPage, sizeof(n->blockPage));
 	memcpy(n->codeWords, was->codeWords, sizeof(n->codeWords));
-	memset(n->pageFlags, 0, sizeof(n->pageFlags) - 1);
+	// The GL renderer kept, its pages stay flagged for giving back what it drew.
+	for (uint32_t p = 0; p < (RDRAM_SIZE >> 12); ++p) {
+		n->pageFlags[p] = was->pageFlags[p] & (keepGl ? 0xFF : PAGE_CODE);
+	}
+	if (keepGl) {
+		n->rdpPending = was->rdpPending;
+	}
 	n->pageFlags[RDRAM_SIZE >> 12] = 0xFF;
-	n->blockGen = was->blockGen + 1;
+	// The same TLB maps the same: the code for each address and the pages found stand.
+	bool const sameTlb = !memcmp(n->cpu.tlb, was->cpu.tlb, sizeof(n->cpu.tlb));
+	n->blockGen = was->blockGen + !sameTlb;
 	n->useBlocks = was->useBlocks, n->useJit = was->useJit;
 	n->jitArena = was->jitArena, n->jitUsed = was->jitUsed, n->jitEnter = was->jitEnter, n->jitLeave = was->jitLeave;
 	memcpy(n->jitTable, was->jitTable, sizeof(n->jitTable));
@@ -115,16 +129,24 @@ bool n64StateLoad(struct N64* n, const void* data, size_t size) {
 	n->idle.enabled = was->idle.enabled;
 	n->catchingUp = false;
 	n->saveDirty = true;
+	n->vpageFillCount = was->vpageFillCount;
 	free(was);
-	// Every page the TLB mapped is looked up again.
-	n->vpageFillCount = VPAGE_FILLED + 1;
-	cpuTlbChanged(n);
-
+	if (!sameTlb) {
+		cpuTlbChanged(n);
+	}
+	// Code that differs in the state's RDRAM is compiled again.
+	for (uint32_t p = 0; p < (RDRAM_SIZE >> 12); ++p) {
+		if ((n->pageFlags[p] & PAGE_CODE) && memcmp(n->rdram + (p << 12), at + (p << 12), 4096)) {
+			blocksInvalidatePage(n, p);
+		}
+	}
 	memcpy(n->rdram, at, RDRAM_SIZE);
 	at += RDRAM_SIZE;
-	memcpy(n->hidden, at, RDRAM_SIZE / 2);
+	if (!keepGl) {
+		memcpy(n->hidden, at, RDRAM_SIZE / 2);
+	}
 	at += RDRAM_SIZE / 2;
-	rdpStateLoad(n, h.has & HAS_RDP ? (const struct RDP*) at : NULL);
+	rdpStateLoad(n, h.has & HAS_RDP ? (const struct RDP*) at : NULL, quick);
 	at += sizeof(struct RDP);
 	if ((h.has & HAS_HLE) && (n->hle || (n->hle = malloc(hleStateSize())))) {
 		memcpy(n->hle, at, hleStateSize());

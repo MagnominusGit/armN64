@@ -3233,9 +3233,16 @@ void rdpStateGet(struct N64* n, struct RDP* out) {
 }
 
 // A save state's RDP (NULL for none yet): the renderer threads, GPU RDP and GL renderer go, and
-// start again from it when next drawn.
-void rdpStateLoad(struct N64* n, const struct RDP* saved) {
+// start again from it when next drawn; with keepGl the GL renderer stays, forgetting what it knew of
+// the RDP's state.
+void rdpStateLoad(struct N64* n, const struct RDP* saved, bool keepGl) {
+	struct Glr* glr = keepGl ? n->glr : NULL;
+	if (glr) {
+		n->glr = NULL;
+		glrStateLoaded(glr);
+	}
 	rdpDestroy(n);
+	n->glr = glr;
 	if (saved && (n->rdp = malloc(sizeof(*n->rdp)))) {
 		memcpy(n->rdp, saved, sizeof(*n->rdp));
 		n->rdp->tmemSource = NULL;

@@ -1486,6 +1486,14 @@ struct Glr* glrCreate(struct N64* n) {
 	return g;
 }
 
+// A save state loaded under the renderer: the RDP's generations start over, so nothing cached by
+// them holds.
+void glrStateLoaded(struct Glr* g) {
+	memset(g->tileTexture, 0, sizeof(g->tileTexture));
+	g->fastValid = false;
+	memset(&g->applied, 0xFF, sizeof(g->applied));
+}
+
 void glrForget(struct N64* n) {
 	if (n->glr) {
 		memset(&n->glr->applied, 0xFF, sizeof(n->glr->applied));

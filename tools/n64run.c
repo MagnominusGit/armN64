@@ -186,6 +186,7 @@ int main(int argc, char** argv) {
 	// N64STATETEST=field: a save state there, then after the run it is loaded and the rest run again;
 	// RDRAM and the picture must come out the same.
 	int stateAt = getenv("N64STATETEST") ? atoi(getenv("N64STATETEST")) : -1;
+	bool quick = getenv("N64STATEQUICK") != NULL;
 	void* state = NULL;
 	bool again = false;
 	uint64_t firstHash = 0;
@@ -193,7 +194,7 @@ int main(int argc, char** argv) {
 	for (int f = 0; f < fields; ++f) {
 		if (f == stateAt && !again) {
 			state = malloc(n64StateSize());
-			if (!state || !n64StateSave(n, state, n64StateSize())) {
+			if (!state || !n64StateSave(n, state, n64StateSize(), quick)) {
 				fprintf(stderr, "can't save a state\n");
 				return 1;
 			}
@@ -208,6 +209,17 @@ int main(int argc, char** argv) {
 				}
 			}
 			n->pad[0] = pad;
+		}
+		// N64RUNAHEAD=1: each field as RetroArch's run-ahead runs it: a quick state, the field, the
+		// state loaded and the field again.
+		static void* ahead;
+		if (getenv("N64RUNAHEAD")) {
+			if (!ahead) {
+				ahead = malloc(n64StateSize());
+			}
+			n64StateSave(n, ahead, n64StateSize(), true);
+			n64RunField(n);
+			n64StateLoad(n, ahead, n64StateSize(), true);
 		}
 		n64RunField(n);
 		// N64RUMBLELOG: when controller 1's Rumble Pak motor turns on and off.
@@ -268,7 +280,7 @@ int main(int argc, char** argv) {
 			if (!again) {
 				firstHash = hash;
 				again = true;
-				if (!n64StateLoad(n, state, n64StateSize())) {
+				if (!n64StateLoad(n, state, n64StateSize(), quick)) {
 					fprintf(stderr, "can't load the state\n");
 					return 1;
 				}
