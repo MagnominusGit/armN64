@@ -441,7 +441,7 @@ void cpuException(struct N64*, int code, int coprocessor);
 void cpuCheckInterrupts(struct N64*);
 uint32_t cpuCount(struct N64*);
 bool cpuPeekAddress(struct N64*, uint64_t vaddr, uint32_t* paddr);
-// Kernel mode with 32-bit addressing, the only mode compiled code runs in.
+// Kernel mode, the only mode compiled code runs in.
 bool cpuPlainMode(const struct N64*);
 uint32_t cpuDcacheMiss(struct N64*, uint32_t vaddr, uint32_t paddr);
 uint32_t cpuIcacheMiss(struct N64*, uint32_t vaddr, uint32_t paddr);

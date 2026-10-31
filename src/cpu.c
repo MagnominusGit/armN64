@@ -403,9 +403,10 @@ static uint32_t endianLanes(const struct CPU* c, int size) {
 	return size == 1 ? 7 : size == 2 ? 6 : size == 4 ? 4 : 0;
 }
 
-// Whether compiled code may run: it takes kernel mode's 32-bit addressing for granted.
+// Whether compiled code may run: kernel mode. Its addresses are 32-bit ones sign-extended (anything
+// else goes to the interpreter), which 64-bit addressing maps as 32-bit addressing does.
 bool cpuPlainMode(const struct N64* n) {
-	return cpuMode(&n->cpu) == MODE_KERNEL && !cpuWide(&n->cpu);
+	return cpuMode(&n->cpu) == MODE_KERNEL;
 }
 
 // Where an address goes in the mode the CPU is in (the VR4300's segments): nowhere (an address
