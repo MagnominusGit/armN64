@@ -1,10 +1,57 @@
 // Runs a cartridge headless. Usage: n64run rom fields [picture.ppm]
+#define _GNU_SOURCE
 #include "n64.h"
 
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 #include <time.h>
+#include <signal.h>
+#include <ucontext.h>
+#include <unistd.h>
+#include <sys/syscall.h>
+
+// N64SAMPLE=file: the main thread's program counter every half millisecond of its CPU time, as
+// 64-bit words, for a profile where perf isn't there (N64_PERFMAP=1 names the compiled blocks).
+enum { SAMPLES = 1 << 22 };
+static uint64_t* samples;
+static volatile size_t sampleCount;
+
+static void sample(int sig, siginfo_t* info, void* context) {
+	ucontext_t* uc = context;
+#if defined(__aarch64__)
+	uint64_t pc = uc->uc_mcontext.pc;
+#else
+	uint64_t pc = (uint64_t) uc->uc_mcontext.gregs[REG_RIP];
+#endif
+	if (sampleCount < SAMPLES) {
+		samples[sampleCount++] = pc;
+	}
+}
+
+static void sampleStart(void) {
+	samples = malloc(SAMPLES * sizeof(*samples));
+	struct sigaction sa = { 0 };
+	sa.sa_sigaction = sample;
+	sa.sa_flags = SA_SIGINFO | SA_RESTART;
+	sigaction(SIGPROF, &sa, NULL);
+	struct sigevent ev = { 0 };
+	ev.sigev_notify = SIGEV_THREAD_ID;
+	ev.sigev_signo = SIGPROF;
+	ev._sigev_un._tid = (pid_t) syscall(SYS_gettid);
+	timer_t timer;
+	timer_create(CLOCK_THREAD_CPUTIME_ID, &ev, &timer);
+	struct itimerspec every = { { 0, 500000 }, { 0, 500000 } };
+	timer_settime(timer, 0, &every, NULL);
+}
+
+static void sampleWrite(const char* path) {
+	FILE* f = fopen(path, "wb");
+	if (f) {
+		fwrite(samples, sizeof(*samples), sampleCount, f);
+		fclose(f);
+	}
+}
 
 static uint8_t* readFile(const char* path, size_t* size) {
 	FILE* f = fopen(path, "rb");
@@ -90,6 +137,9 @@ int main(int argc, char** argv) {
 	bool pics = getenv("N64PICS") != NULL;
 	static uint32_t frame[640 * 480];
 	struct timespec t0, t1;
+	if (getenv("N64SAMPLE")) {
+		sampleStart();
+	}
 	clock_gettime(CLOCK_MONOTONIC, &t0);
 	for (int f = 0; f < fields; ++f) {
 		n64RunField(n);
@@ -97,7 +147,10 @@ int main(int argc, char** argv) {
 			struct timespec a, b;
 			int pw, ph;
 			clock_gettime(CLOCK_MONOTONIC, &a);
-			if (!n64PictureStart(n, &pw, &ph)) {
+			// As the core takes it: from the GL renderer's framebuffer when the GPU drew it last.
+			unsigned framebuffer;
+			int px, py;
+			if (!n64GlPicture(n, &framebuffer, &px, &py, &pw, &ph) && !n64PictureStart(n, &pw, &ph)) {
 				n64Picture(n, frame, &pw, &ph);
 			}
 			clock_gettime(CLOCK_MONOTONIC, &b);
@@ -121,6 +174,9 @@ int main(int argc, char** argv) {
 		}
 	}
 	clock_gettime(CLOCK_MONOTONIC, &t1);
+	if (getenv("N64SAMPLE")) {
+		sampleWrite(getenv("N64SAMPLE"));
+	}
 	double secs = (t1.tv_sec - t0.tv_sec) + (t1.tv_nsec - t0.tv_nsec) / 1e9;
 	printf("%d fields in %.2f s (%.1fx real time), pc %08x\n", fields, secs, fields / 60.0 / secs,
 	       (uint32_t) n->cpu.pc);
