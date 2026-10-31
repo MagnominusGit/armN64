@@ -383,9 +383,9 @@ static bool emitCop0(struct Jit* j, uint32_t op) {
 			if (rd == CP0_COUNT) {
 				// Count: half the cycles before this instruction, from countBase.
 				aDp(e, A_SUB | W64, 0, LIMIT, LEFT, S_LSL, 0);
-				aLsrImmX(e, 0, 0, 1);
 				aLdrX(e, 1, CPU, CPU_OFF(countBase));
 				aDp(e, A_SUB | W64, 0, 0, 1, S_LSL, 0);
+				aLsrImmX(e, 0, 0, 1);
 				if (rs == 0x00) {
 					aSxtw(e, d, 0);
 				} else {

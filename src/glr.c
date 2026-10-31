@@ -1226,7 +1226,8 @@ void glrDraw(struct N64* n, struct RDP* r, const uint64_t* w, int op) {
 			struct Gl* gl = &g->gl;
 			useFramebuffer(g, g->state.target->framebuffer);
 			int sx0 = x0 >> 2 > g->state.scissor[0] ? x0 >> 2 : g->state.scissor[0];
-			int sx1 = (x1 >> 2) + 1 < g->state.scissor[2] ? (x1 >> 2) + 1 : g->state.scissor[2];
+			// The scissor's right edge is in in fill mode.
+			int sx1 = (x1 >> 2) < (int) (r->scissorX1 >> 2) ? (x1 >> 2) + 1 : (int) (r->scissorX1 >> 2) + 1;
 			int sy0 = y0 >> 2 > g->state.scissor[1] ? y0 >> 2 : g->state.scissor[1];
 			int sy1 = rows < g->state.scissor[3] ? rows : g->state.scissor[3];
 			if (sx1 <= sx0 || sy1 <= sy0) {

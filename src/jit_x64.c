@@ -205,8 +205,8 @@ static bool emitCop0(struct Jit* j, uint32_t op) {
 			if (rd == CP0_COUNT) {
 				// Count: half the cycles before this instruction, from countBase.
 				xMovRR(e, 8, RAX, R13);
-				xShiftI(e, X_SHR, 8, R(RAX), 1);
 				xAluRM(e, X_SUB, 8, RAX, CPU_AT(countBase));
+				xShiftI(e, X_SHR, 8, R(RAX), 1);
 				if (rs == 0x00) {
 					xMovsxd(e, RAX, R(RAX));
 				} else {

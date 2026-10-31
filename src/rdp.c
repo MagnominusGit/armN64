@@ -250,7 +250,7 @@ static inline __attribute__((always_inline)) struct Color texel(struct RDP* r, c
 			return tlutColor(r, t->palette << 4 | v, kind == TK_CI4_IA);
 		}
 		if (kind == TK_IA4) {
-			int i = (v >> 1) * 255 / 7;
+			int i = (v >> 1) << 5 | (v >> 1) << 2 | (v >> 2);
 			return (struct Color) { i, i, i, v & 1 ? 255 : 0 };
 		}
 		int i = v * 17;
@@ -918,15 +918,18 @@ static void fillRect(struct N64* n, struct RDP* r, int x0, int y0, int x1, int y
 	}
 }
 
+// The scissor's right edge takes in its own column in fill and copy modes (libdragon's rdpq, from
+// hardware).
 static void clipRect(struct RDP* r, int* x0, int* y0, int* x1, int* y1) {
+	int const right = (r->scissorX1 >> 2) - (((r->otherModes >> 52) & 3) >= 2 ? 0 : 1);
 	if (*x0 < r->scissorX0 >> 2) {
 		*x0 = r->scissorX0 >> 2;
 	}
 	if (*y0 < r->scissorY0 >> 2) {
 		*y0 = r->scissorY0 >> 2;
 	}
-	if (*x1 > (r->scissorX1 >> 2) - 1) {
-		*x1 = (r->scissorX1 >> 2) - 1;
+	if (*x1 > right) {
+		*x1 = right;
 	}
 	if (*y1 > (r->scissorY1 >> 2) - 1) {
 		*y1 = (r->scissorY1 >> 2) - 1;
@@ -1012,8 +1015,9 @@ static int levelOfDetail(struct RDP* r, int primTile, int s, int t, int sx, int 
 	return frac;
 }
 
-// A texture rectangle's first pixel, and its pixels after the scissor.
-static void textureRectBounds(struct RDP* r, uint64_t w0, int* cx0, int* cy0, int* x0, int* y0, int* x1, int* y1) {
+// A texture or fill rectangle's first pixel, and its pixels after the scissor: the right and bottom
+// edges are in only in fill and copy modes.
+static void rectBounds(struct RDP* r, uint64_t w0, int* cx0, int* cy0, int* x0, int* y0, int* x1, int* y1) {
 	int xl = (w0 >> 44) & 0xFFF, yl = (w0 >> 32) & 0xFFF;
 	int xh = (w0 >> 12) & 0xFFF, yh = w0 & 0xFFF;
 	int cycleType = (r->otherModes >> 52) & 3;
@@ -1025,7 +1029,7 @@ static void textureRectBounds(struct RDP* r, uint64_t w0, int* cx0, int* cy0, in
 }
 
 void rdpRectBounds(struct RDP* r, uint64_t w0, int* cx0, int* cy0, int* x0, int* y0, int* x1, int* y1) {
-	textureRectBounds(r, w0, cx0, cy0, x0, y0, x1, y1);
+	rectBounds(r, w0, cx0, cy0, x0, y0, x1, y1);
 }
 
 static void textureRect(struct N64* n, struct RDP* r, uint64_t w0, uint64_t w1, bool flip) {
@@ -1037,7 +1041,7 @@ static void textureRect(struct N64* n, struct RDP* r, uint64_t w0, uint64_t w1, 
 		dsdx /= 4;
 	}
 	int cx0, cy0, x0, y0, x1, y1;
-	textureRectBounds(r, w0, &cx0, &cy0, &x0, &y0, &x1, &y1);
+	rectBounds(r, w0, &cx0, &cy0, &x0, &y0, &x1, &y1);
 	r->maxLevel = 0;
 	bool doLod = cycleType < 2 && (((r->otherModes >> 48) & 1) || lodFracUsed(r));
 	for (int y = y0; y <= y1; ++y) {
@@ -1453,11 +1457,10 @@ static uint64_t primitiveClocks(struct RDP* r, const uint64_t* w, int op) {
 	int x0, y0, x1, y1;
 	if (op == 0x24 || op == 0x25) {
 		int cx0, cy0;
-		textureRectBounds(r, w[0], &cx0, &cy0, &x0, &y0, &x1, &y1);
+		rectBounds(r, w[0], &cx0, &cy0, &x0, &y0, &x1, &y1);
 	} else if (op == 0x36) {
-		x1 = ((w[0] >> 44) & 0xFFF) >> 2, y1 = ((w[0] >> 32) & 0xFFF) >> 2;
-		x0 = ((w[0] >> 12) & 0xFFF) >> 2, y0 = (w[0] & 0xFFF) >> 2;
-		clipRect(r, &x0, &y0, &x1, &y1);
+		int cx0, cy0;
+		rectBounds(r, w[0], &cx0, &cy0, &x0, &y0, &x1, &y1);
 	} else {
 		return 0;
 	}
@@ -1549,10 +1552,9 @@ static void execute(struct N64* n, struct RDP* r, const uint64_t* w, int op) {
 		break;
 	}
 	case 0x36: {
-		int x1 = ((c >> 44) & 0xFFF) >> 2, y1 = ((c >> 32) & 0xFFF) >> 2;
-		int x0 = ((c >> 12) & 0xFFF) >> 2, y0 = (c & 0xFFF) >> 2;
+		int x0, y0, x1, y1, cx0, cy0;
 		int cycleType = (r->otherModes >> 52) & 3;
-		clipRect(r, &x0, &y0, &x1, &y1);
+		rectBounds(r, c, &cx0, &cy0, &x0, &y0, &x1, &y1);
 		if (cycleType == 3) {
 			fillRect(n, r, x0, y0, x1, y1);
 		} else {
@@ -1952,11 +1954,10 @@ static void primitiveRows(struct RDP* r, const uint64_t* w, int op, int* y0, int
 		*y1 = end - 1;
 	} else if (op == 0x24 || op == 0x25) {
 		int cx0, cy0;
-		textureRectBounds(r, w[0], &cx0, &cy0, &x0, y0, &x1, y1);
+		rectBounds(r, w[0], &cx0, &cy0, &x0, y0, &x1, y1);
 	} else {
-		x1 = ((w[0] >> 44) & 0xFFF) >> 2, *y1 = ((w[0] >> 32) & 0xFFF) >> 2;
-		x0 = ((w[0] >> 12) & 0xFFF) >> 2, *y0 = (w[0] & 0xFFF) >> 2;
-		clipRect(r, &x0, y0, &x1, y1);
+		int cx0, cy0;
+		rectBounds(r, w[0], &cx0, &cy0, &x0, y0, &x1, y1);
 	}
 }
 
@@ -2958,7 +2959,7 @@ static void gpuCommand(struct N64* n, struct RDP* r, const uint64_t* w, int op) 
 		}
 	} else if (op == 0x24 || op == 0x25) {
 		int cx0, cy0, x0, x1;
-		textureRectBounds(r, w[0], &cx0, &cy0, &x0, &y0, &x1, &y1);
+		rectBounds(r, w[0], &cx0, &cy0, &x0, &y0, &x1, &y1);
 		if (x1 < x0 || y1 < y0) {
 			return;
 		}
@@ -2973,9 +2974,8 @@ static void gpuCommand(struct N64* n, struct RDP* r, const uint64_t* w, int op) 
 		p[12] = cx0, p[13] = cy0;
 		p[14] = op == 0x25;
 	} else {
-		int x1 = ((w[0] >> 44) & 0xFFF) >> 2, x0 = ((w[0] >> 12) & 0xFFF) >> 2;
-		y1 = ((w[0] >> 32) & 0xFFF) >> 2, y0 = (w[0] & 0xFFF) >> 2;
-		clipRect(r, &x0, &y0, &x1, &y1);
+		int x0, x1, cx0, cy0;
+		rectBounds(r, w[0], &cx0, &cy0, &x0, &y0, &x1, &y1);
 		if (x1 < x0 || y1 < y0) {
 			return;
 		}

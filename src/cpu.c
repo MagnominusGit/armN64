@@ -14,7 +14,12 @@ enum { ST_IE = 1, ST_EXL = 2, ST_ERL = 4, ST_FR = 1 << 26, ST_CU1 = 1 << 29, ST_
 // Timing, in CPU cycles on top of one a instruction: cache line fills and write-backs, and reads of
 // RCP registers (cache figures as in the VR4300 manual and ares; the RCP read cost is fitted to
 // pdrome's instruction timing ROM, which counts loop iterations per field on hardware).
-enum { RCP_READ = 22 };
+enum { RCP_READ = 22, PI_READ = 250 };
+
+// What an uncached read costs: an RCP register, or a word over the PI bus (cartridge, 64DD; ares).
+static uint32_t readCost(uint32_t paddr) {
+	return paddr < RDRAM_SIZE ? 0 : paddr >= 0x05000000 && paddr < 0x1FC00000 ? PI_READ : RCP_READ;
+}
 
 static bool address(struct N64* n, uint64_t vaddr, int align, bool store, uint32_t* paddr);
 
@@ -139,7 +144,7 @@ bool cpuCodeCoherent(struct N64* n, uint32_t vaddr, uint32_t paddr, uint32_t cou
 static uint32_t fetch(struct N64* n, uint64_t vaddr, uint32_t paddr) {
 	struct CPU* c = &n->cpu;
 	if (!c->cachedAccess) {
-		c->stall += paddr >= RDRAM_SIZE ? RCP_READ : 0;
+		c->stall += readCost(paddr);
 		return busRead32(n, paddr);
 	}
 	uint32_t i = ((uint32_t) vaddr >> 5) & 511;
@@ -265,9 +270,9 @@ void cpuReset(struct N64* n) {
 	c->nextPc = c->pc + 4;
 }
 
-// Count runs at half the CPU clock; it is kept as an offset from the cycle counter.
+// Count runs at half the CPU clock, from the cycle countBase (a write starts it on an edge, ares).
 uint32_t cpuCount(struct N64* n) {
-	return (uint32_t) ((n->cycles >> 1) - n->cpu.countBase);
+	return (uint32_t) ((n->cycles - n->cpu.countBase) >> 1);
 }
 
 static bool cpuWide(const struct CPU* c);
@@ -620,7 +625,7 @@ static void cop0Write(struct N64* n, int r, uint64_t v) {
 		cop0[r] = (uint32_t) v;
 		return;
 	case CP0_COUNT:
-		n->cpu.countBase = (n->cycles >> 1) - (uint32_t) v;
+		n->cpu.countBase = n->cycles - 2 * (uint64_t) (uint32_t) v;
 		n->cpu.lastCount = (uint32_t) v;
 		return;
 	// The timer is checked from the Count at the write on, as each instruction checks it (compiled
@@ -791,7 +796,7 @@ static bool loadAt(struct N64* n, uint64_t vaddr, int size, uint64_t* out, uint3
 	p ^= endianLanes(c, size);
 	*paddr = p;
 	if (p >= RDRAM_SIZE) {
-		c->stall += RCP_READ;
+		c->stall += readCost(p);
 	} else if (c->cachedAccess) {
 		uint32_t i = dcacheLine(n, vaddr, p);
 		if (!n->compat) {
@@ -1643,7 +1648,7 @@ bool cpuJitReady(struct N64* n) {
 		return false;
 	}
 	uint32_t delta = (uint32_t) c->cop0[CP0_COMPARE] - now;
-	n->jitFire = ((n->cycles >> 1) + (delta ? delta : 1ull << 32)) << 1;
+	n->jitFire = n->cycles - ((n->cycles - c->countBase) & 1) + 2 * (delta ? delta : 1ull << 32);
 	n->jitLimit = n->eventAt < n->jitFire ? n->eventAt : n->jitFire;
 	return true;
 }
@@ -1663,7 +1668,7 @@ static bool uncachedWord(struct N64* n, uint32_t op) {
 	}
 	uint32_t p = (uint32_t) vaddr & 0x1FFFFFFF;
 	if (op >> 26 == 0x23) {
-		c->stall += p >= RDRAM_SIZE ? RCP_READ : 0;
+		c->stall += readCost(p);
 		c->gpr[RT] = sext32(busRead32(n, p));
 	} else {
 		busWrite32(n, p, (uint32_t) c->gpr[RT]);

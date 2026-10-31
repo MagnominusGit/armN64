@@ -322,7 +322,7 @@ ivec4 texel(int t, int s, int tt) {
 			return tlutColor(tileField(t, T_PALETTE) << 4 | v);
 		}
 		if (format == 3) {
-			int i = (v >> 1) * 255 / 7;
+			int i = (v >> 1) << 5 | (v >> 1) << 2 | (v >> 2);
 			return ivec4(i, i, i, (v & 1) != 0 ? 255 : 0);
 		}
 		int i = v * 17;

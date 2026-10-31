@@ -268,7 +268,42 @@ static void piDmaCode(struct N64* n, uint32_t len) {
 	n64RdramWrite(n, n->pi.dramAddr & 0xFFFFF8, len + 16);
 }
 
+// A DMA's time in RCP cycles, as ares has it: per bus page the domain's latency and a setup, per
+// halfword its pulse and release, per full 128-byte buffer and per byte of a partial one a transfer
+// to RDRAM.
+static uint64_t piDmaCycles(struct N64* n, uint32_t cart, uint32_t len) {
+	const uint32_t* t = &n->pi.timing[(cart >> 24) == 0x05 || ((cart >> 24) >= 0x08 && (cart >> 24) <= 0x0F) ? 4 : 0];
+	len = (len | 1) + 1;
+	uint32_t const shift = (t[2] & 15) + 2, size = 1u << shift, mask = size - 1;
+	uint32_t const first = cart & ~1u, last = first + len - 2;
+	uint32_t const pages = (last >> shift) - (first >> shift) + 1;
+	uint32_t buffers = 0, partial = 0;
+	if (pages == 1) {
+		if (len == 128) {
+			buffers = 1;
+		} else {
+			partial = len;
+		}
+	} else {
+		if (first & mask) {
+			partial += size - (first & mask);
+		} else {
+			++buffers;
+		}
+		if ((last + 2) & mask) {
+			partial += (last & mask) + 2;
+		} else {
+			++buffers;
+		}
+		if (pages > 2) {
+			buffers += (pages - 2) * size / 128;
+		}
+	}
+	return (uint64_t) (14 + t[0] + 1) * pages + (uint64_t) (t[1] + 1 + t[3] + 1) * len / 2 + buffers * 28 + partial;
+}
+
 static void piDma(struct N64* n, uint32_t len, bool toRdram) {
+	uint32_t const cart = n->pi.cartAddr;
 	if (toRdram) {
 		piDmaCode(n, len);
 		piDmaToRdram(n, len);
@@ -288,10 +323,7 @@ static void piDma(struct N64* n, uint32_t len, bool toRdram) {
 	}
 	++n->stats.piDmas;
 	n->stats.piBytes += len;
-	// Domain 1 bus timing, in RCP cycles: latency per page, pulse width and release per halfword.
-	uint32_t* t = n->pi.timing;
-	uint32_t page = 1u << ((t[2] & 15) + 2);
-	uint64_t rcp = (uint64_t) ((len + page - 1) / page) * (t[0] + 1) + (uint64_t) ((len + 1) / 2) * ((t[1] + 1) + (t[3] + 1));
+	uint64_t rcp = piDmaCycles(n, cart, len);
 	// Emulators that hacks were made on finish a DMA in a quarter cycle a byte (lle-compatible accuracy).
 	n->pi.busyUntil = n->cycles + (n->compat ? len / 4 + 1 : rcp * 3 / 2);
 	n64Event(n, n->pi.busyUntil);
