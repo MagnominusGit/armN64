@@ -241,6 +241,28 @@ static void idleRegs(const struct CPU* c, struct IdleRegs* out) {
 	out->hi = c->hi, out->lo = c->lo, out->fcr31 = c->fcr31;
 }
 
+// Interpreter steps until pc again with the registers as given (a loop inside the pass goes round
+// as it needs), within limit steps and the slice; false as idleStepTo.
+static bool idleStepBack(struct N64* n, uint32_t pc, const struct IdleRegs* regs, int limit) {
+	struct CPU* c = &n->cpu;
+	struct IdleRegs now;
+	for (int k = 0; k < limit && n->cycles < n->eventAt; ++k) {
+		cpuStep(n);
+		n->cycles += 1 + c->stall;
+		c->stall = 0;
+		if (n->idle.fatal) {
+			return false;
+		}
+		if ((uint32_t) c->pc == pc && !c->nextInDelay) {
+			idleRegs(c, &now);
+			if (!memcmp(&now, regs, sizeof(now))) {
+				return true;
+			}
+		}
+	}
+	return false;
+}
+
 // A loop that only waits: two passes from here back to here, the second leaving every register as
 // it found it, storing nothing new and touching no register of the RCP. It then goes round the
 // same until something it loads changes, so the rest of each slice is skipped (interrupts and other
@@ -283,11 +305,11 @@ static bool idleRun(struct N64* n) {
 	d->near = 0;
 	uint32_t pc = (uint32_t) c->pc;
 	struct IdleRegs before, after;
-	d->tracing = true, d->fatal = false, d->changed = false;
-	bool once = idleStepTo(n, pc, PASS_LIMIT);
 	idleRegs(c, &before);
+	d->tracing = true, d->fatal = false, d->changed = false;
+	bool once = idleStepBack(n, pc, &before, PASS_LIMIT);
 	d->changed = false, d->loads = 0;
-	bool twice = once && idleStepTo(n, pc, PASS_LIMIT);
+	bool twice = once && idleStepBack(n, pc, &before, PASS_LIMIT);
 	idleRegs(c, &after);
 	d->tracing = false;
 	if (!twice || d->changed || d->loads > (int) (sizeof(d->load) / sizeof(d->load[0])) / 2 ||
