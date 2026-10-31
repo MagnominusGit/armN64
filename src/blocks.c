@@ -72,16 +72,25 @@ static bool pollOp(uint32_t op, uint64_t* reads, uint64_t* writes) {
 	return false;
 }
 
-uint32_t blockPollPass(const uint32_t* ops, uint32_t count, uint32_t vaddr) {
-	if (count < 3 || count > 16) {
+uint32_t blockPollPass(const uint32_t* ops, uint32_t count, uint32_t vaddr, int* reload) {
+	*reload = 0;
+	if (count < 2 || count > 16) {
 		return 0;
 	}
 	// A conditional branch back to the start, then its delay slot.
 	uint32_t branch = ops[count - 2];
 	int code = branch >> 26;
-	bool conditional = (code >= 0x04 && code <= 0x07) || (code == 0x01 && !(((branch >> 16) & 31) & ~1u));
+	bool conditional = (code >= 0x04 && code <= 0x07) || (code >= 0x14 && code <= 0x17) || (code == 0x01 && !(((branch >> 16) & 31) & ~1u));
 	if (!conditional || vaddr + 4 * (count - 1) + ((uint32_t) (int16_t) branch << 2) != vaddr) {
 		return 0;
+	}
+	// Or a branch on a register against zero with the load of that register in its delay slot: each
+	// pass then reads what the pass before loaded, the same while the branch is taken on it.
+	int rs = (branch >> 21) & 31, rt = (branch >> 16) & 31;
+	uint32_t delay = ops[count - 1];
+	if ((code & ~0x10) >= 0x04 && (code & ~0x10) <= 0x05 && (!rs || !rt) && (rs | rt) &&
+	    ((delay >> 26) == 0x23 || (delay >> 26) == 0x27) && (int) ((delay >> 16) & 31) == (rs | rt) && (int) ((delay >> 21) & 31) != (rs | rt)) {
+		*reload = (rs | rt) | ((code & ~0x10) == 0x04 ? 32 : 0);
 	}
 	uint64_t written = 0, readFirst = 0;
 	bool load = false;
@@ -89,9 +98,10 @@ uint32_t blockPollPass(const uint32_t* ops, uint32_t count, uint32_t vaddr) {
 		uint32_t op = ops[k];
 		uint64_t reads, writes;
 		if (k == count - 2) {
-			reads = 1ull << ((op >> 21) & 31) | (code == 0x04 || code == 0x05 ? 1ull << ((op >> 16) & 31) : 0);
+			reads = *reload ? 0 : 1ull << rs | ((code & ~0x10) == 0x04 || (code & ~0x10) == 0x05 ? 1ull << rt : 0);
 			writes = 0;
-		} else if (!pollOp(op, &reads, &writes)) {
+		} else if (!pollOp(op, &reads, &writes) || (*reload && k < count - 2 && (writes & 1ull << (*reload & 31)))) {
+			*reload = 0;
 			return 0;
 		}
 		load |= op >> 26 >= 0x20;
@@ -99,7 +109,11 @@ uint32_t blockPollPass(const uint32_t* ops, uint32_t count, uint32_t vaddr) {
 		written |= writes;
 	}
 	// Each pass reads only what no pass changes, so all of them do the same.
-	return load && !((readFirst & written) & ~1ull) ? count : 0;
+	if (!load || ((readFirst & written) & ~1ull)) {
+		*reload = 0;
+		return 0;
+	}
+	return count;
 }
 
 void blocksInvalidatePage(struct N64* n, uint32_t page) {

@@ -440,8 +440,10 @@ bool blockIsIdleLoop(const uint32_t* ops, uint32_t count, uint32_t vaddr);
 void idleLoad(struct N64*, uint32_t paddr, int size, uint64_t value);
 void idleStore(struct N64*, uint32_t paddr, int size, uint64_t value);
 // The cycles one pass of a poll loop takes with its cache lines in, or 0 if the block isn't one: a
-// loop back to its start through loads and ALU instructions whose every pass reads the same.
-uint32_t blockPollPass(const uint32_t* ops, uint32_t count, uint32_t vaddr);
+// loop back to its start through loads and ALU instructions whose every pass reads the same. For a
+// branch on what its delay slot loads, reload is that register, plus 32 when the branch is taken
+// on zero (else on non-zero); the passes are the same while it is taken on the register.
+uint32_t blockPollPass(const uint32_t* ops, uint32_t count, uint32_t vaddr, int* reload);
 // jit_x64.c
 void* jitCompile(struct N64*, const uint32_t* ops, uint32_t count, uint32_t vaddr, uint32_t paddr);
 void jitReset(struct N64*);

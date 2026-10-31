@@ -775,7 +775,7 @@ static void emitMemory(struct Jit* j, struct Slow* slow) {
 // A poll loop (blockPollPass) about to go round again, pc back at its start, skips the whole passes
 // of pass cycles that fit before the limit when all its I-cache and D-cache lines are in: every pass
 // then reads the same memory, takes the same branch and costs the same.
-static void pollSkip(struct Jit* j, const uint32_t* ops, uint32_t count, uint32_t vaddr, uint32_t paddr, uint32_t pass) {
+static void pollSkip(struct Jit* j, const uint32_t* ops, uint32_t count, uint32_t vaddr, uint32_t paddr, uint32_t pass, int reload) {
 	struct Emitter* e = &j->e;
 	uint8_t* out[64];
 	int sites = 0;
@@ -783,6 +783,11 @@ static void pollSkip(struct Jit* j, const uint32_t* ops, uint32_t count, uint32_
 	movConst(e, RCX, sext32(vaddr));
 	xAluRR(e, X_CMP, 8, R(RAX), RCX);
 	out[sites++] = xJcc(e, CC_NE, NULL);
+	if (reload) {
+		xLoad(e, 8, RDX, gpr(reload & 31));
+		xAluI(e, X_CMP, 8, R(RDX), 0);
+		out[sites++] = xJcc(e, reload & 32 ? CC_NE : CC_E, NULL);
+	}
 	for (uint32_t p = paddr & ~31u; p < paddr + 4 * count; p += 32) {
 		uint32_t v = vaddr + (p - paddr);
 		struct Opnd tag = M(R12, (int32_t) (offsetof(struct CPU, icacheTag) + 4 * ((v >> 5) & 511)));
@@ -915,7 +920,8 @@ void* jitCompile(struct N64* n, const uint32_t* ops, uint32_t count, uint32_t va
 	if (blockIsIdleLoop(ops, count, vaddr)) {
 		skipIdle(e, vaddr, paddr);
 	}
-	uint32_t pollPass = blockPollPass(ops, count, vaddr);
+	int reload;
+	uint32_t pollPass = blockPollPass(ops, count, vaddr, &reload);
 
 	bool delay = false;
 	for (uint32_t k = 0; k < count; ++k) {
@@ -1061,7 +1067,7 @@ void* jitCompile(struct N64* n, const uint32_t* ops, uint32_t count, uint32_t va
 			xAluRR(e, X_CMP, 8, R(R13), R14);
 			xJcc(e, CC_AE, j->leave);
 			if (pollPass) {
-				pollSkip(j, ops, count, vaddr, paddr, pollPass);
+				pollSkip(j, ops, count, vaddr, paddr, pollPass, reload);
 			}
 			chain(j);
 		} else {
