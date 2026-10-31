@@ -398,6 +398,15 @@ static int64_t sectorOffset(const struct DD* d, uint16_t head, uint16_t track, u
 	return at + size <= d->diskSize ? (int64_t) at : -1;
 }
 
+// A sector of the block under the head written: its LBA goes in the disk's changes.
+static void written(struct DD* d, uint16_t head, uint16_t track, uint16_t block) {
+	uint16_t lba = d->physLba[track | head << 12 | block << 13];
+	if (lba < SIZE_LBA) {
+		d->written[lba >> 3] |= (uint8_t) (1 << (lba & 7));
+		d->diskSaved = false;
+	}
+}
+
 void ddBmRequest(struct N64* n) {
 	struct DD* d = &n->dd;
 	d->bmAt = 0;
@@ -439,6 +448,7 @@ void ddBmRequest(struct N64* n) {
 				int64_t at = sectorOffset(d, head, track, block, sector - 1, size);
 				if (at >= 0) {
 					memcpy(d->disk + at, d->ds, size > sizeof(d->ds) ? sizeof(d->ds) : size);
+					written(d, head, track, block);
 				}
 			}
 			d->requestUser = true;
@@ -447,6 +457,7 @@ void ddBmRequest(struct N64* n) {
 			int64_t at = sectorOffset(d, head, track, block, 0x54, size);
 			if (at >= 0) {
 				memcpy(d->disk + at, d->ds, size > sizeof(d->ds) ? sizeof(d->ds) : size);
+				written(d, head, track, block);
 			}
 			d->blockTransfer = false;
 			d->currentSector = block ? 0 : 0x5A;
@@ -455,6 +466,7 @@ void ddBmRequest(struct N64* n) {
 			int64_t at = sectorOffset(d, head, track, block, 0x54, size);
 			if (at >= 0) {
 				memcpy(d->disk + at, d->ds, size > sizeof(d->ds) ? sizeof(d->ds) : size);
+				written(d, head, track, block);
 			}
 			d->requestUser = false;
 			d->bmStart = false;
@@ -655,6 +667,55 @@ bool ddLoad(struct N64* n, const uint8_t* ipl, size_t iplSize, const uint8_t* di
 		}
 	}
 	power(n);
+	return true;
+}
+
+// The disk's changes, for a frontend to keep beside the image: "AN64DISK", then each block written
+// since loading as its LBA (2 bytes), length (4, big-endian) and bytes. NULL with none.
+uint8_t* ddChanges(struct N64* n, size_t* size) {
+	struct DD* d = &n->dd;
+	size_t total = 8;
+	for (uint32_t lba = 0; d->disk && lba < SIZE_LBA; ++lba) {
+		if (d->written[lba >> 3] & (1 << (lba & 7))) {
+			total += 6 + d->lbaOffset[lba + 1] - d->lbaOffset[lba];
+		}
+	}
+	uint8_t* out = total > 8 ? malloc(total) : NULL;
+	if (!out) {
+		return NULL;
+	}
+	memcpy(out, "AN64DISK", 8);
+	uint8_t* at = out + 8;
+	for (uint32_t lba = 0; lba < SIZE_LBA; ++lba) {
+		if (d->written[lba >> 3] & (1 << (lba & 7))) {
+			uint32_t length = d->lbaOffset[lba + 1] - d->lbaOffset[lba];
+			at[0] = (uint8_t) (lba >> 8), at[1] = (uint8_t) lba;
+			put32(at + 2, length);
+			memcpy(at + 6, d->disk + d->lbaOffset[lba], length);
+			at += 6 + length;
+		}
+	}
+	*size = total;
+	return out;
+}
+
+// Changes ddChanges made, back over the loaded disk; false when they don't fit it.
+bool ddApplyChanges(struct N64* n, const uint8_t* data, size_t size) {
+	struct DD* d = &n->dd;
+	if (!d->disk || size < 8 || memcmp(data, "AN64DISK", 8)) {
+		return false;
+	}
+	for (size_t at = 8; at + 6 <= size;) {
+		uint32_t lba = (uint32_t) data[at] << 8 | data[at + 1], length = be32(data + at + 2);
+		if (lba >= SIZE_LBA || length != d->lbaOffset[lba + 1] - d->lbaOffset[lba] || at + 6 + length > size ||
+		    d->lbaOffset[lba] + (uint64_t) length > d->diskSize) {
+			return false;
+		}
+		memcpy(d->disk + d->lbaOffset[lba], data + at + 6, length);
+		d->written[lba >> 3] |= (uint8_t) (1 << (lba & 7));
+		at += 6 + length;
+	}
+	d->diskSaved = true;
 	return true;
 }
 

@@ -227,6 +227,9 @@ struct DD {
 	bool irqMecha, irqBm;
 	// When the command's response and the next sector are due (0 for none).
 	uint64_t mechaAt, bmAt;
+	// The blocks (LBAs) written since the disk loaded, and whether any were since diskSaved was set.
+	uint8_t written[(0x10DC + 7) / 8];
+	bool diskSaved;
 };
 
 struct N64 {
@@ -636,6 +639,8 @@ bool n64StateLoad(struct N64*, const void* data, size_t size);
 
 // carts.c
 bool cartEeprom16k(const uint8_t* rom);
+uint8_t* ddChanges(struct N64* n, size_t* size);
+bool ddApplyChanges(struct N64* n, const uint8_t* data, size_t size);
 uint8_t cartSaveByte(struct N64* n, uint32_t offset);
 void cartSaveStore(struct N64* n, uint32_t offset, uint8_t v);
 uint32_t cartSaveRead32(struct N64* n, uint32_t offset);

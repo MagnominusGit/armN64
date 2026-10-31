@@ -138,6 +138,13 @@ int main(int argc, char** argv) {
 		if (disk != data) {
 			free(disk);
 		}
+		// N64DDSAVE=path: the disk's changes (ddChanges) put back before the run, saved after it.
+		size_t changesSize;
+		uint8_t* changes = getenv("N64DDSAVE") ? readFile(getenv("N64DDSAVE"), &changesSize) : NULL;
+		if (changes && !ddApplyChanges(n, changes, changesSize)) {
+			fprintf(stderr, "the disk changes in %s don't fit\n", getenv("N64DDSAVE"));
+		}
+		free(changes);
 	}
 	if (!data || !n || (!diskGame && !n64LoadRom(n, data, size)) || (diskGame && !iplPath)) {
 		fprintf(stderr, "can't load %s\n", argv[1]);
@@ -203,6 +210,12 @@ int main(int argc, char** argv) {
 			n->pad[0] = pad;
 		}
 		n64RunField(n);
+		// N64RUMBLELOG: when controller 1's Rumble Pak motor turns on and off.
+		static bool rumbling;
+		if (getenv("N64RUMBLELOG") && n->rumble[0] != rumbling) {
+			rumbling = n->rumble[0];
+			printf("field %d: rumble %s\n", f, rumbling ? "on" : "off");
+		}
 		// The game's frames: how often the VI starts showing another framebuffer.
 		static uint32_t lastOrigin;
 		static int flips;
@@ -342,6 +355,17 @@ int main(int argc, char** argv) {
 			fclose(f);
 		}
 		printf("save chip %s\n", n->saveKind == SAVE_SRAM ? "sram" : n->saveKind == SAVE_FLASH ? "flash" : "unused");
+	}
+	if (getenv("N64DDSAVE")) {
+		size_t size;
+		uint8_t* changes = ddChanges(n, &size);
+		FILE* f = changes ? fopen(getenv("N64DDSAVE"), "wb") : NULL;
+		if (f) {
+			fwrite(changes, 1, size, f);
+			fclose(f);
+			printf("disk changes: %zu bytes\n", size);
+		}
+		free(changes);
 	}
 	if (getenv("N64RAMDUMP")) {
 		FILE* f = fopen(getenv("N64RAMDUMP"), "wb");

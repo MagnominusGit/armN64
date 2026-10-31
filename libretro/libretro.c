@@ -278,6 +278,25 @@ static uint8_t* readFile(const char* path, size_t* size) {
 }
 
 // A machine running the game loaded, from power-on.
+// A 64DD disk's changes, beside the save files as <disk name>.ndd.sav.
+static char diskSavePath[4096];
+
+static void diskSave(void) {
+	size_t size;
+	uint8_t* changes = disk && machine && !machine->dd.diskSaved ? ddChanges(machine, &size) : NULL;
+	if (!changes) {
+		return;
+	}
+	FILE* f = fopen(diskSavePath, "wb");
+	if (f && fwrite(changes, 1, size, f) == size) {
+		machine->dd.diskSaved = true;
+	}
+	if (f) {
+		fclose(f);
+	}
+	free(changes);
+}
+
 static struct N64* startMachine(void) {
 	struct N64* n = n64Create();
 	if (!n) {
@@ -290,6 +309,12 @@ static struct N64* startMachine(void) {
 	}
 	n->audio = captured;
 	n->audioCapacity = CAPTURE_SAMPLES;
+	size_t size;
+	uint8_t* changes = disk && diskSavePath[0] ? readFile(diskSavePath, &size) : NULL;
+	if (changes && !ddApplyChanges(n, changes, size)) {
+		logMessage(RETRO_LOG_WARN, "the disk's saved changes don't fit this disk");
+	}
+	free(changes);
 	return n;
 }
 
@@ -486,6 +511,12 @@ bool retro_load_game(const struct retro_game_info* info) {
 			logMessage(RETRO_LOG_ERROR, "a 64DD disk needs 64DD_IPL.bin in the system folder");
 			return false;
 		}
+		const char* saves = NULL;
+		const char* name = strrchr(info->path, '/') ? strrchr(info->path, '/') + 1 : info->path;
+		if (!environment(RETRO_ENVIRONMENT_GET_SAVE_DIRECTORY, &saves) || !saves) {
+			saves = ".";
+		}
+		snprintf(diskSavePath, sizeof(diskSavePath), "%s/%s.sav", saves, name);
 	}
 	machine = startMachine();
 	if (!machine) {
@@ -511,6 +542,7 @@ bool retro_load_game_special(unsigned type, const struct retro_game_info* info, 
 }
 
 void retro_unload_game(void) {
+	diskSave();
 	n64Destroy(machine);
 	glesYield();
 	machine = NULL;
@@ -525,6 +557,7 @@ void retro_reset(void) {
 	if (!machine) {
 		return;
 	}
+	diskSave();
 	n64Destroy(machine);
 	glesYield();
 	machine = startMachine();
@@ -685,6 +718,7 @@ void retro_run(void) {
 		saveExport();
 		machine->saveDirty = false;
 	}
+	diskSave();
 	if (ramView) {
 		swapWords(ramView, machine->rdram, RDRAM_SIZE);
 	}
