@@ -74,6 +74,9 @@ static uint32_t presentRgba[640 * 480];
 // RetroArch fills saveMemory from the save file after the game loads: it goes to the machine on the
 // first run.
 static bool saveGiven;
+// RDRAM as achievements read it: in little-endian words, as mupen64plus-next keeps it (the sets are
+// made on that). Kept up to date each run once the frontend has asked for it.
+static uint8_t* ramView;
 // What the frontend has in each port (RETRO_DEVICE_*), and the rumble each was last given.
 static unsigned devices[4] = { RETRO_DEVICE_JOYPAD, RETRO_DEVICE_JOYPAD, RETRO_DEVICE_JOYPAD, RETRO_DEVICE_JOYPAD };
 static bool rumbling[4];
@@ -203,26 +206,29 @@ void retro_set_controller_port_device(unsigned port, unsigned device) {
 	}
 }
 
-// Saves between the machine and the save file's layout. The SRAM and flash words change byte order.
-static void saveCopy(uint8_t* to, const uint8_t* from, size_t size) {
+// Bytes in 32-bit words of the other byte order (the save file's SRAM and flash, achievement memory).
+static void swapWords(uint8_t* to, const uint8_t* from, size_t size) {
 	for (size_t i = 0; i < size; i += 4) {
-		to[i] = from[i + 3], to[i + 1] = from[i + 2], to[i + 2] = from[i + 1], to[i + 3] = from[i];
+		uint32_t w;
+		memcpy(&w, from + i, 4);
+		w = __builtin_bswap32(w);
+		memcpy(to + i, &w, 4);
 	}
 }
 
 static void saveExport(void) {
 	memcpy(saveMemory, machine->eeprom, sizeof(machine->eeprom));
 	memcpy(saveMemory + FILE_PAKS, machine->paks, sizeof(machine->paks));
-	saveCopy(saveMemory + FILE_SRAM, machine->sram, sizeof(machine->sram));
-	saveCopy(saveMemory + FILE_FLASH, machine->flash, sizeof(machine->flash));
+	swapWords(saveMemory + FILE_SRAM, machine->sram, sizeof(machine->sram));
+	swapWords(saveMemory + FILE_FLASH, machine->flash, sizeof(machine->flash));
 }
 
 // A Controller Pak left empty (by a save file from before there were any) is formatted.
 static void saveImport(void) {
 	memcpy(machine->eeprom, saveMemory, sizeof(machine->eeprom));
 	memcpy(machine->paks, saveMemory + FILE_PAKS, sizeof(machine->paks));
-	saveCopy(machine->sram, saveMemory + FILE_SRAM, sizeof(machine->sram));
-	saveCopy(machine->flash, saveMemory + FILE_FLASH, sizeof(machine->flash));
+	swapWords(machine->sram, saveMemory + FILE_SRAM, sizeof(machine->sram));
+	swapWords(machine->flash, saveMemory + FILE_FLASH, sizeof(machine->flash));
 	for (int i = 0; i < 4; ++i) {
 		const uint8_t* pak = machine->paks[i];
 		size_t k = 0;
@@ -475,6 +481,8 @@ bool retro_load_game(const struct retro_game_info* info) {
 	audioPhase = 0;
 	memset(audioLast, 0, sizeof(audioLast));
 	describeInput();
+	bool achievements = true;
+	environment(RETRO_ENVIRONMENT_SET_SUPPORT_ACHIEVEMENTS, &achievements);
 	return true;
 }
 
@@ -488,7 +496,9 @@ void retro_unload_game(void) {
 	machine = NULL;
 	free(game);
 	free(ipl);
+	free(ramView);
 	game = ipl = NULL;
+	ramView = NULL;
 }
 
 void retro_reset(void) {
@@ -652,6 +662,9 @@ void retro_run(void) {
 		saveExport();
 		machine->saveDirty = false;
 	}
+	if (ramView) {
+		swapWords(ramView, machine->rdram, RDRAM_SIZE);
+	}
 }
 
 size_t retro_serialize_size(void) {
@@ -707,7 +720,10 @@ void* retro_get_memory_data(unsigned id) {
 		return saveMemory;
 	}
 	if (id == RETRO_MEMORY_SYSTEM_RAM && machine) {
-		return machine->rdram;
+		if (!ramView && (ramView = malloc(RDRAM_SIZE))) {
+			swapWords(ramView, machine->rdram, RDRAM_SIZE);
+		}
+		return ramView;
 	}
 	return NULL;
 }
