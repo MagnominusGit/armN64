@@ -291,13 +291,56 @@ static uint64_t cop0Read(struct N64* n, int r) {
 		return cpuCount(n);
 	case CP0_RANDOM:
 		return randomIndex(n);
+	case 21:
+	case 22:
+	case 23:
+	case 24:
+	case 25:
+	case 31:
+		return n->cpu.cop0[CP0_LATCH];
 	}
 	return n->cpu.cop0[r];
 }
 
+// The registers' writable bits as the VR4300 keeps them (nemu64-test, ares).
 static void cop0Write(struct N64* n, int r, uint64_t v) {
 	uint64_t* cop0 = n->cpu.cop0;
+	cop0[CP0_LATCH] = v;
 	switch (r) {
+	case CP0_LATCH:
+	case 21:
+	case 22:
+	case 23:
+	case 24:
+	case 25:
+	case 31:
+	case 27:
+	case CP0_TAGHI:
+		return;
+	case CP0_CONTEXT:
+		cop0[r] = (cop0[r] & 0x7FFFF0) | (v & ~0x7FFFFFull);
+		return;
+	case CP0_XCONTEXT:
+		cop0[r] = (cop0[r] & 0x1FFFFFFF0ull) | (v & ~0x1FFFFFFFFull);
+		return;
+	case CP0_CONFIG:
+		cop0[r] = (v & 0x0F00800F) | 0x70066460;
+		return;
+	case CP0_LLADDR:
+		cop0[r] = (cop0[r] & ~0xFFFFFFFFull) | (uint32_t) v;
+		return;
+	case 18:
+		cop0[r] = v & 0xFFFFFFFB;
+		return;
+	case 19:
+		cop0[r] = v & 0xF;
+		return;
+	case 26:
+		cop0[r] = v & 0xFF;
+		return;
+	case CP0_TAGLO:
+		cop0[r] = (uint32_t) v;
+		return;
 	case CP0_COUNT:
 		n->cpu.countBase = (n->cycles >> 1) - (uint32_t) v;
 		n->cpu.lastCount = (uint32_t) v;
@@ -316,7 +359,7 @@ static void cop0Write(struct N64* n, int r, uint64_t v) {
 		cop0[r] = v & 63;
 		return;
 	case CP0_INDEX:
-		cop0[r] = (cop0[r] & 0x80000000) | (v & 63);
+		cop0[r] = v & 0x8000003F;
 		return;
 	case CP0_ENTRYLO0:
 	case CP0_ENTRYLO1:
@@ -352,9 +395,8 @@ static void cop0Execute(struct N64* n, uint32_t op) {
 	case 0x01:
 		c->gpr[RT] = cop0Read(n, RD);
 		return;
+	// MTC0 writes the whole register, as DMTC0 does.
 	case 0x04:
-		cop0Write(n, RD, sext32((uint32_t) c->gpr[RT]));
-		return;
 	case 0x05:
 		cop0Write(n, RD, c->gpr[RT]);
 		return;

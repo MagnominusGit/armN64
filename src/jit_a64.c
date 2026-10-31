@@ -462,7 +462,8 @@ static bool emitCop0(struct Jit* j, uint32_t op) {
 		return true;
 	}
 	if (rs == 0x00 || rs == 0x01) {
-		if (rd == CP0_RANDOM) {
+		// Random, and the unused registers that read the write latch, in C.
+		if (rd == CP0_RANDOM || (rd >= 21 && rd <= 25) || rd == 31) {
 			return false;
 		}
 		if (rt) {
@@ -488,10 +489,12 @@ static bool emitCop0(struct Jit* j, uint32_t op) {
 		}
 		return true;
 	}
-	if (rs != 0x04 && rs != 0x05) {
+	if ((rs != 0x04 && rs != 0x05) || (rd != CP0_STATUS && rd != CP0_EPC && rd != CP0_ERROREPC)) {
 		return false;
 	}
 	int t = readReg(j, rt);
+	// Each write also goes to the latch.
+	aStrX(e, t, CPU, CPU_OFF(cop0) + 8 * CP0_LATCH);
 	if (rd == CP0_STATUS) {
 		andConst(e, 0, t, 0xFFF7FFFF);
 		aStrX(e, 0, CPU, reg);
@@ -507,16 +510,8 @@ static bool emitCop0(struct Jit* j, uint32_t op) {
 		j->interruptCheck = true;
 		return true;
 	}
-	if (rd == CP0_EPC || rd == CP0_ERROREPC) {
-		if (rs == 0x04) {
-			aSxtw(e, 0, t);
-			aStrX(e, 0, CPU, reg);
-		} else {
-			aStrX(e, t, CPU, reg);
-		}
-		return true;
-	}
-	return false;
+	aStrX(e, t, CPU, reg);
+	return true;
 }
 
 static bool emitInline(struct Jit* j, uint32_t op, uint64_t pc, enum Kind* kind) {

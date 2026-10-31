@@ -20,6 +20,9 @@ enum {
 	CP0_COMPARE = 11, CP0_STATUS = 12, CP0_CAUSE = 13, CP0_EPC = 14, CP0_PRID = 15,
 	CP0_CONFIG = 16, CP0_LLADDR = 17, CP0_XCONTEXT = 20, CP0_TAGLO = 28, CP0_TAGHI = 29,
 	CP0_ERROREPC = 30,
+	// Every write to a COP0 register is latched; the unused registers read the latch. It's kept in
+	// unused register 7's place.
+	CP0_LATCH = 7,
 };
 
 // Exception codes.
@@ -331,6 +334,10 @@ struct N64 {
 	struct FrameSkip skip;
 	// The last picture made, shown again for a skipped frame.
 	uint32_t* lastPicture;
+	// The VI's last picture, with what it was made from (n64.c): made again only when that changes.
+	struct ViKept* viKept;
+	// Threads that make bands of the VI's picture on the CPU (n64.c), as many as the renderers.
+	struct ViPool* viPool;
 	int lastWidth, lastHeight;
 	// CPU cycles per video field: 60 fields a second for NTSC and MPAL, 50 for PAL.
 	uint64_t fieldCycles;

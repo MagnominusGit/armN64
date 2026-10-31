@@ -192,7 +192,8 @@ static bool emitCop0(struct Jit* j, uint32_t op) {
 		return true;
 	}
 	if (rs == 0x00 || rs == 0x01) {
-		if (rd == CP0_RANDOM) {
+		// Random, and the unused registers that read the write latch, in C.
+		if (rd == CP0_RANDOM || (rd >= 21 && rd <= 25) || rd == 31) {
 			return false;
 		}
 		if (rt) {
@@ -219,6 +220,12 @@ static bool emitCop0(struct Jit* j, uint32_t op) {
 	if (rs != 0x04 && rs != 0x05) {
 		return false;
 	}
+	if (rd != CP0_STATUS && rd != CP0_EPC && rd != CP0_ERROREPC) {
+		return false;
+	}
+	// Each write also goes to the latch.
+	xLoad(e, 8, RAX, gpr(rt));
+	xStore(e, 8, M(R12, (int32_t) (offsetof(struct CPU, cop0) + 8 * CP0_LATCH)), RAX);
 	if (rd == CP0_STATUS) {
 		xLoad(e, 4, RAX, gpr(rt));
 		xAluI(e, X_AND, 4, R(RAX), (int32_t) 0xFFF7FFFF);
@@ -239,11 +246,6 @@ static bool emitCop0(struct Jit* j, uint32_t op) {
 		return true;
 	}
 	if (rd == CP0_EPC || rd == CP0_ERROREPC) {
-		if (rs == 0x04) {
-			xMovsxd(e, RAX, gpr(rt));
-		} else {
-			xLoad(e, 8, RAX, gpr(rt));
-		}
 		xStore(e, 8, reg, RAX);
 		return true;
 	}

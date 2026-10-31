@@ -42,6 +42,10 @@ struct N64* n64Create(void) {
 	return n;
 }
 
+static void viKeptFree(struct ViKept* kept);
+struct ViPool;
+static void viPoolStop(struct ViPool* p);
+
 void n64Destroy(struct N64* n) {
 	if (n) {
 		blocksFree(n);
@@ -50,6 +54,8 @@ void n64Destroy(struct N64* n) {
 		rdpDestroy(n);
 		glesDestroy(n->viGles);
 		free(n->lastPicture);
+		viKeptFree(n->viKept);
+		viPoolStop(n->viPool);
 		free(n->isViewer);
 		free(n->hle);
 		free(n->rdram);
@@ -409,6 +415,24 @@ struct ViSetup {
 	bool wide, gammaOn, divot, dither, aa;
 };
 
+// The setup, the RDRAM bytes and hidden bits the filters read, and the picture they made.
+struct ViKept {
+	struct ViSetup setup;
+	uint32_t addr, len;
+	uint8_t* bytes;
+	uint32_t* picture;
+	size_t room, pictureRoom;
+	bool valid;
+};
+
+static void viKeptFree(struct ViKept* kept) {
+	if (kept) {
+		free(kept->bytes);
+		free(kept->picture);
+		free(kept);
+	}
+}
+
 static bool viSetup(struct N64* n, struct ViSetup* s) {
 	uint32_t* v = n->vi.reg;
 	int type = v[0] & 3;
@@ -546,49 +570,29 @@ bool n64PictureStart(struct N64* n, int* width, int* height) {
 }
 
 // The picture the VI scans out, scaled by its X and Y scale registers, as 0x00RRGGBB.
-static int viPicture(struct N64* n, uint32_t* out, int* width, int* height) {
-	struct ViSetup s;
-	if (!viSetup(n, &s)) {
-		*width = *height = 0;
-		return 0;
-	}
-	int w = s.w, h = s.h;
-	*width = w;
-	*height = h;
-	if (n->viGpu && viGpuStart(n, &s)) {
-		const uint32_t* picture = glesMap(n->pictureGles, n->pictureBinding, 0, (size_t) w * h * 4);
-		if (picture) {
-			for (int i = 0; i < w * h; ++i) {
-				uint32_t p = picture[i];
-				out[i] = n->pictureRgba ? (p & 0xFF) << 16 | (p & 0xFF00) | (p >> 16 & 0xFF) : p;
-			}
-			glesUnmap(n->pictureGles, n->pictureBinding);
-			return w * h;
-		}
-	}
-	viWait(n, &s);
-	uint32_t origin = s.origin, stride = s.stride;
-	bool gammaOn = s.gammaOn, divot = s.divot, dither = s.dither, aa = s.aa, wide = s.wide;
-	// With gamma on, the VI outputs the square root of each channel (scaled to 8 bits).
-	static uint8_t gamma[256];
-	if (!gamma[255]) {
-		for (int i = 0; i < 256; ++i) {
-			int g = 0;
-			while ((g + 1) * (g + 1) <= i * 256) {
-				++g;
-			}
-			gamma[i] = (uint8_t) (g > 255 ? 255 : g);
-		}
-	}
-	// Rows y-1, y and y+1 (a ring of three), decoded from column -3 to w+2.
-	static struct ViRow rows[3];
-	static int16_t full[3][642], restored[3][642], line[3][642], divoted[3][640];
-	static uint8_t lineCvg[642];
+// The VI filters for rows y0 to y1 of the picture, as one thread makes them: rows y-1, y and y+1 (a
+// ring of three), decoded from column -3 to w+2.
+struct ViBand {
+	struct ViRow rows[3];
+	int16_t full[3][642], restored[3][642], line[3][642], divoted[3][640];
+	uint8_t lineCvg[642];
+};
+
+static uint8_t viGamma[256];
+
+static void viRows(struct N64* n, const struct ViSetup* restrict sp, uint32_t* out, int y0, int y1, struct ViBand* restrict b) {
+	uint32_t origin = sp->origin, stride = sp->stride;
+	bool gammaOn = sp->gammaOn, divot = sp->divot, dither = sp->dither, aa = sp->aa, wide = sp->wide;
+	int w = sp->w;
+	const uint8_t* gamma = viGamma;
+	struct ViRow* rows = b->rows;
+	int16_t (*full)[642] = b->full, (*restored)[642] = b->restored, (*line)[642] = b->line, (*divoted)[640] = b->divoted;
+	uint8_t* lineCvg = b->lineCvg;
 	for (int k = 0; k < 3; ++k) {
-		viDecodeRow(n, wide, origin, (int64_t) (k - 1) * stride - 3, w + 6, &rows[k]);
+		viDecodeRow(n, wide, origin, (int64_t) (y0 + k - 1) * stride - 3, w + 6, &rows[(y0 + k) % 3]);
 	}
-	for (int y = 0; y < h; ++y) {
-		if (y > 0) {
+	for (int y = y0; y < y1; ++y) {
+		if (y > y0) {
 			viDecodeRow(n, wide, origin, (int64_t) (y + 1) * stride - 3, w + 6, &rows[(y + 2) % 3]);
 		}
 		const struct ViRow* up = &rows[y % 3], * at = &rows[(y + 1) % 3], * down = &rows[(y + 2) % 3];
@@ -651,6 +655,186 @@ static int viPicture(struct N64* n, uint32_t* out, int* width, int* height) {
 				o[x] = (uint32_t) divoted[0][x] << 16 | (uint32_t) divoted[1][x] << 8 | (uint32_t) divoted[2][x];
 			}
 		}
+	}
+}
+
+// Threads that make bands of the picture beside the emulation's own, as many as the renderers: they
+// are idle once the VI has waited for them.
+#include <pthread.h>
+struct ViPool {
+	pthread_t threads[8];
+	int count;
+	pthread_mutex_t lock;
+	pthread_cond_t start, done;
+	uint64_t job;
+	int busy;
+	bool quit;
+	struct N64* n;
+	const struct ViSetup* setup;
+	uint32_t* out;
+	struct ViBand bands[9];
+};
+
+static void viBand(struct ViPool* p, int index) {
+	int const parts = p->count + 1, h = p->setup->h;
+	viRows(p->n, p->setup, p->out, h * index / parts, h * (index + 1) / parts, &p->bands[index]);
+}
+
+static void* viWorker(void* arg) {
+	struct ViPool* p = arg;
+	pthread_mutex_lock(&p->lock);
+	int const index = p->busy++;
+	uint64_t seen = p->job;
+	pthread_cond_signal(&p->done);
+	for (;;) {
+		while (p->job == seen && !p->quit) {
+			pthread_cond_wait(&p->start, &p->lock);
+		}
+		if (p->quit) {
+			break;
+		}
+		seen = p->job;
+		pthread_mutex_unlock(&p->lock);
+		viBand(p, index + 1);
+		pthread_mutex_lock(&p->lock);
+		if (--p->busy == 0) {
+			pthread_cond_signal(&p->done);
+		}
+	}
+	pthread_mutex_unlock(&p->lock);
+	return NULL;
+}
+
+static struct ViPool* viPoolStart(int count) {
+	struct ViPool* p = calloc(1, sizeof(*p));
+	if (!p) {
+		return NULL;
+	}
+	pthread_mutex_init(&p->lock, NULL);
+	pthread_cond_init(&p->start, NULL);
+	pthread_cond_init(&p->done, NULL);
+	pthread_mutex_lock(&p->lock);
+	for (int i = 0; i < count && i < 8; ++i) {
+		if (pthread_create(&p->threads[p->count], NULL, viWorker, p) == 0) {
+			++p->count;
+		}
+	}
+	// Each takes its index as it starts.
+	while (p->busy < p->count) {
+		pthread_cond_wait(&p->done, &p->lock);
+	}
+	p->busy = 0;
+	pthread_mutex_unlock(&p->lock);
+	return p;
+}
+
+static void viPoolStop(struct ViPool* p) {
+	if (!p) {
+		return;
+	}
+	pthread_mutex_lock(&p->lock);
+	p->quit = true;
+	pthread_cond_broadcast(&p->start);
+	pthread_mutex_unlock(&p->lock);
+	for (int i = 0; i < p->count; ++i) {
+		pthread_join(p->threads[i], NULL);
+	}
+	pthread_mutex_destroy(&p->lock);
+	pthread_cond_destroy(&p->start);
+	pthread_cond_destroy(&p->done);
+	free(p);
+}
+
+static void viPoolRun(struct N64* n, struct ViPool* p, const struct ViSetup* setup, uint32_t* out) {
+	pthread_mutex_lock(&p->lock);
+	p->n = n, p->setup = setup, p->out = out;
+	p->busy = p->count;
+	++p->job;
+	pthread_cond_broadcast(&p->start);
+	pthread_mutex_unlock(&p->lock);
+	viBand(p, 0);
+	pthread_mutex_lock(&p->lock);
+	while (p->busy) {
+		pthread_cond_wait(&p->done, &p->lock);
+	}
+	pthread_mutex_unlock(&p->lock);
+}
+
+static int viPicture(struct N64* n, uint32_t* out, int* width, int* height) {
+	struct ViSetup s;
+	memset(&s, 0, sizeof(s));
+	if (!viSetup(n, &s)) {
+		*width = *height = 0;
+		return 0;
+	}
+	int w = s.w, h = s.h;
+	*width = w;
+	*height = h;
+	if (n->viGpu && viGpuStart(n, &s)) {
+		const uint32_t* picture = glesMap(n->pictureGles, n->pictureBinding, 0, (size_t) w * h * 4);
+		if (picture) {
+			for (int i = 0; i < w * h; ++i) {
+				uint32_t p = picture[i];
+				out[i] = n->pictureRgba ? (p & 0xFF) << 16 | (p & 0xFF00) | (p >> 16 & 0xFF) : p;
+			}
+			glesUnmap(n->pictureGles, n->pictureBinding);
+			return w * h;
+		}
+	}
+	viWait(n, &s);
+	// Many games show a frame for two or three fields: the same setup over the same bytes makes the
+	// same picture.
+	uint32_t keepAddr, keepLen;
+	bool const keepable = viRange(&s, &keepAddr, &keepLen);
+	size_t const hiddenLen = s.wide ? 0 : keepLen / 2, keepBytes = keepLen + hiddenLen;
+	struct ViKept* kept = n->viKept;
+	if (keepable && kept && kept->valid && kept->addr == keepAddr && kept->len == keepLen && !memcmp(&kept->setup, &s, sizeof(s)) &&
+	    !memcmp(kept->bytes, &n->rdram[keepAddr], keepLen) && !memcmp(kept->bytes + keepLen, &n->hidden[keepAddr >> 1], hiddenLen)) {
+		memcpy(out, kept->picture, (size_t) w * h * 4);
+		return w * h;
+	}
+	// With gamma on, the VI outputs the square root of each channel (scaled to 8 bits).
+	if (!viGamma[255]) {
+		for (int i = 0; i < 256; ++i) {
+			int g = 0;
+			while ((g + 1) * (g + 1) <= i * 256) {
+				++g;
+			}
+			viGamma[i] = (uint8_t) (g > 255 ? 255 : g);
+		}
+	}
+	if (n->rdpThreads > 0 && !n->viPool) {
+		n->viPool = viPoolStart(n->rdpThreads);
+	}
+	if (n->viPool && h >= 32) {
+		viPoolRun(n, n->viPool, &s, out);
+	} else {
+		static struct ViBand band;
+		viRows(n, &s, out, 0, h, &band);
+	}
+	if (!kept && (kept = n->viKept = calloc(1, sizeof(*kept))) == NULL) {
+		return w * h;
+	}
+	kept->valid = false;
+	size_t const pixels = (size_t) w * h * 4;
+	if (keepable && keepBytes > kept->room) {
+		uint8_t* more = realloc(kept->bytes, keepBytes);
+		kept->bytes = more ? more : kept->bytes;
+		kept->room = more ? keepBytes : kept->room;
+	}
+	if (keepable && pixels > kept->pictureRoom) {
+		uint32_t* more = realloc(kept->picture, pixels);
+		kept->picture = more ? more : kept->picture;
+		kept->pictureRoom = more ? pixels : kept->pictureRoom;
+	}
+	if (keepable && keepBytes <= kept->room && pixels <= kept->pictureRoom) {
+		kept->setup = s;
+		kept->addr = keepAddr;
+		kept->len = keepLen;
+		memcpy(kept->bytes, &n->rdram[keepAddr], keepLen);
+		memcpy(kept->bytes + keepLen, &n->hidden[keepAddr >> 1], hiddenLen);
+		memcpy(kept->picture, out, pixels);
+		kept->valid = true;
 	}
 	return w * h;
 }
