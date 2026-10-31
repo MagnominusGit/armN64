@@ -23,7 +23,7 @@ typedef unsigned char GLboolean;
 
 enum {
 	GL_TEXTURE_2D = 0x0DE1, GL_RGBA = 0x1908, GL_RGBA8 = 0x8058, GL_UNSIGNED_BYTE = 0x1401, GL_FLOAT = 0x1406,
-	GL_FRAMEBUFFER = 0x8D40, GL_COLOR_ATTACHMENT0 = 0x8CE0, GL_DEPTH_ATTACHMENT = 0x8D00, GL_RENDERBUFFER = 0x8D41,
+	GL_FRAMEBUFFER = 0x8D40, GL_READ_FRAMEBUFFER = 0x8CA8, GL_DRAW_FRAMEBUFFER = 0x8CA9, GL_COLOR_ATTACHMENT0 = 0x8CE0, GL_DEPTH_ATTACHMENT = 0x8D00, GL_RENDERBUFFER = 0x8D41,
 	GL_DEPTH_COMPONENT24 = 0x81A6, GL_FRAMEBUFFER_COMPLETE = 0x8CD5,
 	GL_TEXTURE_MIN_FILTER = 0x2801, GL_TEXTURE_MAG_FILTER = 0x2800, GL_NEAREST = 0x2600, GL_TEXTURE_WRAP_S = 0x2802,
 	GL_TEXTURE_WRAP_T = 0x2803, GL_CLAMP_TO_EDGE = 0x812F, GL_TEXTURE0 = 0x84C0,
@@ -42,6 +42,7 @@ enum { TARGETS = 8, TARGET_ROWS = 480, PROGRAMS = 256, TEXTURES = 1024, TEXTURE_
 struct Gl {
 	void (*GenFramebuffers)(GLsizei, GLuint*);
 	void (*BindFramebuffer)(GLenum, GLuint);
+	void (*BlitFramebuffer)(GLint, GLint, GLint, GLint, GLint, GLint, GLint, GLint, GLbitfield, GLenum);
 	void (*FramebufferTexture2D)(GLenum, GLenum, GLenum, GLuint, GLint);
 	void (*FramebufferRenderbuffer)(GLenum, GLenum, GLenum, GLuint);
 	GLenum (*CheckFramebufferStatus)(GLenum);
@@ -177,6 +178,10 @@ struct Glr {
 	struct Gl gl;
 	struct Target target[TARGETS];
 	GLuint depth, vertexArray, vertexBuffer, vertexShader;
+	// Targets drawn at scale times the RDP's resolution (N64_GL_SCALE); their pixels go to and from
+	// RDRAM through a texture at its resolution.
+	int scale;
+	GLuint native, nativeFramebuffer;
 	struct Program programs[PROGRAMS];
 	int programCount;
 	struct Texture textures[TEXTURES];
@@ -203,6 +208,24 @@ static void useFramebuffer(struct Glr* g, GLuint framebuffer) {
 		g->gl.BindFramebuffer(GL_FRAMEBUFFER, framebuffer);
 		g->applied.framebuffer = framebuffer;
 	}
+}
+
+static void useScissor(struct Glr* g, bool on, int x, int y, int w, int h);
+
+// Rows from to to - 1 between a target and the texture at the RDP's resolution, scaled (nearest).
+static void blitRows(struct Glr* g, struct Target* t, int from, int to, bool toTarget) {
+	struct Gl* gl = &g->gl;
+	int const k = g->scale, w = (int) t->width;
+	useScissor(g, false, 0, 0, 0, 0);
+	gl->BindFramebuffer(GL_READ_FRAMEBUFFER, toTarget ? g->nativeFramebuffer : t->framebuffer);
+	gl->BindFramebuffer(GL_DRAW_FRAMEBUFFER, toTarget ? t->framebuffer : g->nativeFramebuffer);
+	if (toTarget) {
+		gl->BlitFramebuffer(0, from, w, to, 0, from * k, w * k, to * k, GL_COLOR_BUFFER_BIT, GL_NEAREST);
+	} else {
+		gl->BlitFramebuffer(0, from * k, w * k, to * k, 0, from, w, to, GL_COLOR_BUFFER_BIT, GL_NEAREST);
+	}
+	gl->BindFramebuffer(GL_FRAMEBUFFER, g->nativeFramebuffer);
+	g->applied.framebuffer = g->nativeFramebuffer;
 }
 
 static void useTexture(struct Glr* g, int unit, GLuint texture) {
@@ -232,7 +255,7 @@ static void useScissor(struct Glr* g, bool on, int x, int y, int w, int h) {
 		a->scissorOn = on;
 	}
 	if (on && (a->scissor[0] != x || a->scissor[1] != y || a->scissor[2] != w || a->scissor[3] != h)) {
-		g->gl.Scissor(x, y, w, h);
+		g->gl.Scissor(x * g->scale, y * g->scale, w * g->scale, h * g->scale);
 		a->scissor[0] = x, a->scissor[1] = y, a->scissor[2] = w, a->scissor[3] = h;
 	}
 }
@@ -255,7 +278,7 @@ static void uniform(struct Glr* g, GLint location, int count, const float* value
 static bool loadGl(struct Glr* g) {
 	struct Gl* gl = &g->gl;
 #define GLFN(name) (*(void**) &gl->name = glesProc(g->gles, "gl" #name), gl->name != NULL)
-	return GLFN(GenFramebuffers) && GLFN(BindFramebuffer) && GLFN(FramebufferTexture2D) && GLFN(FramebufferRenderbuffer) &&
+	return GLFN(GenFramebuffers) && GLFN(BindFramebuffer) && GLFN(BlitFramebuffer) && GLFN(FramebufferTexture2D) && GLFN(FramebufferRenderbuffer) &&
 	       GLFN(CheckFramebufferStatus) && GLFN(DeleteFramebuffers) && GLFN(GenRenderbuffers) && GLFN(BindRenderbuffer) &&
 	       GLFN(RenderbufferStorage) && GLFN(GenTextures) && GLFN(DeleteTextures) && GLFN(BindTexture) && GLFN(ActiveTexture) &&
 	       GLFN(TexImage2D) && GLFN(TexSubImage2D) && GLFN(TexParameteri) && GLFN(Viewport) && GLFN(Scissor) && GLFN(Enable) &&
@@ -610,8 +633,11 @@ static void loadPixels(struct N64* n, struct Glr* g, struct Target* t, int from,
 		}
 	}
 	struct Gl* gl = &g->gl;
-	uploadTexture(g, t->texture);
+	uploadTexture(g, g->scale > 1 ? g->native : t->texture);
 	gl->TexSubImage2D(GL_TEXTURE_2D, 0, 0, from, (GLsizei) t->width, to - from, GL_RGBA, GL_UNSIGNED_BYTE, out);
+	if (g->scale > 1) {
+		blitRows(g, t, from, to, true);
+	}
 }
 
 static void flushBatch(struct N64* n, struct Glr* g);
@@ -647,7 +673,7 @@ static struct Target* target(struct N64* n, struct Glr* g, uint32_t addr, uint32
 			gl->GenFramebuffers(1, &t->framebuffer);
 		}
 		uploadTexture(g, t->texture);
-		gl->TexImage2D(GL_TEXTURE_2D, 0, GL_RGBA8, (GLsizei) width, TARGET_ROWS, 0, GL_RGBA, GL_UNSIGNED_BYTE, NULL);
+		gl->TexImage2D(GL_TEXTURE_2D, 0, GL_RGBA8, (GLsizei) width * g->scale, TARGET_ROWS * g->scale, 0, GL_RGBA, GL_UNSIGNED_BYTE, NULL);
 		gl->TexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_NEAREST);
 		gl->TexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_NEAREST);
 		useFramebuffer(g, t->framebuffer);
@@ -694,7 +720,11 @@ static void writePixels(struct N64* n, struct Target* t, int from, int to) {
 	uint32_t start = t->addr + (uint32_t) from * t->width * bytes;
 	// First, as it may give back another target's rows (through g->image).
 	n64RdramWrite(n, start & (RDRAM_SIZE - 1), (uint32_t) (to - from) * t->width * bytes);
-	useFramebuffer(g, t->framebuffer);
+	if (g->scale > 1) {
+		blitRows(g, t, from, to, false);
+	} else {
+		useFramebuffer(g, t->framebuffer);
+	}
 	gl->ReadPixels(0, from, (GLsizei) t->width, to - from, GL_RGBA, GL_UNSIGNED_BYTE, g->image);
 	n->stats.glRows += (uint64_t) (to - from);
 	for (int y = from; y < to; ++y) {
@@ -878,7 +908,7 @@ static void flushBatch(struct N64* n, struct Glr* g) {
 	struct Applied* a = &g->applied;
 	useFramebuffer(g, s->target->framebuffer);
 	if (a->viewport != (int) s->target->width) {
-		gl->Viewport(0, 0, (GLsizei) s->target->width, TARGET_ROWS);
+		gl->Viewport(0, 0, (GLsizei) s->target->width * g->scale, TARGET_ROWS * g->scale);
 		a->viewport = (int) s->target->width;
 	}
 	useScissor(g, true, s->scissor[0], s->scissor[1], s->scissor[2] - s->scissor[0], s->scissor[3] - s->scissor[1]);
@@ -1316,6 +1346,20 @@ unsigned glrPicture(struct N64* n, uint32_t origin, uint32_t stride, int size, i
 	return 0;
 }
 
+// A picture from a target as drawn (scale times its size, bottom row first), for tests.
+bool glrRead(struct N64* n, unsigned framebuffer, int x, int y, int w, int h, uint32_t* out) {
+	struct Glr* g = n->glr;
+	if (!g) {
+		return false;
+	}
+	int const k = g->scale;
+	glesUse(g->gles);
+	flushBatch(n, g);
+	useFramebuffer(g, framebuffer);
+	g->gl.ReadPixels(x * k, y * k, w * k, h * k, GL_RGBA, GL_UNSIGNED_BYTE, out);
+	return true;
+}
+
 bool glrShows(struct N64* n, uint32_t origin) {
 	struct Glr* g = n->glr;
 	for (int i = 0; i < TARGETS; ++i) {
@@ -1404,7 +1448,20 @@ struct Glr* glrCreate(struct N64* n) {
 	g->vertexShader = compile(g, GL_VERTEX_SHADER, vertexSource);
 	gl->GenRenderbuffers(1, &g->depth);
 	gl->BindRenderbuffer(GL_RENDERBUFFER, g->depth);
-	gl->RenderbufferStorage(GL_RENDERBUFFER, GL_DEPTH_COMPONENT24, 1024, TARGET_ROWS);
+	const char* scale = n->settings ? n->settings("N64_GL_SCALE") : getenv("N64_GL_SCALE");
+	g->scale = scale && *scale >= '1' && *scale <= '8' ? *scale - '0' : 1;
+	n->glrScale = g->scale;
+	gl->RenderbufferStorage(GL_RENDERBUFFER, GL_DEPTH_COMPONENT24, 1024 * g->scale, TARGET_ROWS * g->scale);
+	if (g->scale > 1) {
+		gl->GenTextures(1, &g->native);
+		uploadTexture(g, g->native);
+		gl->TexImage2D(GL_TEXTURE_2D, 0, GL_RGBA8, 1024, TARGET_ROWS, 0, GL_RGBA, GL_UNSIGNED_BYTE, NULL);
+		gl->TexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_NEAREST);
+		gl->TexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_NEAREST);
+		gl->GenFramebuffers(1, &g->nativeFramebuffer);
+		useFramebuffer(g, g->nativeFramebuffer);
+		gl->FramebufferTexture2D(GL_FRAMEBUFFER, GL_COLOR_ATTACHMENT0, GL_TEXTURE_2D, g->native, 0);
+	}
 	gl->GenVertexArrays(1, &g->vertexArray);
 	gl->BindVertexArray(g->vertexArray);
 	gl->GenBuffers(1, &g->vertexBuffer);

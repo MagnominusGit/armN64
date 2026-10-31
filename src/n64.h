@@ -365,6 +365,8 @@ struct N64 {
 	// N64_RDP_GL (with hle): the GL renderer draws what the HLE makes (glr.c).
 	bool rdpGl;
 	struct Glr* glr;
+	// How many times the RDP's resolution the GL renderer draws at (N64_GL_SCALE).
+	int glrScale;
 	// Many RDP triangles in a field (a microcode left to the RSP): the GL renderer gives way to the
 	// RDP threads asked for, between slices.
 	int rdpThreadsAsked;

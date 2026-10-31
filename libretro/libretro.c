@@ -97,6 +97,9 @@ static struct retro_core_option_v2_definition optionDefinitions[] = {
 	{ "armn64_renderer", "Renderer (Restart)", NULL,
 	  "GPU draws with OpenGL ES 3.1: HLE with the GL renderer, MLE and LLE with the RDP in compute shaders (exact, but slower than the renderer threads on most handhelds). CPU draws with the renderer threads. Auto takes the GPU for HLE and the CPU otherwise.",
 	  NULL, "system", { { "auto", "Auto" }, { "gpu", "GPU" }, { "cpu", "CPU" }, { NULL, NULL } }, "auto" },
+	{ "armn64_resolution", "Resolution (Restart)", NULL,
+	  "HLE's GL renderer draws at this many times the game's resolution: sharper edges and textures, at a GPU cost. What the game reads back from its framebuffer stays at its own resolution.",
+	  NULL, "system", { { "1", "Native" }, { "2", "2x" }, { "3", "3x" }, { "4", "4x" }, { NULL, NULL } }, "1" },
 	{ "armn64_vi_filters", "VI Filters", NULL,
 	  "The video interface's antialiasing, divot and dither filters, which soften edges and smooth 16-bit colour as a TV showed it. Auto turns them on for MLE and LLE and off for HLE, where they cost speed.",
 	  NULL, "system", { { "auto", "Auto" }, { "on", "On" }, { "off", "Off" }, { NULL, NULL } }, "auto" },
@@ -126,6 +129,9 @@ static const char* settings(const char* name) {
 	static char threads[4];
 	if (!strcmp(name, "N64_ACCURACY")) {
 		return optionValue(environment, "armn64_accuracy");
+	}
+	if (!strcmp(name, "N64_GL_SCALE")) {
+		return optionValue(environment, "armn64_resolution");
 	}
 	if (!strcmp(name, "N64_SLICE")) {
 		return optionIs(environment, "armn64_accuracy", "hle") ? "8192" : "1024";
@@ -193,7 +199,10 @@ void retro_get_system_info(struct retro_system_info* info) {
 }
 
 void retro_get_system_av_info(struct retro_system_av_info* info) {
-	info->geometry = (struct retro_game_geometry) { (unsigned) pictureWidth, (unsigned) pictureHeight, 640, 480, 4.0f / 3.0f };
+	// The GL renderer's pictures are up to its scale times the largest.
+	const char* scale = optionValue(environment, "armn64_resolution");
+	unsigned k = scale && *scale >= '1' && *scale <= '4' ? (unsigned) (*scale - '0') : 1;
+	info->geometry = (struct retro_game_geometry) { (unsigned) pictureWidth, (unsigned) pictureHeight, 640 * k, 480 * k, 4.0f / 3.0f };
 	info->timing = (struct retro_system_timing) { pal ? 50.0 : 60.0, OUT_RATE };
 }
 
@@ -379,12 +388,14 @@ static void present(int width, int height, unsigned buffer) {
 	videoRefresh(RETRO_HW_FRAME_BUFFER_VALID, (unsigned) width, (unsigned) height, 0);
 }
 
-// The GL renderer's picture from its framebuffer into the frontend's, upside down as GL keeps it.
+// The GL renderer's picture from its framebuffer into the frontend's, upside down as GL keeps it, at
+// the renderer's scale (width and height are already scaled).
 static void presentGl(unsigned framebuffer, int x, int y, int width, int height) {
+	int const k = machine->glrScale;
 	gl.Disable(GL_SCISSOR_TEST);
 	gl.BindFramebuffer(GL_READ_FRAMEBUFFER, framebuffer);
 	gl.BindFramebuffer(GL_DRAW_FRAMEBUFFER, (unsigned) hw.get_current_framebuffer());
-	gl.BlitFramebuffer(x, y, x + width, y + height, 0, height, width, 0, GL_COLOR_BUFFER_BIT, GL_NEAREST);
+	gl.BlitFramebuffer(x * k, y * k, x * k + width, y * k + height, 0, height, width, 0, GL_COLOR_BUFFER_BIT, GL_NEAREST);
 	glrForget(machine);
 	videoRefresh(RETRO_HW_FRAME_BUFFER_VALID, (unsigned) width, (unsigned) height, 0);
 }
@@ -632,6 +643,7 @@ void retro_run(void) {
 	unsigned buffer = 0, framebuffer = 0;
 	int x = 0, y = 0;
 	if (shared && hwReady && n64GlPicture(machine, &framebuffer, &x, &y, &width, &height) && width && height) {
+		width *= machine->glrScale, height *= machine->glrScale;
 		if (width != pictureWidth || height != pictureHeight) {
 			pictureWidth = width, pictureHeight = height;
 			struct retro_game_geometry geometry = { (unsigned) width, (unsigned) height, 640, 480, 4.0f / 3.0f };

@@ -99,6 +99,7 @@ void glrDestroy(struct Glr*);
 void glrDraw(struct N64*, struct RDP*, const uint64_t* w, int op);
 // Brings what the GPU drew back to RDRAM.
 void glrSync(struct N64*);
+bool glrRead(struct N64*, unsigned framebuffer, int x, int y, int w, int h, uint32_t* out);
 // Whether the VI's framebuffer (origin) is one the GPU draws: then the picture is the GPU's,
 // without bringing it back (a frontend shows that texture).
 // A texture rectangle's pixels (inclusive, scissored) and the corner its coordinates start at.

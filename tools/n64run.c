@@ -300,6 +300,27 @@ int main(int argc, char** argv) {
 			printf("r%-2d %016llx%s", i, (unsigned long long) c->gpr[i], i % 4 == 3 ? "\n" : "  ");
 		}
 	}
+	// N64GLSHOT=path: the GL renderer's picture as it drew it (at N64_GL_SCALE), as a PPM.
+	unsigned glFramebuffer;
+	int gx, gy, gw, gh;
+	if (getenv("N64GLSHOT") && n64GlPicture(n, &glFramebuffer, &gx, &gy, &gw, &gh)) {
+		int k = n->glrScale;
+		uint32_t* image = malloc((size_t) gw * gh * k * k * 4);
+		FILE* f = fopen(getenv("N64GLSHOT"), "wb");
+		if (image && f && glrRead(n, glFramebuffer, gx, gy, gw, gh, image)) {
+			fprintf(f, "P6\n%d %d\n255\n", gw * k, gh * k);
+			for (int y = 0; y < gh * k; ++y) {
+				for (int x = 0; x < gw * k; ++x) {
+					uint32_t c = image[(size_t) y * gw * k + x];
+					fputc(c & 255, f), fputc((c >> 8) & 255, f), fputc((c >> 16) & 255, f);
+				}
+			}
+		}
+		if (f) {
+			fclose(f);
+		}
+		free(image);
+	}
 	rdpWait(n);
 	if (getenv("N64SAVEDUMP")) {
 		FILE* f = fopen(getenv("N64SAVEDUMP"), "wb");
