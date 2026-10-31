@@ -111,10 +111,8 @@ static void vectorLoad(struct N64* n, uint32_t op) {
 		}
 		return;
 	}
+	// LWV loads nothing: the register stays as it was (nemu64-test, hardware).
 	case 10:
-		for (int i = 16 - e; i < e + 16; ++i) {
-			setVbyte(r, vt, i & 15, *dmem(n, addr + (i - (16 - e))));
-		}
 		return;
 	case 11: {
 		uint32_t begin = addr & ~7u;
@@ -243,8 +241,9 @@ static void cop2(struct N64* n, uint32_t op) {
 			r->r[RT] = (uint32_t) (int32_t) (int16_t) (vbyte(r, RD, e) << 8 | vbyte(r, RD, (e + 1) & 15));
 		}
 		return;
+	// CFC2 and CTC2 name the flags by the register's low two bits; 2 and 3 are both VCE.
 	case 0x02: {
-		int32_t v = RD == 0 ? (int16_t) r->vco : RD == 1 ? (int16_t) r->vcc : r->vce;
+		int32_t v = (RD & 3) == 0 ? (int16_t) r->vco : (RD & 3) == 1 ? (int16_t) r->vcc : r->vce;
 		if (RT) {
 			r->r[RT] = (uint32_t) v;
 		}
@@ -257,9 +256,9 @@ static void cop2(struct N64* n, uint32_t op) {
 		}
 		return;
 	case 0x06:
-		if (RD == 0) {
+		if ((RD & 3) == 0) {
 			r->vco = (uint16_t) r->r[RT];
-		} else if (RD == 1) {
+		} else if ((RD & 3) == 1) {
 			r->vcc = (uint16_t) r->r[RT];
 		} else {
 			r->vce = (uint8_t) r->r[RT];
@@ -606,7 +605,7 @@ void rspStep(struct N64* n) {
 			dest = -1;
 			break;
 		case 0x09:
-			result = pc + 8;
+			result = (pc + 8) & 0xFFF;
 			branch(r, true, s);
 			break;
 		case 0x0D:
@@ -653,11 +652,11 @@ void rspStep(struct N64* n) {
 			branch(r, !lt, target);
 			break;
 		case 0x10:
-			g[31] = pc + 8;
+			g[31] = (pc + 8) & 0xFFF;
 			branch(r, lt, target);
 			break;
 		case 0x11:
-			g[31] = pc + 8;
+			g[31] = (pc + 8) & 0xFFF;
 			branch(r, !lt, target);
 			break;
 		}
@@ -667,7 +666,7 @@ void rspStep(struct N64* n) {
 		branch(r, true, (op & 0x3FF) << 2);
 		break;
 	case 0x03:
-		g[31] = pc + 8;
+		g[31] = (pc + 8) & 0xFFF;
 		branch(r, true, (op & 0x3FF) << 2);
 		break;
 	case 0x04:

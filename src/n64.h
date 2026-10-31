@@ -545,6 +545,9 @@ void busWrite8(struct N64*, uint32_t addr, uint64_t value);
 void busWrite16(struct N64*, uint32_t addr, uint64_t value);
 void busWrite32(struct N64*, uint32_t addr, uint32_t value);
 void busWrite64(struct N64*, uint32_t addr, uint64_t value);
+// MI repeat mode, set: the CPU's uncached write to RDRAM, spread as the MI does it; false when the
+// mode is off.
+bool busRepeatWrite(struct N64*, uint32_t addr, int size, uint64_t value);
 
 // rdp.c
 void rdpRun(struct N64*);

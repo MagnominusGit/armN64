@@ -450,7 +450,15 @@ VECTOR_OP(vsarL) {
 	store(dp, load(r->accL));
 }
 
+// The reserved opcodes: the accumulator's low lanes take vs + vt, vd zero (ares, hardware tests).
 VECTOR_OP(vzero) {
+	OPERANDS;
+	store(r->accL, s + t);
+	store(dp, zero);
+}
+
+// VSAR of an element that isn't one of the accumulator's: zero.
+VECTOR_OP(vsarNone) {
 	store(dp, splat(0));
 }
 
@@ -584,7 +592,7 @@ static RspVectorFn* const vectorOps[64] = {
 RspVectorFn* rspVectorFn(uint32_t op) {
 	if ((op & 0x3F) == 0x1D) {
 		int e = (op >> 21) & 15;
-		return e == 8 ? vsarH : e == 9 ? vsarM : e == 10 ? vsarL : vzero;
+		return e == 8 ? vsarH : e == 9 ? vsarM : e == 10 ? vsarL : vsarNone;
 	}
 	return vectorOps[op & 0x3F];
 }

@@ -853,7 +853,7 @@ static enum Kind emitInstruction(struct Jit* j, uint32_t op, uint32_t pc, bool d
 			aAndBits(e, 0, 0, 2, 10);
 			aStr(e, 0, RSP, RSP_OFF(nextPc));
 			if (f == 0x09) {
-				storeConst(e, rd, pc + 8);
+				storeConst(e, rd, (pc + 8) & 0xFFF);
 			}
 			return BRANCH;
 		case 0x0D:
@@ -895,7 +895,7 @@ static enum Kind emitInstruction(struct Jit* j, uint32_t op, uint32_t pc, bool d
 			aLdr(e, 0, RSP, gprOff(rs));
 			aDpImm(e, A_SUBS_IMM, ZR, 0, 0);
 			if (rt & 0x10) {
-				storeConst(e, 31, pc + 8);
+				storeConst(e, 31, (pc + 8) & 0xFFF);
 			}
 			branchTo(e, rt & 1 ? C_GE : C_LT, pc, target);
 			return BRANCH;
@@ -908,7 +908,7 @@ static enum Kind emitInstruction(struct Jit* j, uint32_t op, uint32_t pc, bool d
 		aMovImm(e, 0, ((op & 0x3FF) << 2) & 0xFFC);
 		aStr(e, 0, RSP, RSP_OFF(nextPc));
 		if (op >> 26 == 0x03) {
-			storeConst(e, 31, pc + 8);
+			storeConst(e, 31, (pc + 8) & 0xFFF);
 		}
 		return BRANCH;
 	case 0x04: case 0x05:

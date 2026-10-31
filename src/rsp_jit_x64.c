@@ -275,7 +275,7 @@ static enum Kind emitInstruction(struct Jit* j, uint32_t op, uint32_t pc, bool d
 			xAluI(e, X_AND, 4, R(RAX), 0xFFC);
 			xStore(e, 4, RSP_AT(nextPc), RAX);
 			if (f == 0x09) {
-				storeConst(e, rd, pc + 8);
+				storeConst(e, rd, (pc + 8) & 0xFFF);
 			}
 			return BRANCH;
 		case 0x0D:
@@ -315,7 +315,7 @@ static enum Kind emitInstruction(struct Jit* j, uint32_t op, uint32_t pc, bool d
 		case 0x00: case 0x01: case 0x10: case 0x11:
 			xAluI(e, X_CMP, 4, gpr(rs), 0);
 			if (rt & 0x10) {
-				storeConst(e, 31, pc + 8);
+				storeConst(e, 31, (pc + 8) & 0xFFF);
 			}
 			branchTo(e, rt & 1 ? CC_GE : CC_L, pc, target);
 			return BRANCH;
@@ -326,7 +326,7 @@ static enum Kind emitInstruction(struct Jit* j, uint32_t op, uint32_t pc, bool d
 	case 0x02: case 0x03:
 		xStoreI(e, 4, RSP_AT(nextPc), ((op & 0x3FF) << 2) & 0xFFC);
 		if (op >> 26 == 0x03) {
-			storeConst(e, 31, pc + 8);
+			storeConst(e, 31, (pc + 8) & 0xFFF);
 		}
 		return BRANCH;
 	case 0x04: case 0x05:

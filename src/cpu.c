@@ -599,6 +599,9 @@ static bool store(struct N64* n, uint64_t vaddr, int size, uint64_t v) {
 	if (n->idle.tracing) {
 		idleStore(n, p, size, v);
 	}
+	if (!cached(vaddr) && p < 0x04000000 && busRepeatWrite(n, p, size, v)) {
+		return true;
+	}
 	switch (size) {
 	case 1:
 		busWrite8(n, p, v);
@@ -1387,7 +1390,8 @@ bool cpuJitReady(struct N64* n) {
 static bool uncachedWord(struct N64* n, uint32_t op) {
 	struct CPU* c = &n->cpu;
 	uint64_t vaddr = c->gpr[RS] + IMM;
-	if ((op >> 26 != 0x23 && op >> 26 != 0x2B) || ((uint32_t) vaddr & 0xE0000003) != 0xA0000000) {
+	if ((op >> 26 != 0x23 && op >> 26 != 0x2B) || ((uint32_t) vaddr & 0xE0000003) != 0xA0000000 ||
+	    (uint64_t) (int64_t) (int32_t) vaddr != vaddr || (n->miMode & 0x80)) {
 		return false;
 	}
 	uint32_t p = (uint32_t) vaddr & 0x1FFFFFFF;

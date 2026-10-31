@@ -336,6 +336,13 @@ uint32_t busRead32(struct N64* n, uint32_t addr) {
 	if (addr >= 0x05000000 && addr < 0x06400000) {
 		return ddRead32(n, addr);
 	}
+	// The first RDRAM chip's registers as the boot code leaves them (device type, delays, RAS
+	// interval), the same on hardware with and without the Expansion Pak; odd words read 0 while
+	// MI's register select is off (nemu64-test).
+	if (addr >= 0x03F00000 && addr < 0x04000000) {
+		static const uint32_t chip[16] = { [0] = 0xB4190010, [2] = 0x2B3B1A0B, [6] = 0x101C0A04 };
+		return addr < 0x03F00200 ? chip[(addr >> 2) & 15] : 0;
+	}
 	if (addr < RDRAM_SIZE) {
 		if (n->pageFlags[addr >> 12] & PAGE_RDP_WRITES) {
 			rdpWaitRead(n, addr & ~3u, 4);
@@ -765,6 +772,64 @@ static uint8_t* writable(struct N64* n, uint32_t addr, uint32_t len) {
 		return &n->rdram[addr];
 	}
 	return NULL;
+}
+
+// MI repeat mode (MI_MODE bit 7, set by a write with bit 8): the next uncached RDRAM write from the
+// CPU fills repeat length + 1 bytes from its address with its data over and over, the address wrapping
+// within a 2 KiB row, and turns the mode off (ares).
+static void repeatPut(struct N64* n, uint32_t addr, uint64_t value, int bytes) {
+	uint8_t* p = writable(n, addr, (uint32_t) bytes);
+	for (int i = 0; i < bytes; ++i) {
+		p[i] = (uint8_t) (value >> (56 - 8 * i));
+	}
+}
+
+bool busRepeatWrite(struct N64* n, uint32_t addr, int size, uint64_t value) {
+	if (!(n->miMode & 0x80)) {
+		return false;
+	}
+	n->miMode &= ~0x80u;
+	if (addr >= 0x03F00000) {
+		return true;
+	}
+	uint32_t length = (n->miMode & 0x7F) + 1;
+	if (size == 1) {
+		value &= 0xFFFFFFFFu >> (24 - (addr & 3) * 8);
+		value = (uint32_t) ((value << 24) | (value >> 8));
+	} else if (size == 2) {
+		value &= 0xFFFFFFFFu >> (16 - (addr & 2) * 8);
+		value = (uint32_t) ((value << 16) | (value >> 16));
+	}
+	if (size != 8) {
+		value = (value << 32) | (uint32_t) value;
+	}
+	uint32_t const end = (addr & ~7u) + length < RDRAM_SIZE ? (addr & ~7u) + length : RDRAM_SIZE;
+	if (end <= addr) {
+		return true;
+	}
+	length = end - addr;
+	for (int step = 1; step <= 4; step <<= 1) {
+		if ((addr & (uint32_t) step) && length >= (uint32_t) step) {
+			repeatPut(n, addr, value, step);
+			value = (value << (8 * step)) | (value >> (64 - 8 * step));
+			addr = (addr & ~0x7FFu) | ((addr + (uint32_t) step) & 0x7FF);
+			length -= (uint32_t) step;
+		}
+	}
+	while (length >= 8) {
+		repeatPut(n, addr, value, 8);
+		addr = (addr & ~0x7FFu) | ((addr + 8) & 0x7FF);
+		length -= 8;
+	}
+	for (int step = 4; step >= 1; step >>= 1) {
+		if (length >= (uint32_t) step) {
+			repeatPut(n, addr, value, step);
+			value <<= 8 * step;
+			addr += (uint32_t) step;
+			length -= (uint32_t) step;
+		}
+	}
+	return true;
 }
 
 void busWrite8(struct N64* n, uint32_t addr, uint64_t v) {
