@@ -55,7 +55,16 @@ add_executable(n64run tools/n64run.c)
 target_link_libraries(n64run n64)
 
 # The libretro core.
-add_library(armn64_libretro SHARED libretro/libretro.c)
+# The Controller Pak manager's font (Armulators' Inter, OFL) as a C array.
+set(PAKS_FONT ${CMAKE_CURRENT_SOURCE_DIR}/armulators/app/fonts/Inter-Medium.otf)
+add_custom_command(OUTPUT ${CMAKE_CURRENT_BINARY_DIR}/paks_font.inc
+	COMMAND ${CMAKE_COMMAND} -DFONTS=${PAKS_FONT} -DOUT=${CMAKE_CURRENT_BINARY_DIR}/paks_font.inc -P ${CMAKE_CURRENT_SOURCE_DIR}/armulators/app/fonts/embed.cmake
+	DEPENDS ${PAKS_FONT} ${CMAKE_CURRENT_SOURCE_DIR}/armulators/app/fonts/embed.cmake VERBATIM)
+set(PAKS_SOURCES libretro/paks.c ${CMAKE_CURRENT_BINARY_DIR}/paks_font.inc)
+set(PAKS_INCLUDES ${CMAKE_CURRENT_BINARY_DIR} ${CMAKE_CURRENT_SOURCE_DIR}/armulators/app)
+
+add_library(armn64_libretro SHARED libretro/libretro.c ${PAKS_SOURCES})
+target_include_directories(armn64_libretro PRIVATE ${PAKS_INCLUDES})
 target_link_libraries(armn64_libretro n64 armulators-libretro)
 set_target_properties(armn64_libretro PROPERTIES PREFIX "")
 target_link_options(armn64_libretro PRIVATE -Wl,--version-script=${ARMULATORS_LINK_SCRIPT} -Wl,--no-undefined)
@@ -65,5 +74,5 @@ target_link_options(armn64_libretro PRIVATE -Wl,--version-script=${ARMULATORS_LI
 option(ARMN64_APP "Build armn64, the standalone SDL2 app" OFF)
 if(ARMN64_APP)
 	armulators_app(armn64-app DESCRIPTOR ${CMAKE_CURRENT_SOURCE_DIR}/app.cmake
-		SOURCES libretro/libretro.c app/hooks.c INCLUDES ${CMAKE_CURRENT_SOURCE_DIR}/libretro LIBS n64)
+		SOURCES libretro/libretro.c ${PAKS_SOURCES} app/hooks.c INCLUDES ${CMAKE_CURRENT_SOURCE_DIR}/libretro ${PAKS_INCLUDES} LIBS n64)
 endif()

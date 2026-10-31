@@ -7,6 +7,7 @@
 
 #include "libretro.h"
 #include "options.h"
+#include "paks.h"
 
 #include <dirent.h>
 #include <math.h>
@@ -124,6 +125,25 @@ static struct retro_core_option_v2_definition optionDefinitions[] = {
 	  NULL, "input", { { "memory", "Controller Pak" }, { "rumble", "Rumble Pak" }, { "transfer", "Transfer Pak" }, { "none", "None" }, { NULL, NULL } }, "memory" },
 	{ "armn64_pak4", "Player 4 Pak (Restart)", NULL, "What is in controller 4's slot: a Controller Pak for saves, a Rumble Pak, or a Transfer Pak with the Game Boy ROM in system/armN64/TransferPak4 (its .sav beside it).",
 	  NULL, "input", { { "memory", "Controller Pak" }, { "rumble", "Rumble Pak" }, { "transfer", "Transfer Pak" }, { "none", "None" }, { NULL, NULL } }, "memory" },
+	{ "armn64_pak1_card", "Player 1 Controller Pak Card", NULL,
+	  "Which Controller Pak is in controller 1's slot: the game's own (kept in its save file) or a shared card (saves/armN64/ControllerPak/Card N.mpk, the same in every game, like a real pak).",
+	  NULL, "input", { { "game", "The Game's Own" }, { "1", "Shared Card 1" }, { "2", "Shared Card 2" }, { "3", "Shared Card 3" }, { "4", "Shared Card 4" },
+	                   { "5", "Shared Card 5" }, { "6", "Shared Card 6" }, { "7", "Shared Card 7" }, { "8", "Shared Card 8" }, { NULL, NULL } }, "game" },
+	{ "armn64_pak2_card", "Player 2 Controller Pak Card", NULL,
+	  "Which Controller Pak is in controller 2's slot: the game's own (kept in its save file) or a shared card (saves/armN64/ControllerPak/Card N.mpk, the same in every game, like a real pak).",
+	  NULL, "input", { { "game", "The Game's Own" }, { "1", "Shared Card 1" }, { "2", "Shared Card 2" }, { "3", "Shared Card 3" }, { "4", "Shared Card 4" },
+	                   { "5", "Shared Card 5" }, { "6", "Shared Card 6" }, { "7", "Shared Card 7" }, { "8", "Shared Card 8" }, { NULL, NULL } }, "game" },
+	{ "armn64_pak3_card", "Player 3 Controller Pak Card", NULL,
+	  "Which Controller Pak is in controller 3's slot: the game's own (kept in its save file) or a shared card (saves/armN64/ControllerPak/Card N.mpk, the same in every game, like a real pak).",
+	  NULL, "input", { { "game", "The Game's Own" }, { "1", "Shared Card 1" }, { "2", "Shared Card 2" }, { "3", "Shared Card 3" }, { "4", "Shared Card 4" },
+	                   { "5", "Shared Card 5" }, { "6", "Shared Card 6" }, { "7", "Shared Card 7" }, { "8", "Shared Card 8" }, { NULL, NULL } }, "game" },
+	{ "armn64_pak4_card", "Player 4 Controller Pak Card", NULL,
+	  "Which Controller Pak is in controller 4's slot: the game's own (kept in its save file) or a shared card (saves/armN64/ControllerPak/Card N.mpk, the same in every game, like a real pak).",
+	  NULL, "input", { { "game", "The Game's Own" }, { "1", "Shared Card 1" }, { "2", "Shared Card 2" }, { "3", "Shared Card 3" }, { "4", "Shared Card 4" },
+	                   { "5", "Shared Card 5" }, { "6", "Shared Card 6" }, { "7", "Shared Card 7" }, { "8", "Shared Card 8" }, { NULL, NULL } }, "game" },
+	{ "armn64_pak_manager", "Controller Pak Manager", NULL,
+	  "Open pauses the game and shows the notes on the Controller Paks: copy them between paks, delete, export and import them (saves/armN64/ControllerPak/notes), format a pak. B closes it.",
+	  NULL, "input", { { "closed", "Closed" }, { "open", "Open" }, { NULL, NULL } }, "closed" },
 	{ NULL, NULL, NULL, NULL, NULL, NULL, { { NULL, NULL } }, NULL },
 };
 
@@ -244,27 +264,16 @@ static void swapWords(uint8_t* to, const uint8_t* from, size_t size) {
 
 static void saveExport(void) {
 	memcpy(saveMemory, machine->eeprom, sizeof(machine->eeprom));
-	memcpy(saveMemory + FILE_PAKS, machine->paks, sizeof(machine->paks));
+	paksExport(machine, saveMemory + FILE_PAKS);
 	swapWords(saveMemory + FILE_SRAM, machine->sram, sizeof(machine->sram));
 	swapWords(saveMemory + FILE_FLASH, machine->flash, sizeof(machine->flash));
 }
 
-// A Controller Pak left empty (by a save file from before there were any) is formatted.
 static void saveImport(void) {
 	memcpy(machine->eeprom, saveMemory, sizeof(machine->eeprom));
-	memcpy(machine->paks, saveMemory + FILE_PAKS, sizeof(machine->paks));
+	paksImport(machine, saveMemory + FILE_PAKS);
 	swapWords(machine->sram, saveMemory + FILE_SRAM, sizeof(machine->sram));
 	swapWords(machine->flash, saveMemory + FILE_FLASH, sizeof(machine->flash));
-	for (int i = 0; i < 4; ++i) {
-		const uint8_t* pak = machine->paks[i];
-		size_t k = 0;
-		while (k < sizeof(machine->paks[i]) && !pak[k]) {
-			++k;
-		}
-		if (k == sizeof(machine->paks[i])) {
-			pakFormat(machine->paks[i]);
-		}
-	}
 }
 
 static uint8_t* readFile(const char* path, size_t* size) {
@@ -623,6 +632,8 @@ bool retro_load_game(const struct retro_game_info* info) {
 		}
 		snprintf(diskSavePath, sizeof(diskSavePath), "%s/%s.sav", saves, name);
 	}
+	const char* saveDir = NULL;
+	paksInit(environment(RETRO_ENVIRONMENT_GET_SAVE_DIRECTORY, &saveDir) ? saveDir : NULL);
 	machine = startMachine();
 	if (!machine) {
 		logMessage(RETRO_LOG_ERROR, "this game can't be loaded");
@@ -648,6 +659,9 @@ bool retro_load_game_special(unsigned type, const struct retro_game_info* info, 
 }
 
 void retro_unload_game(void) {
+	if (machine) {
+		paksSync(machine);
+	}
 	diskSave();
 	transferPaksSave();
 	n64Destroy(machine);
@@ -786,6 +800,59 @@ static void playAudio(void) {
 	}
 }
 
+// A picture made on the CPU (0x00RRGGBB) to the frontend.
+static void showPicture(int width, int height, bool shared) {
+	if (width != pictureWidth || height != pictureHeight) {
+		pictureWidth = width, pictureHeight = height;
+		struct retro_game_geometry geometry = { (unsigned) width, (unsigned) height, 640, 480, 4.0f / 3.0f };
+		environment(RETRO_ENVIRONMENT_SET_GEOMETRY, &geometry);
+	}
+	if (!shared) {
+		videoRefresh(picture, (unsigned) width, (unsigned) height, (size_t) width * 4);
+	} else if (hwReady) {
+		present(width, height, 0);
+	}
+}
+
+// Each port's Controller Pak card from the options; the manager while it is open (the game paused),
+// and the option back to Closed once it is.
+static bool pakManagerAsked;
+
+static bool pakManager(bool shared) {
+	int cards[4];
+	for (int port = 0; port < 4; ++port) {
+		char key[24];
+		snprintf(key, sizeof(key), "armn64_pak%d_card", port + 1);
+		const char* value = optionValue(environment, key);
+		cards[port] = value && value[0] >= '1' && value[0] <= '8' ? value[0] - '0' : 0;
+	}
+	paksPlug(machine, cards);
+	bool const asked = optionIs(environment, "armn64_pak_manager", "open");
+	if (asked && !pakManagerAsked) {
+		paksManagerOpen();
+	}
+	pakManagerAsked = asked;
+	uint32_t buttons = 0;
+	for (unsigned id = 0; id <= RETRO_DEVICE_ID_JOYPAD_R; ++id) {
+		buttons |= inputState(0, RETRO_DEVICE_JOYPAD, 0, id) ? 1u << id : 0;
+	}
+	int width, height;
+	if (!paksManager(machine, buttons, picture, &width, &height)) {
+		if (asked) {
+			struct retro_variable closed = { "armn64_pak_manager", "closed" };
+			environment(RETRO_ENVIRONMENT_SET_VARIABLE, &closed);
+		}
+		return false;
+	}
+	showPicture(width, height, shared);
+	size_t const silence = OUT_RATE / (pal ? 50 : 60);
+	memset(played, 0, silence * 4);
+	for (size_t done = 0; done < silence;) {
+		done += audioBatch(played + done * 2, silence - done);
+	}
+	return true;
+}
+
 void retro_run(void) {
 	if (!machine) {
 		return;
@@ -799,6 +866,12 @@ void retro_run(void) {
 		glesResume();
 	}
 	inputPoll();
+	if (pakManager(shared)) {
+		if (!shared) {
+			glesYield();
+		}
+		return;
+	}
 	readPorts();
 	machine->viFilters = optionIs(environment, "armn64_vi_filters", "on") ||
 	                     (!optionIs(environment, "armn64_vi_filters", "off") && machine->accuracy != ACCURACY_HLE);
@@ -824,16 +897,7 @@ void retro_run(void) {
 		}
 		present(width, height, buffer);
 	} else if (n64Picture(machine, picture, &width, &height) && width && height) {
-		if (width != pictureWidth || height != pictureHeight) {
-			pictureWidth = width, pictureHeight = height;
-			struct retro_game_geometry geometry = { (unsigned) width, (unsigned) height, 640, 480, 4.0f / 3.0f };
-			environment(RETRO_ENVIRONMENT_SET_GEOMETRY, &geometry);
-		}
-		if (!shared) {
-			videoRefresh(picture, (unsigned) width, (unsigned) height, (size_t) width * 4);
-		} else if (hwReady) {
-			present(width, height, 0);
-		}
+		showPicture(width, height, shared);
 	} else {
 		videoRefresh(NULL, (unsigned) pictureWidth, (unsigned) pictureHeight, 0);
 	}
@@ -843,6 +907,7 @@ void retro_run(void) {
 	playAudio();
 	tellFallbacks();
 	if (machine->saveDirty) {
+		paksSync(machine);
 		saveExport();
 		machine->saveDirty = false;
 	}
