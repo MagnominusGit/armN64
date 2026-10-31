@@ -8,6 +8,7 @@
 #include "libretro.h"
 #include "options.h"
 
+#include <dirent.h>
 #include <math.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -115,14 +116,14 @@ static struct retro_core_option_v2_definition optionDefinitions[] = {
 	  NULL, "system", { { "auto", "Auto" }, { "on", "On" }, { "off", "Off" }, { NULL, NULL } }, "auto" },
 	{ "armn64_frameskip", "Frame Skip (Restart)", NULL, "Leaves out the drawing of frames that are never shown, as many games make more than the screen can show.",
 	  NULL, "system", { { "disabled", "Off" }, { "enabled", "On" }, { NULL, NULL } }, "disabled" },
-	{ "armn64_pak1", "Player 1 Pak", NULL, "What is in controller 1's slot: a Controller Pak for saves, or a Rumble Pak.",
-	  NULL, "input", { { "memory", "Controller Pak" }, { "rumble", "Rumble Pak" }, { "none", "None" }, { NULL, NULL } }, "memory" },
-	{ "armn64_pak2", "Player 2 Pak", NULL, "What is in controller 2's slot: a Controller Pak for saves, or a Rumble Pak.",
-	  NULL, "input", { { "memory", "Controller Pak" }, { "rumble", "Rumble Pak" }, { "none", "None" }, { NULL, NULL } }, "memory" },
-	{ "armn64_pak3", "Player 3 Pak", NULL, "What is in controller 3's slot: a Controller Pak for saves, or a Rumble Pak.",
-	  NULL, "input", { { "memory", "Controller Pak" }, { "rumble", "Rumble Pak" }, { "none", "None" }, { NULL, NULL } }, "memory" },
-	{ "armn64_pak4", "Player 4 Pak", NULL, "What is in controller 4's slot: a Controller Pak for saves, or a Rumble Pak.",
-	  NULL, "input", { { "memory", "Controller Pak" }, { "rumble", "Rumble Pak" }, { "none", "None" }, { NULL, NULL } }, "memory" },
+	{ "armn64_pak1", "Player 1 Pak (Restart)", NULL, "What is in controller 1's slot: a Controller Pak for saves, a Rumble Pak, or a Transfer Pak with the Game Boy ROM in system/armN64/TransferPak1 (its .sav beside it).",
+	  NULL, "input", { { "memory", "Controller Pak" }, { "rumble", "Rumble Pak" }, { "transfer", "Transfer Pak" }, { "none", "None" }, { NULL, NULL } }, "memory" },
+	{ "armn64_pak2", "Player 2 Pak (Restart)", NULL, "What is in controller 2's slot: a Controller Pak for saves, a Rumble Pak, or a Transfer Pak with the Game Boy ROM in system/armN64/TransferPak2 (its .sav beside it).",
+	  NULL, "input", { { "memory", "Controller Pak" }, { "rumble", "Rumble Pak" }, { "transfer", "Transfer Pak" }, { "none", "None" }, { NULL, NULL } }, "memory" },
+	{ "armn64_pak3", "Player 3 Pak (Restart)", NULL, "What is in controller 3's slot: a Controller Pak for saves, a Rumble Pak, or a Transfer Pak with the Game Boy ROM in system/armN64/TransferPak3 (its .sav beside it).",
+	  NULL, "input", { { "memory", "Controller Pak" }, { "rumble", "Rumble Pak" }, { "transfer", "Transfer Pak" }, { "none", "None" }, { NULL, NULL } }, "memory" },
+	{ "armn64_pak4", "Player 4 Pak (Restart)", NULL, "What is in controller 4's slot: a Controller Pak for saves, a Rumble Pak, or a Transfer Pak with the Game Boy ROM in system/armN64/TransferPak4 (its .sav beside it).",
+	  NULL, "input", { { "memory", "Controller Pak" }, { "rumble", "Rumble Pak" }, { "transfer", "Transfer Pak" }, { "none", "None" }, { NULL, NULL } }, "memory" },
 	{ NULL, NULL, NULL, NULL, NULL, NULL, { { NULL, NULL } }, NULL },
 };
 
@@ -285,6 +286,72 @@ static uint8_t* readFile(const char* path, size_t* size) {
 }
 
 // A machine running the game loaded, from power-on.
+// The Game Boy cartridges in Transfer Paks: the first .gb or .gbc in system/armN64/TransferPak<port>,
+// and its save RAM as the .sav of the same name there.
+static char gbSavePath[4][4096];
+
+static void transferPaksLoad(struct N64* n) {
+	const char* system = NULL;
+	if (!environment(RETRO_ENVIRONMENT_GET_SYSTEM_DIRECTORY, &system) || !system) {
+		return;
+	}
+	for (int port = 0; port < 4; ++port) {
+		char key[16], dir[4096];
+		snprintf(key, sizeof(key), "armn64_pak%d", port + 1);
+		gbSavePath[port][0] = 0;
+		if (!optionIs(environment, key, "transfer")) {
+			continue;
+		}
+		snprintf(dir, sizeof(dir), "%s/armN64/TransferPak%d", system, port + 1);
+		DIR* d = opendir(dir);
+		struct dirent* e;
+		while (d && (e = readdir(d))) {
+			size_t len = strlen(e->d_name);
+			if ((len > 3 && !strcasecmp(e->d_name + len - 3, ".gb")) || (len > 4 && !strcasecmp(e->d_name + len - 4, ".gbc"))) {
+				char path[4096];
+				int const stem = (int) (strrchr(e->d_name, '.') - e->d_name);
+				if (snprintf(path, sizeof(path), "%s/%s", dir, e->d_name) >= (int) sizeof(path) ||
+				    snprintf(gbSavePath[port], sizeof(gbSavePath[port]), "%s/%.*s.sav", dir, stem, e->d_name) >= (int) sizeof(gbSavePath[port])) {
+					gbSavePath[port][0] = 0;
+					break;
+				}
+				size_t size;
+				uint8_t* rom = readFile(path, &size);
+				if (!rom || !gbCartLoad(&n->tpak[port].cart, rom, size)) {
+					gbSavePath[port][0] = 0;
+				} else {
+					uint8_t* sav = readFile(gbSavePath[port], &size);
+					if (sav) {
+						memcpy(n->tpak[port].cart.ram, sav, size < n->tpak[port].cart.ramSize ? size : n->tpak[port].cart.ramSize);
+					}
+					free(sav);
+				}
+				free(rom);
+				break;
+			}
+		}
+		if (d) {
+			closedir(d);
+		}
+	}
+}
+
+static void transferPaksSave(void) {
+	for (int port = 0; machine && port < 4; ++port) {
+		struct GbCart* c = &machine->tpak[port].cart;
+		if (!c->ramDirty || !gbSavePath[port][0]) {
+			continue;
+		}
+		FILE* f = fopen(gbSavePath[port], "wb");
+		if (f && fwrite(c->ram, 1, c->ramSize, f) == c->ramSize) {
+			c->ramDirty = false;
+		}
+		if (f) {
+			fclose(f);
+		}
+	}
+}
+
 // A 64DD disk's changes, beside the save files as <disk name>.ndd.sav.
 static char diskSavePath[4096];
 
@@ -322,6 +389,7 @@ static struct N64* startMachine(void) {
 		logMessage(RETRO_LOG_WARN, "the disk's saved changes don't fit this disk");
 	}
 	free(changes);
+	transferPaksLoad(n);
 	return n;
 }
 
@@ -550,6 +618,7 @@ bool retro_load_game_special(unsigned type, const struct retro_game_info* info, 
 
 void retro_unload_game(void) {
 	diskSave();
+	transferPaksSave();
 	n64Destroy(machine);
 	glesYield();
 	machine = NULL;
@@ -565,6 +634,7 @@ void retro_reset(void) {
 		return;
 	}
 	diskSave();
+	transferPaksSave();
 	n64Destroy(machine);
 	glesYield();
 	machine = startMachine();
@@ -638,7 +708,8 @@ static void readPorts(void) {
 		machine->plugged[port] = device == RETRO_DEVICE_MOUSE ? PLUG_MOUSE : device == RETRO_DEVICE_NONE ? PLUG_NONE : PLUG_CONTROLLER;
 		char key[16];
 		snprintf(key, sizeof(key), "armn64_pak%u", port + 1);
-		machine->pak[port] = optionIs(environment, key, "rumble") ? PAK_RUMBLE : optionIs(environment, key, "none") ? PAK_NONE : PAK_MEMORY;
+		machine->pak[port] = optionIs(environment, key, "rumble") ? PAK_RUMBLE : optionIs(environment, key, "transfer") ? PAK_TRANSFER :
+		                     optionIs(environment, key, "none") ? PAK_NONE : PAK_MEMORY;
 		machine->pad[port] = machine->plugged[port] == PLUG_MOUSE ? readMouse(port) : machine->plugged[port] ? readController(port) : 0;
 		bool const on = machine->pak[port] == PAK_RUMBLE && machine->rumble[port] && optionIs(environment, "armn64_rumble", "enabled");
 		if (setRumble && on != rumbling[port]) {
@@ -744,6 +815,7 @@ void retro_run(void) {
 		machine->saveDirty = false;
 	}
 	diskSave();
+	transferPaksSave();
 	if (ramView) {
 		for (uint32_t p = 0; p < (RDRAM_SIZE >> 12); ++p) {
 			if (!machine->dirtyPages[p]) {

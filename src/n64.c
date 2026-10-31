@@ -67,6 +67,9 @@ void n64Destroy(struct N64* n) {
 		free(n->isViewer);
 		free(n->hle);
 		free(n->hleAudio);
+		for (int i = 0; i < 4; ++i) {
+			gbCartFree(&n->tpak[i].cart);
+		}
 		free(n->rdram);
 		free(n->hidden);
 		free(n->vpages);
@@ -134,10 +137,11 @@ static void start(struct N64* n) {
 	if (mouse && *mouse >= '1' && *mouse <= '4') {
 		n->plugged[*mouse - '1'] = PLUG_MOUSE;
 	}
-	// N64_PAK: what is in the controllers' slots, a letter a port (m Controller Pak, r Rumble Pak).
+	// N64_PAK: what is in the controllers' slots, a letter a port (m Controller Pak, r Rumble Pak, t
+	// Transfer Pak).
 	const char* paks = setting(n, "N64_PAK");
 	for (int i = 0; paks && i < 4 && paks[i]; ++i) {
-		n->pak[i] = paks[i] == 'm' ? PAK_MEMORY : paks[i] == 'r' ? PAK_RUMBLE : PAK_NONE;
+		n->pak[i] = paks[i] == 'm' ? PAK_MEMORY : paks[i] == 'r' ? PAK_RUMBLE : paks[i] == 't' ? PAK_TRANSFER : PAK_NONE;
 	}
 	n->flashMode = n->flashStatus = 0;
 	if (n->compat) {

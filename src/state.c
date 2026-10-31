@@ -124,6 +124,9 @@ bool n64StateLoad(struct N64* n, const void* data, size_t size, bool quick) {
 	memcpy(n->plugged, was->plugged, sizeof(n->plugged));
 	memcpy(n->pak, was->pak, sizeof(n->pak));
 	memcpy(n->pad, was->pad, sizeof(n->pad));
+	for (int i = 0; i < 4; ++i) {
+		n->tpak[i].cart.rom = was->tpak[i].cart.rom, n->tpak[i].cart.romSize = was->tpak[i].cart.romSize;
+	}
 	n->unimplemented = was->unimplemented, n->stats = was->stats;
 	n->dd.ipl = was->dd.ipl, n->dd.disk = was->dd.disk, n->dd.diskSize = was->dd.diskSize;
 	n->idle.enabled = was->idle.enabled;

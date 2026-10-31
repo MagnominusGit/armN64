@@ -27,7 +27,7 @@ else()
 	set(JIT_SOURCES src/jit_none.c)
 endif()
 
-add_library(n64 STATIC src/n64.c src/blocks.c ${JIT_SOURCES} src/cpu.c src/fpu.c src/fpu_fast.c src/bus.c src/pif.c src/rsp.c src/rsp_vu.c src/rdp.c src/hle.c src/gles.c src/glr.c src/carts.c src/dd.c src/state.c
+add_library(n64 STATIC src/n64.c src/blocks.c ${JIT_SOURCES} src/cpu.c src/fpu.c src/fpu_fast.c src/bus.c src/pif.c src/rsp.c src/rsp_vu.c src/rdp.c src/hle.c src/gles.c src/glr.c src/carts.c src/gbcart.c src/dd.c src/state.c
 	src/audio_hle/audio_hle.c src/audio_hle/alist.c src/audio_hle/alist_audio.c src/audio_hle/alist_naudio.c src/audio_hle/alist_nead.c
 	src/audio_hle/audio.c src/audio_hle/memory.c src/audio_hle/mp3.c src/audio_hle/musyx.c)
 # The GPU shaders (RDP and VI), as C strings.

@@ -140,12 +140,50 @@ static uint8_t pakCrc(const uint8_t* data) {
 	return crc;
 }
 
+// The Transfer Pak, as mupen64plus has it: powered by 0x84 at 0x8000 (0xFE off), the cartridge's
+// 16 KB bank at 0xC000 chosen at 0xA000, access mode and status at 0xB000.
+static void transferRead(struct TransferPak* t, uint32_t address, uint8_t* data) {
+	uint8_t fill = 0;
+	if (address >= 0x8000 && address < 0x9000) {
+		fill = t->on ? 0x84 : 0x00;
+	} else if (address >= 0xB000 && address < 0xC000 && t->on) {
+		fill = t->cart.rom ? (t->access ? 0x89 : 0x80) : 0x40;
+	} else if (address >= 0xC000 && t->on && t->access) {
+		for (int i = 0; i < 32; ++i) {
+			data[i] = gbCartRead(&t->cart, (uint16_t) ((address & 0x3FFF) + t->bank * 0x4000 + (uint32_t) i));
+		}
+		return;
+	}
+	memset(data, fill, 32);
+	if (address >= 0xB000 && address < 0xC000 && t->on) {
+		data[0] |= t->changed;
+		t->changed = 0;
+	}
+}
+
+static void transferWrite(struct TransferPak* t, uint32_t address, const uint8_t* data) {
+	if (address >= 0x8000 && address < 0x9000) {
+		t->on = data[0] == 0x84 ? true : data[0] == 0xFE ? false : t->on;
+	} else if (address >= 0xA000 && address < 0xB000 && t->on) {
+		t->bank = data[0] & 3;
+	} else if (address >= 0xB000 && address < 0xC000 && t->on) {
+		t->access = data[0] & 1;
+		t->changed = 0x04;
+	} else if (address >= 0xC000 && t->on && t->access) {
+		for (int i = 0; i < 32; ++i) {
+			gbCartWrite(&t->cart, (uint16_t) ((address & 0x3FFF) + t->bank * 0x4000 + (uint32_t) i), data[i]);
+		}
+	}
+}
+
 // 32 bytes of the pak in controller port's slot at address (its low 5 bits are the address's CRC):
-// a Controller Pak's memory, or the Rumble Pak's (0x80 where it says what it is, its motor at
-// 0xC000).
+// a Controller Pak's memory, the Rumble Pak's (0x80 where it says what it is, its motor at 0xC000),
+// or the Transfer Pak's.
 static void pakRead(struct N64* n, int port, uint32_t address, uint8_t* data) {
 	address &= 0xFFE0;
-	if (n->pak[port] == PAK_MEMORY) {
+	if (n->pak[port] == PAK_TRANSFER) {
+		transferRead(&n->tpak[port], address, data);
+	} else if (n->pak[port] == PAK_MEMORY) {
 		address < 0x8000 ? memcpy(data, &n->paks[port][address], 32) : memset(data, 0, 32);
 	} else {
 		memset(data, n->pak[port] == PAK_RUMBLE && address >= 0x8000 && address < 0x9000 ? 0x80 : 0, 32);
@@ -154,7 +192,9 @@ static void pakRead(struct N64* n, int port, uint32_t address, uint8_t* data) {
 
 static void pakWrite(struct N64* n, int port, uint32_t address, const uint8_t* data) {
 	address &= 0xFFE0;
-	if (n->pak[port] == PAK_MEMORY && address < 0x8000) {
+	if (n->pak[port] == PAK_TRANSFER) {
+		transferWrite(&n->tpak[port], address, data);
+	} else if (n->pak[port] == PAK_MEMORY && address < 0x8000) {
 		memcpy(&n->paks[port][address], data, 32);
 		n->saveDirty = true;
 	} else if (n->pak[port] == PAK_RUMBLE && address >= 0xC000) {

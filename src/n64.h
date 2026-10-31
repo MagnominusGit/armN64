@@ -232,6 +232,20 @@ struct DD {
 	bool diskSaved;
 };
 
+// A Game Boy cartridge in a Transfer Pak (gbcart.c): its ROM (the host's), save RAM and mapper.
+struct GbCart {
+	uint8_t* rom;
+	size_t romSize;
+	uint8_t ram[0x8000];
+	uint32_t ramSize;
+	int mbc;
+	bool ramOn, ramDirty;
+	uint32_t romLow, romHigh, ramBank;
+	uint8_t mode, latch;
+	// MBC3's clock: seconds, minutes, hours, day (low, high), and as last latched.
+	uint8_t rtc[5], rtcLatched[5];
+};
+
 struct N64 {
 	uint8_t* rdram;
 	// RDRAM's hidden ninth bits, as the RDP keeps them: two coverage bits for each halfword.
@@ -408,10 +422,17 @@ struct N64 {
 	// in the top half and stick (a mouse's movement) below; whether a Rumble Pak's motor is on; the
 	// Controller Paks' memory.
 	enum { PLUG_NONE, PLUG_CONTROLLER, PLUG_MOUSE } plugged[4];
-	enum { PAK_NONE, PAK_MEMORY, PAK_RUMBLE } pak[4];
+	enum { PAK_NONE, PAK_MEMORY, PAK_RUMBLE, PAK_TRANSFER } pak[4];
 	uint32_t pad[4];
 	bool rumble[4];
 	uint8_t paks[4][0x8000];
+	// The Transfer Paks: powered, in access mode, the 16 KB bank of the cartridge at 0xC000, and the
+	// access mode change their status reports once.
+	struct TransferPak {
+		bool on, access;
+		uint8_t bank, changed;
+		struct GbCart cart;
+	} tpak[4];
 	const char* unimplemented;
 	// Activity counts for diagnostics.
 	struct {
@@ -644,6 +665,10 @@ bool n64StateLoad(struct N64*, const void* data, size_t size, bool quick);
 
 // carts.c
 bool cartEeprom16k(const uint8_t* rom);
+bool gbCartLoad(struct GbCart*, const uint8_t* rom, size_t size);
+void gbCartFree(struct GbCart*);
+uint8_t gbCartRead(struct GbCart*, uint16_t addr);
+void gbCartWrite(struct GbCart*, uint16_t addr, uint8_t v);
 uint8_t* ddChanges(struct N64* n, size_t* size);
 bool ddApplyChanges(struct N64* n, const uint8_t* data, size_t size);
 uint8_t cartSaveByte(struct N64* n, uint32_t offset);

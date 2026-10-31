@@ -163,6 +163,22 @@ int main(int argc, char** argv) {
 	if (getenv("N64SAMPLE")) {
 		sampleStart();
 	}
+	// N64_TPAK=Game Boy ROM: the cartridge in controller 1's Transfer Pak; N64_TPAKSAV=its save RAM,
+	// loaded before the run and saved after.
+	if (getenv("N64_TPAK")) {
+		size_t gbSize;
+		uint8_t* gb = readFile(getenv("N64_TPAK"), &gbSize);
+		if (!gb || !gbCartLoad(&n->tpak[0].cart, gb, gbSize)) {
+			fprintf(stderr, "can't load the Game Boy ROM %s\n", getenv("N64_TPAK"));
+		}
+		free(gb);
+		size_t savSize;
+		uint8_t* sav = getenv("N64_TPAKSAV") ? readFile(getenv("N64_TPAKSAV"), &savSize) : NULL;
+		if (sav) {
+			memcpy(n->tpak[0].cart.ram, sav, savSize < n->tpak[0].cart.ramSize ? savSize : n->tpak[0].cart.ramSize);
+		}
+		free(sav);
+	}
 	// N64SAVELOAD / N64SAVEDUMP=path: the saves before the run and after it, as the machine holds them
 	// (the EEPROM, the four Controller Paks, the SRAM, the flash).
 	struct {
@@ -403,6 +419,14 @@ int main(int argc, char** argv) {
 			printf("disk changes: %zu bytes\n", size);
 		}
 		free(changes);
+	}
+	if (getenv("N64_TPAKSAV") && n->tpak[0].cart.ramDirty) {
+		FILE* f = fopen(getenv("N64_TPAKSAV"), "wb");
+		if (f) {
+			fwrite(n->tpak[0].cart.ram, 1, n->tpak[0].cart.ramSize, f);
+			fclose(f);
+			printf("Game Boy save RAM written\n");
+		}
 	}
 	if (getenv("N64RAMDUMP")) {
 		FILE* f = fopen(getenv("N64RAMDUMP"), "wb");
