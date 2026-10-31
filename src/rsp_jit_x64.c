@@ -5,9 +5,10 @@
 #include <sys/mman.h>
 
 // x86-64 code for blocks of RSP instructions. Each block's first instruction takes its timing from
-// rspTimingStep (the instruction before it isn't known); the rest have the timing compiled in.
-// Scalar instructions and DMEM loads and stores run inline, the vector unit and COP0 through C.
-// Code stops after any instruction that takes the clock to the limit, as rspCatchUp does.
+// rspTimingStep (the instruction before it isn't known) unless the timing is plain; the rest have the
+// timing compiled in. Scalar instructions and DMEM loads and stores run inline, the vector unit and
+// COP0 through C. In lle, code stops after any instruction that takes the clock to the limit, as
+// rspCatchUp does; in mle and hle at the block's end.
 //
 // Registers: rbx = n, r12 = &n->rsp, r13 = clock, r14 = the limit, r15 = lastStart,
 // ebp = lastAlone.
@@ -213,6 +214,85 @@ static void emitMemory(struct Emitter* e, uint32_t op) {
 	}
 }
 
+// SSE instructions: [prefix] [REX] 0F op (0F 38 op or 0F 3A op for op > 0xFF) with a ModRM.
+enum { XMM0, XMM1, XMM2 };
+
+static void sse(struct Emitter* e, uint8_t prefix, uint32_t op, int reg, struct Opnd rm) {
+	if (prefix) {
+		e8(e, prefix);
+	}
+	emitRex(e, 4, reg, rm, false);
+	e8(e, 0x0F);
+	if (op > 0xFF) {
+		e8(e, op >> 8);
+	}
+	e8(e, op);
+	emitModrm(e, reg, rm);
+}
+
+// The bytes of every 16-bit lane of x swapped (t is scratch).
+static void sseSwapBytes(struct Emitter* e, int x, int t) {
+	sse(e, 0x66, 0x6F, t, R(x));
+	sse(e, 0x66, 0x71, 6, R(x));
+	e8(e, 8);
+	sse(e, 0x66, 0x71, 2, R(t));
+	e8(e, 8);
+	sse(e, 0x66, 0xEB, x, R(t));
+}
+
+// MOVD, MOVQ or MOVDQU between xmm x and memory, 4, 8 or 16 bytes.
+static void sseLoad(struct Emitter* e, int size, int x, struct Opnd m) {
+	sse(e, size == 4 ? 0x66 : 0xF3, size == 4 ? 0x6E : size == 8 ? 0x7E : 0x6F, x, m);
+}
+
+static void sseStore(struct Emitter* e, int size, struct Opnd m, int x) {
+	sse(e, size == 16 ? 0xF3 : 0x66, size == 4 ? 0x7E : size == 8 ? 0xD6 : 0x7F, x, m);
+}
+
+// LSV, LLV, LDV and LQV (SSV to SQV) at an even element that fits: the lanes move whole,
+// byte-swapped. Addresses past the end of DMEM, and LQV/SQV off a 16-byte boundary, take the
+// general path in C.
+static bool emitVectorMemory(struct Emitter* e, uint32_t op, bool store) {
+	int kind = (op >> 11) & 31, el = (op >> 7) & 15, vt = (op >> 16) & 31;
+	if (kind < 1 || kind > 4 || (el & 1) || el + (1 << kind) > 16) {
+		return false;
+	}
+	int size = 1 << kind;
+	int32_t offset = ((int32_t) ((op & 0x7F) << 25) >> 25) * size;
+	uint8_t* wraps = dmemAddress(e, (op >> 21) & 31, offset, size);
+	uint8_t* unaligned = NULL;
+	if (size == 16) {
+		xTestI(e, 4, R(RCX), 15);
+		unaligned = xJcc(e, CC_NE, NULL);
+	}
+	struct Opnd lanes = RSP_AT(vr[vt][el / 2]);
+	struct Opnd from = store ? lanes : dmem(RCX), to = store ? dmem(RCX) : lanes;
+	if (size == 2) {
+		xMovzx(e, RAX, 2, from);
+		xShiftI(e, X_ROL, 2, R(RAX), 8);
+		xStore(e, 2, to, RAX);
+	} else if (size == 4) {
+		xLoad(e, 4, RAX, from);
+		xBswap(e, 4, RAX);
+		xShiftI(e, X_ROL, 4, R(RAX), 16);
+		xStore(e, 4, to, RAX);
+	} else {
+		sseLoad(e, size, XMM0, from);
+		sseSwapBytes(e, XMM0, XMM1);
+		sseStore(e, size, to, XMM0);
+	}
+	uint8_t* done = xJmp(e, NULL);
+	patchHere(e, wraps);
+	if (unaligned) {
+		patchHere(e, unaligned);
+	}
+	xMovRR(e, 8, RDI, RBX);
+	xMovI(e, RSI, op);
+	callC(e, store ? (const void*) rspVectorStore : (const void*) rspVectorLoad);
+	patchHere(e, done);
+	return true;
+}
+
 // nextPc = taken (cc) ? target : pc + 8, as branch() leaves it.
 static void branchTo(struct Emitter* e, int cc, uint32_t pc, uint32_t target) {
 	xMovIKeepFlags(e, RCX, (pc + 8) & 0xFFC);
@@ -405,6 +485,9 @@ static enum Kind emitInstruction(struct Jit* j, uint32_t op, uint32_t pc, bool d
 		emitMemory(e, op);
 		return PLAIN;
 	case 0x32: case 0x3A:
+		if (emitVectorMemory(e, op, op >> 26 == 0x3A)) {
+			return PLAIN;
+		}
 		xMovRR(e, 8, RDI, RBX);
 		xMovI(e, RSI, op);
 		callC(e, op >> 26 == 0x32 ? (const void*) rspVectorLoad : (const void*) rspVectorStore);
@@ -491,7 +574,10 @@ void* rspCompile(struct N64* n, const uint8_t* ops, uint32_t count, uint32_t sta
 	for (uint32_t k = 0; k < count; ++k) {
 		uint32_t op = be32(&ops[k * 4]), pc = start + k * 4;
 		bool last = k + 1 == count;
-		if (k == 0) {
+		if (k == 0 && plainTiming) {
+			loadTiming(e);
+			emitTiming(e, op, 0, pc);
+		} else if (k == 0) {
 			xMovRR(e, 8, RDI, RBX);
 			xMovI(e, RSI, op);
 			xMovI(e, RDX, pc);
@@ -514,11 +600,13 @@ void* rspCompile(struct N64* n, const uint8_t* ops, uint32_t count, uint32_t sta
 		if (last) {
 			exitAt(j, xJmp(e, NULL), op, pc, kind, delay);
 			j->exits[j->exitCount - 1].last = true;
-		} else {
+			j->exits[j->exitCount - 1].pcsStored = pcsStored;
+		} else if (!plainTiming) {
+			// lle stops at the instruction that reaches the limit; mle and hle at the block's end.
 			xAluRR(e, X_CMP, 8, R(R13), R14);
 			exitAt(j, xJcc(e, CC_AE, NULL), op, pc, kind, delay);
+			j->exits[j->exitCount - 1].pcsStored = pcsStored;
 		}
-		j->exits[j->exitCount - 1].pcsStored = pcsStored;
 		if (check) {
 			// Halted or IMEM rewritten: leave whatever the clock says.
 			uint8_t* over = xJmp(e, NULL);
