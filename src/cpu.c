@@ -174,6 +174,15 @@ static bool cpuWide(const struct CPU* c) {
 	return c->cop0[CP0_STATUS] >> (7 - cpuMode(c)) & 1;
 }
 
+// User mode with Status.RE runs little-endian: the bus sees each access's byte lanes swapped within
+// the doubleword, the address xored by this (ares).
+static uint32_t endianLanes(const struct CPU* c, int size) {
+	if (!(c->cop0[CP0_STATUS] & (1u << 25)) || cpuMode(c) != MODE_USER) {
+		return 0;
+	}
+	return size == 1 ? 7 : size == 2 ? 6 : size == 4 ? 4 : 0;
+}
+
 // Whether compiled code may run: it takes kernel mode's 32-bit addressing for granted.
 bool cpuPlainMode(const struct N64* n) {
 	return cpuMode(&n->cpu) == MODE_KERNEL && !cpuWide(&n->cpu);
@@ -567,6 +576,7 @@ static bool load(struct N64* n, uint64_t vaddr, int size, uint64_t* out) {
 	if (!address(n, vaddr, size, false, &p)) {
 		return false;
 	}
+	p ^= endianLanes(&n->cpu, size);
 	dataTiming(&n->cpu, vaddr, p, false);
 	switch (size) {
 	case 1:
@@ -595,6 +605,7 @@ static bool store(struct N64* n, uint64_t vaddr, int size, uint64_t v) {
 	if (!address(n, vaddr, size, true, &p)) {
 		return false;
 	}
+	p ^= endianLanes(&n->cpu, size);
 	dataTiming(&n->cpu, vaddr, p, true);
 	if (n->idle.tracing) {
 		idleStore(n, p, size, v);
@@ -988,20 +999,22 @@ static void loadStore(struct N64* n, uint32_t op) {
 			r[RT] = v;
 		}
 		return;
+	// The partial loads and stores: little-endian, the byte's place in the word mirrored.
 	case 0x22:
 	case 0x26: {
 		if (!load(n, vaddr & ~3ull, 4, &v)) {
 			return;
 		}
+		int const off = endianLanes(c, 4) ? 3 - (int) (vaddr & 3) : (int) (vaddr & 3);
 		uint32_t w = (uint32_t) v, old = (uint32_t) r[RT];
 		if ((op >> 26) == 0x22) {
-			int sh = (vaddr & 3) * 8;
+			int sh = off * 8;
 			r[RT] = sext32((old & ~(0xFFFFFFFFu << sh)) | (w << sh));
-		} else if ((vaddr & 3) == 3) {
+		} else if (off == 3) {
 			r[RT] = sext32(w);
 		} else {
 			// Part of a word: the register's upper half stays.
-			int sh = (3 - (vaddr & 3)) * 8;
+			int sh = (3 - off) * 8;
 			r[RT] = (r[RT] & ~0xFFFFFFFFull) | ((old & ~(0xFFFFFFFFu >> sh)) | (w >> sh));
 		}
 		return;
@@ -1011,12 +1024,13 @@ static void loadStore(struct N64* n, uint32_t op) {
 		if (!load(n, vaddr & ~7ull, 8, &v)) {
 			return;
 		}
+		int const off = endianLanes(c, 4) ? 7 - (int) (vaddr & 7) : (int) (vaddr & 7);
 		uint64_t old = r[RT];
 		if ((op >> 26) == 0x1A) {
-			int sh = (vaddr & 7) * 8;
+			int sh = off * 8;
 			r[RT] = (old & ~(~0ull << sh)) | (v << sh);
 		} else {
-			int sh = (7 - (vaddr & 7)) * 8;
+			int sh = (7 - off) * 8;
 			r[RT] = (old & ~(~0ull >> sh)) | (v >> sh);
 		}
 		return;
@@ -1035,16 +1049,18 @@ static void loadStore(struct N64* n, uint32_t op) {
 		return;
 	case 0x2A:
 	case 0x2E: {
+		// The store's exceptions, with the address as given.
 		uint32_t p;
-		if (!address(n, vaddr & ~3ull, 4, true, &p) || !load(n, vaddr & ~3ull, 4, &v)) {
+		if (!address(n, vaddr, 1, true, &p) || !load(n, vaddr & ~3ull, 4, &v)) {
 			return;
 		}
+		int const off = endianLanes(c, 4) ? 3 - (int) (vaddr & 3) : (int) (vaddr & 3);
 		uint32_t w = (uint32_t) v, t = (uint32_t) r[RT];
 		if ((op >> 26) == 0x2A) {
-			int sh = (vaddr & 3) * 8;
+			int sh = off * 8;
 			w = (w & ~(0xFFFFFFFFu >> sh)) | (t >> sh);
 		} else {
-			int sh = (3 - (vaddr & 3)) * 8;
+			int sh = (3 - off) * 8;
 			w = (w & ~(0xFFFFFFFFu << sh)) | (t << sh);
 		}
 		store(n, vaddr & ~3ull, 4, w);
@@ -1053,15 +1069,16 @@ static void loadStore(struct N64* n, uint32_t op) {
 	case 0x2C:
 	case 0x2D: {
 		uint32_t p;
-		if (!address(n, vaddr & ~7ull, 8, true, &p) || !load(n, vaddr & ~7ull, 8, &v)) {
+		if (!address(n, vaddr, 1, true, &p) || !load(n, vaddr & ~7ull, 8, &v)) {
 			return;
 		}
+		int const off = endianLanes(c, 4) ? 7 - (int) (vaddr & 7) : (int) (vaddr & 7);
 		uint64_t t = r[RT];
 		if ((op >> 26) == 0x2C) {
-			int sh = (vaddr & 7) * 8;
+			int sh = off * 8;
 			v = (v & ~(~0ull >> sh)) | (t >> sh);
 		} else {
-			int sh = (7 - (vaddr & 7)) * 8;
+			int sh = (7 - off) * 8;
 			v = (v & ~(~0ull << sh)) | (t << sh);
 		}
 		store(n, vaddr & ~7ull, 8, v);
@@ -1074,6 +1091,7 @@ static void loadStore(struct N64* n, uint32_t op) {
 		if (!address(n, vaddr, size, false, &p)) {
 			return;
 		}
+		p ^= endianLanes(c, size);
 		r[RT] = size == 4 ? sext32(busRead32(n, p)) : busRead64(n, p);
 		n->idle.fatal = true;
 		c->llBit = true;
@@ -1438,6 +1456,7 @@ void cpuStep(struct N64* n) {
 	if (!address(n, c->curPc, 4, false, &p)) {
 		return;
 	}
+	p ^= endianLanes(c, 4);
 	fetchTiming(c, c->curPc, p);
 	uint32_t op = busRead32(n, p);
 #ifdef N64_TRACE

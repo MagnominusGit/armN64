@@ -464,8 +464,9 @@ uint32_t busRead32(struct N64* n, uint32_t addr) {
 		case 0x08:
 		case 0x0C:
 			return 0x7F;
+		// IO busy while a write to cartridge space is on the bus.
 		case 0x10:
-			return n->pi.status | (n->miIntr & MI_PI ? 8 : 0);
+			return n->pi.status | (n->miIntr & MI_PI ? 8 : 0) | (n->pi.romLatched && n->cycles < n->pi.romLatchUntil ? 2 : 0);
 		default:
 			if ((addr & 0x3F) >= 0x14 && (addr & 0x3F) < 0x34) {
 				return n->pi.timing[((addr & 0x3F) - 0x14) >> 2];
@@ -728,6 +729,10 @@ void busWrite32(struct N64* n, uint32_t addr, uint32_t v) {
 			fflush(stdout);
 		}
 	} else if (addr >= 0x10000000 && addr < 0x1FC00000) {
+		// While one write is on the bus, others are lost.
+		if (n->pi.romLatched && n->cycles < n->pi.romLatchUntil) {
+			return;
+		}
 		n->pi.romLatch = v;
 		n->pi.romLatched = true;
 		// Domain 1 timing for one word: latency, then two halfwords of pulse and release.
