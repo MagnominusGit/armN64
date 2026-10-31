@@ -68,6 +68,9 @@ struct CPU {
 	uint32_t stall;
 	// Count when the timer was last checked, so a Compare value passed during a stall still fires.
 	uint32_t lastCount;
+	// The row each RDRAM bank has open, and when the CPU's posted uncached writes are done.
+	uint32_t openRow[8];
+	uint64_t writesDone;
 };
 
 struct SP {
@@ -75,6 +78,8 @@ struct SP {
 	uint32_t memAddr, dramAddr, status, semaphore, pc;
 	// The length registers as they read: the last DMA's length (0xFF8 once done), count and skip.
 	uint32_t length;
+	// RCP cycles when the DMAs under way are done, and when a queued one starts (DMA full until then).
+	uint64_t dmaUntil, dmaFullUntil;
 	// A task hleGraphics ran: the RSP shows it running (doing nothing) until then.
 	uint64_t hleDoneAt;
 };
@@ -177,7 +182,7 @@ enum { ACCURACY_LLE_ACCURATE, ACCURACY_LLE_COMPATIBLE, ACCURACY_HLE };
 
 // CPU cycles for cache line fills and the write-back of a dirty data line (cpu.c and both code
 // generators).
-enum { ICACHE_FILL = 48, DCACHE_FILL = 40, DCACHE_WRITEBACK = 40 };
+enum { ICACHE_FILL = 44, DCACHE_FILL = 33, DCACHE_WRITEBACK = 40 };
 
 // Per 4 KB page of RDRAM: it holds compiled code, or RDP commands not yet drawn write or read it.
 enum { PAGE_CODE = 1, PAGE_RDP_WRITES = 2, PAGE_RDP_READS = 4, PAGE_RDP = 6 };

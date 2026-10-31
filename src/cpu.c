@@ -11,14 +11,46 @@
 
 enum { ST_IE = 1, ST_EXL = 2, ST_ERL = 4, ST_FR = 1 << 26, ST_CU1 = 1 << 29, ST_CU2 = 1 << 30, ST_BEV = 1 << 22 };
 
-// Timing, in CPU cycles on top of one a instruction: cache line fills and write-backs, and reads of
-// RCP registers (cache figures as in the VR4300 manual and ares; the RCP read cost is fitted to
-// pdrome's instruction timing ROM, which counts loop iterations per field on hardware).
-enum { RCP_READ = 22, PI_READ = 250 };
+// Timing, in CPU cycles on top of one a instruction (hacktarux's n64-systembench, from hardware):
+// uncached reads of RDRAM, of RCP registers and over the PI bus; uncached writes, posted, done after
+// a while that the next uncached read waits for; another row opened in an RDRAM bank.
+enum { RDRAM_READ = 32, RCP_READ = 22, SP_MEM_READ = 27, PI_READ = 214, RDRAM_WRITE = 12, RCP_WRITE = 6, DMEM_WRITE = 6, IMEM_WRITE = 10, ROW_MISS = 8 };
 
-// What an uncached read costs: an RCP register, or a word over the PI bus (cartridge, 64DD; ares).
-static uint32_t readCost(uint32_t paddr) {
-	return paddr < RDRAM_SIZE ? 0 : paddr >= 0x05000000 && paddr < 0x1FC00000 ? PI_READ : RCP_READ;
+static uint32_t rowCost(struct CPU* c, uint32_t paddr) {
+	uint32_t const bank = (paddr >> 20) & 7, row = paddr >> 11;
+	if (c->openRow[bank] == row) {
+		return 0;
+	}
+	c->openRow[bank] = row;
+	return ROW_MISS;
+}
+
+static void readTiming(struct N64* n, uint32_t paddr, int size) {
+	struct CPU* c = &n->cpu;
+	uint64_t const now = n->cycles + c->stall;
+	if (c->writesDone > now) {
+		c->stall += (uint32_t) (c->writesDone - now);
+	}
+	if (paddr < RDRAM_SIZE) {
+		c->stall += RDRAM_READ + (size == 8 ? 3 : 0) + rowCost(c, paddr);
+	} else if (paddr < 0x04000000) {
+		c->stall += RDRAM_READ + (size == 8);
+	} else if (paddr < 0x04040000) {
+		c->stall += SP_MEM_READ;
+	} else {
+		c->stall += paddr >= 0x05000000 && paddr < 0x1FC00000 ? PI_READ : RCP_READ;
+	}
+}
+
+static void writeTiming(struct N64* n, uint32_t paddr) {
+	struct CPU* c = &n->cpu;
+	if (paddr >= 0x05000000) {
+		return;
+	}
+	uint64_t const now = n->cycles + c->stall;
+	uint32_t const cost = paddr < 0x04000000 ? RDRAM_WRITE + (paddr < RDRAM_SIZE ? rowCost(c, paddr) : 0) :
+	                      paddr < 0x04001000 ? DMEM_WRITE : paddr < 0x04040000 ? IMEM_WRITE : RCP_WRITE;
+	c->writesDone = (c->writesDone > now ? c->writesDone : now) + cost;
 }
 
 static bool address(struct N64* n, uint64_t vaddr, int align, bool store, uint32_t* paddr);
@@ -47,7 +79,7 @@ static void icacheSet(struct CPU* c, uint32_t i, uint32_t ptag, bool valid) {
 }
 
 static void dcacheWriteBack(struct N64* n, uint32_t i) {
-	n->cpu.stall += DCACHE_WRITEBACK;
+	n->cpu.stall += DCACHE_WRITEBACK + rowCost(&n->cpu, dcacheAddress(&n->cpu, i));
 	if (!n->compat) {
 		busWriteLine(n, dcacheAddress(&n->cpu, i), n->cpu.dcacheData[i], 16);
 	}
@@ -55,7 +87,7 @@ static void dcacheWriteBack(struct N64* n, uint32_t i) {
 
 static void dcacheFill(struct N64* n, uint32_t i, uint32_t paddr) {
 	struct CPU* c = &n->cpu;
-	c->stall += DCACHE_FILL;
+	c->stall += DCACHE_FILL + rowCost(c, paddr);
 	dcacheSet(c, i, paddr, true);
 	c->dcacheDirty[i] = false;
 	if (!n->compat) {
@@ -65,7 +97,7 @@ static void dcacheFill(struct N64* n, uint32_t i, uint32_t paddr) {
 
 static void icacheFill(struct N64* n, uint32_t i, uint32_t paddr) {
 	struct CPU* c = &n->cpu;
-	c->stall += ICACHE_FILL;
+	c->stall += ICACHE_FILL + rowCost(c, paddr);
 	icacheSet(c, i, paddr, true);
 	if (!n->compat) {
 		busReadLine(n, icacheAddress(c, i), c->icacheData[i], 32);
@@ -144,7 +176,7 @@ bool cpuCodeCoherent(struct N64* n, uint32_t vaddr, uint32_t paddr, uint32_t cou
 static uint32_t fetch(struct N64* n, uint64_t vaddr, uint32_t paddr) {
 	struct CPU* c = &n->cpu;
 	if (!c->cachedAccess) {
-		c->stall += readCost(paddr);
+		readTiming(n, paddr, 4);
 		return busRead32(n, paddr);
 	}
 	uint32_t i = ((uint32_t) vaddr >> 5) & 511;
@@ -260,6 +292,7 @@ void cpuReset(struct N64* n) {
 	memset(c, 0, sizeof(*c));
 	memset(c->dcacheTag, 0xFF, sizeof(c->dcacheTag));
 	memset(c->icacheTag, 0xFF, sizeof(c->icacheTag));
+	memset(c->openRow, 0xFF, sizeof(c->openRow));
 	cpuTlbChanged(n);
 	c->cop0[CP0_STATUS] = 0x34000000;
 	c->cop0[CP0_CONFIG] = 0x7006E463;
@@ -795,9 +828,9 @@ static bool loadAt(struct N64* n, uint64_t vaddr, int size, uint64_t* out, uint3
 	}
 	p ^= endianLanes(c, size);
 	*paddr = p;
-	if (p >= RDRAM_SIZE) {
-		c->stall += readCost(p);
-	} else if (c->cachedAccess) {
+	if (p >= RDRAM_SIZE || !c->cachedAccess) {
+		readTiming(n, p, size);
+	} else {
 		uint32_t i = dcacheLine(n, vaddr, p);
 		if (!n->compat) {
 			*out = bytesBE(&c->dcacheData[i][p & (16 - size)], size);
@@ -852,8 +885,11 @@ static bool store(struct N64* n, uint64_t vaddr, int size, uint64_t v) {
 			return true;
 		}
 	}
-	if (!c->cachedAccess && p < 0x04000000 && busRepeatWrite(n, p, size, v)) {
-		return true;
+	if (!c->cachedAccess) {
+		writeTiming(n, p);
+		if (p < 0x04000000 && busRepeatWrite(n, p, size, v)) {
+			return true;
+		}
 	}
 	switch (size) {
 	case 1:
@@ -1668,9 +1704,10 @@ static bool uncachedWord(struct N64* n, uint32_t op) {
 	}
 	uint32_t p = (uint32_t) vaddr & 0x1FFFFFFF;
 	if (op >> 26 == 0x23) {
-		c->stall += readCost(p);
+		readTiming(n, p, 4);
 		c->gpr[RT] = sext32(busRead32(n, p));
 	} else {
+		writeTiming(n, p);
 		busWrite32(n, p, (uint32_t) c->gpr[RT]);
 	}
 	return true;

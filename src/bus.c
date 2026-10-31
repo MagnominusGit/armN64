@@ -11,10 +11,21 @@ static inline uint32_t* reg(uint32_t* regs, uint32_t addr, int count) {
 
 // SP DMA: rows of len+1 bytes (rounded to 8), count+1 rows, skipping between rows in RDRAM. Past the
 // RDRAM there is (no mirror): it reads zeros and takes no writes (libdragon's IPL3 clears IMEM so).
+// The RCP's time: the RSP's while it is being caught up, else the CPU's.
+static uint64_t rcpNow(struct N64* n) {
+	return n->catchingUp ? n->rsp.clock : n->cycles * 2 / 3;
+}
+
 static void spDma(struct N64* n, uint32_t lenReg, bool toRdram) {
 	uint32_t len = ((lenReg & 0xFFF) | 7) + 1;
 	uint32_t count = ((lenReg >> 12) & 0xFF) + 1;
 	uint32_t skip = lenReg >> 20;
+	// Its time in RCP cycles (hacktarux's n64-systembench): a setup, then each row by its bytes, the
+	// later ones taking a least time; a DMA asked for while one is under way waits for it.
+	uint64_t const row = toRdram ? (len * 150) >> 10 : (len * 157) >> 10, least = toRdram ? 10 : 14;
+	uint64_t const now = rcpNow(n), start = n->sp.dmaUntil > now ? n->sp.dmaUntil : now;
+	n->sp.dmaFullUntil = n->sp.dmaUntil > now ? n->sp.dmaUntil : 0;
+	n->sp.dmaUntil = start + 26 + row + (count - 1) * (row > least ? row : least);
 	uint32_t mem = n->sp.memAddr & 0x1FF8;
 	uint32_t base = mem & 0x1000;
 	uint32_t dram = n->sp.dramAddr & (n->compat ? 0xFFFFFF : 0xFFFFF8);
@@ -422,10 +433,11 @@ uint32_t busRead32(struct N64* n, uint32_t addr) {
 		case 0x0C:
 			return n->sp.length;
 		case 0x10:
-			return n->sp.status;
+			return n->sp.status | (rcpNow(n) < n->sp.dmaUntil ? 4 : 0) | (rcpNow(n) < n->sp.dmaFullUntil ? 8 : 0);
 		case 0x14:
+			return rcpNow(n) < n->sp.dmaFullUntil;
 		case 0x18:
-			return 0;
+			return rcpNow(n) < n->sp.dmaUntil;
 		case 0x1C: {
 			uint32_t v = n->sp.semaphore;
 			n->sp.semaphore = 1;
@@ -448,7 +460,7 @@ uint32_t busRead32(struct N64* n, uint32_t addr) {
 			// The RSP reads it at its own time (OoT's boot microcode uses it after the clear). It
 			// stops at its largest value (Majora's Mask's boot microcode, read every task, never
 			// sees a low 7 bits of zero).
-			uint64_t t = (n->catchingUp ? n->rsp.clock : n->cycles * 2 / 3) - n->dp.clockBase;
+			uint64_t t = rcpNow(n) - n->dp.clockBase;
 			return t > 0xFFFFFF ? 0xFFFFFF : (uint32_t) t;
 		}
 		case 0x14:
@@ -626,7 +638,7 @@ void busWrite32(struct N64* n, uint32_t addr, uint32_t v) {
 				n->dp.bufBusy = 0;
 			}
 			if (v & 0x200) {
-				n->dp.clockBase = n->catchingUp ? n->rsp.clock : n->cycles * 2 / 3;
+				n->dp.clockBase = rcpNow(n);
 			}
 			break;
 		}
@@ -777,9 +789,10 @@ void busWrite32(struct N64* n, uint32_t addr, uint32_t v) {
 		}
 		n->pi.romLatch = v;
 		n->pi.romLatched = true;
-		// Domain 1 timing for one word: latency, then two halfwords of pulse and release.
+		// Domain 1 timing for one word: a setup, the latency, then two halfwords of pulse and release
+		// (the setup from hacktarux's n64-systembench).
 		const uint32_t* t = n->pi.timing;
-		n->pi.romLatchUntil = n->cycles + ((t[0] + 1) + 2 * ((t[1] + 1) + (t[3] + 1))) * 3 / 2;
+		n->pi.romLatchUntil = n->cycles + (10 + (t[0] + 1) + 2 * ((t[1] + 1) + (t[3] + 1))) * 3 / 2;
 	}
 }
 
