@@ -198,6 +198,11 @@ int main(int argc, char** argv) {
 	}
 	// N64INPUT="from-to:pad,...": controller 1 holds pad (buttons and stick as the PIF reads them, in
 	// hex) for fields from to to.
+	// N64AUDIODUMP=path: what the AI played, as 16-bit stereo samples, with its last rate printed.
+	if (getenv("N64AUDIODUMP")) {
+		n->audioCapacity = 2 * 48000 * (size_t) (fields / 50 + 2);
+		n->audio = calloc(n->audioCapacity, sizeof(int16_t));
+	}
 	const char* input = getenv("N64INPUT");
 	// N64STATETEST=field: a save state there, then after the run it is loaded and the rest run again;
 	// RDRAM and the picture must come out the same.
@@ -426,6 +431,14 @@ int main(int argc, char** argv) {
 			fwrite(n->tpak[0].cart.ram, 1, n->tpak[0].cart.ramSize, f);
 			fclose(f);
 			printf("Game Boy save RAM written\n");
+		}
+	}
+	if (getenv("N64AUDIODUMP") && n->audio) {
+		FILE* f = fopen(getenv("N64AUDIODUMP"), "wb");
+		if (f) {
+			fwrite(n->audio, sizeof(int16_t), n->audioCount, f);
+			fclose(f);
+			printf("audio: %zu samples at %u Hz\n", n->audioCount / 2, n->audioRate);
 		}
 	}
 	if (getenv("N64RAMDUMP")) {
