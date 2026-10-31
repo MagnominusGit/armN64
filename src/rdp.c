@@ -1905,6 +1905,11 @@ void rdpWaitDrawn(struct N64* n, uint32_t addr, uint32_t len) {
 	if (!n->rdpPending) {
 		return;
 	}
+	// The GL renderer gives back the pixels it drew there.
+	if (n->glr) {
+		glrSyncRange(n, addr, len);
+		return;
+	}
 	struct Renderers* all = n->rdp->renderers;
 	if (!all) {
 		rdpWait(n);

@@ -1291,6 +1291,30 @@ bool glrDrew(struct N64* n, uint32_t addr, uint32_t len) {
 	return false;
 }
 
+// The framebuffer of the color image the VI shows from origin (rows rows, stride pixels a row, size
+// 2 or 3), when the GPU drew all of those rows since its pixels last went back to RDRAM: x and y of
+// the picture's first pixel in it. 0 otherwise: RDRAM has the picture.
+unsigned glrPicture(struct N64* n, uint32_t origin, uint32_t stride, int size, int rows, int* x, int* y) {
+	struct Glr* g = n->glr;
+	uint32_t const bytes = size == 3 ? 4 : 2;
+	for (int i = 0; i < TARGETS; ++i) {
+		struct Target* t = &g->target[i];
+		if (!t->texture || t->size != size || t->width != stride || t->dirtyTo <= t->dirtyFrom || origin < t->addr) {
+			continue;
+		}
+		uint32_t const offset = origin - t->addr, row = offset / (stride * bytes);
+		if ((int) row < t->dirtyFrom || (int) row + rows > t->dirtyTo) {
+			continue;
+		}
+		glesUse(g->gles);
+		flushBatch(n, g);
+		*x = (int) (offset % (stride * bytes) / bytes);
+		*y = (int) row;
+		return t->framebuffer;
+	}
+	return 0;
+}
+
 bool glrShows(struct N64* n, uint32_t origin) {
 	struct Glr* g = n->glr;
 	for (int i = 0; i < TARGETS; ++i) {
@@ -1303,6 +1327,30 @@ bool glrShows(struct N64* n, uint32_t origin) {
 		}
 	}
 	return false;
+}
+
+// RDRAM [addr, addr + len) about to be read: the GPU's rows there go back. Rows at the end of what a
+// color image drew go back alone (the VI's filters read a row of the image before the one shown,
+// which the GPU may still be drawing); anything else gives everything back.
+void glrSyncRange(struct N64* n, uint32_t addr, uint32_t len) {
+	struct Glr* g = n->glr;
+	for (int i = 0; i < TARGETS; ++i) {
+		struct Target* t = &g->target[i];
+		uint32_t const row = t->width * (t->size == 3 ? 4 : t->size == 1 ? 1 : 2);
+		uint32_t const from = t->addr + (uint32_t) t->dirtyFrom * row, to = t->addr + (uint32_t) t->dirtyTo * row;
+		if (!t->texture || t->dirtyTo <= t->dirtyFrom || addr >= to || addr + len <= from) {
+			continue;
+		}
+		int const first = (int) ((addr > from ? addr - t->addr : from - t->addr) / row);
+		if (first <= t->dirtyFrom || addr + len < to) {
+			glrSync(n);
+			return;
+		}
+		glesUse(g->gles);
+		flushBatch(n, g);
+		writePixels(n, t, first, t->dirtyTo);
+		t->dirtyTo = first;
+	}
 }
 
 void glrSync(struct N64* n) {

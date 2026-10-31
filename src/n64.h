@@ -428,6 +428,7 @@ bool n64PictureStart(struct N64*, int* width, int* height);
 // After n64PictureStart, the GL buffer holding the picture in RGBA bytes (with the GPU RDP, in its
 // context); 0 when it is elsewhere.
 unsigned n64PictureBuffer(struct N64*);
+bool n64GlPicture(struct N64*, unsigned* framebuffer, int* x, int* y, int* width, int* height);
 
 // cpu.c
 void cpuReset(struct N64*);

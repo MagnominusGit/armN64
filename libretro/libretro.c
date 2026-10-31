@@ -320,6 +320,16 @@ static void present(int width, int height, unsigned buffer) {
 	videoRefresh(RETRO_HW_FRAME_BUFFER_VALID, (unsigned) width, (unsigned) height, 0);
 }
 
+// The GL renderer's picture from its framebuffer into the frontend's, upside down as GL keeps it.
+static void presentGl(unsigned framebuffer, int x, int y, int width, int height) {
+	gl.Disable(GL_SCISSOR_TEST);
+	gl.BindFramebuffer(GL_READ_FRAMEBUFFER, framebuffer);
+	gl.BindFramebuffer(GL_DRAW_FRAMEBUFFER, (unsigned) hw.get_current_framebuffer());
+	gl.BlitFramebuffer(x, y, x + width, y + height, 0, height, width, 0, GL_COLOR_BUFFER_BIT, GL_NEAREST);
+	glrForget(machine);
+	videoRefresh(RETRO_HW_FRAME_BUFFER_VALID, (unsigned) width, (unsigned) height, 0);
+}
+
 static void describeInput(void) {
 	static const struct retro_input_descriptor descriptors[] = {
 		{ 0, RETRO_DEVICE_JOYPAD, 0, RETRO_DEVICE_ID_JOYPAD_B, "A" },
@@ -509,9 +519,18 @@ void retro_run(void) {
 	machine->buttons = readController();
 	n64RunField(machine);
 	int width = 0, height = 0;
-	// The GPU RDP's picture goes from its buffer to the frontend's framebuffer without the CPU.
-	unsigned buffer = 0;
-	if (shared && hwReady && n64PictureStart(machine, &width, &height) && width && height && (buffer = n64PictureBuffer(machine))) {
+	// The GPU RDP's picture goes from its buffer to the frontend's framebuffer without the CPU, and so
+	// does the GL renderer's.
+	unsigned buffer = 0, framebuffer = 0;
+	int x = 0, y = 0;
+	if (shared && hwReady && n64GlPicture(machine, &framebuffer, &x, &y, &width, &height) && width && height) {
+		if (width != pictureWidth || height != pictureHeight) {
+			pictureWidth = width, pictureHeight = height;
+			struct retro_game_geometry geometry = { (unsigned) width, (unsigned) height, 640, 480, 4.0f / 3.0f };
+			environment(RETRO_ENVIRONMENT_SET_GEOMETRY, &geometry);
+		}
+		presentGl(framebuffer, x, y, width, height);
+	} else if (shared && hwReady && n64PictureStart(machine, &width, &height) && width && height && (buffer = n64PictureBuffer(machine))) {
 		if (width != pictureWidth || height != pictureHeight) {
 			pictureWidth = width, pictureHeight = height;
 			struct retro_game_geometry geometry = { (unsigned) width, (unsigned) height, 640, 480, 4.0f / 3.0f };
