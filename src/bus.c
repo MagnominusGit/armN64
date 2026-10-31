@@ -45,13 +45,17 @@ static void spDma(struct N64* n, uint32_t lenReg, bool toRdram) {
 	}
 	n->sp.memAddr = mem;
 	n->sp.dramAddr = dram;
+	n->sp.length = 0xFF8 | (lenReg & 0xFFF00000u);
 	if (!toRdram && base) {
 		++n->rspCodeGen;
 	}
 }
 
+// Each flag has a clear and a set bit; written together they change nothing.
 static void spWriteStatus(struct N64* n, uint32_t v) {
 	uint32_t* s = &n->sp.status;
+	uint32_t const clear = v & ~(v >> 1) & 0x00AAAAA9u, set = v & ~(v << 1) & 0x01555552u;
+	v = clear | set | (v & 4);
 	if ((v & 1) && (*s & 1)) {
 		++n->stats.rspTasks;
 		if (n->hleCheck && be32(&n->sp.mem[0xFC0]) == 1 && !(be32(&n->sp.mem[0xFC4]) & 1)) {
@@ -375,6 +379,9 @@ uint32_t busRead32(struct N64* n, uint32_t addr) {
 			return n->sp.memAddr;
 		case 0x04:
 			return n->sp.dramAddr;
+		case 0x08:
+		case 0x0C:
+			return n->sp.length;
 		case 0x10:
 			return n->sp.status;
 		case 0x14:
@@ -722,7 +729,7 @@ void busWrite32(struct N64* n, uint32_t addr, uint32_t v) {
 	}
 }
 
-// Sub-word reads come from the word that holds them; RDRAM and SP memory take sub-word writes. On
+// Sub-word reads come from the word that holds them; RDRAM takes sub-word writes. On
 // the cartridge bus the PI answers with the upper half of the word at (address + 2) & ~3, and a byte
 // read takes a byte of that half (Peter Lemon's PI test, hardware).
 static bool cartSpace(uint32_t addr) {
@@ -757,37 +764,31 @@ static uint8_t* writable(struct N64* n, uint32_t addr, uint32_t len) {
 		}
 		return &n->rdram[addr];
 	}
-	if (addr >= 0x04000000 && addr < 0x04040000) {
-		rspCatchUp(n);
-		n->rspCodeGen += (addr >> 12) & 1;
-		return &n->sp.mem[addr & 0x1FFF];
-	}
-	if (addr >= 0x1FC007C0 && addr < 0x1FC00800) {
-		return &n->pifRam[addr & 0x3F];
-	}
 	return NULL;
 }
 
-void busWrite8(struct N64* n, uint32_t addr, uint8_t v) {
+void busWrite8(struct N64* n, uint32_t addr, uint64_t v) {
 	uint8_t* p = writable(n, addr, 1);
 	if (p) {
-		*p = v;
+		*p = (uint8_t) v;
 	} else {
-		busWrite32(n, addr & ~3u, (uint32_t) v << (24 - (addr & 3) * 8));
+		busWrite32(n, addr & ~3u, (uint32_t) (v << (24 - (addr & 3) * 8)));
 	}
 }
 
-void busWrite16(struct N64* n, uint32_t addr, uint16_t v) {
+void busWrite16(struct N64* n, uint32_t addr, uint64_t v) {
 	uint8_t* p = writable(n, addr & ~1u, 2);
 	if (p) {
-		p[0] = v >> 8;
-		p[1] = v;
+		p[0] = (uint8_t) (v >> 8);
+		p[1] = (uint8_t) v;
 	} else {
-		busWrite32(n, addr & ~3u, (uint32_t) v << (16 - (addr & 2) * 8));
+		busWrite32(n, addr & ~3u, (uint32_t) (v << (16 - (addr & 2) * 8)));
 	}
 }
 
 void busWrite64(struct N64* n, uint32_t addr, uint64_t v) {
 	busWrite32(n, addr, v >> 32);
-	busWrite32(n, addr + 4, (uint32_t) v);
+	if ((addr & 0x1FFFFFFF) < RDRAM_SIZE) {
+		busWrite32(n, addr + 4, (uint32_t) v);
+	}
 }

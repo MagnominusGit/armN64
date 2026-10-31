@@ -166,7 +166,8 @@ static bool fpuOpValid(uint32_t op) {
 	return func <= 15 || func == 32 || func == 33 || func == 36 || func == 37 || func >= 0x30;
 }
 
-// MFC0 and DMFC0 of anything but Random; MTC0 and DMTC0 of Status, EPC and ErrorEPC.
+// MFC0 and DMFC0 of anything but Random and the registers that read the latch; MTC0 and DMTC0 of EPC
+// and ErrorEPC.
 static bool emitCop0(struct Jit* j, uint32_t op) {
 	struct Emitter* e = &j->e;
 	int rs = (op >> 21) & 31, rt = (op >> 16) & 31, rd = (op >> 11) & 31;
@@ -220,35 +221,16 @@ static bool emitCop0(struct Jit* j, uint32_t op) {
 	if (rs != 0x04 && rs != 0x05) {
 		return false;
 	}
-	if (rd != CP0_STATUS && rd != CP0_EPC && rd != CP0_ERROREPC) {
+	// Status in C: a write may leave the mode compiled code runs in.
+	if (rd != CP0_EPC && rd != CP0_ERROREPC) {
 		return false;
 	}
 	// Each write also goes to the latch.
 	xLoad(e, 8, RAX, gpr(rt));
 	xStore(e, 8, M(R12, (int32_t) (offsetof(struct CPU, cop0) + 8 * CP0_LATCH)), RAX);
-	if (rd == CP0_STATUS) {
-		xLoad(e, 4, RAX, gpr(rt));
-		xAluI(e, X_AND, 4, R(RAX), (int32_t) 0xFFF7FFFF);
-		xStore(e, 8, reg, RAX);
-		// Interrupts on (IE, not EXL or ERL) and one of them pending.
-		xMovRR(e, 4, RCX, RAX);
-		xAluI(e, X_AND, 4, R(RCX), 7);
-		xAluI(e, X_CMP, 4, R(RCX), 1);
-		uint8_t* off = xJcc(e, CC_NE, NULL);
-		xLoad(e, 4, RCX, M(R12, (int32_t) (offsetof(struct CPU, cop0) + 8 * CP0_CAUSE)));
-		xAluRR(e, X_AND, 4, R(RCX), RAX);
-		xAluI(e, X_AND, 4, R(RCX), 0xFF00);
-		uint8_t* done = xJmp(e, NULL);
-		patchHere(e, off);
-		xAluRR(e, X_XOR, 4, R(RCX), RCX);
-		patchHere(e, done);
-		j->interruptCheck = true;
-		return true;
-	}
-	if (rd == CP0_EPC || rd == CP0_ERROREPC) {
-		xStore(e, 8, reg, RAX);
-		return true;
-	}
+	xStore(e, 8, reg, RAX);
+	return true;
+
 	return false;
 }
 
@@ -321,10 +303,13 @@ static bool emitInline(struct Jit* j, uint32_t op, uint64_t pc, enum Kind* kind)
 			}
 			return true;
 		case 0x18: case 0x19:
-			// The products' low and high words, sign-extended; the multiplier holds the pipeline.
+			// The products' low and high words, sign-extended; the multiplier holds the pipeline. MULT
+			// takes rs whole and rt sign-extended from 35 bits, as the interpreter.
 			if ((op & 0x3F) == 0x18) {
-				xMovsxd(e, RAX, gpr(rs));
-				xMovsxd(e, RCX, gpr(rt));
+				xLoad(e, 8, RAX, gpr(rs));
+				xLoad(e, 8, RCX, gpr(rt));
+				xShiftI(e, X_SHL, 8, R(RCX), 29);
+				xShiftI(e, X_SAR, 8, R(RCX), 29);
 			} else {
 				xLoad(e, 4, RAX, gpr(rs));
 				xLoad(e, 4, RCX, gpr(rt));
@@ -660,11 +645,15 @@ static void emitMemory(struct Jit* j, struct Slow* slow) {
 		needCop1(j);
 	}
 
-	// Like the interpreter, the low 32 bits of the address.
-	xLoad(e, 4, RAX, gpr(rs));
+	// The address in 64 bits, which the interpreter takes when it isn't a 32-bit one sign-extended (an
+	// address error); the low 32 bits from here on.
+	xLoad(e, 8, RAX, gpr(rs));
 	if ((int16_t) op) {
-		xAluI(e, X_ADD, 4, R(RAX), (int16_t) op);
+		xAluI(e, X_ADD, 8, R(RAX), (int16_t) op);
 	}
+	xMovsxd(e, RCX, R(RAX));
+	xAluRR(e, X_CMP, 8, R(RCX), RAX);
+	slow->site[slow->sites++] = xJcc(e, CC_NE, NULL);
 	xMovRR(e, 4, R8, RAX);
 	// The physical page from vpages: one not looked up lands past RDRAM.
 	xMovRR(e, 4, RCX, RAX);

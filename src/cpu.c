@@ -90,11 +90,15 @@ uint32_t cpuCount(struct N64* n) {
 	return (uint32_t) ((n->cycles >> 1) - n->cpu.countBase);
 }
 
+static bool cpuWide(const struct CPU* c);
+
 void cpuException(struct N64* n, int code, int coprocessor) {
 	n->idle.fatal = true;
 	struct CPU* c = &n->cpu;
 	uint64_t* cop0 = c->cop0;
 	bool refill = (code == EXC_TLBL || code == EXC_TLBS) && c->exception;
+	// The TLB refill vector, 0x080 with 64-bit addressing.
+	uint32_t const refillAt = cpuWide(c) ? 0x80 : 0;
 	c->exception = false;
 	if (!(cop0[CP0_STATUS] & ST_EXL)) {
 		cop0[CP0_EPC] = c->inDelay ? c->curPc - 4 : c->curPc;
@@ -105,7 +109,7 @@ void cpuException(struct N64* n, int code, int coprocessor) {
 	cop0[CP0_CAUSE] = (cop0[CP0_CAUSE] & ~0x3000007Cull) | (uint64_t) code << 2 | (uint64_t) coprocessor << 28;
 	cop0[CP0_STATUS] |= ST_EXL;
 	uint64_t base = cop0[CP0_STATUS] & ST_BEV ? 0xFFFFFFFFBFC00200ull : 0xFFFFFFFF80000000ull;
-	c->pc = base + (refill ? 0 : 0x180);
+	c->pc = base + (refill ? refillAt : 0x180);
 	c->nextPc = c->pc + 4;
 	c->nextInDelay = false;
 	c->inDelay = false;
@@ -156,87 +160,167 @@ void cpuTlbChanged(struct N64* n) {
 	n->vpageFillCount = 0;
 }
 
-static bool translate(struct N64* n, uint64_t vaddr, bool store, uint32_t* paddr) {
-	struct CPU* c = &n->cpu;
-	uint32_t v = (uint32_t) vaddr;
-	if ((v & 0xC0000000) == 0x80000000) {
+// The privilege the CPU runs at: kernel (KSU 0, or EXL or ERL set), supervisor (KSU 1) or user;
+// and whether it addresses with 64 bits there (KX, SX or UX).
+enum { MODE_KERNEL, MODE_SUPERVISOR, MODE_USER };
+
+static int cpuMode(const struct CPU* c) {
+	uint64_t st = c->cop0[CP0_STATUS];
+	int ksu = (st >> 3) & 3;
+	return st & (ST_EXL | ST_ERL) || ksu == 0 ? MODE_KERNEL : ksu == 1 ? MODE_SUPERVISOR : MODE_USER;
+}
+
+static bool cpuWide(const struct CPU* c) {
+	return c->cop0[CP0_STATUS] >> (7 - cpuMode(c)) & 1;
+}
+
+// Whether compiled code may run: it takes kernel mode's 32-bit addressing for granted.
+bool cpuPlainMode(const struct N64* n) {
+	return cpuMode(&n->cpu) == MODE_KERNEL && !cpuWide(&n->cpu);
+}
+
+// Where an address goes in the mode the CPU is in (the VR4300's segments): nowhere (an address
+// error), through the TLB, or straight to a physical address, through the caches or not.
+enum { SEG_UNUSED, SEG_MAPPED, SEG_CACHED, SEG_DIRECT };
+
+static int segmentOf(const struct CPU* c, uint64_t vaddr, uint32_t* paddr) {
+	int const mode = cpuMode(c);
+	if (!cpuWide(c)) {
+		uint32_t v = (uint32_t) vaddr;
 		*paddr = v & 0x1FFFFFFF;
-		return true;
+		if (v < 0x80000000u) {
+			return SEG_MAPPED;
+		}
+		if (mode == MODE_KERNEL) {
+			return v < 0xA0000000u ? SEG_CACHED : v < 0xC0000000u ? SEG_DIRECT : SEG_MAPPED;
+		}
+		return mode == MODE_SUPERVISOR && v >= 0xC0000000u && v < 0xE0000000u ? SEG_MAPPED : SEG_UNUSED;
 	}
+	*paddr = (uint32_t) vaddr;
+	if (vaddr <= 0x000000FFFFFFFFFFull) {
+		return SEG_MAPPED;
+	}
+	if (mode != MODE_USER && vaddr >= 0x4000000000000000ull && vaddr <= 0x400000FFFFFFFFFFull) {
+		return SEG_MAPPED;
+	}
+	if (mode == MODE_SUPERVISOR) {
+		return vaddr >= 0xFFFFFFFFC0000000ull && vaddr <= 0xFFFFFFFFDFFFFFFFull ? SEG_MAPPED : SEG_UNUSED;
+	}
+	if (mode == MODE_USER) {
+		return SEG_UNUSED;
+	}
+	// xkphys: the cache algorithm in bits 61-59 (2 uncached), 32 bits of physical address.
+	if (vaddr >= 0x8000000000000000ull && vaddr <= 0xBFFFFFFFFFFFFFFFull) {
+		if (vaddr & 0x07FFFFFF00000000ull) {
+			return SEG_UNUSED;
+		}
+		return ((vaddr >> 59) & 7) == 2 ? SEG_DIRECT : SEG_CACHED;
+	}
+	if (vaddr >= 0xC000000000000000ull && vaddr <= 0xC00000FF7FFFFFFFull) {
+		return SEG_MAPPED;
+	}
+	if (vaddr >= 0xFFFFFFFF80000000ull) {
+		*paddr = (uint32_t) vaddr & 0x1FFFFFFF;
+		return vaddr < 0xFFFFFFFFA0000000ull ? SEG_CACHED : vaddr < 0xFFFFFFFFC0000000ull ? SEG_DIRECT : SEG_MAPPED;
+	}
+	return SEG_UNUSED;
+}
+
+// What an address error or TLB exception records of the address: BadVAddr, the page in EntryHi,
+// and the page in Context and XContext.
+static void faultAddress(struct CPU* c, uint64_t vaddr) {
+	uint64_t* cop0 = c->cop0;
+	cop0[CP0_BADVADDR] = vaddr;
+	cop0[CP0_ENTRYHI] = (cop0[CP0_ENTRYHI] & 0xFF) | (vaddr & 0xC00000FFFFFFE000ull);
+	cop0[CP0_CONTEXT] = (cop0[CP0_CONTEXT] & ~0x7FFFF0ull) | ((vaddr >> 9) & 0x7FFFF0);
+	cop0[CP0_XCONTEXT] = (cop0[CP0_XCONTEXT] & ~0x1FFFFFFF0ull) | ((vaddr >> 9) & 0x7FFFFFF0) | (vaddr >> 62) << 31;
+}
+
+// The TLB entry mapping vaddr (its region, 40 bits of page and address space), or -1.
+static int tlbFind(const struct CPU* c, uint64_t vaddr) {
 	for (int i = 0; i < 32; ++i) {
-		struct TLBEntry* e = &c->tlb[i];
-		uint32_t mask = e->pageMask | 0x1FFF;
-		if (((v ^ (uint32_t) e->entryHi) & ~mask) != 0) {
+		const struct TLBEntry* e = &c->tlb[i];
+		uint64_t mask = ~(uint64_t) (e->pageMask | 0x1FFF) & 0xC00000FFFFFFFFFFull;
+		if (((vaddr ^ e->entryHi) & mask) != 0) {
 			continue;
 		}
 		bool global = e->entryLo[0] & e->entryLo[1] & 1;
 		if (!global && ((e->entryHi ^ c->cop0[CP0_ENTRYHI]) & 0xFF)) {
 			continue;
 		}
-		uint32_t offsetMask = mask >> 1;
-		uint64_t lo = e->entryLo[(v & (offsetMask + 1)) ? 1 : 0];
-		if (!(lo & 2)) {
-			goto miss;
-		}
-		if (store && !(lo & 4)) {
-			c->cop0[CP0_BADVADDR] = vaddr;
-			c->cop0[CP0_CONTEXT] = (c->cop0[CP0_CONTEXT] & ~0x7FFFF0ull) | ((v >> 9) & 0x7FFFF0);
-			c->cop0[CP0_ENTRYHI] = (c->cop0[CP0_ENTRYHI] & 0xFF) | (vaddr & ~0x1FFFull);
-			cpuException(n, EXC_MOD, 0);
-			return false;
-		}
-		*paddr = ((uint32_t) (lo >> 6) << 12 & ~offsetMask) | (v & offsetMask);
-		if ((*paddr & ~0xFFFu) < RDRAM_SIZE) {
-			uint32_t delta = (*paddr & ~0xFFFu) - (v & ~0xFFFu);
-			uint32_t page = v >> 12, writes = lo & 4 ? delta : vpageUnknown(page);
-			if (n->vpages[page] != delta || n->vpages[VPAGES + page] != writes) {
-				if (n->vpageFillCount < VPAGE_FILLED) {
-					n->vpageFilled[n->vpageFillCount] = page;
-				}
-				++n->vpageFillCount;
-				n->vpages[page] = delta;
-				n->vpages[VPAGES + page] = writes;
-			}
-		}
+		return i;
+	}
+	return -1;
+}
+
+static bool translate(struct N64* n, uint64_t vaddr, bool store, uint32_t* paddr) {
+	struct CPU* c = &n->cpu;
+	uint32_t v = (uint32_t) vaddr;
+	int const seg = segmentOf(c, vaddr, paddr);
+	if (seg == SEG_CACHED || seg == SEG_DIRECT) {
 		return true;
 	}
-	c->exception = true;
-miss:
-	c->cop0[CP0_BADVADDR] = vaddr;
-	c->cop0[CP0_CONTEXT] = (c->cop0[CP0_CONTEXT] & ~0x7FFFF0ull) | ((v >> 9) & 0x7FFFF0);
-	c->cop0[CP0_ENTRYHI] = (c->cop0[CP0_ENTRYHI] & 0xFF) | (vaddr & ~0x1FFFull);
-	cpuException(n, store ? EXC_TLBS : EXC_TLBL, 0);
-	return false;
+	if (seg == SEG_UNUSED) {
+		faultAddress(c, vaddr);
+		cpuException(n, store ? EXC_ADES : EXC_ADEL, 0);
+		return false;
+	}
+	int const i = tlbFind(c, vaddr);
+	if (i < 0) {
+		c->exception = true;
+		faultAddress(c, vaddr);
+		cpuException(n, store ? EXC_TLBS : EXC_TLBL, 0);
+		return false;
+	}
+	struct TLBEntry* e = &c->tlb[i];
+	uint32_t offsetMask = (e->pageMask | 0x1FFF) >> 1;
+	uint64_t lo = e->entryLo[(v & (offsetMask + 1)) ? 1 : 0];
+	if (!(lo & 2) || (store && !(lo & 4))) {
+		faultAddress(c, vaddr);
+		cpuException(n, !(lo & 2) ? (store ? EXC_TLBS : EXC_TLBL) : EXC_MOD, 0);
+		return false;
+	}
+	*paddr = ((uint32_t) (lo >> 6) << 12 & ~offsetMask) | (v & offsetMask);
+	// Compiled code finds the pages through vpages, by 32-bit kernel addresses only.
+	if ((*paddr & ~0xFFFu) < RDRAM_SIZE && cpuPlainMode(n) && (uint64_t) (int64_t) (int32_t) v == vaddr) {
+		uint32_t delta = (*paddr & ~0xFFFu) - (v & ~0xFFFu);
+		uint32_t page = v >> 12, writes = lo & 4 ? delta : vpageUnknown(page);
+		if (n->vpages[page] != delta || n->vpages[VPAGES + page] != writes) {
+			if (n->vpageFillCount < VPAGE_FILLED) {
+				n->vpageFilled[n->vpageFillCount] = page;
+			}
+			++n->vpageFillCount;
+			n->vpages[page] = delta;
+			n->vpages[VPAGES + page] = writes;
+		}
+	}
+	return true;
 }
 
 // For tools: the physical address of a virtual one, without raising exceptions or changing state.
 bool cpuPeekAddress(struct N64* n, uint64_t vaddr, uint32_t* paddr) {
 	struct CPU* c = &n->cpu;
-	uint32_t v = (uint32_t) vaddr;
-	if ((v & 0xC0000000) == 0x80000000) {
-		*paddr = v & 0x1FFFFFFF;
-		return true;
+	int const seg = segmentOf(c, vaddr, paddr);
+	if (seg != SEG_MAPPED) {
+		return seg != SEG_UNUSED;
 	}
-	for (int i = 0; i < 32; ++i) {
-		struct TLBEntry* e = &c->tlb[i];
-		uint32_t mask = e->pageMask | 0x1FFF;
-		bool global = e->entryLo[0] & e->entryLo[1] & 1;
-		if (((v ^ (uint32_t) e->entryHi) & ~mask) || (!global && ((e->entryHi ^ c->cop0[CP0_ENTRYHI]) & 0xFF))) {
-			continue;
-		}
-		uint32_t offsetMask = mask >> 1;
-		uint64_t lo = e->entryLo[(v & (offsetMask + 1)) ? 1 : 0];
-		*paddr = ((uint32_t) (lo >> 6) << 12 & ~offsetMask) | (v & offsetMask);
-		return lo & 2;
+	int const i = tlbFind(c, vaddr);
+	if (i < 0) {
+		return false;
 	}
-	return false;
+	const struct TLBEntry* e = &c->tlb[i];
+	uint32_t offsetMask = (e->pageMask | 0x1FFF) >> 1;
+	uint64_t lo = e->entryLo[((uint32_t) vaddr & (offsetMask + 1)) ? 1 : 0];
+	*paddr = ((uint32_t) (lo >> 6) << 12 & ~offsetMask) | ((uint32_t) vaddr & offsetMask);
+	return lo & 2;
 }
 
+// In 32-bit addressing, an address must be a 32-bit one sign-extended.
 static bool address(struct N64* n, uint64_t vaddr, int align, bool store, uint32_t* paddr) {
 	if ((vaddr & (align - 1)) && n->compat) {
 		vaddr &= ~(uint64_t) (align - 1);
-	} else if (vaddr & (align - 1)) {
-		n->cpu.cop0[CP0_BADVADDR] = vaddr;
+	} else if ((vaddr & (align - 1)) || (!n->compat && (uint64_t) (int64_t) (int32_t) vaddr != vaddr && !cpuWide(&n->cpu))) {
+		faultAddress(&n->cpu, vaddr);
 		cpuException(n, store ? EXC_ADES : EXC_ADEL, 0);
 		return false;
 	}
@@ -265,11 +349,14 @@ static void tlbWrite(struct N64* n, int i) {
 	struct CPU* c = &n->cpu;
 	struct TLBEntry* e = &c->tlb[i & 31];
 	struct TLBEntry old = *e;
-	e->pageMask = c->cop0[CP0_PAGEMASK] & 0x01FFE000;
+	// The mask goes by pairs of bits: one with its upper bit clear masks nothing (ares).
+	uint32_t pm = (uint32_t) c->cop0[CP0_PAGEMASK] & 0x01554000;
+	e->pageMask = pm | pm >> 1;
 	e->entryHi = c->cop0[CP0_ENTRYHI] & ~(uint64_t) e->pageMask & ~0x1F00ull;
 	uint64_t g = c->cop0[CP0_ENTRYLO0] & c->cop0[CP0_ENTRYLO1] & 1;
-	e->entryLo[0] = (c->cop0[CP0_ENTRYLO0] & 0x3FFFFFFE) | g;
-	e->entryLo[1] = (c->cop0[CP0_ENTRYLO1] & 0x3FFFFFFE) | g;
+	// 32 bits of physical address: PFN bits 6-25.
+	e->entryLo[0] = (c->cop0[CP0_ENTRYLO0] & 0x03FFFFFE) | g;
+	e->entryLo[1] = (c->cop0[CP0_ENTRYLO1] & 0x03FFFFFE) | g;
 	// Writing an entry as it was maps nothing differently.
 	if (old.pageMask != e->pageMask || old.entryHi != e->entryHi || old.entryLo[0] != e->entryLo[0] || old.entryLo[1] != e->entryLo[1]) {
 		++n->blockGen;
@@ -278,9 +365,9 @@ static void tlbWrite(struct N64* n, int i) {
 }
 
 static uint32_t randomIndex(struct N64* n) {
-	uint32_t wired = n->cpu.cop0[CP0_WIRED] & 31;
+	uint32_t wired = n->cpu.cop0[CP0_WIRED] & 63;
 	if (wired > 31) {
-		return 31;
+		return 63 - (uint32_t) (n->cycles % 64);
 	}
 	return 31 - (uint32_t) ((n->cycles) % (32 - wired));
 }
@@ -391,6 +478,11 @@ static void cop0Write(struct N64* n, int r, uint64_t v) {
 
 static void cop0Execute(struct N64* n, uint32_t op) {
 	struct CPU* c = &n->cpu;
+	// Outside kernel mode COP0 needs CU0.
+	if ((c->cop0[CP0_STATUS] & 0x18) && cpuMode(c) != MODE_KERNEL && !(c->cop0[CP0_STATUS] & 1u << 28)) {
+		cpuException(n, EXC_CPU, 0);
+		return;
+	}
 	switch (RS) {
 	case 0x00:
 		c->gpr[RT] = sext32((uint32_t) cop0Read(n, RD));
@@ -550,7 +642,7 @@ static void special(struct N64* n, uint32_t op) {
 		branch(c, true, s);
 		return;
 	case 0x09:
-		r[RD] = c->curPc + 8;
+		r[RD] = c->pc + 4;
 		branch(c, true, s);
 		return;
 	case 0x0C:
@@ -583,9 +675,11 @@ static void special(struct N64* n, uint32_t op) {
 		r[RD] = (uint64_t) ((int64_t) t >> (s & 63));
 		return;
 	// The multiply/divide unit holds the pipeline; cycles fitted to the same timing ROM.
+	// MULT: rs whole times rt sign-extended from 35 bits, as hardware does with operands that aren't
+	// sign-extended 32-bit ones.
 	case 0x18: {
 		c->stall += 3;
-		int64_t p = (int64_t) (int32_t) s * (int32_t) t;
+		int64_t p = (int64_t) ((uint64_t) s * (uint64_t) ((int64_t) (t << 29) >> 29));
 		c->lo = sext32((uint32_t) p);
 		c->hi = sext32((uint32_t) (p >> 32));
 		return;
@@ -784,7 +878,8 @@ static void special(struct N64* n, uint32_t op) {
 static void regimm(struct N64* n, uint32_t op) {
 	struct CPU* c = &n->cpu;
 	int64_t s = (int64_t) c->gpr[RS];
-	uint64_t target = c->curPc + 4 + (IMM << 2);
+	// From the next fetch address: in a jump's delay slot, the jump's target.
+	uint64_t target = c->pc + (IMM << 2);
 	int64_t imm = (int64_t) IMM;
 	switch (RT) {
 	case 0x00:
@@ -830,19 +925,19 @@ static void regimm(struct N64* n, uint32_t op) {
 		}
 		return;
 	case 0x10:
-		c->gpr[31] = c->curPc + 8;
+		c->gpr[31] = c->pc + 4;
 		branch(c, s < 0, target);
 		return;
 	case 0x11:
-		c->gpr[31] = c->curPc + 8;
+		c->gpr[31] = c->pc + 4;
 		branch(c, s >= 0, target);
 		return;
 	case 0x12:
-		c->gpr[31] = c->curPc + 8;
+		c->gpr[31] = c->pc + 4;
 		branchLikely(c, s < 0, target);
 		return;
 	case 0x13:
-		c->gpr[31] = c->curPc + 8;
+		c->gpr[31] = c->pc + 4;
 		branchLikely(c, s >= 0, target);
 		return;
 	}
@@ -899,9 +994,12 @@ static void loadStore(struct N64* n, uint32_t op) {
 		if ((op >> 26) == 0x22) {
 			int sh = (vaddr & 3) * 8;
 			r[RT] = sext32((old & ~(0xFFFFFFFFu << sh)) | (w << sh));
+		} else if ((vaddr & 3) == 3) {
+			r[RT] = sext32(w);
 		} else {
+			// Part of a word: the register's upper half stays.
 			int sh = (3 - (vaddr & 3)) * 8;
-			r[RT] = sext32((old & ~(0xFFFFFFFFu >> sh)) | (w >> sh));
+			r[RT] = (r[RT] & ~0xFFFFFFFFull) | ((old & ~(0xFFFFFFFFu >> sh)) | (w >> sh));
 		}
 		return;
 	}
@@ -934,7 +1032,8 @@ static void loadStore(struct N64* n, uint32_t op) {
 		return;
 	case 0x2A:
 	case 0x2E: {
-		if (!load(n, vaddr & ~3ull, 4, &v)) {
+		uint32_t p;
+		if (!address(n, vaddr & ~3ull, 4, true, &p) || !load(n, vaddr & ~3ull, 4, &v)) {
 			return;
 		}
 		uint32_t w = (uint32_t) v, t = (uint32_t) r[RT];
@@ -950,7 +1049,8 @@ static void loadStore(struct N64* n, uint32_t op) {
 	}
 	case 0x2C:
 	case 0x2D: {
-		if (!load(n, vaddr & ~7ull, 8, &v)) {
+		uint32_t p;
+		if (!address(n, vaddr & ~7ull, 8, true, &p) || !load(n, vaddr & ~7ull, 8, &v)) {
 			return;
 		}
 		uint64_t t = r[RT];
@@ -1029,11 +1129,33 @@ static void cop1Memory(struct N64* n, uint32_t op) {
 	}
 }
 
+// The 64-bit instructions, reserved in user and supervisor modes with 32-bit addressing (ares).
+static bool wideOp(uint32_t op) {
+	switch (op >> 26) {
+	case 0x00:
+		switch (op & 0x3F) {
+		case 0x14: case 0x16: case 0x17: case 0x1C: case 0x1D: case 0x1E: case 0x1F:
+		case 0x2C: case 0x2D: case 0x2E: case 0x2F:
+		case 0x38: case 0x3A: case 0x3B: case 0x3C: case 0x3E: case 0x3F:
+			return true;
+		}
+		return false;
+	case 0x18: case 0x19: case 0x1A: case 0x1B: case 0x2C: case 0x2D: case 0x34: case 0x37: case 0x3C: case 0x3F:
+		return true;
+	}
+	return false;
+}
+
 static void execute(struct N64* n, uint32_t op) {
 	struct CPU* c = &n->cpu;
 	uint64_t* r = c->gpr;
 	uint64_t s = r[RS];
-	uint64_t target = c->curPc + 4 + (IMM << 2);
+	if ((c->cop0[CP0_STATUS] & 0x18) && cpuMode(c) != MODE_KERNEL && !cpuWide(c) && wideOp(op)) {
+		cpuException(n, EXC_RI, 0);
+		return;
+	}
+	// From the next fetch address: in a jump's delay slot, the jump's target.
+	uint64_t target = c->pc + (IMM << 2);
 	switch (op >> 26) {
 	case 0x00:
 		special(n, op);
@@ -1043,9 +1165,9 @@ static void execute(struct N64* n, uint32_t op) {
 		return;
 	case 0x02:
 	case 0x03: {
-		uint64_t jump = ((c->curPc + 4) & ~0x0FFFFFFFull) | (uint64_t) (op & 0x03FFFFFF) << 2;
+		uint64_t jump = (c->pc & ~0x0FFFFFFFull) | (uint64_t) (op & 0x03FFFFFF) << 2;
 		if (op >> 26 == 0x03) {
-			r[31] = c->curPc + 8;
+			r[31] = c->pc + 4;
 		}
 		branch(c, true, jump);
 		return;
@@ -1239,6 +1361,9 @@ void cpuStepOp(struct N64* n, uint32_t op, uint32_t paddr) {
 // the cycle at which Count reaches Compare. False when an interrupt is due, for cpuStep to take.
 bool cpuJitReady(struct N64* n) {
 	struct CPU* c = &n->cpu;
+	if (!cpuPlainMode(n)) {
+		return false;
+	}
 	uint32_t now = cpuCount(n);
 	if ((uint32_t) ((uint32_t) c->cop0[CP0_COMPARE] - c->lastCount - 1) < now - c->lastCount) {
 		c->cop0[CP0_CAUSE] |= 0x8000;
@@ -1288,7 +1413,7 @@ bool cpuJitStep(struct N64* n, uint32_t op) {
 	n->jitLimit = n->eventAt < n->jitFire ? n->eventAt : n->jitFire;
 	bool timer = op >> 26 == 0x10 && (RS == 0x04 || RS == 0x05) && (RD == CP0_COUNT || RD == CP0_COMPARE);
 	bool icache = op >> 26 == 0x2F && ((op >> 16) & 3) == 0;
-	return c->pc != pc || n->blockGen != gen || interruptPending(n) || timer || icache;
+	return c->pc != pc || n->blockGen != gen || interruptPending(n) || timer || icache || !cpuPlainMode(n);
 }
 
 void cpuStep(struct N64* n) {

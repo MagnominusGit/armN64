@@ -278,14 +278,6 @@ static int branchCondition(struct Jit* j, uint32_t op, int rs, int rt) {
 	return rt & 1 ? C_GE : C_LT;
 }
 
-// rd = rn & value, through a scratch register if AArch64 can't encode the constant.
-static void andConst(struct Emitter* e, int rd, int rn, uint32_t value) {
-	if (!aLogicImm(e, A_AND_IMM, rd, rn, value)) {
-		aMovImm(e, 17, value);
-		aDp(e, A_AND, rd, rn, 17, S_LSL, 0);
-	}
-}
-
 static int memSize(uint32_t op);
 static void emitMemory(struct Jit* j, struct Slow* slow);
 
@@ -438,7 +430,8 @@ static bool emitFpu(struct Jit* j, uint32_t op) {
 	return true;
 }
 
-// MFC0 and DMFC0 of anything but Random; MTC0 and DMTC0 of Status, EPC and ErrorEPC.
+// MFC0 and DMFC0 of anything but Random and the registers that read the latch; MTC0 and DMTC0 of EPC
+// and ErrorEPC.
 static bool emitCop0(struct Jit* j, uint32_t op) {
 	struct Emitter* e = &j->e;
 	int rs = (op >> 21) & 31, rt = (op >> 16) & 31, rd = (op >> 11) & 31;
@@ -489,27 +482,13 @@ static bool emitCop0(struct Jit* j, uint32_t op) {
 		}
 		return true;
 	}
-	if ((rs != 0x04 && rs != 0x05) || (rd != CP0_STATUS && rd != CP0_EPC && rd != CP0_ERROREPC)) {
+	// Status in C: a write may leave the mode compiled code runs in.
+	if ((rs != 0x04 && rs != 0x05) || (rd != CP0_EPC && rd != CP0_ERROREPC)) {
 		return false;
 	}
 	int t = readReg(j, rt);
 	// Each write also goes to the latch.
 	aStrX(e, t, CPU, CPU_OFF(cop0) + 8 * CP0_LATCH);
-	if (rd == CP0_STATUS) {
-		andConst(e, 0, t, 0xFFF7FFFF);
-		aStrX(e, 0, CPU, reg);
-		// Interrupts on (IE, not EXL or ERL) and one of them pending.
-		aAndBits(e, 1, 0, 0, 3);
-		aDpImm(e, A_SUBS_IMM, ZR, 1, 1);
-		aMovImm(e, 2, 0);
-		uint8_t* off = aBcond(e, C_NE, NULL);
-		aLdr(e, 2, CPU, CPU_OFF(cop0) + 8 * CP0_CAUSE);
-		aDp(e, A_AND, 2, 2, 0, S_LSL, 0);
-		aAndBits(e, 2, 2, 8, 8);
-		patchHere(e, off);
-		j->interruptCheck = true;
-		return true;
-	}
 	aStrX(e, t, CPU, reg);
 	return true;
 }
@@ -578,10 +557,13 @@ static bool emitInline(struct Jit* j, uint32_t op, uint64_t pc, enum Kind* kind)
 			}
 			return true;
 		case 0x18: case 0x19: {
-			// The products' low and high words, sign-extended; the multiplier holds the pipeline.
+			// The products' low and high words, sign-extended; the multiplier holds the pipeline. MULT
+			// takes rs whole and rt sign-extended from 35 bits, as the interpreter.
 			int s = readReg(j, rs), t = readReg(j, rt);
 			if (f == 0x18) {
-				aSmull(e, 0, s, t);
+				aLslImmX(e, 1, t, 29);
+				aAsrImmX(e, 1, 1, 29);
+				emit32(e, 0x9B000000 | (1 << 16) | (ZR << 10) | (s << 5) | 0);  // MUL x0, s, x1
 			} else {
 				aUmull(e, 0, s, t);
 			}
@@ -995,16 +977,24 @@ static void emitMemory(struct Jit* j, struct Slow* slow) {
 		needCop1(j);
 	}
 
+	// The address in 64 bits, which the interpreter takes when it isn't a 32-bit one sign-extended (an
+	// address error); the low 32 bits from here on.
 	int base = readReg(j, rs);
 	if (base == ZR) {
 		aMovImm(e, 0, (uint32_t) offset);
-	} else if (offset >= 0 && offset < 4096) {
-		aDpImm(e, A_ADD_IMM, 0, base, (unsigned) offset);
-	} else if (offset < 0 && offset > -4096) {
-		aDpImm(e, A_SUB_IMM, 0, base, (unsigned) -offset);
 	} else {
-		aMovImm(e, 1, (uint32_t) offset);
-		aDp(e, A_ADD, 0, base, 1, S_LSL, 0);
+		if (offset >= 0 && offset < 4096) {
+			aDpImm(e, A_ADD_IMM | W64, 0, base, (unsigned) offset);
+		} else if (offset < 0 && offset > -4096) {
+			aDpImm(e, A_SUB_IMM | W64, 0, base, (unsigned) -offset);
+		} else {
+			aMovImm(e, 1, (uint32_t) offset);
+			aSxtw(e, 1, 1);
+			aDp(e, A_ADD | W64, 0, base, 1, S_LSL, 0);
+		}
+		aSxtw(e, 1, 0);
+		aDp(e, A_SUBS | W64, ZR, 0, 1, S_LSL, 0);
+		slowIf(j, C_NE);
 	}
 	// The physical page from vpages: one not looked up lands past RDRAM.
 	aLsrImm(e, 1, 0, 12);

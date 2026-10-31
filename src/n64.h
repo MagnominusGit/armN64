@@ -69,6 +69,8 @@ struct CPU {
 struct SP {
 	uint8_t mem[0x2000];
 	uint32_t memAddr, dramAddr, status, semaphore, pc;
+	// The length registers as they read: the last DMA's length (0xFF8 once done), count and skip.
+	uint32_t length;
 	// A task hleGraphics ran: the RSP shows it running (doing nothing) until then.
 	uint64_t hleDoneAt;
 };
@@ -418,6 +420,8 @@ void cpuException(struct N64*, int code, int coprocessor);
 void cpuCheckInterrupts(struct N64*);
 uint32_t cpuCount(struct N64*);
 bool cpuPeekAddress(struct N64*, uint64_t vaddr, uint32_t* paddr);
+// Kernel mode with 32-bit addressing, the only mode compiled code runs in.
+bool cpuPlainMode(const struct N64*);
 
 // rsp.c
 void rspInitTables(void);
@@ -534,8 +538,11 @@ uint8_t busRead8(struct N64*, uint32_t addr);
 uint16_t busRead16(struct N64*, uint32_t addr);
 uint32_t busRead32(struct N64*, uint32_t addr);
 uint64_t busRead64(struct N64*, uint32_t addr);
-void busWrite8(struct N64*, uint32_t addr, uint8_t value);
-void busWrite16(struct N64*, uint32_t addr, uint16_t value);
+// A CPU store of a byte, halfword or doubleword: RDRAM takes it as it is; the RCP's memories and
+// registers take a word, the whole register shifted to the bytes' place (a doubleword: its upper
+// word), as ares has it from hardware tests.
+void busWrite8(struct N64*, uint32_t addr, uint64_t value);
+void busWrite16(struct N64*, uint32_t addr, uint64_t value);
 void busWrite32(struct N64*, uint32_t addr, uint32_t value);
 void busWrite64(struct N64*, uint32_t addr, uint64_t value);
 
