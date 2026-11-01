@@ -639,8 +639,14 @@ ivec4 blendInput(ivec4 pixel, ivec4 memory, int cycle) {
 	return o;
 }
 
+// The highest bit of v (16 bits) by smearing it down: Mesa gives 1 << findMSB(v) as -0x8000 for
+// 0x8000.
 int normalizeHighest(int v) {
-	return v != 0 ? 1 << findMSB(v) : 0;
+	v |= v >> 1;
+	v |= v >> 2;
+	v |= v >> 4;
+	v |= v >> 8;
+	return v - (v >> 1);
 }
 
 int dzEncode(int v) {
