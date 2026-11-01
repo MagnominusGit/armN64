@@ -1302,8 +1302,10 @@ void glrDraw(struct N64* n, struct RDP* r, const uint64_t* w, int op) {
 			rdpDrawSoftware(n, r, w, op);
 			return;
 		}
-		if (r->cycleType == 3 && (y1 >> 2) >= TARGET_ROWS) {
-			// A fill taller than a target (several images at once): in RDRAM.
+		// A fill taller than a target (several images at once), or one whose pixels aren't all the same
+		// (an 8-bit image takes the fill's bytes in turn, a 16-bit one its two halves): in RDRAM.
+		bool uniform = r->colorSize == 3 || (r->colorSize == 2 && (r->fillColor >> 16) == (r->fillColor & 0xFFFF));
+		if (r->cycleType == 3 && ((y1 >> 2) >= TARGET_ROWS || !uniform)) {
 			glrSync(n);
 			rdpDrawSoftware(n, r, w, op);
 			return;
