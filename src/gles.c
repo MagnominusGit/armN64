@@ -615,7 +615,8 @@ void glesUniforms(struct Gles* g, const int* values, int count) {
 void glesDispatch(struct Gles* g, unsigned x, unsigned y) {
 	use(g);
 	g->glDispatchCompute(x, y, 1);
-	g->glMemoryBarrier(GL_SHADER_STORAGE_BARRIER_BIT);
+	// Its writes seen by later dispatches, and kept by later uploads into the same buffer.
+	g->glMemoryBarrier(GL_SHADER_STORAGE_BARRIER_BIT | GL_BUFFER_UPDATE_BARRIER_BIT);
 	// Each dispatch its own submission: the kernel's GPU hang check times submissions.
 	g->glFlush();
 }
