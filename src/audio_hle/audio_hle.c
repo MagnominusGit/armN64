@@ -136,7 +136,18 @@ static bool audioHleRun(struct N64* n, uint8_t* dram)
         return false;
     }
     run(hle);
+    hle_written(hle);
     return true;
+}
+
+/* armN64: the bytes of DRAM the task wrote last, for the machine (the RDP's pages, compiled code);
+ * not for the copy N64AUDIOCHECK runs on. */
+void hle_written(struct hle_t* hle)
+{
+    struct N64* n = hle->user_defined;
+    if (hle->written_end > hle->written_start && hle->dram == n->rdram)
+        n64RdramWrite(n, hle->written_start, hle->written_end - hle->written_start);
+    hle->written_start = hle->written_end = 0;
 }
 
 /* The audio task in DMEM run here, done a little later; false leaves it to the RSP. */

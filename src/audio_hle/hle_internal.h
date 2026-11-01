@@ -43,6 +43,9 @@ struct hle_t
     /* armN64: the task was left to the RSP (HleForwardTask) */
     int forwarded;
 
+    /* armN64: the run of DRAM bytes written last, told to the machine by hle_written */
+    uint32_t written_start, written_end;
+
     uint8_t dmem_buffer[0x1000];
 
     /* alist.c */
@@ -71,6 +74,7 @@ struct hle_t
 #define SP_STATUS_TASKDONE         0x200
 
 void rsp_break(struct hle_t* hle, unsigned int setbits);
+void hle_written(struct hle_t* hle);
 
 #endif
 

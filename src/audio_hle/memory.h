@@ -154,8 +154,14 @@ static inline uint32_t dram_r32(struct hle_t* hle, uint32_t address)
 
 static inline void dram_w8(struct hle_t* hle, uint32_t address, uint8_t value)
 {
-    hle->dram[address & hle->dram_mask] = value;
-    hle->dram_dirty[(address & hle->dram_mask) >> 12] = 0;
+    uint32_t a = address & hle->dram_mask;
+    if (a != hle->written_end) {
+        hle_written(hle);
+        hle->written_start = a;
+    }
+    hle->written_end = a + 1;
+    hle->dram[a] = value;
+    hle->dram_dirty[a >> 12] = 0;
 }
 
 static inline void dram_w16(struct hle_t* hle, uint32_t address, uint16_t value)
