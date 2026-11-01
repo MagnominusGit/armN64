@@ -329,6 +329,8 @@ static const char fragmentHead[] =
 	"uniform highp sampler2D uTex0, uTex1;\n"
 	"out vec4 oColor;\n"
 	"vec3 e8(vec3 v) { return floor(v * 255.0 + 0.5); }\n"
+	// rdp.c's clamp9: the combiner keeps 9 bits; 0x100-0x17F saturate, 0x180-0x1FF are negative.
+	"vec4 clamp9(vec4 v) { v = mod(v, 512.0); return mix(mix(v, vec4(255.0), step(256.0, v)), vec4(0.0), step(384.0, v)); }\n"
 	"float e8(float v) { return floor(v * 255.0 + 0.5); }\n"
 	"int wrapCoord(int c, int shift, int lo, int hi, int cm, int mask, out int frac) {\n"
 	"	if (shift < 11) c >>= shift; else c <<= 16 - shift;\n"
@@ -463,14 +465,14 @@ static const char* input8(char* out, size_t size, const char* input) {
 }
 
 // One combiner cycle as GLSL, in the RDP's integers: ((a - b) * m + d * 256 + 128) / 256 for color and
-// alpha, kept within 0-255.
+// alpha, kept in 9 bits and saturated as the RDP does.
 static void cycleSource(char* out, size_t size, uint64_t c, int cycle) {
 	int a = cycle ? (c >> 37) & 15 : (c >> 52) & 15, m = cycle ? (c >> 32) & 31 : (c >> 47) & 31;
 	int b = cycle ? (c >> 24) & 15 : (c >> 28) & 15, d = cycle ? (c >> 6) & 7 : (c >> 15) & 7;
 	int aa = cycle ? (c >> 21) & 7 : (c >> 44) & 7, ab = cycle ? (c >> 3) & 7 : (c >> 12) & 7;
 	int am = cycle ? (c >> 18) & 7 : (c >> 41) & 7, ad = cycle ? c & 7 : (c >> 9) & 7;
 	char in[8][64];
-	snprintf(out, size, "	combined = clamp(floor((vec4((%s - %s) * %s, (%s - %s) * %s) + vec4(%s, %s) * 256.0 + 128.0) / 256.0), 0.0, 255.0) / 255.0;\n",
+	snprintf(out, size, "	combined = clamp9(floor((vec4((%s - %s) * %s, (%s - %s) * %s) + vec4(%s, %s) * 256.0 + 128.0) / 256.0)) / 255.0;\n",
 	         input8(in[0], 64, rgbInput(0, a)), input8(in[1], 64, rgbInput(1, b)), input8(in[2], 64, rgbInput(2, m)),
 	         input8(in[3], 64, alphaInput(aa, false)), input8(in[4], 64, alphaInput(ab, false)), input8(in[5], 64, alphaInput(am, true)),
 	         input8(in[6], 64, rgbInput(3, d)), input8(in[7], 64, alphaInput(ad, false)));
