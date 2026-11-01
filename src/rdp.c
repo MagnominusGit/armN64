@@ -3140,6 +3140,12 @@ static void gpuCommand(struct N64* n, struct RDP* r, const uint64_t* w, int op) 
 	}
 	uint32_t bpp = r->colorSize == 1 ? 1 : r->colorSize == 3 ? 4 : 2;
 	uint32_t right = (uint32_t) ((r->scissorX1 >> 2) + 1);
+	if (op == 0x24 || op == 0x25 || op == 0x36) {
+		// A rectangle ends where it does, not at the scissor (Mario Tennis draws into a narrow image).
+		int cx0, cy0, x0, ry0, x1, ry1;
+		rectBounds(r, w[0], &cx0, &cy0, &x0, &ry0, &x1, &ry1);
+		right = x1 >= x0 && (uint32_t) x1 + 1 < right ? (uint32_t) x1 + 1 : right;
+	}
 	bool depth = r->zAddr && (r->zCompare || r->zUpdate);
 	uint32_t color = r->colorAddr + (uint32_t) y0 * r->colorWidth * bpp;
 	uint32_t colorLen = (uint32_t) (y1 - y0) * r->colorWidth * bpp + right * bpp;
