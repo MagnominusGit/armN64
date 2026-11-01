@@ -501,6 +501,9 @@ static struct Program* program(struct Glr* g, struct ProgramKey key) {
 		if (cycleType == 1) {
 			cycleSource(line, sizeof(line), key.combine, 0);
 			strcat(source, line);
+			// The second cycle sees the pipelined texels: texel 1 as texel 0, and texel 0 as texel 1
+			// (rdp.c's shadePixel).
+			strcat(source, "	vec4 swapped = tex0;\n	tex0 = tex1;\n	tex1 = swapped;\n");
 		}
 		cycleSource(line, sizeof(line), key.combine, 1);
 		strcat(source, line);
