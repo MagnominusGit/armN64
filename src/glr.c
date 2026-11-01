@@ -22,7 +22,7 @@ typedef intptr_t GLsizeiptr;
 typedef unsigned char GLboolean;
 
 enum {
-	GL_TEXTURE_2D = 0x0DE1, GL_RGBA = 0x1908, GL_RGBA8 = 0x8058, GL_UNSIGNED_BYTE = 0x1401, GL_FLOAT = 0x1406,
+	GL_TEXTURE_2D = 0x0DE1, GL_RGBA = 0x1908, GL_RGBA8 = 0x8058, GL_UNSIGNED_BYTE = 0x1401, GL_UNSIGNED_INT = 0x1405, GL_FLOAT = 0x1406,
 	GL_FRAMEBUFFER = 0x8D40, GL_READ_FRAMEBUFFER = 0x8CA8, GL_DRAW_FRAMEBUFFER = 0x8CA9, GL_COLOR_ATTACHMENT0 = 0x8CE0, GL_DEPTH_ATTACHMENT = 0x8D00, GL_RENDERBUFFER = 0x8D41,
 	GL_DEPTH_COMPONENT24 = 0x81A6, GL_FRAMEBUFFER_COMPLETE = 0x8CD5, GL_DEPTH_STENCIL_ATTACHMENT = 0x821A, GL_DEPTH24_STENCIL8 = 0x88F0,
 	GL_STENCIL_TEST = 0x0B90, GL_STENCIL_BUFFER_BIT = 0x400, GL_KEEP = 0x1E00, GL_REPLACE = 0x1E01, GL_EQUAL = 0x202, GL_GEQUAL = 0x206,
@@ -37,7 +37,7 @@ enum {
 	GL_PACK_ALIGNMENT = 0x0D05, GL_UNPACK_ALIGNMENT = 0x0CF5,
 };
 
-enum { TARGETS = 8, TARGET_ROWS = 480, PROGRAMS = 256, TEXTURES = 1024, TEXTURE_BUCKETS = 2048, BATCH_VERTICES = 1 << 16, VERTEX_FLOATS = 10,
+enum { TARGETS = 8, TARGET_ROWS = 480, PROGRAMS = 256, TEXTURES = 1024, TEXTURE_BUCKETS = 2048, BATCH_VERTICES = 1 << 16, VERTEX_FLOATS = 11,
        VERTEX_BUFFER_BYTES = BATCH_VERTICES * VERTEX_FLOATS * 4 * 2 };
 
 struct Gl {
@@ -104,6 +104,7 @@ struct Gl {
 	void* (*MapBufferRange)(GLenum, GLintptr, GLsizeiptr, GLbitfield);
 	GLboolean (*UnmapBuffer)(GLenum);
 	void (*VertexAttribPointer)(GLuint, GLint, GLenum, GLboolean, GLsizei, const void*);
+	void (*VertexAttribIPointer)(GLuint, GLint, GLenum, GLsizei, const void*);
 	void (*EnableVertexAttribArray)(GLuint);
 	void (*DrawArrays)(GLenum, GLint, GLsizei);
 	void (*Flush)(void);
@@ -204,6 +205,8 @@ struct Glr {
 	int rawTriangles;
 	// The stencil value the last decal batch marked its pixels with.
 	int stencilRef;
+	// The primitive's number (the RDP's seq), for the noise.
+	uint32_t seq;
 	// The HLE's corners for triangles it has sent and the RDP hasn't reached yet (a ring).
 	struct GlrCorners* queue;
 	uint32_t queueRead, queueWrite;
@@ -298,7 +301,7 @@ static bool loadGl(struct Glr* g) {
 	       GLFN(CreateProgram) && GLFN(AttachShader) && GLFN(LinkProgram) && GLFN(GetProgramiv) && GLFN(GetProgramInfoLog) &&
 	       GLFN(UseProgram) && GLFN(DeleteProgram) && GLFN(GetUniformLocation) && GLFN(Uniform1i) && GLFN(Uniform1f) &&
 	       GLFN(Uniform2f) && GLFN(Uniform4f) && GLFN(Uniform4iv) && GLFN(GenVertexArrays) && GLFN(BindVertexArray) &&
-	       GLFN(GenBuffers) && GLFN(BindBuffer) && GLFN(BufferData) && GLFN(MapBufferRange) && GLFN(UnmapBuffer) && GLFN(VertexAttribPointer) &&
+	       GLFN(GenBuffers) && GLFN(BindBuffer) && GLFN(BufferData) && GLFN(MapBufferRange) && GLFN(UnmapBuffer) && GLFN(VertexAttribPointer) && GLFN(VertexAttribIPointer) &&
 	       GLFN(EnableVertexAttribArray) && GLFN(DrawArrays) && GLFN(Flush);
 #undef GLFN
 }
@@ -310,11 +313,14 @@ static const char vertexSource[] =
 	"layout(location = 0) in vec4 aPos;\n"
 	"layout(location = 1) in vec4 aShade;\n"
 	"layout(location = 2) in vec2 aTex;\n"
+	"layout(location = 3) in uint aSeq;\n"
 	"uniform vec2 uSize;\n"
 	"uniform int uPersp;\n"
 	"out vec4 vShade;\n"
 	"out vec3 vTex;\n"
+	"flat out uint vSeq;\n"
 	"void main() {\n"
+	"	vSeq = aSeq;\n"
 	// Depth as the RDP's 18 bits over a cleared pixel's 0x3FFFF (the corners' z is 15.3 over 0x7FFF).
 	"	gl_Position = vec4(aPos.x / uSize.x * 2.0 - 1.0, aPos.y / uSize.y * 2.0 - 1.0, aPos.z * (262136.0 / 262143.0) * 2.0 - 1.0, 1.0);\n"
 	"	float q = uPersp != 0 ? aPos.w : 1.0;\n"
@@ -331,6 +337,7 @@ static const char fragmentHead[] =
 	"precision highp int;\n"
 	"in vec4 vShade;\n"
 	"in vec3 vTex;\n"
+	"flat in uint vSeq;\n"
 	"uniform vec4 uPrim, uEnv, uFog, uBlend;\n"
 	"uniform float uPrimLod, uPrimDepth;\n"
 	"uniform int uPersp;\n"
@@ -359,16 +366,7 @@ static const char fragmentHead[] =
 	"	if (image.w != 0) j %= image.w;\n"
 	"	return texelFetch(t, ivec2(clamp(i, 0, image.x - 1), j), 0);\n"
 	"}\n"
-	// The combiner's noise: a hash of the pixel, a byte for each channel (rdp.c's, without the
-	// primitive's number).
-	"vec3 noise() {\n"
-	"	uvec2 p = uvec2(gl_FragCoord.xy);\n"
-	"	uint h = p.x * 0x9E3779B1u ^ p.y * 0x85EBCA77u;\n"
-	"	h ^= h >> 15;\n"
-	"	h *= 0x2C1B3C6Du;\n"
-	"	h ^= h >> 12;\n"
-	"	return vec3(uvec3(h, h >> 8, h >> 16) & 255u) / 255.0;\n"
-	"}\n"
+
 	// The RDP's divide (rdp.c texCoords): w's top 15 bits normalized, a table's reciprocal, the
 	// products saturating outside 16 bits.
 	"const ivec2 rcpTable[64] = ivec2[64](\n"
@@ -554,6 +552,18 @@ static struct Program* program(struct Glr* g, struct ProgramKey key) {
 	char line[1024];
 	int cycleType = key.modes & MODE_CYCLE;
 	snprintf(source, sizeof(source), "%s", fragmentHead);
+	// rdp.c's noise: a hash of the pixel (at the RDP's resolution), the primitive's number and what
+	// it is for (the combiner's channels 0-2, the dither 4).
+	snprintf(line, sizeof(line),
+	         "uint pixelNoise(uint tag) {\n"
+	         "	uvec2 p = uvec2(gl_FragCoord.xy) / %du;\n"
+	         "	uint h = p.x * 0x9E3779B1u ^ p.y * 0x85EBCA77u ^ vSeq * 0xC2B2AE3Du ^ tag;\n"
+	         "	h ^= h >> 15;\n"
+	         "	h *= 0x2C1B3C6Du;\n"
+	         "	return h ^ (h >> 12);\n"
+	         "}\n"
+	         "vec3 noise() { return vec3(uvec3(pixelNoise(0u), pixelNoise(1u), pixelNoise(2u)) & 255u) / 255.0; }\n", g->scale);
+	strcat(source, line);
 	strcat(source, "void main() {\n	vec4 combined = vec4(0.0);\n");
 	strcat(source, key.modes & MODE_SHADED ? "	vec4 shade = vShade;\n" : "	vec4 shade = vec4(0.0);\n");
 	if (key.modes & MODE_TEXTURED) {
@@ -603,7 +613,7 @@ static struct Program* program(struct Glr* g, struct ProgramKey key) {
 		// The matrix's value for all three channels, or three bits of noise for each.
 		char matrix[256];
 		if (key.modes & MODE_NOISE) {
-			snprintf(matrix, sizeof(matrix), "uint h = uint(px.x) * 0x9E3779B1u ^ uint(px.y) * 0x85EBCA77u ^ 4u; h ^= h >> 15; h *= 0x2C1B3C6Du; h ^= h >> 12;\n	ivec3 ditherM = ivec3(uvec3(h, h >> 3, h >> 6) & 7u)");
+			snprintf(matrix, sizeof(matrix), "uint h = pixelNoise(4u);\n	ivec3 ditherM = ivec3(uvec3(h, h >> 3, h >> 6) & 7u)");
 		} else {
 			snprintf(matrix, sizeof(matrix), "ivec3 ditherM = ivec3(%s[(px.y & 3) * 4 + (px.x & 3)])",
 			         key.modes & MODE_BAYER ? "int[16](0, 4, 1, 5, 4, 0, 5, 1, 3, 7, 2, 6, 7, 3, 6, 2)" : "int[16](0, 6, 1, 7, 4, 2, 5, 3, 3, 5, 2, 4, 7, 1, 6, 0)");
@@ -1266,6 +1276,7 @@ static void vertex(struct Glr* g, float x, float y, float z, float invW, const f
 	v[0] = x, v[1] = y, v[2] = z, v[3] = invW;
 	v[4] = rgba[0], v[5] = rgba[1], v[6] = rgba[2], v[7] = rgba[3];
 	v[8] = s, v[9] = t;
+	memcpy(&v[10], &g->seq, 4);
 }
 
 // A rectangle from (x0, y0) to (x1, y1) in pixels, with texture coordinates at its corners.
@@ -1347,6 +1358,7 @@ static void triangle(struct N64* n, struct Glr* g, struct RDP* r, const struct G
 void glrDraw(struct N64* n, struct RDP* r, const uint64_t* w, int op) {
 	struct Glr* g = n->glr;
 	glesUse(g->gles);
+	g->seq = r->seq;
 	uint64_t c = w[0];
 	const struct GlrCorners* q = op >= 0x08 && op <= 0x0F ? queued(g, w) : NULL;
 	if (q && r->colorSize != 1) {
@@ -1633,9 +1645,11 @@ struct Glr* glrCreate(struct N64* n) {
 	gl->VertexAttribPointer(0, 4, GL_FLOAT, 0, VERTEX_FLOATS * 4, (const void*) 0);
 	gl->VertexAttribPointer(1, 4, GL_FLOAT, 0, VERTEX_FLOATS * 4, (const void*) 16);
 	gl->VertexAttribPointer(2, 2, GL_FLOAT, 0, VERTEX_FLOATS * 4, (const void*) 32);
+	gl->VertexAttribIPointer(3, 1, GL_UNSIGNED_INT, VERTEX_FLOATS * 4, (const void*) 40);
 	gl->EnableVertexAttribArray(0);
 	gl->EnableVertexAttribArray(1);
 	gl->EnableVertexAttribArray(2);
+	gl->EnableVertexAttribArray(3);
 	gl->PixelStorei(GL_PACK_ALIGNMENT, 1);
 	gl->PixelStorei(GL_UNPACK_ALIGNMENT, 1);
 	gl->Disable(GL_DITHER);

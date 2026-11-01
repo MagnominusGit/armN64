@@ -3289,6 +3289,8 @@ bool frameSkipped(struct N64* n, uint32_t origin) {
 }
 
 void rdpDrawSoftware(struct N64* n, struct RDP* r, const uint64_t* w, int op) {
+	// The primitive is numbered already (execute numbers it again).
+	--r->seq;
 	execute(n, r, w, op);
 }
 
@@ -3365,6 +3367,8 @@ static void command(struct N64* n, struct RDP* r, const uint64_t* w, int op, int
 	// The GL renderer draws; the RDP keeps the state (texture loads included) and the time.
 	if (n->glr && ((op >= 0x08 && op <= 0x0F) || op == 0x24 || op == 0x25 || op == 0x36)) {
 		if (!(n->skip.on && skipCommand(n, w, op))) {
+			// Numbered as execute numbers it (the noise).
+			++r->seq;
 			glrDraw(n, r, w, op);
 		} else {
 			glrSkip(n, w, op);
