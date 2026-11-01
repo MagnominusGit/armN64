@@ -425,6 +425,7 @@ static const char fragmentHead[] =
 enum {
 	MODE_CYCLE = 3, MODE_ALPHA_COMPARE = 4, MODE_TEXTURED = 8, MODE_SHADED = 16, MODE_DITHER = 32, MODE_BAYER = 64, MODE_IMAGE16 = 128, MODE_BLEND = 1 << 24, MODE_PRIM_DEPTH = 1 << 25,
 	MODE_CVG_ALPHA = 1 << 26, MODE_ALPHA_CVG = 1 << 27, MODE_BLEND_COLOR = 1 << 28, MODE_BLEND_MEMORY_FIRST = 1 << 29, MODE_BLEND_CONSTANT = 1 << 30,
+	MODE_NOISE = 1u << 31,
 };
 
 static const char* rgbInput(int which, int sel) {
@@ -1340,11 +1341,13 @@ void glrDraw(struct N64* n, struct RDP* r, const uint64_t* w, int op) {
 			gl->Clear(GL_COLOR_BUFFER_BIT);
 			return;
 		}
-		if (!drawState(n, g, r, false, false, false, 0, false, y0 >> 2, (y1 >> 2) + 1)) {
+		// Depth from the primitive's, as texture rectangles have it (Robot Poncots' dimmed scene
+		// behind its HUD).
+		if (!drawState(n, g, r, false, false, r->zAddr && r->zPrim, 0, false, y0 >> 2, (y1 >> 2) + 1)) {
 			return;
 		}
 		static const float zero[2] = { 0, 0 };
-		rectangle(g, x0 / 4.0f, y0 / 4.0f, x1 / 4.0f, y1 / 4.0f, 0, zero, zero, false);
+		rectangle(g, x0 / 4.0f, y0 / 4.0f, x1 / 4.0f, y1 / 4.0f, (float) (r->primZ >> 3) / 0x7FFF, zero, zero, false);
 		return;
 	}
 	// Texture rectangles: the pixels the RDP covers, and the texels at their corners (the shader
