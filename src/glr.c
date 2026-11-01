@@ -346,6 +346,16 @@ static const char fragmentHead[] =
 	"	if (image.w != 0) j %= image.w;\n"
 	"	return texelFetch(t, ivec2(clamp(i, 0, image.x - 1), j), 0);\n"
 	"}\n"
+	// The combiner's noise: a hash of the pixel, a byte for each channel (rdp.c's, without the
+	// primitive's number).
+	"vec3 noise() {\n"
+	"	uvec2 p = uvec2(gl_FragCoord.xy);\n"
+	"	uint h = p.x * 0x9E3779B1u ^ p.y * 0x85EBCA77u;\n"
+	"	h ^= h >> 15;\n"
+	"	h *= 0x2C1B3C6Du;\n"
+	"	h ^= h >> 12;\n"
+	"	return vec3(uvec3(h, h >> 8, h >> 16) & 255u) / 255.0;\n"
+	"}\n"
 	"vec4 sampleTile(sampler2D t, ivec4 a, ivec4 b, ivec4 c, ivec4 image) {\n"
 	"	vec3 top = vTex - 0.5 * dFdx(vTex) - 0.5 * dFdy(vTex);\n"
 	"	vec2 st = top.xy / top.z;\n"
@@ -382,6 +392,9 @@ static const char* rgbInput(int which, int sel) {
 		static const char* mul[10] = { "vec3(0.0)", "vec3(combined.a)", "vec3(tex0.a)", "vec3(tex1.a)", "vec3(uPrim.a)", "vec3(shade.a)",
 		                               "vec3(uEnv.a)", "vec3(0.0)", "vec3(uPrimLod)", "vec3(0.0)" };
 		return sel < 16 ? mul[sel - 6] : "vec3(0.0)";
+	}
+	if (which == 0 && sel == 7) {
+		return "noise()";
 	}
 	return (which == 0 || which == 3) && sel == 6 ? "vec3(1.0)" : "vec3(0.0)";
 }
