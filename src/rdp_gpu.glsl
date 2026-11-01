@@ -6,8 +6,8 @@ precision highp int;
 layout(local_size_x = 16, local_size_y = 16) in;
 
 layout(std430, binding = 0) buffer Rdram { uint rdram[]; };
-layout(std430, binding = 1) readonly buffer Tmem { uint tmem[]; };
-layout(std430, binding = 2) readonly buffer Data { int data[]; };
+layout(std430, binding = 1) buffer Tmem { uint tmem[]; };
+layout(std430, binding = 2) buffer Data { int data[]; };
 layout(std430, binding = 3) writeonly buffer Last { uint lastOut[]; };
 
 // 0 bins, 1 bin lists, 2 first tile x, 3 first tile y, 4 tiles across, 5 lastOut base, 6 color image,
