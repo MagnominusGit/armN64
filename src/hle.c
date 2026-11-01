@@ -98,6 +98,9 @@ struct Hle {
 	char why[48];
 	// Counting the commands instead of drawing them (N64HLECHECK).
 	bool dry;
+	// The output buffer full while the RDP is frozen and hasn't taken the last fill: the microcode
+	// waits for it, the rest of the list kept until it has.
+	bool stalled;
 	uint64_t list[LIST_MAX];
 	size_t count;
 	// The list's length as the RDP's own commands fill it, the GL renderer's triangles at the size of
@@ -129,19 +132,26 @@ static size_t commandWords(uint64_t w) {
 	       op == 0x24 || op == 0x25 ? 2 : 1;
 }
 
-static void flush(struct N64* n, struct Hle* h) {
+static void flush(struct N64* n, struct Hle* h, bool canStall) {
 	// Whole commands only: a full list may end inside one, which waits for the next flush.
-	size_t total = h->count, whole = 0;
+	size_t total = h->count, whole = 0, sent;
 	while (whole < total && whole + commandWords(h->list[whole]) <= total) {
 		whole += commandWords(h->list[whole]);
 	}
-	h->count = whole;
+	h->count = sent = whole;
+	h->stalled = false;
 	size_t capacity = (h->fifoEnd - h->fifoStart) / 8;
 	if (!h->dry && capacity && h->count) {
 		// A FIFO microcode's commands go through its output buffer in RDRAM, the RDP's registers
 		// pointing at them, where programs can see them (DPC_CURRENT, the buffer); a list longer
-		// than the buffer goes round it, the RDP taking each fill.
+		// than the buffer goes round it, the RDP taking each fill. A frozen RDP takes none, so the
+		// microcode waits before writing over a fill (Banjo-Kazooie's intro).
 		for (size_t done = 0; done < h->count;) {
+			if (canStall && (n->dp.status & 2) && n->dp.current < n->dp.end) {
+				h->stalled = true;
+				sent = done;
+				break;
+			}
 			size_t end = done;
 			while (end < h->count && end - done + commandWords(h->list[end]) <= capacity) {
 				end += commandWords(h->list[end]);
@@ -175,13 +185,13 @@ static void flush(struct N64* n, struct Hle* h) {
 			i += commandWords(h->list[i]);
 		}
 	}
-	memmove(h->list, h->list + whole, (total - whole) * sizeof(h->list[0]));
-	h->count = total - whole;
+	memmove(h->list, h->list + sent, (total - sent) * sizeof(h->list[0]));
+	h->count = total - sent;
 }
 
 static void emit(struct N64* n, struct Hle* h, uint64_t w) {
 	if (h->count == LIST_MAX) {
-		flush(n, h);
+		flush(n, h, false);
 	}
 	h->list[h->count++] = w;
 	if (!h->left) {
@@ -1509,20 +1519,26 @@ static void finishTask(struct N64* n, struct Hle* h) {
 	} else if (!h->dry) {
 		n->sp.hleDoneAt = n->cycles + 4096 + 64 * (uint64_t) h->timeCount;
 	}
-	flush(n, h);
+	flush(n, h, !h->dry);
 	h->timeCount = h->count;
-	if (!h->dry && !h->waiting) {
+	if (h->stalled) {
+		n->sp.hleDoneAt = n->cycles + 2048;
+	} else if (!h->dry && !h->waiting) {
 		n->dp.busyUntil = n->dp.busyUntil > n->sp.hleDoneAt ? n->dp.busyUntil : n->sp.hleDoneAt;
 	}
 }
 
 bool hleWaiting(struct N64* n) {
-	return n->hle && n->hle->waiting;
+	return n->hle && (n->hle->waiting || n->hle->stalled);
 }
 
 // A waiting task looks at the command it waits on again, and goes on when the CPU changed it.
 void hleResume(struct N64* n) {
 	struct Hle* h = n->hle;
+	if (h->stalled) {
+		finishTask(n, h);
+		return;
+	}
 	if (rd32(n, h->waitPc) >> 24 == (h->family == FAMILY_F3DEX2 ? 0xDE : 0x06) && address(h, rd32(n, h->waitPc + 4)) == h->waitPc) {
 		n->sp.hleDoneAt = n->cycles + 2048;
 		return;
