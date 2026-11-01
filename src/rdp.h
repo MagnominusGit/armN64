@@ -92,15 +92,25 @@ struct RDP {
 	uint32_t stateGen;
 };
 
-// The HLE's triangle for the GL renderer: a head word, three corners of five words, then the edge
-// words of the RDP triangle it stands for.
-enum { GLR_TRIANGLE_WORDS = 20 };
+// The HLE's corners of a triangle for the GL renderer, beside the RDP triangle they stand for
+// (found by its edge words): depth, texture and shade (bits 0-2), tile (8-10), level (12-14) and
+// perspective (16); per corner x, y, z, 1/w, r, g, b, a, s, t.
+struct GlrCorners {
+	uint64_t edges[4];
+	uint32_t flags;
+	float v[3][10];
+};
 
 // The GL renderer (glr.c), for HLE: N64_RDP_GL.
 struct Glr* glrCreate(struct N64*);
 void glrDestroy(struct Glr*);
-// A primitive: the HLE's triangle (op 0x01: three projected vertices), or an RDP one.
+// A primitive: an RDP one, drawn from the HLE's corners when it queued them.
 void glrDraw(struct N64*, struct RDP*, const uint64_t* w, int op);
+// The HLE's corners for a triangle it sends next (the GL renderer made if there is none yet), the
+// triangle a skipped frame leaves undrawn, and corners for triangles that won't come.
+void glrQueue(struct N64*, const struct GlrCorners*);
+void glrSkip(struct N64*, const uint64_t* w, int op);
+void glrQueueClear(struct N64*);
 // Brings what the GPU drew back to RDRAM.
 void glrSync(struct N64*);
 void glrStateLoaded(struct Glr*);

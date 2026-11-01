@@ -1652,10 +1652,6 @@ static void loadTlut(struct N64* n, struct RDP* r, uint64_t w) {
 // ---- Command processing
 
 static int commandWords(int op) {
-	// The HLE's triangle for the GL renderer: a header and three vertices.
-	if (op == 0x01) {
-		return GLR_TRIANGLE_WORDS;
-	}
 	if (op >= 0x08 && op <= 0x0F) {
 		return 4 + (op & 4 ? 8 : 0) + (op & 2 ? 8 : 0) + (op & 1 ? 2 : 0);
 	}
@@ -3367,11 +3363,13 @@ static void command(struct N64* n, struct RDP* r, const uint64_t* w, int op, int
 		}
 	}
 	// The GL renderer draws; the RDP keeps the state (texture loads included) and the time.
-	if (n->glr && (op == 0x01 || (op >= 0x08 && op <= 0x0F) || op == 0x24 || op == 0x25 || op == 0x36)) {
+	if (n->glr && ((op >= 0x08 && op <= 0x0F) || op == 0x24 || op == 0x25 || op == 0x36)) {
 		if (!(n->skip.on && skipCommand(n, w, op))) {
 			glrDraw(n, r, w, op);
+		} else {
+			glrSkip(n, w, op);
 		}
-		uint64_t clocks = op == 0x01 ? primitiveClocks(r, w + 16, 0x08) : primitiveClocks(r, w, op);
+		uint64_t clocks = primitiveClocks(r, w, op);
 		r->clocks += clocks;
 		n->dp.bufBusy += (uint32_t) clocks;
 		n->dp.pipeBusy += (uint32_t) clocks;

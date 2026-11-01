@@ -197,6 +197,9 @@ struct Glr {
 	size_t vertexOffset;
 	uint64_t rawField;
 	int rawTriangles;
+	// The HLE's corners for triangles it has sent and the RDP hasn't reached yet (a ring).
+	struct GlrCorners* queue;
+	uint32_t queueRead, queueWrite;
 	// The state of the last primitive, valid while the RDP's stateGen stays (and no sync).
 	bool fastValid;
 	uint32_t fastGen;
@@ -1242,40 +1245,84 @@ static void rectangle(struct Glr* g, float x0, float y0, float x1, float y1, flo
 	vertex(g, x0, y1, z, 1, none, s01, t01);
 }
 
-static float halfFloat(uint64_t w, bool high) {
-	uint32_t bits = high ? (uint32_t) (w >> 32) : (uint32_t) w;
-	float f;
-	memcpy(&f, &bits, 4);
-	return f;
+enum { QUEUE = 1 << 14 };
+
+// The corners queued for RDP triangle w, the ones before them dropped (triangles that never came);
+// NULL for a triangle without (from a microcode run on the RSP).
+static const struct GlrCorners* queued(struct Glr* g, const uint64_t* w) {
+	for (uint32_t i = g->queueRead; i != g->queueWrite && i - g->queueRead < 8; ++i) {
+		const struct GlrCorners* q = &g->queue[i & (QUEUE - 1)];
+		if (!memcmp(q->edges, w, sizeof(q->edges))) {
+			g->queueRead = i + 1;
+			return q;
+		}
+	}
+	return NULL;
+}
+
+void glrQueue(struct N64* n, const struct GlrCorners* q) {
+	if (!n->glr) {
+		n->glr = glrCreate(n);
+	}
+	struct Glr* g = n->glr;
+	if (!g) {
+		return;
+	}
+	if (g->queueWrite - g->queueRead == QUEUE) {
+		++g->queueRead;
+	}
+	g->queue[g->queueWrite++ & (QUEUE - 1)] = *q;
+}
+
+void glrSkip(struct N64* n, const uint64_t* w, int op) {
+	if (op >= 0x08 && op <= 0x0F) {
+		queued(n->glr, w);
+	}
+}
+
+void glrQueueClear(struct N64* n) {
+	if (n->glr) {
+		n->glr->queueRead = n->glr->queueWrite;
+	}
+}
+
+// The HLE's triangle from its corners.
+static void triangle(struct N64* n, struct Glr* g, struct RDP* r, const struct GlrCorners* q) {
+	uint32_t c = q->flags;
+	// Depth from the primitive's needs no depth per corner (NFL Quarterback Club 99's shadows).
+	bool z = (c & 1) || (r->zAddr && r->zPrim), tex = c & 2, shade = c & 4, persp = (c >> 16) & 1;
+	float top = 1e9f, bottom = -1e9f;
+	for (int k = 0; k < 3; ++k) {
+		top = q->v[k][1] < top ? q->v[k][1] : top;
+		bottom = q->v[k][1] > bottom ? q->v[k][1] : bottom;
+	}
+	r->maxLevel = (int) ((c >> 12) & 7);
+	if (!drawState(n, g, r, tex, shade, z, (c >> 8) & 7, persp, (int) floorf(top), (int) ceilf(bottom) + 1)) {
+		return;
+	}
+	// 1/w scaled as the microcodes send it, the corners' largest a half (hle.c triangle).
+	float maxW = fmaxf(q->v[0][3], fmaxf(q->v[1][3], q->v[2][3]));
+	float k = maxW > 0 ? 0.5f / maxW : 0.5f;
+	for (int i = 0; i < 3; ++i) {
+		vertex(g, q->v[i][0], q->v[i][1], q->v[i][2], q->v[i][3] * k, &q->v[i][4], q->v[i][8], q->v[i][9]);
+	}
 }
 
 void glrDraw(struct N64* n, struct RDP* r, const uint64_t* w, int op) {
 	struct Glr* g = n->glr;
 	glesUse(g->gles);
 	uint64_t c = w[0];
-	if (op == 0x01) {
-		// Depth from the primitive's needs no depth per corner (NFL Quarterback Club 99's shadows).
-		bool z = (c & 1) || (r->zAddr && r->zPrim), tex = c & 2, shade = c & 4, persp = (c >> 16) & 1;
-		float v[3][10];
-		float top = 1e9f, bottom = -1e9f;
-		for (int k = 0; k < 3; ++k) {
-			for (int i = 0; i < 5; ++i) {
-				v[k][i * 2] = halfFloat(w[1 + k * 5 + i], true);
-				v[k][i * 2 + 1] = halfFloat(w[1 + k * 5 + i], false);
-			}
-			top = v[k][1] < top ? v[k][1] : top;
-			bottom = v[k][1] > bottom ? v[k][1] : bottom;
+	const struct GlrCorners* q = op >= 0x08 && op <= 0x0F ? queued(g, w) : NULL;
+	if (q && r->colorSize != 1) {
+		triangle(n, g, r, q);
+		return;
+	}
+	if (r->colorSize == 1) {
+		// 8-bit images (masks programs read back, Blast Corps'): the RDP's own pixels.
+		if (n->rdpPending) {
+			glrSync(n);
 		}
-		r->maxLevel = (int) ((c >> 12) & 7);
-		if (!drawState(n, g, r, tex, shade, z, (c >> 8) & 7, persp, (int) floorf(top), (int) ceilf(bottom) + 1)) {
-			return;
-		}
-		// 1/w scaled as the microcodes send it, the corners' largest a half (hle.c triangle).
-		float maxW = fmaxf(v[0][3], fmaxf(v[1][3], v[2][3]));
-		float k = maxW > 0 ? 0.5f / maxW : 0.5f;
-		for (int i = 0; i < 3; ++i) {
-			vertex(g, v[i][0], v[i][1], v[i][2], v[i][3] * k, &v[i][4], v[i][8], v[i][9]);
-		}
+		rdpDrawSoftware(n, r, w, op);
 		return;
 	}
 	if (op >= 0x08 && op <= 0x0F) {
@@ -1516,7 +1563,8 @@ struct Glr* glrCreate(struct N64* n) {
 	g->gles = glesCreateContext(error, sizeof(error));
 	g->batch = malloc((size_t) BATCH_VERTICES * VERTEX_FLOATS * 4);
 	g->image = malloc(1024 * TARGET_ROWS * 4);
-	if (!g->gles || !g->batch || !g->image || !loadGl(g)) {
+	g->queue = malloc(sizeof(*g->queue) * QUEUE);
+	if (!g->gles || !g->batch || !g->image || !g->queue || !loadGl(g)) {
 		fprintf(stderr, "GL renderer unavailable (%s), using the RDP\n", g->gles ? "GL functions missing" : error);
 		glrDestroy(g);
 		n->rdpGl = false;
@@ -1569,6 +1617,7 @@ struct Glr* glrCreate(struct N64* n) {
 // them holds.
 void glrStateLoaded(struct Glr* g) {
 	memset(g->tileTexture, 0, sizeof(g->tileTexture));
+	g->queueRead = g->queueWrite;
 	g->fastValid = false;
 	memset(&g->applied, 0xFF, sizeof(g->applied));
 }
@@ -1596,5 +1645,6 @@ void glrDestroy(struct Glr* g) {
 	glesDestroy(g->gles);
 	free(g->batch);
 	free(g->image);
+	free(g->queue);
 	free(g);
 }

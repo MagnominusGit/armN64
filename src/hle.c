@@ -98,14 +98,16 @@ struct Hle {
 	char why[48];
 	// Counting the commands instead of drawing them (N64HLECHECK).
 	bool dry;
+	// The color image is 8-bit: the GL renderer leaves those triangles to the RDP (no corners).
+	bool image8;
 	// The output buffer full while the RDP is frozen and hasn't taken the last fill: the microcode
 	// waits for it, the rest of the list kept until it has.
 	bool stalled;
 	uint64_t list[LIST_MAX];
 	size_t count;
-	// The list's length as the RDP's own commands fill it, the GL renderer's triangles at the size of
-	// the RDP triangles they stand for (glrRdpWords): the task's time is the same with either.
-	size_t timeCount, left, glrRdpWords;
+	// The list's length as the RDP's commands fill it (the task's time), and the words left of the
+	// command the list ends in.
+	size_t timeCount, left;
 };
 
 static uint32_t rd32(struct N64* n, uint32_t a) {
@@ -128,7 +130,7 @@ static uint32_t address(struct Hle* h, uint32_t a) {
 // The words of the command a list word starts.
 static size_t commandWords(uint64_t w) {
 	int op = (w >> 56) & 0x3F;
-	return op == 0x01 ? GLR_TRIANGLE_WORDS : op >= 0x08 && op <= 0x0F ? 4 + (op & 4 ? 8 : 0) + (op & 2 ? 8 : 0) + (op & 1 ? 2 : 0) :
+	return op >= 0x08 && op <= 0x0F ? 4 + (op & 4 ? 8 : 0) + (op & 2 ? 8 : 0) + (op & 1 ? 2 : 0) :
 	       op == 0x24 || op == 0x25 ? 2 : 1;
 }
 
@@ -197,8 +199,7 @@ static void emit(struct N64* n, struct Hle* h, uint64_t w) {
 	if (!h->left) {
 		// A full list keeps the words of the command it ends in.
 		h->left = commandWords(w);
-		size_t words = ((w >> 56) & 0x3F) == 0x01 ? h->glrRdpWords : h->left;
-		h->timeCount = h->timeCount + words > LIST_MAX ? words : h->timeCount + words;
+		h->timeCount = h->timeCount + h->left > LIST_MAX ? h->left : h->timeCount + h->left;
 	}
 	--h->left;
 }
@@ -439,13 +440,13 @@ static void triangle(struct N64* n, struct Hle* h, const struct ScreenVertex* a,
 	float k = maxW > 0 ? 0.5f / maxW : 0.5f;
 	struct EdgeSetup edge;
 	edgeSetup(h, a, b, c, &edge);
-	if (n->rdpGl) {
-		// For the GL renderer: the corners as they are (flat shading takes the one colour).
-		h->glrRdpWords = commandWords(edge.w[0]);
+	if (n->rdpGl && !h->image8 && !h->dry) {
+		// For the GL renderer: the corners as they are (flat shading takes the one colour), beside
+		// the RDP triangle, which keeps the list and its time the same.
 		bool persp = h->modeH & 0x80000;
-		uint64_t head = (uint64_t) 0x01 << 56 | (uint64_t) ((h->geometry & GEOM_SHADE ? 4 : 0) | (h->texOn ? 2 : 0) | (h->geometry & GEOM_ZBUFFER ? 1 : 0)) |
-		                (uint64_t) (h->texTile & 7) << 8 | (uint64_t) (h->texLevel & 7) << 12 | (uint64_t) persp << 16;
-		emit(n, h, head);
+		struct GlrCorners q = { { edge.w[0], edge.w[1], edge.w[2], edge.w[3] },
+		                        (uint32_t) ((h->geometry & GEOM_SHADE ? 4 : 0) | (h->texOn ? 2 : 0) | (h->geometry & GEOM_ZBUFFER ? 1 : 0)) |
+		                        (uint32_t) (h->texTile & 7) << 8 | (uint32_t) (h->texLevel & 7) << 12 | (uint32_t) persp << 16, { { 0 } } };
 		const struct ScreenVertex* corners[3] = { a, b, c };
 		for (int j = 0; j < 3; ++j) {
 			struct ScreenVertex v = *corners[j];
@@ -456,18 +457,9 @@ static void triangle(struct N64* n, struct Hle* h, const struct ScreenVertex* a,
 				v.s *= v.invW * k, v.t *= v.invW * k;
 			}
 			const float f[10] = { v.x, v.y, v.z, v.invW, v.r, v.g, v.b, v.a, v.s, v.t };
-			for (int i = 0; i < 10; i += 2) {
-				uint32_t hi, lo;
-				memcpy(&hi, &f[i], 4);
-				memcpy(&lo, &f[i + 1], 4);
-				emit(n, h, (uint64_t) hi << 32 | lo);
-			}
+			memcpy(q.v[j], f, sizeof(f));
 		}
-		// Then the RDP triangle's edges, for its time.
-		for (int i = 0; i < 4; ++i) {
-			emit(n, h, edge.w[i]);
-		}
-		return;
+		glrQueue(n, &q);
 	}
 	a = edge.a, b = edge.b, c = edge.c;
 	bool shade = h->geometry & GEOM_SHADE, tex = h->texOn, z = h->geometry & GEOM_ZBUFFER;
@@ -738,6 +730,9 @@ static uint32_t rdpCommand(struct N64* n, struct Hle* h, uint32_t pc, uint32_t w
 	}
 	if (op == 0xFD || op == 0xFE || op == 0xFF) {
 		w1 = address(h, w1);
+	}
+	if (op == 0xFF) {
+		h->image8 = ((w0 >> 19) & 3) == 1;
 	}
 	if (op == 0xEF) {
 		h->modeH = w0 & 0xFFFFFF, h->modeL = w1;
@@ -1630,6 +1625,9 @@ bool hleGraphics(struct N64* n, bool dry) {
 		// The RSP runs this task from the start (what the list made so far goes).
 		h->count = 0;
 		h->doneList = 0;
+		if (n->rdpGl) {
+			glrQueueClear(n);
+		}
 		return false;
 	}
 	finishTask(n, h);
