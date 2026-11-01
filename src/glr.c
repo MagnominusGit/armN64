@@ -139,14 +139,14 @@ struct ProgramKey {
 
 // A program's uniforms as last set.
 struct Uniforms {
-	float size[2], prim[4], env[4], fog[4], blend[4], primLod, primDepth;
+	float size[2], prim[4], env[4], fog[4], blend[4], primLod, primDepth, k[2];
 	int persp, tile[2][12], image[2][4];
 };
 
 struct Program {
 	struct ProgramKey key;
 	GLuint program;
-	GLint size, persp, prim, env, fog, blend, primLod, primDepth, tile[2], image[2], texture[2];
+	GLint size, persp, prim, env, fog, blend, primLod, primDepth, k, tile[2], image[2], texture[2];
 	struct Uniforms set;
 	bool uniformsSet;
 };
@@ -174,7 +174,7 @@ struct DrawState {
 	struct Program* program;
 	struct Texture* texture[2];
 	int tile[2][12];
-	float prim[4], env[4], fog[4], blend[4], primLod, primDepth;
+	float prim[4], env[4], fog[4], blend[4], primLod, primDepth, k[2];
 	int scissor[4];
 	bool depthTest, depthWrite, decal, depthLess, blendOn, persp;
 	// Into the GPU's depth only (depthTriangle).
@@ -352,6 +352,7 @@ static const char fragmentHead[] =
 	"flat in uint vSeq;\n"
 	"uniform vec4 uPrim, uEnv, uFog, uBlend;\n"
 	"uniform float uPrimLod, uPrimDepth;\n"
+	"uniform vec2 uK;\n"
 	"uniform int uPersp;\n"
 	"uniform ivec4 uTile0[3], uTile1[3];\n"
 	"uniform ivec4 uImage0, uImage1;\n"
@@ -457,11 +458,15 @@ static const char* rgbInput(int which, int sel) {
 	}
 	if (which == 2) {
 		static const char* mul[10] = { "vec3(0.0)", "vec3(combined.a)", "vec3(tex0.a)", "vec3(tex1.a)", "vec3(uPrim.a)", "vec3(shade.a)",
-		                               "vec3(uEnv.a)", "vec3(lodFrac)", "vec3(uPrimLod)", "vec3(0.0)" };
+		                               "vec3(uEnv.a)", "vec3(lodFrac)", "vec3(uPrimLod)", "vec3(uK.y)" };
 		return sel < 16 ? mul[sel - 6] : "vec3(0.0)";
 	}
 	if (which == 0 && sel == 7) {
 		return "noise()";
+	}
+	// K4 and K5, the color conversion's last two (Conker's mouth).
+	if (which == 1 && sel == 7) {
+		return "vec3(uK.x)";
 	}
 	return (which == 0 || which == 3) && sel == 6 ? "vec3(1.0)" : "vec3(0.0)";
 }
@@ -838,6 +843,7 @@ compileFragment:;
 	pr->blend = gl->GetUniformLocation(p, "uBlend");
 	pr->primLod = gl->GetUniformLocation(p, "uPrimLod");
 	pr->primDepth = gl->GetUniformLocation(p, "uPrimDepth");
+	pr->k = gl->GetUniformLocation(p, "uK");
 	pr->tile[0] = gl->GetUniformLocation(p, "uTile0");
 	pr->tile[1] = gl->GetUniformLocation(p, "uTile1");
 	pr->image[0] = gl->GetUniformLocation(p, "uImage0");
@@ -1188,6 +1194,7 @@ static void flushBatch(struct N64* n, struct Glr* g) {
 	uniform(g, p->blend, 4, s->blend, u->blend);
 	uniform(g, p->primLod, 1, &s->primLod, &u->primLod);
 	uniform(g, p->primDepth, 1, &s->primDepth, &u->primDepth);
+	uniform(g, p->k, 2, s->k, u->k);
 	for (int k = 0; k < 2; ++k) {
 		if (s->texture[k]) {
 			useTexture(g, k, s->texture[k]->texture);
@@ -1390,6 +1397,7 @@ static bool drawState(struct N64* n, struct Glr* g, struct RDP* r, bool textured
 	}
 	colorOf(&r->prim, s.prim), colorOf(&r->env, s.env), colorOf(&r->fog, s.fog), colorOf(&r->blend, s.blend);
 	s.primLod = r->primLod / 255.0f;
+	s.k[0] = r->k4 / 255.0f, s.k[1] = r->k5 / 255.0f;
 	s.primDepth = (float) r->primZ / 0x3FFFF;
 	s.depthTest = depth && r->zCompare;
 	s.depthWrite = depth && r->zUpdate;
