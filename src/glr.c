@@ -1104,7 +1104,7 @@ static bool drawState(struct N64* n, struct Glr* g, struct RDP* r, bool textured
 		return false;
 	}
 	// No command but primitives since the last: the same state.
-	int primitive = textured | shaded << 1 | depth << 2 | tile << 3 | persp << 6;
+	int primitive = textured | shaded << 1 | depth << 2 | tile << 3 | persp << 6 | r->maxLevel << 7;
 	if (g->fastValid && g->stateSet && g->fastGen == r->stateGen && g->fastKey == primitive) {
 		return drawRows(n, g, r, g->fastRows, y0, y1);
 	}
@@ -1156,8 +1156,10 @@ static bool drawState(struct N64* n, struct Glr* g, struct RDP* r, bool textured
 	}
 	if (textured) {
 		for (int k = 0; k < (cycleType == 1 ? 2 : 1); ++k) {
-			// Without filtering a cycle converts its texels from YUV.
-			int index = (tile + k) & 7, w, h;
+			// Without filtering a cycle converts its texels from YUV. With the level of detail and
+			// one level, both texels are that level's (rdp.c levelOfDetail: always distant).
+			bool oneLevel = ((r->otherModes >> 48) & 1) && !((r->otherModes >> 50) & 1) && r->maxLevel == 0;
+			int index = (tile + (oneLevel ? 0 : k)) & 7, w, h;
 			bool filter = k == 0 ? cycleType >= 2 || ((r->otherModes >> 43) & 1) : (r->otherModes >> 42) & 1;
 			s.texture[k] = texture(n, g, r, index, !filter, &w, &h);
 			const struct Tile* t = &r->tile[index];
@@ -1264,6 +1266,7 @@ void glrDraw(struct N64* n, struct RDP* r, const uint64_t* w, int op) {
 			top = v[k][1] < top ? v[k][1] : top;
 			bottom = v[k][1] > bottom ? v[k][1] : bottom;
 		}
+		r->maxLevel = (int) ((c >> 12) & 7);
 		if (!drawState(n, g, r, tex, shade, z, (c >> 8) & 7, persp, (int) floorf(top), (int) ceilf(bottom) + 1)) {
 			return;
 		}
@@ -1378,6 +1381,7 @@ void glrDraw(struct N64* n, struct RDP* r, const uint64_t* w, int op) {
 	float ax[2] = { (float) (x0 - cx0), (float) (x1 + 1 - cx0) }, ay[2] = { (float) (y0 - cy0), (float) (y1 + 1 - cy0) };
 	const float* along = flip ? ay : ax, * across = flip ? ax : ay;
 	float ss[2] = { s0 + along[0] * dsdx, s0 + along[1] * dsdx }, ts[2] = { t0 + across[0] * dtdy, t0 + across[1] * dtdy };
+	r->maxLevel = 0;
 	if (!drawState(n, g, r, true, false, r->zAddr && r->zPrim, tile, false, y0, y1 + 1)) {
 		return;
 	}
