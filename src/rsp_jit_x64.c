@@ -7,7 +7,8 @@
 // x86-64 code for blocks of RSP instructions. Each block's first instruction takes its timing from
 // rspTimingStep (the instruction before it isn't known) unless the timing is plain; the rest have the
 // timing compiled in. Scalar instructions, DMEM loads and stores and most of the vector unit run
-// inline, the rest of the vector unit and COP0 through C. In lle, code stops after any instruction that takes the clock to the limit, as
+// inline, the rest of the vector unit and COP0 through C but its SP status, DMA and semaphore reads. A
+// block that waits for a DMA (rspDmaWait) first skips the passes it would make. In lle, code stops after any instruction that takes the clock to the limit, as
 // rspCatchUp does; in mle and hle at the block's end.
 //
 // Registers: rbx = n, r12 = &n->rsp, r13 = clock, r14 = the limit, r15 = lastStart,
@@ -919,6 +920,33 @@ static void storePcs(struct Emitter* e, uint32_t pc, bool delay) {
 	}
 }
 
+// MFC0 of SP_STATUS, DMA_FULL, DMA_BUSY or the semaphore, as busRead32 gives them at the clock.
+static void emitSpRead(struct Emitter* e, int reg, int rt) {
+	if (reg == 7) {
+		xLoad(e, 4, RAX, N64_AT(sp.semaphore));
+		xStoreI(e, 4, N64_AT(sp.semaphore), 1);
+	} else if (reg == 4) {
+		xLoad(e, 4, RAX, N64_AT(sp.status));
+		xAluRR(e, X_XOR, 4, R(RCX), RCX);
+		xAluRM(e, X_CMP, 8, R13, N64_AT(sp.dmaUntil));
+		xSetcc(e, CC_B, R(RCX));
+		xShiftI(e, X_SHL, 4, R(RCX), 2);
+		xAluRR(e, X_OR, 4, R(RAX), RCX);
+		xAluRR(e, X_XOR, 4, R(RCX), RCX);
+		xAluRM(e, X_CMP, 8, R13, N64_AT(sp.dmaFullUntil));
+		xSetcc(e, CC_B, R(RCX));
+		xShiftI(e, X_SHL, 4, R(RCX), 3);
+		xAluRR(e, X_OR, 4, R(RAX), RCX);
+	} else {
+		xAluRR(e, X_XOR, 4, R(RAX), RAX);
+		xAluRM(e, X_CMP, 8, R13, reg == 5 ? N64_AT(sp.dmaFullUntil) : N64_AT(sp.dmaUntil));
+		xSetcc(e, CC_B, R(RAX));
+	}
+	if (rt) {
+		xStore(e, 4, gpr(rt), RAX);
+	}
+}
+
 // IMEM's generation, in the frame's spare slot, to see whether a call rewrote it.
 static void saveGen(struct Emitter* e) {
 	xLoad(e, 4, RAX, N64_AT(rspCodeGen));
@@ -1052,7 +1080,9 @@ static enum Kind emitInstruction(struct Jit* j, uint32_t op, uint32_t pc, bool d
 		storeConst(e, rt, (uint32_t) (uint16_t) op << 16);
 		return PLAIN;
 	case 0x10:
-		if (rs == 0x00 || rs == 0x04) {
+		if (rs == 0x00 && (rd & 15) >= 4 && (rd & 15) <= 7) {
+			emitSpRead(e, rd & 15, rt);
+		} else if (rs == 0x00 || rs == 0x04) {
 			storePcs(e, pc, delay);
 			*pcsStored = true;
 			storeTiming(e);
@@ -1205,6 +1235,13 @@ void* rspCompile(struct N64* n, const uint8_t* ops, uint32_t count, uint32_t sta
 
 	accLiveness(ops, count);
 	acc.cached = acc.dirty = false;
+	uint32_t const wait = plainTiming ? rspDmaWait(ops, count) : 0;
+	if (wait) {
+		xMovRR(e, 8, RDI, RBX);
+		xMovI(e, RSI, wait);
+		xMovRR(e, 8, RDX, R14);
+		callC(e, rspDmaWaitSkip);
+	}
 	bool delay = false;
 	uint32_t prev = 0;
 	for (uint32_t k = 0; k < count; ++k) {

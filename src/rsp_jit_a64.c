@@ -6,7 +6,7 @@
 
 // AArch64 code for blocks of RSP instructions, as rsp_jit_x64.c does it, but with every
 // instruction's timing compiled in (the first one's pairing checked against lastDesc); scalar instructions and DMEM loads and stores
-// inline, the vector unit and COP0 through C.
+// inline, the vector unit and COP0 through C but COP0's SP status, DMA and semaphore reads.
 //
 // Registers: x19 = n, x20 = &n->rsp, x21 = clock, x22 = the limit, x23 = lastStart,
 // w24 = lastAlone, x25 = DMEM, w26 = IMEM's generation before a call, x27 = the vector registers
@@ -106,6 +106,36 @@ struct Jit {
 	int exitCount;
 	uint8_t* leave;
 };
+
+// MFC0 of SP_STATUS, DMA_FULL, DMA_BUSY or the semaphore, as busRead32 gives them at the clock.
+static void emitSpRead(struct Emitter* e, int reg, int rt) {
+	unsigned at;
+	if (reg == 7) {
+		int const base = fieldBase(e, N64_OFF(sp.semaphore), 4, &at);
+		aLdr(e, 0, base, at);
+		aMovImm(e, 1, 1);
+		aStr(e, 1, base, at);
+	} else {
+		if (reg == 4) {
+			loadN32(e, 0, N64_OFF(sp.status));
+		}
+		for (int flag = 5; flag <= 6; ++flag) {
+			if (reg != 4 && reg != flag) {
+				continue;
+			}
+			int const base = fieldBase(e, flag == 5 ? N64_OFF(sp.dmaFullUntil) : N64_OFF(sp.dmaUntil), 8, &at);
+			aLdrX(e, 1, base, at);
+			aDp(e, A_SUBS | W64, ZR, CLOCK, 1, S_LSL, 0);
+			aCset(e, reg == 4 ? 1 : 0, C_LO);
+			if (reg == 4) {
+				aDp(e, A_ORR, 0, 0, 1, S_LSL, flag == 5 ? 3 : 2);
+			}
+		}
+	}
+	if (rt) {
+		aStr(e, 0, RSP, gprOff(rt));
+	}
+}
 
 static void exitAt(struct Jit* j, uint8_t* site, uint32_t op, uint32_t pc, enum Kind kind, bool delay) {
 	j->exits[j->exitCount++] = (struct Exit) { site, op, pc, kind, delay, false, false, false, acc.dirty };
@@ -1013,7 +1043,9 @@ static enum Kind emitInstruction(struct Jit* j, uint32_t op, uint32_t pc, bool d
 		storeConst(e, rt, (uint32_t) (uint16_t) op << 16);
 		return PLAIN;
 	case 0x10:
-		if (rs == 0x00 || rs == 0x04) {
+		if (rs == 0x00 && (rd & 15) >= 4 && (rd & 15) <= 7) {
+			emitSpRead(e, rd & 15, rt);
+		} else if (rs == 0x00 || rs == 0x04) {
 			storePcs(e, pc, delay);
 			*pcsStored = true;
 			storeTiming(e);
@@ -1171,6 +1203,13 @@ void* rspCompile(struct N64* n, const uint8_t* ops, uint32_t count, uint32_t sta
 
 	accLiveness(ops, count);
 	acc.cached = acc.dirty = false;
+	uint32_t const wait = plainTiming ? rspDmaWait(ops, count) : 0;
+	if (wait) {
+		aMovX(e, 0, N);
+		aMovImm(e, 1, wait);
+		aMovX(e, 2, LIMIT);
+		callC(e, rspDmaWaitSkip);
+	}
 	bool delay = false;
 	uint32_t prev = 0;
 	for (uint32_t k = 0; k < count; ++k) {

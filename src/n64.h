@@ -539,6 +539,8 @@ void rspBreak(struct N64*);
 // rsp_jit.c, and a code generator for the host (rsp_jit_x64.c, rsp_jit_a64.c)
 void* rspJitLookup(struct N64*, uint32_t pc);
 void rspJitFree(struct N64*);
+uint32_t rspDmaWait(const uint8_t* ops, uint32_t count);
+void rspDmaWaitSkip(struct N64*, uint32_t wait, uint64_t limit);
 void* rspCompile(struct N64*, const uint8_t* ops, uint32_t count, uint32_t start);
 void rspArenaFree(struct N64*);
 // blocks.c: the CPU runs from blocks of instructions fetched once, until the next event.
