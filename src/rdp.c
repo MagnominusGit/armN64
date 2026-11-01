@@ -936,7 +936,7 @@ static void shadePixel(struct N64* n, struct RDP* r, int x, int y, struct Pixel*
 		default:
 			pass = farther && nearer && !max;
 		}
-		if (!pass) {
+			if (!pass) {
 			return;
 		}
 	} else {
@@ -3505,6 +3505,8 @@ void rdpStateLoad(struct N64* n, const struct RDP* saved, bool keepGl) {
 	rdpDestroy(n);
 	n->glr = glr;
 	if (saved && (n->rdp = malloc(sizeof(*n->rdp)))) {
+		// A state loaded before the RDP drew anything still needs the blender's divider.
+		buildBlendDivide();
 		memcpy(n->rdp, saved, sizeof(*n->rdp));
 		n->rdp->tmemSource = NULL;
 		n->rdp->renderers = NULL;
