@@ -3015,6 +3015,15 @@ static void gpuSyncRead(struct N64* n, struct RDP* r, uint32_t addr, uint32_t le
 		gpuSync(n, r);
 		return;
 	}
+	// The drawn ranges it touches come back whole: a read goes on through what was drawn (a depth
+	// buffer read here and there, NFL Quarterback Club 99).
+	for (int i = 0; i < g->drawnCount; ++i) {
+		uint32_t a = g->drawnFrom[i] & ~0xFFFu, b = (g->drawnTo[i] + 0xFFF) & ~0xFFFu;
+		if (a < to && b > from) {
+			from = a < from ? a : from;
+			to = b > to ? b : to;
+		}
+	}
 	++n->stats.glSyncs;
 	gpuSubmit(n, r);
 	gpuUpdate(n, g);
