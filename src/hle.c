@@ -691,6 +691,29 @@ static void readLight(struct N64* n, struct Hle* h, uint32_t a, int index) {
 	normalize(h->lightDir[index]);
 }
 
+static void readLookat(struct N64* n, struct Hle* h, uint32_t a, int index);
+
+// The lookats and lights each task starts with: Fast3D's and F3DEX's data (DMEM from 0) as the
+// microcode loads it, found by its G_MOVEMEM table's lookat Y, X and light places, ten 0x20 apart
+// (Mario Kart 64's logo is lit and mapped by these alone).
+static void defaultLights(struct N64* n, struct Hle* h, uint32_t data, uint32_t size) {
+	for (uint32_t i = 0; i + 20 <= size; i += 2) {
+		int k = 1;
+		while (k < 10 && (uint16_t) rd16(n, data + i + 2 * k) == (uint16_t) rd16(n, data + i + 2 * k - 2) + 0x20) {
+			++k;
+		}
+		uint32_t const last = (uint16_t) rd16(n, data + i + 18);
+		if (k == 10 && last + 16 <= size) {
+			readLookat(n, h, data + (uint16_t) rd16(n, data + i), 1);
+			readLookat(n, h, data + (uint16_t) rd16(n, data + i + 2), 0);
+			for (int l = 0; l < 8; ++l) {
+				readLight(n, h, data + (uint16_t) rd16(n, data + i + 4 + 2 * l), l);
+			}
+			return;
+		}
+	}
+}
+
 static void readLookat(struct N64* n, struct Hle* h, uint32_t a, int index) {
 	for (int i = 0; i < 3; ++i) {
 		h->lookat[index][i] = rd8(n, a + 8 + i);
@@ -1630,6 +1653,9 @@ bool hleGraphics(struct N64* n, bool dry) {
 	// The lookat directions the microcodes' data starts with (texture generation without a lookat).
 	static const float lookat[2][3] = { { 1, 0, 0 }, { 0, 1, 0 } };
 	memcpy(h->lookat, lookat, sizeof(lookat));
+	if (f == FAMILY_F3D || f == FAMILY_F3DEX) {
+		defaultLights(n, h, data, dataSize);
+	}
 	// So do the other modes (the data's set-other-modes command).
 	h->modeH = 0x080CFF, h->modeL = 0;
 	h->spriteMode = false;
