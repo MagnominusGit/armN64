@@ -1352,7 +1352,9 @@ static bool drawState(struct N64* n, struct Glr* g, struct RDP* r, bool textured
 	if (depth && r->zPrim && !g->depthImage) {
 		modes |= MODE_PRIM_DEPTH;
 	}
-	if (r->cvgTimesAlpha && r->antialias) {
+	// Coverage times alpha, with antialiasing or with colour only where the coverage wraps (over a
+	// pixel already fully covered): none left, nothing written (Conker's iris).
+	if (r->cvgTimesAlpha && (r->antialias || r->colorOnCvg)) {
 		modes |= MODE_CVG_ALPHA;
 	}
 	// With coverage times alpha too the alpha stays (the VI's antialiasing is what smooths those edges).
