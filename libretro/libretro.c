@@ -10,6 +10,7 @@
 #include "paks.h"
 
 #include <dirent.h>
+#include <glob.h>
 #include <math.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -50,6 +51,7 @@ static bool pal;
 static uint32_t picture[640 * 480];
 static int pictureWidth = 320, pictureHeight = 240;
 static float pictureAspect = 4.0f / 3.0f;
+static unsigned maxScale = 1;
 static int16_t captured[CAPTURE_SAMPLES];
 static int16_t played[OUT_FRAMES * 2];
 // Where resampling is between the last frame kept from the run before and the next.
@@ -99,21 +101,26 @@ static struct retro_core_option_v2_definition optionDefinitions[] = {
 	{ "armn64_stick_gate", "Octagonal Stick Gate", NULL,
 	  "Shapes the stick's range like the N64 controller's octagonal gate: full right reaches 85, and the diagonals the gate's corners (69, 69) instead of a circle's.",
 	  NULL, "input", { { "disabled", "Off" }, { "enabled", "On" }, { NULL, NULL } }, "disabled" },
+	{ "armn64_preset", "Preset (Restart)", NULL,
+	  "Speed: HLE drawn on the GPU. Balanced: MLE on the GPU. Accurate: LLE on the CPU. Overclocked: MLE on the GPU at twice the CPU, RSP and RDP clocks. "
+	  "Custom uses the Graphics, Renderer and Overclock options below.",
+	  NULL, "system", { { "speed", "Speed" }, { "balanced", "Balanced" }, { "accurate", "Accurate" }, { "overclocked", "Overclocked" }, { "custom", "Custom" }, { NULL, NULL } }, "speed" },
 	{ "armn64_accuracy", "Graphics (Restart)", NULL,
-	  "HLE draws the game's display lists without its microcode and puts speed first. MLE and LLE run the microcode on the RSP: "
+	  "With the Custom preset. HLE draws the game's display lists without its microcode and puts speed first. MLE and LLE run the microcode on the RSP: "
 	  "LLE is the hardware cycle for cycle, MLE the middle ground that also runs hacks made on other emulators.",
 	  NULL, "system", { { "hle", "HLE" }, { "mle", "MLE" }, { "lle", "LLE" }, { NULL, NULL } }, "hle" },
 	{ "armn64_rdp_threads", "Renderer Threads (Restart)", NULL, "Threads beside the emulation that draw the RDP's pictures. Auto takes the cores there are, up to 3.",
 	  NULL, "system", { { "auto", "Auto" }, { "0", "None" }, { "1", "1" }, { "2", "2" }, { "3", "3" }, { NULL, NULL } }, "auto" },
 	{ "armn64_renderer", "Renderer (Restart)", NULL,
-	  "GPU draws with OpenGL ES 3.1: HLE with the GL renderer, MLE and LLE with the RDP in compute shaders (exact, but slower than the renderer threads on most handhelds). CPU draws with the renderer threads. Auto takes the GPU for HLE and the CPU otherwise.",
-	  NULL, "system", { { "auto", "Auto" }, { "gpu", "GPU" }, { "cpu", "CPU" }, { NULL, NULL } }, "auto" },
+	  "With the Custom preset. GPU draws with OpenGL ES 3.1: HLE with the GL renderer, MLE and LLE with the RDP in compute shaders (exact). CPU draws with the renderer threads.",
+	  NULL, "system", { { "gpu", "GPU" }, { "cpu", "CPU" }, { NULL, NULL } }, "gpu" },
 	{ "armn64_overclock", "Overclock (Restart)", NULL,
-	  "Runs the CPU, RSP and RDP faster than the hardware while video, audio and the game's timers keep real time: less slowdown, and room for ROM hacks made on emulators. Some games depend on the hardware's timing. MLE and HLE only.",
+	  "With the Custom preset. Runs the CPU, RSP and RDP faster than the hardware while video, audio and the game's timers keep real time: less slowdown, and room for ROM hacks made on emulators. Some games depend on the hardware's timing. MLE and HLE only.",
 	  NULL, "system", { { "1", "Off" }, { "1.5", "1.5x" }, { "2", "2x" }, { "2.5", "2.5x" }, { "3", "3x" }, { "4", "4x" }, { NULL, NULL } }, "1" },
 	{ "armn64_resolution", "Resolution (Restart)", NULL,
-	  "HLE's GL renderer draws at this many times the game's resolution: sharper edges and textures, at a GPU cost. What the game reads back from its framebuffer stays at its own resolution.",
-	  NULL, "system", { { "1", "Native" }, { "2", "2x" }, { "3", "3x" }, { "4", "4x" }, { NULL, NULL } }, "1" },
+	  "HLE's GL renderer draws at this many times the game's resolution: sharper edges and textures, at a GPU cost. Auto fits the display (2x on a 640x480 screen, 4x at 1080p). "
+	  "What the game reads back from its framebuffer stays at its own resolution.",
+	  NULL, "system", { { "auto", "Auto" }, { "1", "Native" }, { "2", "2x" }, { "3", "3x" }, { "4", "4x" }, { "5", "5x" }, { "6", "6x" }, { "7", "7x" }, { "8", "8x" }, { NULL, NULL } }, "auto" },
 	{ "armn64_vi_filters", "VI Filters", NULL,
 	  "The video interface's antialiasing, divot and dither filters, which soften edges and smooth 16-bit colour as a TV showed it. Auto turns them on for MLE and LLE and off for HLE, where they cost speed.",
 	  NULL, "system", { { "auto", "Auto" }, { "on", "On" }, { "off", "Off" }, { NULL, NULL } }, "auto" },
@@ -163,17 +170,81 @@ static void logMessage(enum retro_log_level level, const char* message) {
 	}
 }
 
+// What the preset picks, or with Custom the options themselves.
+static const char* preset(void) {
+	const char* value = optionValue(environment, "armn64_preset");
+	return value ? value : "speed";
+}
+
+static const char* accuracy(void) {
+	const char* p = preset();
+	const char* custom = optionValue(environment, "armn64_accuracy");
+	return !strcmp(p, "speed")                                    ? "hle"
+	       : !strcmp(p, "balanced") || !strcmp(p, "overclocked") ? "mle"
+	       : !strcmp(p, "accurate")                               ? "lle"
+	       : custom                                               ? custom
+	                                                              : "hle";
+}
+
+static bool gpuRenderer(void) {
+	const char* p = preset();
+	return !strcmp(p, "custom") ? !optionIs(environment, "armn64_renderer", "cpu") : strcmp(p, "accurate") != 0;
+}
+
+static const char* overclock(void) {
+	const char* p = preset();
+	return !strcmp(p, "overclocked") ? "2" : !strcmp(p, "custom") ? optionValue(environment, "armn64_overclock") : "1";
+}
+
+// The GL renderer's scale: the option's, or with Auto the most times a 320x240 picture fits the
+// connected display (from DRM's modes), up to 8.
+static int glScale(void) {
+	const char* value = optionValue(environment, "armn64_resolution");
+	if (value && *value >= '1' && *value <= '8') {
+		return *value - '0';
+	}
+	static int display;
+	if (!display) {
+		display = 1;
+		glob_t found;
+		if (glob("/sys/class/drm/card*-*/status", 0, NULL, &found) == 0) {
+			for (size_t i = 0; i < found.gl_pathc; ++i) {
+				char path[512], line[64] = "";
+				FILE* f = fopen(found.gl_pathv[i], "r");
+				bool connected = f && fgets(line, sizeof(line), f) && !strncmp(line, "connected", 9);
+				if (f) {
+					fclose(f);
+				}
+				snprintf(path, sizeof(path), "%.*smodes", (int) (strlen(found.gl_pathv[i]) - 6), found.gl_pathv[i]);
+				f = connected ? fopen(path, "r") : NULL;
+				int w = 0, h = 0;
+				if (f && fscanf(f, "%dx%d", &w, &h) == 2) {
+					int k = w / 320 < h / 240 ? w / 320 : h / 240;
+					display = k > display ? k : display;
+				}
+				if (f) {
+					fclose(f);
+				}
+			}
+			globfree(&found);
+		}
+		display = display > 8 ? 8 : display;
+	}
+	return display;
+}
+
 // The emulator's settings, from the core's options; the recompilers are always on.
 static const char* settings(const char* name) {
-	static char threads[4];
+	static char threads[4], scale[2];
 	if (!strcmp(name, "N64_ACCURACY")) {
-		return optionValue(environment, "armn64_accuracy");
+		return accuracy();
 	}
 	if (!strcmp(name, "N64_OVERCLOCK")) {
-		return optionValue(environment, "armn64_overclock");
+		return overclock();
 	}
 	if (!strcmp(name, "N64_GL_SCALE")) {
-		return optionValue(environment, "armn64_resolution");
+		scale[0] = (char) ('0' + glScale());
+		return scale;
 	}
 	// Compiled GPU programs in system/armN64/cache.
 	if (!strcmp(name, "N64_SHADER_CACHE")) {
@@ -189,7 +260,7 @@ static const char* settings(const char* name) {
 		return cache;
 	}
 	if (!strcmp(name, "N64_SLICE")) {
-		return optionIs(environment, "armn64_accuracy", "hle") ? "8192" : "1024";
+		return !strcmp(accuracy(), "hle") ? "8192" : "1024";
 	}
 	if (!strcmp(name, "N64_JIT") || !strcmp(name, "N64_RSPJIT")) {
 		return "1";
@@ -200,7 +271,7 @@ static const char* settings(const char* name) {
 	// The GPU RDP's pictures stay on the GPU (the VI in its context); beside the renderer threads the
 	// VI runs in the frontend's context.
 	if (!strcmp(name, "N64_VI_GPU")) {
-		return (hwWanted && !optionIs(environment, "armn64_accuracy", "hle")) || viInContext ? "1" : "0";
+		return (hwWanted && strcmp(accuracy(), "hle")) || viInContext ? "1" : "0";
 	}
 	if (!strcmp(name, "N64_FRAMESKIP")) {
 		return optionIs(environment, "armn64_frameskip", "enabled") ? "1" : "0";
@@ -255,9 +326,8 @@ void retro_get_system_info(struct retro_system_info* info) {
 
 void retro_get_system_av_info(struct retro_system_av_info* info) {
 	// The GL renderer's pictures are up to its scale times the largest.
-	const char* scale = optionValue(environment, "armn64_resolution");
-	unsigned k = scale && *scale >= '1' && *scale <= '4' ? (unsigned) (*scale - '0') : 1;
-	info->geometry = (struct retro_game_geometry) { (unsigned) pictureWidth, (unsigned) pictureHeight, 640 * k, 480 * k, pictureAspect };
+	maxScale = (unsigned) glScale();
+	info->geometry = (struct retro_game_geometry) { (unsigned) pictureWidth, (unsigned) pictureHeight, 640 * maxScale, 480 * maxScale, pictureAspect };
 	info->timing = (struct retro_system_timing) { pal ? 50.0 : 60.0, OUT_RATE };
 }
 
@@ -637,8 +707,7 @@ bool retro_load_game(const struct retro_game_info* info) {
 	}
 	// The GPU renderers, in the frontend's GL context if it has one, else in the core's own (beside a
 	// Vulkan frontend, say). With the renderer threads, the VI's filters use the GL context.
-	hwWanted = optionIs(environment, "armn64_renderer", "gpu") ||
-	           (!optionIs(environment, "armn64_renderer", "cpu") && optionIs(environment, "armn64_accuracy", "hle"));
+	hwWanted = gpuRenderer();
 	bool context = askHardwareContext();
 	viInContext = context && !hwWanted;
 	if (hwWanted && !context) {
@@ -845,7 +914,7 @@ static void setGeometry(int width, int height) {
 	                                                                  : 4.0f / 3.0f;
 	if (width != pictureWidth || height != pictureHeight || aspect != pictureAspect) {
 		pictureWidth = width, pictureHeight = height, pictureAspect = aspect;
-		struct retro_game_geometry geometry = { (unsigned) width, (unsigned) height, 640, 480, aspect };
+		struct retro_game_geometry geometry = { (unsigned) width, (unsigned) height, 640 * maxScale, 480 * maxScale, aspect };
 		environment(RETRO_ENVIRONMENT_SET_GEOMETRY, &geometry);
 	}
 }

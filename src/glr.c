@@ -25,7 +25,7 @@ enum {
 	GL_TEXTURE_2D = 0x0DE1, GL_RGBA = 0x1908, GL_RGBA8 = 0x8058, GL_UNSIGNED_BYTE = 0x1401, GL_UNSIGNED_INT = 0x1405, GL_FLOAT = 0x1406,
 	GL_FRAMEBUFFER = 0x8D40, GL_READ_FRAMEBUFFER = 0x8CA8, GL_DRAW_FRAMEBUFFER = 0x8CA9, GL_COLOR_ATTACHMENT0 = 0x8CE0, GL_DEPTH_ATTACHMENT = 0x8D00, GL_RENDERBUFFER = 0x8D41,
 	GL_DEPTH_COMPONENT24 = 0x81A6, GL_FRAMEBUFFER_COMPLETE = 0x8CD5, GL_DEPTH_STENCIL_ATTACHMENT = 0x821A, GL_DEPTH24_STENCIL8 = 0x88F0,
-	GL_STENCIL_TEST = 0x0B90, GL_EXTENSIONS = 0x1F03, GL_STENCIL_BUFFER_BIT = 0x400, GL_KEEP = 0x1E00, GL_REPLACE = 0x1E01, GL_EQUAL = 0x202, GL_GEQUAL = 0x206,
+	GL_STENCIL_TEST = 0x0B90, GL_EXTENSIONS = 0x1F03, GL_MAX_TEXTURE_SIZE = 0x0D33, GL_MAX_RENDERBUFFER_SIZE = 0x84E8, GL_STENCIL_BUFFER_BIT = 0x400, GL_KEEP = 0x1E00, GL_REPLACE = 0x1E01, GL_EQUAL = 0x202, GL_GEQUAL = 0x206,
 	GL_TEXTURE_MIN_FILTER = 0x2801, GL_TEXTURE_MAG_FILTER = 0x2800, GL_NEAREST = 0x2600, GL_TEXTURE_WRAP_S = 0x2802,
 	GL_TEXTURE_WRAP_T = 0x2803, GL_CLAMP_TO_EDGE = 0x812F, GL_TEXTURE0 = 0x84C0,
 	GL_ARRAY_BUFFER = 0x8892, GL_STREAM_DRAW = 0x88E0, GL_TRIANGLES = 4, GL_MAP_WRITE_BIT = 2, GL_MAP_UNSYNCHRONIZED_BIT = 0x20,
@@ -76,6 +76,7 @@ struct Gl {
 	void (*ColorMask)(GLboolean, GLboolean, GLboolean, GLboolean);
 	void (*ClearStencil)(GLint);
 	const unsigned char* (*GetString)(GLenum);
+	void (*GetIntegerv)(GLenum, GLint*);
 	void (*ReadPixels)(GLint, GLint, GLsizei, GLsizei, GLenum, GLenum, void*);
 	void (*PixelStorei)(GLenum, GLint);
 	GLuint (*CreateShader)(GLenum);
@@ -305,7 +306,7 @@ static bool loadGl(struct Glr* g) {
 	       GLFN(RenderbufferStorage) && GLFN(GenTextures) && GLFN(DeleteTextures) && GLFN(BindTexture) && GLFN(ActiveTexture) &&
 	       GLFN(TexImage2D) && GLFN(TexSubImage2D) && GLFN(TexParameteri) && GLFN(Viewport) && GLFN(Scissor) && GLFN(Enable) &&
 	       GLFN(Disable) && GLFN(ClearColor) && GLFN(ClearDepthf) && GLFN(Clear) && GLFN(DepthFunc) && GLFN(DepthMask) &&
-	       GLFN(BlendFunc) && GLFN(BlendFuncSeparate) && GLFN(BlendColor) && GLFN(PolygonOffset) && GLFN(StencilFunc) && GLFN(StencilOp) && GLFN(ColorMask) && GLFN(ClearStencil) && GLFN(GetString) && GLFN(ReadPixels) && GLFN(PixelStorei) && GLFN(CreateShader) &&
+	       GLFN(BlendFunc) && GLFN(BlendFuncSeparate) && GLFN(BlendColor) && GLFN(PolygonOffset) && GLFN(StencilFunc) && GLFN(StencilOp) && GLFN(ColorMask) && GLFN(ClearStencil) && GLFN(GetString) && GLFN(GetIntegerv) && GLFN(ReadPixels) && GLFN(PixelStorei) && GLFN(CreateShader) &&
 	       GLFN(ShaderSource) && GLFN(CompileShader) && GLFN(GetShaderiv) && GLFN(GetShaderInfoLog) && GLFN(DeleteShader) &&
 	       GLFN(CreateProgram) && GLFN(AttachShader) && GLFN(LinkProgram) && GLFN(GetProgramiv) && GLFN(GetProgramInfoLog) &&
 	       GLFN(UseProgram) && GLFN(DeleteProgram) && GLFN(GetUniformLocation) && GLFN(Uniform1i) && GLFN(Uniform1f) &&
@@ -1781,6 +1782,13 @@ struct Glr* glrCreate(struct N64* n) {
 	gl->BindRenderbuffer(GL_RENDERBUFFER, g->depth);
 	const char* scale = n->settings ? n->settings("N64_GL_SCALE") : getenv("N64_GL_SCALE");
 	g->scale = scale && *scale >= '1' && *scale <= '8' ? *scale - '0' : 1;
+	// No larger than the GPU's images can be.
+	GLint maxTexture = 0, maxRenderbuffer = 0;
+	gl->GetIntegerv(GL_MAX_TEXTURE_SIZE, &maxTexture);
+	gl->GetIntegerv(GL_MAX_RENDERBUFFER_SIZE, &maxRenderbuffer);
+	while (g->scale > 1 && (1024 * g->scale > maxTexture || 1024 * g->scale > maxRenderbuffer)) {
+		--g->scale;
+	}
 	n->glrScale = g->scale;
 	gl->RenderbufferStorage(GL_RENDERBUFFER, GL_DEPTH24_STENCIL8, 1024 * g->scale, TARGET_ROWS * g->scale);
 	if (g->scale > 1) {
