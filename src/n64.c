@@ -157,15 +157,17 @@ static void start(struct N64* n) {
 	pifBoot(n);
 	n->eeprom16k = n->rom ? cartEeprom16k(n->rom) : false;
 	memset(n->eeprom, 0xFF, sizeof(n->eeprom));
-	// 1, 1.5, 2, 2.5, 3 or 4 times the CPU's clock; LLE is always the hardware's.
+	// 1, 1.5, 2, 2.5, 3 or 4 times the CPU's clock, once the boot is done.
 	const char* overclock = setting(n, "N64_OVERCLOCK");
-	double factor = overclock && n->accuracy != ACCURACY_LLE ? strtod(overclock, NULL) : 1;
-	n->ocDen = 2;
-	n->ocNum = factor >= 1 && factor <= 4 ? (uint32_t) (factor * 2 + 0.5) : 2;
-	if (n->ocNum % 2 == 0) {
-		n->ocNum /= 2, n->ocDen = 1;
+	double factor = overclock ? strtod(overclock, NULL) : 1;
+	n->ocWantDen = 2;
+	n->ocWantNum = factor >= 1 && factor <= 4 ? (uint32_t) (factor * 2 + 0.5) : 2;
+	if (n->ocWantNum % 2 == 0) {
+		n->ocWantNum /= 2, n->ocWantDen = 1;
 	}
-	n->countCycles = 2 * n->ocNum / n->ocDen;
+	n->ocNum = n->ocDen = 1;
+	n->ocAt = n->ocHwAt = 0;
+	n->countCycles = 2;
 	n->fieldCycles = hwCycles(n, CPU_HZ / (n->cpu.gpr[20] == 0 ? 50 : 60));
 	n->vi.reg[6] = n->cpu.gpr[20] == 0 ? 0x271 : 0x20D;
 	n->nextVi = n->fieldCycles;
@@ -275,7 +277,34 @@ static uint64_t viIntrAt(struct N64* n, uint64_t start) {
 // With a slice, the CPU runs ahead of the RSP by up to that many cycles (or to the next event),
 // and the RSP catches up then or when the CPU touches what it shares with it. Without one, the
 // two step in lockstep.
+// The overclock starts: the times that keep real time move out by the new clock. It waits for the
+// game's first SI DMA, past libultra's osContInit, which waits for half a second from power-on
+// with a timer that an older libultra's other timers keep putting off (Conker, Tetris 64).
+static void overclock(struct N64* n) {
+	uint64_t const now = n->cycles, num = (uint64_t) n->ocWantNum * n->ocDen, den = (uint64_t) n->ocWantDen * n->ocNum;
+	uint32_t const count = cpuCount(n);
+	bool const pal = n->fieldCycles == hwCycles(n, CPU_HZ / 50);
+	uint64_t* const later[] = { &n->nextVi, &n->ai.endsAt, &n->dd.mechaAt, &n->dd.bmAt };
+	for (size_t i = 0; i < sizeof(later) / sizeof(later[0]); ++i) {
+		if (*later[i] > now) {
+			*later[i] = now + (*later[i] - now) * num / den;
+		}
+	}
+	if (n->ai.queued) {
+		n->ai.startedAt = now - (now - n->ai.startedAt) * num / den;
+	}
+	n->ocHwAt = hwNow(n), n->ocAt = now;
+	n->ocNum = n->ocWantNum, n->ocDen = n->ocWantDen;
+	n->countCycles = 2 * n->ocNum / n->ocDen;
+	n->cpu.countBase = now - n->countCycles * (uint64_t) count;
+	n->fieldCycles = hwCycles(n, CPU_HZ / (pal ? 50 : 60));
+	blocksFree(n);
+}
+
 void n64RunField(struct N64* n) {
+	if (n->stats.siDmas && (n->ocNum != n->ocWantNum || n->ocDen != n->ocWantDen)) {
+		overclock(n);
+	}
 	uint64_t start = n->nextVi - n->fieldCycles, passed = start;
 	while (n->cycles < n->nextVi) {
 		uint64_t intrAt = viIntrAt(n, start);

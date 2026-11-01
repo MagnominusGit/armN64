@@ -416,10 +416,13 @@ struct N64 {
 	int lastWidth, lastHeight;
 	// CPU cycles per video field: 60 fields a second for NTSC and MPAL, 50 for PAL.
 	uint64_t fieldCycles;
-	// Overclocking (N64_OVERCLOCK, MLE and HLE): the CPU, RSP and RDP run ocNum / ocDen times the
-	// hardware's clock, so the VI, AI, PI, SI, 64DD and Count, which keep real time, take that many
-	// more cycles; countCycles cycles a Count tick (2 at the hardware's clock).
-	uint32_t ocNum, ocDen, countCycles;
+	// Overclocking (N64_OVERCLOCK): the CPU and the RCP (RSP, RDP, PI, SI) run ocNum / ocDen times
+	// the hardware's clock, so the VI, AI, 64DD and Count, which keep real time, take that many more
+	// cycles; countCycles cycles a Count tick (2 at the hardware's clock). The boot runs at the
+	// hardware's clock and ocWantNum / ocWantDen start with the first SI DMA (n64.c); the clock
+	// was hardware cycles ocHwAt at cycle ocAt.
+	uint32_t ocNum, ocDen, countCycles, ocWantNum, ocWantDen;
+	uint64_t ocAt, ocHwAt;
 	uint64_t fields;
 	// Where the settings (N64_ACCURACY and the others) come from when the machine starts: the
 	// environment unless a frontend gives its own lookup.
@@ -721,6 +724,11 @@ uint32_t pifDmaCycles(struct N64*, bool write);
 // A real time in the hardware's cycles (93.75 MHz) in the CPU's, which overclocking makes more of.
 static inline uint64_t hwCycles(const struct N64* n, uint64_t cycles) {
 	return cycles * n->ocNum / n->ocDen;
+}
+
+// The time since power-on in the hardware's cycles.
+static inline uint64_t hwNow(const struct N64* n) {
+	return n->ocHwAt + (n->cycles - n->ocAt) * n->ocDen / n->ocNum;
 }
 
 // The RSP's clock now: two thirds of the CPU's.

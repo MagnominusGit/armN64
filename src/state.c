@@ -93,6 +93,7 @@ bool n64StateLoad(struct N64* n, const void* data, size_t size, bool quick) {
 	n->rdram = was->rdram, n->hidden = was->hidden, n->rom = was->rom, n->romSize = was->romSize;
 	n->rdp = was->rdp, n->hle = was->hle, n->hleAudio = was->hleAudio, n->isViewer = was->isViewer;
 	n->hleCheck = was->hleCheck, n->gfxRsp = was->gfxRsp, n->slice = was->slice, n->accuracy = was->accuracy, n->compat = was->compat, n->emulatorLike = was->emulatorLike, n->rspPlainTiming = was->rspPlainTiming, n->fast = was->fast;
+	n->ocWantNum = was->ocWantNum, n->ocWantDen = was->ocWantDen;
 	memcpy(n->blockPage, was->blockPage, sizeof(n->blockPage));
 	memcpy(n->codeWords, was->codeWords, sizeof(n->codeWords));
 	// The GL renderer kept, its pages stay flagged for giving back what it drew.

@@ -105,7 +105,7 @@ static struct retro_core_option_v2_definition optionDefinitions[] = {
 	  "Fast: built-in microcodes, loose timing. Balanced: each game's own microcode. Accurate: cycle for cycle. Applies on Restart.",
 	  NULL, "system", { { "hle", "Fast (HLE)" }, { "mle", "Balanced (MLE)" }, { "lle", "Accurate (LLE)" }, { NULL, NULL } }, "hle" },
 	{ "armn64_overclock", "Overclock", NULL,
-	  "A faster CPU, RSP and RDP for less slowdown; some games need the real speed. Applies on Restart.",
+	  "A faster CPU, RSP and RDP for less slowdown and shorter loading; the boot keeps the real speed. Applies on Restart.",
 	  NULL, "system", { { "1", "Off" }, { "1.5", "1.5x" }, { "2", "2x" }, { "2.5", "2.5x" }, { "3", "3x" }, { "4", "4x" }, { NULL, NULL } }, "1" },
 	{ "armn64_renderer", "Renderer", NULL,
 	  "GL is fastest and can draw sharper, but isn't exact; GPU and CPU are. Auto picks by Accuracy. Applies on Restart.",
@@ -197,7 +197,7 @@ static const char* renderer(void) {
 
 static const char* overclock(void) {
 	const char* value = optionValue(environment, "armn64_overclock");
-	return value && strcmp(accuracy(), "lle") ? value : "1";
+	return value ? value : "1";
 }
 
 // Hides the options that do nothing with the others' values. The frontend calls it when an option
@@ -209,7 +209,6 @@ static bool showOptions(void) {
 		const char* key;
 		bool shown;
 	} const options[] = {
-		{ "armn64_overclock", strcmp(accuracy(), "lle") != 0 },
 		{ "armn64_resolution", gl },
 		{ "armn64_vi_filters", !gl },
 		{ "armn64_gfx_rsp", hle },
