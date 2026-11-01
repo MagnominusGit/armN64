@@ -71,6 +71,13 @@ static const uint8_t ditherMatrix[2][16] = {
 };
 
 // Whether the pixels take noise: from the combiner, a noise dither or the alpha test's dither.
+// Whether a pixel depends on the one drawn before it: the first cycle's COMBINED is that pixel's
+// result, and in two cycles the first's own result counts only through the second's COMBINED or
+// the alpha compare (New Tetris's first cycle only passes it on).
+static bool readsLastPixel(const struct RDP* r) {
+	return r->stage[r->cycleType == 1 ? 0 : 1].readsCombined && (r->cycleType != 1 || r->stage[1].readsCombined || r->alphaCompare);
+}
+
 static bool usesNoise(const struct RDP* r) {
 	uint64_t m = r->otherModes;
 	return r->stage[r->cycleType == 1 ? 0 : 1].noise || (r->cycleType == 1 && r->stage[1].noise) || ((m >> 38) & 3) == 2 || ((m >> 36) & 3) == 2 ||
@@ -2224,8 +2231,7 @@ static void submit(struct N64* n, struct RDP* r, const uint64_t* w, int op, int 
 			}
 		}
 		bool shades = !(op == 0x36 && r->cycleType == 3) && !((op == 0x24 || op == 0x25) && r->cycleType == 2);
-		const struct Stage* first = &r->stage[r->cycleType == 1 ? 0 : 1];
-		if (shades && (first->readsCombined || usesNoise(r))) {
+		if (shades && (readsLastPixel(r) || usesNoise(r))) {
 			header |= ENTRY_ALONE;
 		}
 	}
@@ -3160,12 +3166,11 @@ static void gpuCommand(struct N64* n, struct RDP* r, const uint64_t* w, int op) 
 	uint32_t zLen = (uint32_t) (y1 - y0) * r->colorWidth * 2 + right * 2;
 	bool overlap = depth && z < color + colorLen && color < z + zLen;
 	bool shades = !(op == 0x36 && r->cycleType == 3) && !((op == 0x24 || op == 0x25) && r->cycleType == 2);
-	const struct Stage* firstStage = &r->stage[r->cycleType == 1 ? 0 : 1];
 	// A rectangle running past the image's width by less than a row the GPU draws, the pixels past it
 	// on the next row (Puyo Puyo, Tarzan, Virtual Pool's copies to x = width).
 	bool wraps = right > r->colorWidth;
 	bool wrapOnce = wraps && (op == 0x24 || op == 0x25 || op == 0x36) && right <= 2 * r->colorWidth && y1 + 1 < GPU_TILES * 16;
-	bool alone = (wraps && !wrapOnce) || overlap || (shades && firstStage->readsCombined);
+	bool alone = (wraps && !wrapOnce) || overlap || (shades && readsLastPixel(r));
 	if (alone || y1 >= GPU_TILES * 16) {
 		gpuSync(n, r);
 		// execute counts the primitive itself (its noise from the same number as on the CPU).
