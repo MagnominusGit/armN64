@@ -90,84 +90,85 @@ static unsigned devices[4] = { RETRO_DEVICE_JOYPAD, RETRO_DEVICE_JOYPAD, RETRO_D
 static bool rumbling[4];
 
 static struct retro_core_option_v2_category optionCategories[] = {
-	{ "system", "System", "How the game is emulated." },
-	{ "input", "Input", "What is in each controller's slot." },
+	{ "system", "System", "How exactly the console is emulated, and how fast it runs." },
+	{ "video", "Video", "How the picture is drawn and shown." },
+	{ "input", "Input", "The stick and rumble." },
+	{ "paks", "Controller Paks", "What is in each controller's slot, and the Controller Pak Manager." },
+	{ "advanced", "Advanced", "Settings for particular games and devices." },
 	{ NULL, NULL, NULL },
 };
 
+// Keys and values match saved configurations; labels are what the menu shows. showOptions hides
+// the options that do nothing with the others' values.
 static struct retro_core_option_v2_definition optionDefinitions[] = {
-	{ "armn64_rumble", "Rumble", NULL, "A Rumble Pak's motor shakes the controller (the player's pak set to Rumble Pak).",
+	{ "armn64_accuracy", "Accuracy", NULL,
+	  "Fast: built-in microcodes, loose timing. Balanced: each game's own microcode. Accurate: cycle for cycle. Applies on Restart.",
+	  NULL, "system", { { "hle", "Fast (HLE)" }, { "mle", "Balanced (MLE)" }, { "lle", "Accurate (LLE)" }, { NULL, NULL } }, "hle" },
+	{ "armn64_overclock", "Overclock", NULL,
+	  "A faster CPU, RSP and RDP for less slowdown; some games need the real speed. Applies on Restart.",
+	  NULL, "system", { { "1", "Off" }, { "1.5", "1.5x" }, { "2", "2x" }, { "2.5", "2.5x" }, { "3", "3x" }, { "4", "4x" }, { NULL, NULL } }, "1" },
+	{ "armn64_renderer", "Renderer", NULL,
+	  "GL is fastest and can draw sharper, but isn't exact; GPU and CPU are. Auto picks by Accuracy. Applies on Restart.",
+	  NULL, "video", { { "auto", "Auto" }, { "gl", "GL (Fast)" }, { "gpu", "GPU (Exact)" }, { "cpu", "CPU (Exact)" }, { NULL, NULL } }, "auto" },
+	{ "armn64_resolution", "Resolution", NULL,
+	  "The GL renderer's resolution; Auto fits the display. Applies on Restart.",
+	  NULL, "video", { { "auto", "Auto" }, { "1", "Native" }, { "2", "2x" }, { "3", "3x" }, { "4", "4x" }, { "5", "5x" }, { "6", "6x" }, { "7", "7x" }, { "8", "8x" }, { NULL, NULL } }, "auto" },
+	{ "armn64_aspect", "Aspect Ratio", NULL,
+	  "Fill 4:3 stretches the picture; TV 4:3 keeps a TV's borders; Square Pixels shows each pixel square.",
+	  NULL, "video", { { "fill", "Fill 4:3" }, { "tv", "TV 4:3" }, { "square", "Square Pixels" }, { NULL, NULL } }, "fill" },
+	{ "armn64_crop_overscan", "Crop Overscan", NULL,
+	  "Hides the picture's edges as a TV's frame did, with the black lines many games leave there.",
+	  NULL, "video", { { "enabled", "On" }, { "disabled", "Off" }, { NULL, NULL } }, "enabled" },
+	{ "armn64_vi_filters", "TV Filters", NULL,
+	  "The console's antialiasing and dither filters, as a TV showed them. Auto: on with Balanced and Accurate.",
+	  NULL, "video", { { "auto", "Auto" }, { "on", "On" }, { "off", "Off" }, { NULL, NULL } }, "auto" },
+	{ "armn64_frameskip", "Frame Skip", NULL, "Doesn't draw the frames a game makes but never shows. Applies on Restart.",
+	  NULL, "video", { { "disabled", "Off" }, { "enabled", "On" }, { NULL, NULL } }, "disabled" },
+	{ "armn64_rumble", "Controller Rumble", NULL, "Shakes your controller when a player's Rumble Pak would.",
 	  NULL, "input", { { "disabled", "Off" }, { "enabled", "On" }, { NULL, NULL } }, "disabled" },
 	{ "armn64_stick_gate", "Octagonal Stick Gate", NULL,
-	  "Shapes the stick's range like the N64 controller's octagonal gate: full right reaches 85, and the diagonals the gate's corners (69, 69) instead of a circle's.",
+	  "Shapes the stick's range like the N64 controller's octagonal gate instead of a circle.",
 	  NULL, "input", { { "disabled", "Off" }, { "enabled", "On" }, { NULL, NULL } }, "disabled" },
-	{ "armn64_preset", "Preset (Restart)", NULL,
-	  "Speed: HLE with the GL renderer. Balanced: MLE with the exact RDP on the GPU. Accurate: LLE with the exact RDP on the CPU. Overclocked: Balanced at twice the CPU, RSP and RDP clocks. "
-	  "Custom uses the Graphics, Renderer and Overclock options below.",
-	  NULL, "system", { { "speed", "Speed" }, { "balanced", "Balanced" }, { "accurate", "Accurate" }, { "overclocked", "Overclocked" }, { "custom", "Custom" }, { NULL, NULL } }, "speed" },
-	{ "armn64_accuracy", "Graphics (Restart)", NULL,
-	  "With the Custom preset. HLE puts speed first: the library microcodes (Fast3D, F3DEX and the like) run in C and the rest on the RSP, with the timing kept loosely. "
-	  "MLE and LLE run every microcode on the RSP: LLE is the hardware cycle for cycle, MLE the middle ground that also runs hacks made on other emulators.",
-	  NULL, "system", { { "hle", "HLE" }, { "mle", "MLE" }, { "lle", "LLE" }, { NULL, NULL } }, "hle" },
-	{ "armn64_rdp_threads", "Renderer Threads (Restart)", NULL,
-	  "With the CPU renderer, threads beside the emulation that draw the RDP's pictures (the GPU renderer has one feed the GPU, the GL renderer none). Auto takes the cores there are, up to 3.",
-	  NULL, "system", { { "auto", "Auto" }, { "0", "None" }, { "1", "1" }, { "2", "2" }, { "3", "3" }, { NULL, NULL } }, "auto" },
-	{ "armn64_rsp_thread", "RSP Thread (Restart)", NULL,
-	  "Runs the RSP on a thread of its own beside the CPU: faster for the games whose microcode HLE leaves to the RSP (Rogue Squadron, Indiana Jones), at the cost of a core. HLE only.",
-	  NULL, "system", { { "disabled", "Off" }, { "enabled", "On" }, { NULL, NULL } }, "disabled" },
-	{ "armn64_gfx_rsp", "HLE Graphics Microcode (Restart)", NULL,
-	  "Library runs the library microcodes (Fast3D, F3DEX and the like) in C, the fastest. RSP runs them on the RSP as MLE does: slower, for when a library "
-	  "microcode's C version gets something wrong. Other microcodes always run on the RSP. HLE only.",
-	  NULL, "system", { { "library", "Library" }, { "rsp", "RSP" }, { NULL, NULL } }, "library" },
-	{ "armn64_renderer", "Renderer (Restart)", NULL,
-	  "With the Custom preset. GL draws the RDP's triangles with OpenGL ES 3.1, also at higher resolutions: the fastest, close to the hardware but not exact. "
-	  "GPU runs the exact RDP in OpenGL ES 3.1 compute shaders, CPU the same on the renderer threads.",
-	  NULL, "system", { { "gl", "GL" }, { "gpu", "GPU (Exact)" }, { "cpu", "CPU (Exact)" }, { NULL, NULL } }, "gl" },
-	{ "armn64_overclock", "Overclock (Restart)", NULL,
-	  "With the Custom preset. Runs the CPU, RSP and RDP faster than the hardware while video, audio and the game's timers keep real time: less slowdown, and room for ROM hacks made on emulators. Some games depend on the hardware's timing. MLE and HLE only.",
-	  NULL, "system", { { "1", "Off" }, { "1.5", "1.5x" }, { "2", "2x" }, { "2.5", "2.5x" }, { "3", "3x" }, { "4", "4x" }, { NULL, NULL } }, "1" },
-	{ "armn64_resolution", "Resolution (Restart)", NULL,
-	  "The GL renderer draws at this many times the game's resolution: sharper edges and textures, at a GPU cost. Auto fits the display (2x on a 640x480 screen, 4x at 1080p). "
-	  "What the game reads back from its framebuffer stays at its own resolution.",
-	  NULL, "system", { { "auto", "Auto" }, { "1", "Native" }, { "2", "2x" }, { "3", "3x" }, { "4", "4x" }, { "5", "5x" }, { "6", "6x" }, { "7", "7x" }, { "8", "8x" }, { NULL, NULL } }, "auto" },
-	{ "armn64_vi_filters", "VI Filters", NULL,
-	  "The video interface's antialiasing, divot and dither filters, which soften edges and smooth 16-bit colour as a TV showed it. Auto turns them on for MLE and LLE and off for HLE, where they cost speed. The GL renderer's pictures don't use them.",
-	  NULL, "system", { { "auto", "Auto" }, { "on", "On" }, { "off", "Off" }, { NULL, NULL } }, "auto" },
-	{ "armn64_aspect", "Aspect Ratio", NULL,
-	  "Fill 4:3 stretches the game's window to 4:3. TV 4:3 shows the picture as a TV did: the whole screen is 4:3 and the game's window keeps its shape in it. Square Pixels shows each pixel square.",
-	  NULL, "system", { { "fill", "Fill 4:3" }, { "tv", "TV 4:3" }, { "square", "Square Pixels" }, { NULL, NULL } }, "fill" },
-	{ "armn64_crop_overscan", "Crop Overscan", NULL,
-	  "Hides a thirtieth of the picture at each edge, as a TV's frame did: the black lines many games leave there (Super Mario 64's at the top and bottom).",
-	  NULL, "system", { { "enabled", "On" }, { "disabled", "Off" }, { NULL, NULL } }, "enabled" },
-	{ "armn64_frameskip", "Frame Skip (Restart)", NULL, "Leaves out the drawing of frames that are never shown, as many games make more than the screen can show.",
-	  NULL, "system", { { "disabled", "Off" }, { "enabled", "On" }, { NULL, NULL } }, "disabled" },
-	{ "armn64_pak1", "Player 1 Pak (Restart)", NULL, "What is in controller 1's slot: a Controller Pak for saves, a Rumble Pak, or a Transfer Pak with the Game Boy ROM in system/armN64/TransferPak1 (its .sav beside it).",
-	  NULL, "input", { { "memory", "Controller Pak" }, { "rumble", "Rumble Pak" }, { "transfer", "Transfer Pak" }, { "none", "None" }, { NULL, NULL } }, "memory" },
-	{ "armn64_pak2", "Player 2 Pak (Restart)", NULL, "What is in controller 2's slot: a Controller Pak for saves, a Rumble Pak, or a Transfer Pak with the Game Boy ROM in system/armN64/TransferPak2 (its .sav beside it).",
-	  NULL, "input", { { "memory", "Controller Pak" }, { "rumble", "Rumble Pak" }, { "transfer", "Transfer Pak" }, { "none", "None" }, { NULL, NULL } }, "memory" },
-	{ "armn64_pak3", "Player 3 Pak (Restart)", NULL, "What is in controller 3's slot: a Controller Pak for saves, a Rumble Pak, or a Transfer Pak with the Game Boy ROM in system/armN64/TransferPak3 (its .sav beside it).",
-	  NULL, "input", { { "memory", "Controller Pak" }, { "rumble", "Rumble Pak" }, { "transfer", "Transfer Pak" }, { "none", "None" }, { NULL, NULL } }, "memory" },
-	{ "armn64_pak4", "Player 4 Pak (Restart)", NULL, "What is in controller 4's slot: a Controller Pak for saves, a Rumble Pak, or a Transfer Pak with the Game Boy ROM in system/armN64/TransferPak4 (its .sav beside it).",
-	  NULL, "input", { { "memory", "Controller Pak" }, { "rumble", "Rumble Pak" }, { "transfer", "Transfer Pak" }, { "none", "None" }, { NULL, NULL } }, "memory" },
-	{ "armn64_pak1_card", "Player 1 Controller Pak Card", NULL,
-	  "Which Controller Pak is in controller 1's slot: the game's own (kept in its save file) or a shared card (saves/armN64/ControllerPak/Card N.mpk, the same in every game, like a real pak).",
-	  NULL, "input", { { "game", "The Game's Own" }, { "1", "Shared Card 1" }, { "2", "Shared Card 2" }, { "3", "Shared Card 3" }, { "4", "Shared Card 4" },
-	                   { "5", "Shared Card 5" }, { "6", "Shared Card 6" }, { "7", "Shared Card 7" }, { "8", "Shared Card 8" }, { NULL, NULL } }, "game" },
-	{ "armn64_pak2_card", "Player 2 Controller Pak Card", NULL,
-	  "Which Controller Pak is in controller 2's slot: the game's own (kept in its save file) or a shared card (saves/armN64/ControllerPak/Card N.mpk, the same in every game, like a real pak).",
-	  NULL, "input", { { "game", "The Game's Own" }, { "1", "Shared Card 1" }, { "2", "Shared Card 2" }, { "3", "Shared Card 3" }, { "4", "Shared Card 4" },
-	                   { "5", "Shared Card 5" }, { "6", "Shared Card 6" }, { "7", "Shared Card 7" }, { "8", "Shared Card 8" }, { NULL, NULL } }, "game" },
-	{ "armn64_pak3_card", "Player 3 Controller Pak Card", NULL,
-	  "Which Controller Pak is in controller 3's slot: the game's own (kept in its save file) or a shared card (saves/armN64/ControllerPak/Card N.mpk, the same in every game, like a real pak).",
-	  NULL, "input", { { "game", "The Game's Own" }, { "1", "Shared Card 1" }, { "2", "Shared Card 2" }, { "3", "Shared Card 3" }, { "4", "Shared Card 4" },
-	                   { "5", "Shared Card 5" }, { "6", "Shared Card 6" }, { "7", "Shared Card 7" }, { "8", "Shared Card 8" }, { NULL, NULL } }, "game" },
-	{ "armn64_pak4_card", "Player 4 Controller Pak Card", NULL,
-	  "Which Controller Pak is in controller 4's slot: the game's own (kept in its save file) or a shared card (saves/armN64/ControllerPak/Card N.mpk, the same in every game, like a real pak).",
-	  NULL, "input", { { "game", "The Game's Own" }, { "1", "Shared Card 1" }, { "2", "Shared Card 2" }, { "3", "Shared Card 3" }, { "4", "Shared Card 4" },
-	                   { "5", "Shared Card 5" }, { "6", "Shared Card 6" }, { "7", "Shared Card 7" }, { "8", "Shared Card 8" }, { NULL, NULL } }, "game" },
+	{ "armn64_pak1", "Player 1 Pak", NULL,
+	  "What is in controller 1's slot. Transfer Pak (on Restart): the Game Boy ROM in system/armN64/TransferPak1.",
+	  NULL, "paks", { { "memory", "Controller Pak" }, { "rumble", "Rumble Pak" }, { "transfer", "Transfer Pak" }, { "none", "None" }, { NULL, NULL } }, "memory" },
+	{ "armn64_pak2", "Player 2 Pak", NULL,
+	  "What is in controller 2's slot. Transfer Pak (on Restart): the Game Boy ROM in system/armN64/TransferPak2.",
+	  NULL, "paks", { { "memory", "Controller Pak" }, { "rumble", "Rumble Pak" }, { "transfer", "Transfer Pak" }, { "none", "None" }, { NULL, NULL } }, "memory" },
+	{ "armn64_pak3", "Player 3 Pak", NULL,
+	  "What is in controller 3's slot. Transfer Pak (on Restart): the Game Boy ROM in system/armN64/TransferPak3.",
+	  NULL, "paks", { { "memory", "Controller Pak" }, { "rumble", "Rumble Pak" }, { "transfer", "Transfer Pak" }, { "none", "None" }, { NULL, NULL } }, "memory" },
+	{ "armn64_pak4", "Player 4 Pak", NULL,
+	  "What is in controller 4's slot. Transfer Pak (on Restart): the Game Boy ROM in system/armN64/TransferPak4.",
+	  NULL, "paks", { { "memory", "Controller Pak" }, { "rumble", "Rumble Pak" }, { "transfer", "Transfer Pak" }, { "none", "None" }, { NULL, NULL } }, "memory" },
+	{ "armn64_pak1_card", "Player 1 Controller Pak", NULL,
+	  "This Game's saves notes with the game; a Shared Pak is the same in every game, like a real one.",
+	  NULL, "paks", { { "game", "This Game's" }, { "1", "Shared Pak 1" }, { "2", "Shared Pak 2" }, { "3", "Shared Pak 3" }, { "4", "Shared Pak 4" },
+	                  { "5", "Shared Pak 5" }, { "6", "Shared Pak 6" }, { "7", "Shared Pak 7" }, { "8", "Shared Pak 8" }, { NULL, NULL } }, "game" },
+	{ "armn64_pak2_card", "Player 2 Controller Pak", NULL,
+	  "This Game's saves notes with the game; a Shared Pak is the same in every game, like a real one.",
+	  NULL, "paks", { { "game", "This Game's" }, { "1", "Shared Pak 1" }, { "2", "Shared Pak 2" }, { "3", "Shared Pak 3" }, { "4", "Shared Pak 4" },
+	                  { "5", "Shared Pak 5" }, { "6", "Shared Pak 6" }, { "7", "Shared Pak 7" }, { "8", "Shared Pak 8" }, { NULL, NULL } }, "game" },
+	{ "armn64_pak3_card", "Player 3 Controller Pak", NULL,
+	  "This Game's saves notes with the game; a Shared Pak is the same in every game, like a real one.",
+	  NULL, "paks", { { "game", "This Game's" }, { "1", "Shared Pak 1" }, { "2", "Shared Pak 2" }, { "3", "Shared Pak 3" }, { "4", "Shared Pak 4" },
+	                  { "5", "Shared Pak 5" }, { "6", "Shared Pak 6" }, { "7", "Shared Pak 7" }, { "8", "Shared Pak 8" }, { NULL, NULL } }, "game" },
+	{ "armn64_pak4_card", "Player 4 Controller Pak", NULL,
+	  "This Game's saves notes with the game; a Shared Pak is the same in every game, like a real one.",
+	  NULL, "paks", { { "game", "This Game's" }, { "1", "Shared Pak 1" }, { "2", "Shared Pak 2" }, { "3", "Shared Pak 3" }, { "4", "Shared Pak 4" },
+	                  { "5", "Shared Pak 5" }, { "6", "Shared Pak 6" }, { "7", "Shared Pak 7" }, { "8", "Shared Pak 8" }, { NULL, NULL } }, "game" },
 	{ "armn64_pak_manager", "Controller Pak Manager", NULL,
-	  "Open pauses the game and shows the notes on the Controller Paks: copy them between paks, delete, export and import them (saves/armN64/ControllerPak/notes), format a pak. B closes it.",
-	  NULL, "input", { { "closed", "Closed" }, { "open", "Open" }, { NULL, NULL } }, "closed" },
+	  "Open pauses the game to copy, delete, export, import and format the paks' notes. B closes it.",
+	  NULL, "paks", { { "closed", "Closed" }, { "open", "Open" }, { NULL, NULL } }, "closed" },
+	{ "armn64_gfx_rsp", "Graphics Microcode", NULL,
+	  "With Fast. Game's Own runs the real microcode on the RSP: slower, for a game drawn wrong. Applies on Restart.",
+	  NULL, "advanced", { { "library", "Built In (Fast)" }, { "rsp", "Game's Own" }, { NULL, NULL } }, "library" },
+	{ "armn64_rsp_thread", "Threaded RSP", NULL,
+	  "With Fast. A core of its own for the RSP: faster for games like Rogue Squadron. Applies on Restart.",
+	  NULL, "advanced", { { "disabled", "Off" }, { "enabled", "On" }, { NULL, NULL } }, "disabled" },
+	{ "armn64_rdp_threads", "Renderer Threads", NULL,
+	  "With the CPU renderer. Cores drawing beside the emulation; Auto takes up to 3. Applies on Restart.",
+	  NULL, "advanced", { { "auto", "Auto" }, { "0", "None" }, { "1", "1" }, { "2", "2" }, { "3", "3" }, { NULL, NULL } }, "auto" },
 	{ NULL, NULL, NULL, NULL, NULL, NULL, { { NULL, NULL } }, NULL },
 };
 
@@ -179,31 +180,57 @@ static void logMessage(enum retro_log_level level, const char* message) {
 	}
 }
 
-// What the preset picks, or with Custom the options themselves.
-static const char* preset(void) {
-	const char* value = optionValue(environment, "armn64_preset");
-	return value ? value : "speed";
-}
-
 static const char* accuracy(void) {
-	const char* p = preset();
-	const char* custom = optionValue(environment, "armn64_accuracy");
-	return !strcmp(p, "speed")                                    ? "hle"
-	       : !strcmp(p, "balanced") || !strcmp(p, "overclocked") ? "mle"
-	       : !strcmp(p, "accurate")                               ? "lle"
-	       : custom                                               ? custom
-	                                                              : "hle";
+	const char* value = optionValue(environment, "armn64_accuracy");
+	return value && (!strcmp(value, "mle") || !strcmp(value, "lle")) ? value : "hle";
 }
 
+// The renderer the option picks, with Auto the one for the accuracy.
 static const char* renderer(void) {
-	const char* p = preset();
-	const char* custom = optionValue(environment, "armn64_renderer");
-	return !strcmp(p, "speed") ? "gl" : !strcmp(p, "accurate") ? "cpu" : strcmp(p, "custom") ? "gpu" : custom ? custom : "gl";
+	const char* value = optionValue(environment, "armn64_renderer");
+	if (value && (!strcmp(value, "gl") || !strcmp(value, "gpu") || !strcmp(value, "cpu"))) {
+		return value;
+	}
+	const char* a = accuracy();
+	return !strcmp(a, "hle") ? "gl" : !strcmp(a, "mle") ? "gpu" : "cpu";
 }
 
 static const char* overclock(void) {
-	const char* p = preset();
-	return !strcmp(p, "overclocked") ? "2" : !strcmp(p, "custom") ? optionValue(environment, "armn64_overclock") : "1";
+	const char* value = optionValue(environment, "armn64_overclock");
+	return value && strcmp(accuracy(), "lle") ? value : "1";
+}
+
+// Hides the options that do nothing with the others' values. The frontend calls it when an option
+// changes; returns whether that changed which are shown.
+static bool showOptions(void) {
+	static bool shownSet, shown[16];
+	bool const hle = !strcmp(accuracy(), "hle"), gl = !strcmp(renderer(), "gl");
+	struct {
+		const char* key;
+		bool shown;
+	} const options[] = {
+		{ "armn64_overclock", strcmp(accuracy(), "lle") != 0 },
+		{ "armn64_resolution", gl },
+		{ "armn64_vi_filters", !gl },
+		{ "armn64_gfx_rsp", hle },
+		{ "armn64_rsp_thread", hle },
+		{ "armn64_rdp_threads", !strcmp(renderer(), "cpu") },
+		{ "armn64_pak1_card", optionIs(environment, "armn64_pak1", "memory") || !optionValue(environment, "armn64_pak1") },
+		{ "armn64_pak2_card", optionIs(environment, "armn64_pak2", "memory") || !optionValue(environment, "armn64_pak2") },
+		{ "armn64_pak3_card", optionIs(environment, "armn64_pak3", "memory") || !optionValue(environment, "armn64_pak3") },
+		{ "armn64_pak4_card", optionIs(environment, "armn64_pak4", "memory") || !optionValue(environment, "armn64_pak4") },
+	};
+	bool changed = false;
+	for (size_t i = 0; i < sizeof(options) / sizeof(options[0]); ++i) {
+		if (!shownSet || shown[i] != options[i].shown) {
+			shown[i] = options[i].shown;
+			struct retro_core_option_display display = { options[i].key, options[i].shown };
+			environment(RETRO_ENVIRONMENT_SET_CORE_OPTIONS_DISPLAY, &display);
+			changed = true;
+		}
+	}
+	shownSet = true;
+	return changed;
 }
 
 // The GL renderer's scale: the option's, or with Auto the most times a 320x240 picture fits the
@@ -310,7 +337,11 @@ void retro_set_environment(retro_environment_t callback) {
 	if (callback(RETRO_ENVIRONMENT_GET_LOG_INTERFACE, &logging)) {
 		logPrintf = logging.log;
 	}
-	optionsGive(callback, &coreOptions);
+	if (optionsGive(callback, &coreOptions)) {
+		struct retro_core_options_update_display_callback display = { showOptions };
+		callback(RETRO_ENVIRONMENT_SET_CORE_OPTIONS_UPDATE_DISPLAY_CALLBACK, &display);
+		showOptions();
+	}
 }
 
 void retro_set_video_refresh(retro_video_refresh_t callback) {
@@ -715,6 +746,7 @@ bool retro_load_game(const struct retro_game_info* info) {
 	}
 	// The GPU renderers, in the frontend's GL context if it has one, else in the core's own (beside a
 	// Vulkan frontend, say). With the renderer threads, the VI's filters use the GL context.
+	showOptions();
 	hwWanted = strcmp(renderer(), "cpu") != 0;
 	bool context = askHardwareContext();
 	viInContext = context && !hwWanted;
@@ -999,7 +1031,7 @@ void retro_run(void) {
 	}
 	readPorts();
 	machine->viFilters = optionIs(environment, "armn64_vi_filters", "on") ||
-	                     (!optionIs(environment, "armn64_vi_filters", "off") && machine->accuracy != ACCURACY_HLE);
+	                     (!optionIs(environment, "armn64_vi_filters", "off") && machine->accuracy != ACCURACY_HLE && !machine->rdpGl);
 	n64RunField(machine);
 	int width = 0, height = 0;
 	// The GPU RDP's picture goes from its buffer to the frontend's framebuffer without the CPU, and so
