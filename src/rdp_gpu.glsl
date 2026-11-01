@@ -50,9 +50,9 @@ const int TILES_ACROSS = 64;
 // Primitive kinds and record fields (rdp.c GPU_*).
 const int KIND_TRIANGLE = 0, KIND_TEXRECT = 1, KIND_FILL = 2, KIND_RECT = 3;
 const int P_KIND = 0, P_STATE = 1, P_X0 = 2, P_Y0 = 3, P_X1 = 4, P_Y1 = 5, P_TILE = 6, P_MAXLEVEL = 7;
-const int P_TRI = 8, P_FLAGS = 10, P_SDX = 11, P_TDX = 15, P_TDY = 18, P_ZDX = 21, P_SEQ = 24;
+const int P_TRI = 8, P_FLAGS = 10, P_SDX = 11, P_TDX = 15, P_TDY = 18, P_ZDX = 21, P_SEQ = 24, P_WRAP = 25;
 const int P_S0 = 8, P_T0 = 9, P_DSDX = 10, P_DTDY = 11, P_CX0 = 12, P_CY0 = 13, P_FLIP = 14;
-const int PRIM_SIZE = 25;
+const int PRIM_SIZE = 26;
 // A triangle's record (rdp.c gpuTriangle): its edges, the scissor, and the shade, texture and depth
 // values at its top.
 const int T_YL = 0, T_YM = 1, T_YH = 2, T_XL = 3, T_DXL = 4, T_XH = 5, T_DXH = 6, T_XM = 7, T_DXM = 8, T_SCISSOR = 9;
@@ -1247,6 +1247,22 @@ void main() {
 		for (int j = 0; j < n; ++j) {
 			int index = data[u[1] + first + base + j];
 			int p = index * PRIM_SIZE;
+			// Past the image's width a pixel is the next row's first, drawn there: a rectangle's at
+			// x + width on the row above comes before its own (rdp.c gpuCommand).
+			if (x >= u[7]) {
+				continue;
+			}
+			if (data[p + P_WRAP] != 0) {
+				int wx = x + u[7], wy = y - 1;
+				if (wx >= data[p + P_X0] && wx <= data[p + P_X1] && wy >= data[p + P_Y0] && wy <= data[p + P_Y1]) {
+					shaded = false;
+					drawPrim(p, wx, wy, ivec4(0));
+					if (shaded) {
+						key = uint(index + 1) << 20 | uint(wy) << 10 | 1023u;
+						keyColor = lastCombined;
+					}
+				}
+			}
 			if (x < data[p + P_X0] || x > data[p + P_X1] || y < data[p + P_Y0] || y > data[p + P_Y1]) {
 				continue;
 			}

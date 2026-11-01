@@ -2245,7 +2245,7 @@ static void submit(struct N64* n, struct RDP* r, const uint64_t* w, int op, int 
 #include "rdp_gpu_glsl.h"
 
 enum {
-	GPU_PRIM_SIZE = 25, GPU_TRI_SIZE = 35, GPU_TILE_FIELDS = 15, GPU_STATE_SIZE = 19 + 8 * GPU_TILE_FIELDS + 4,
+	GPU_PRIM_SIZE = 26, GPU_TRI_SIZE = 35, GPU_TILE_FIELDS = 15, GPU_STATE_SIZE = 19 + 8 * GPU_TILE_FIELDS + 4,
 	GPU_TILES = 64, GPU_PRIMS_MAX = 4000, GPU_LAST_SIZE = 1 << 20, GPU_BATCHES_MAX = 4096,
 	// Tiles times primitives in one dispatch: a long dispatch trips the kernel's GPU hang check.
 	GPU_ENTRIES_MAX = 1024,
@@ -2721,7 +2721,8 @@ static bool gpuTriangle(struct Gpu* g, struct RDP* r, const uint64_t* w, int op,
 // The tiles a primitive's box has on tile row ty; for a triangle, only those its edges reach on
 // that row's sub-scanlines (a pixel wider each side).
 static void rowTiles(const struct Gpu* g, const int32_t* p, int ty, int* tx0, int* tx1) {
-	*tx0 = p[2] >> 4, *tx1 = p[4] >> 4;
+	// A wrapping rectangle's pixels past the width land from column 0 on the row below.
+	*tx0 = p[25] ? 0 : p[2] >> 4, *tx1 = p[4] >> 4;
 	if (p[0] != GPU_KIND_TRIANGLE) {
 		return;
 	}
@@ -2809,7 +2810,7 @@ static void gpuSubmit(struct N64* n, struct RDP* r) {
 	size_t entries = 0;
 	for (int i = 0; i < g->primCount; ++i) {
 		const int32_t* p = g->prims + i * GPU_PRIM_SIZE;
-		int ax = p[2] >> 4, ay = p[3] >> 4, bx = p[4] >> 4, by = p[5] >> 4;
+		int ax = p[25] ? 0 : p[2] >> 4, ay = p[3] >> 4, bx = p[4] >> 4, by = (p[5] + p[25]) >> 4;
 		tx0 = ax < tx0 ? ax : tx0, ty0 = ay < ty0 ? ay : ty0;
 		tx1 = bx > tx1 ? bx : tx1, ty1 = by > ty1 ? by : ty1;
 		for (int ty = ay; ty <= by; ++ty) {
@@ -2849,7 +2850,7 @@ static void gpuSubmit(struct N64* n, struct RDP* r) {
 	int32_t* lists = d + listsAt;
 	for (int i = 0; i < g->primCount; ++i) {
 		const int32_t* p = g->prims + i * GPU_PRIM_SIZE;
-		for (int ty = p[3] >> 4; ty <= p[5] >> 4; ++ty) {
+		for (int ty = p[3] >> 4; ty <= (p[5] + p[25]) >> 4; ++ty) {
 			int rx0, rx1;
 			rowTiles(g, p, ty, &rx0, &rx1);
 			for (int tx = rx0; tx <= rx1; ++tx) {
@@ -3160,7 +3161,11 @@ static void gpuCommand(struct N64* n, struct RDP* r, const uint64_t* w, int op) 
 	bool overlap = depth && z < color + colorLen && color < z + zLen;
 	bool shades = !(op == 0x36 && r->cycleType == 3) && !((op == 0x24 || op == 0x25) && r->cycleType == 2);
 	const struct Stage* firstStage = &r->stage[r->cycleType == 1 ? 0 : 1];
-	bool alone = right > r->colorWidth || overlap || (shades && firstStage->readsCombined);
+	// A rectangle running past the image's width by less than a row the GPU draws, the pixels past it
+	// on the next row (Puyo Puyo, Tarzan, Virtual Pool's copies to x = width).
+	bool wraps = right > r->colorWidth;
+	bool wrapOnce = wraps && (op == 0x24 || op == 0x25 || op == 0x36) && right <= 2 * r->colorWidth && y1 + 1 < GPU_TILES * 16;
+	bool alone = (wraps && !wrapOnce) || overlap || (shades && firstStage->readsCombined);
 	if (alone || y1 >= GPU_TILES * 16) {
 		gpuSync(n, r);
 		// execute counts the primitive itself (its noise from the same number as on the CPU).
@@ -3189,6 +3194,7 @@ static void gpuCommand(struct N64* n, struct RDP* r, const uint64_t* w, int op) 
 	p[22] = r->dzpix;
 	p[23] = r->primDz;
 	p[24] = (int32_t) r->seq;
+	p[25] = wrapOnce;
 	if (op >= 0x08 && op <= 0x0F) {
 		if (!gpuTriangle(g, r, w, op, p)) {
 			return;
@@ -3218,7 +3224,7 @@ static void gpuCommand(struct N64* n, struct RDP* r, const uint64_t* w, int op) 
 		p[0] = r->cycleType == 3 ? GPU_KIND_FILL : GPU_KIND_RECT;
 		p[2] = x0, p[3] = y0, p[4] = x1, p[5] = y1;
 	}
-	g->entries += ((p[4] >> 4) - (p[2] >> 4) + 1) * ((p[5] >> 4) - (p[3] >> 4) + 1);
+	g->entries += ((p[4] >> 4) - ((p[25] ? 0 : p[2]) >> 4) + 1) * (((p[5] + p[25]) >> 4) - (p[3] >> 4) + 1);
 	g->features |= gpuFeatures(r, op);
 	g->edge |= p[4] >= (int) r->colorWidth;
 	p[1] = gpuState(g, r);
