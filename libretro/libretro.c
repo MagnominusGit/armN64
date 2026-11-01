@@ -633,9 +633,8 @@ static void notify(const char* text) {
 	logMessage(RETRO_LOG_WARN, text);
 }
 
-// What HLE gave up for this game, said once: a graphics microcode it doesn't know (run on the RSP),
-// and the GL renderer stopping (the CPU renderer drawing from then on).
-static bool toldRsp, toldGl, hadGl;
+// What HLE gave up for this game, said once: a graphics microcode it doesn't know (run on the RSP).
+static bool toldRsp;
 
 static void tellFallbacks(void) {
 	char text[160];
@@ -644,13 +643,6 @@ static void tellFallbacks(void) {
 		notify(text);
 		toldRsp = true;
 	}
-	if (!toldGl && hadGl && !machine->rdpGl) {
-		snprintf(text, sizeof(text), "The GL renderer stopped (%s): the CPU renderer draws from here.",
-		         machine->glrStopReason ? machine->glrStopReason : "unknown reason");
-		notify(text);
-		toldGl = true;
-	}
-	hadGl = machine->rdpGl;
 }
 
 // Each port's controls, and what can be plugged in.
@@ -749,7 +741,7 @@ bool retro_load_game(const struct retro_game_info* info) {
 	pal = machine->fieldCycles == hwCycles(machine, CPU_HZ / 50);
 	saveExport();
 	saveGiven = false;
-	toldRsp = toldGl = hadGl = false;
+	toldRsp = false;
 	struct retro_rumble_interface rumble;
 	setRumble = environment(RETRO_ENVIRONMENT_GET_RUMBLE_INTERFACE, &rumble) ? rumble.set_rumble_state : NULL;
 	memset(rumbling, 0, sizeof(rumbling));

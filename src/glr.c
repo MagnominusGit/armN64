@@ -208,8 +208,6 @@ struct Glr {
 	uint32_t* image;
 	struct Applied applied;
 	size_t vertexOffset;
-	uint64_t rawField;
-	int rawTriangles;
 	// The stencil value the last decal batch marked its pixels with.
 	int stencilRef;
 	// The primitive's number (the RDP's seq), for the noise.
@@ -1512,6 +1510,59 @@ static void triangle(struct N64* n, struct Glr* g, struct RDP* r, const struct G
 	}
 }
 
+// An RDP triangle without the HLE's corners (from a microcode run on the RSP): its corners and their
+// values found back from the command. Each attribute is planar from its start on the major edge at
+// the top scanline, along that edge by its edge slope and across by its x slope (hle.c triangle).
+static void rawCorners(const struct RDP* r, const uint64_t* w, int op, struct GlrCorners* q) {
+	#define FIX(v) ((float) (int32_t) (v) / 65536.0f)
+	#define PART(word, k) ((uint32_t) ((word) >> (48 - 16 * (k))) & 0xFFFF)
+	#define SPLIT(hi, lo, k) FIX(PART(hi, k) << 16 | PART(lo, k))
+	float const y1 = (float) ((int32_t) ((uint32_t) w[0] << 18) >> 18) / 4;
+	float const y2 = (float) ((int32_t) ((uint32_t) (w[0] >> 16) << 18) >> 18) / 4;
+	float const y3 = (float) ((int32_t) ((uint32_t) (w[0] >> 32) << 18) >> 18) / 4;
+	float const xl = FIX(w[1] >> 32), xh = FIX(w[2] >> 32), ish = FIX(w[2]);
+	float const top = floorf(y1);
+	float const x[3] = { xh + (y1 - top) * ish, xl, xh + (y3 - top) * ish }, y[3] = { y1, y2, y3 };
+	*q = (struct GlrCorners) { { w[0], w[1], w[2], w[3] },
+	                           (uint32_t) (op & 7) | (uint32_t) ((w[0] >> 48) & 7) << 8 | (uint32_t) ((w[0] >> 51) & 7) << 12 | (uint32_t) ((r->otherModes >> 51) & 1) << 16,
+	                           { { 0 } } };
+	// One attribute at each corner, from its start, x slope and edge slope.
+	float at[3][9];
+	int const shadeAt = 4, texAt = 4 + (op & 4 ? 8 : 0), zAt = texAt + (op & 2 ? 8 : 0);
+	for (int k = 0; k < 3; ++k) {
+		float const across = x[k] - (xh + (y[k] - top) * ish), down = y[k] - top;
+		for (int a = 0; a < 4 && (op & 4); ++a) {
+			const uint64_t* c = &w[shadeAt];
+			at[k][a] = SPLIT(c[0], c[2], a) + SPLIT(c[4], c[6], a) * down + SPLIT(c[1], c[3], a) * across;
+		}
+		for (int a = 0; a < 3 && (op & 2); ++a) {
+			const uint64_t* c = &w[texAt];
+			at[k][4 + a] = SPLIT(c[0], c[2], a) + SPLIT(c[4], c[6], a) * down + SPLIT(c[1], c[3], a) * across;
+		}
+		if (op & 1) {
+			at[k][7] = FIX(w[zAt] >> 32) + FIX(w[zAt + 1] >> 32) * down + FIX(w[zAt]) * across;
+		}
+	}
+	for (int k = 0; k < 3; ++k) {
+		float* v = q->v[k];
+		v[0] = x[k], v[1] = y[k];
+		v[2] = op & 1 ? fminf(fmaxf(at[k][7] / 0x7FFF, 0), 1) : 0;
+		for (int a = 0; a < 4; ++a) {
+			v[4 + a] = op & 4 ? fminf(fmaxf(at[k][a] / 255, 0), 1) : 0;
+		}
+		// S and T come times the corner's 1/w (W, a 0x7FFF fraction) with perspective, as they are
+		// without.
+		float const invW = op & 2 ? at[k][6] / 0x7FFF : 1;
+		bool const persp = (q->flags >> 16) & 1;
+		v[3] = invW > 1e-6f ? invW : 1e-6f;
+		v[8] = op & 2 ? at[k][4] / 32 / (persp ? v[3] : 1) : 0;
+		v[9] = op & 2 ? at[k][5] / 32 / (persp ? v[3] : 1) : 0;
+	}
+	#undef FIX
+	#undef PART
+	#undef SPLIT
+}
+
 void glrDraw(struct N64* n, struct RDP* r, const uint64_t* w, int op) {
 	struct Glr* g = n->glr;
 	glesUse(g->gles);
@@ -1531,23 +1582,9 @@ void glrDraw(struct N64* n, struct RDP* r, const uint64_t* w, int op) {
 		return;
 	}
 	if (op >= 0x08 && op <= 0x0F) {
-		// An RDP triangle (from a microcode run on the RSP): the RDP draws it in RDRAM; many in a
-		// field and the RDP threads take over.
-		if (g->rawField != n->fields) {
-			g->rawField = n->fields;
-			g->rawTriangles = 0;
-		}
-		if (++g->rawTriangles > 100) {
-			n->glrStop = true;
-			n->glrStopReason = "the microcode sends the RDP its own triangles";
-		}
-		glrSync(n);
-		rdpDrawSoftware(n, r, w, op);
-		for (int i = 0; i < TARGETS; ++i) {
-			if (g->target[i].addr == r->colorAddr) {
-				g->target[i].loadedRows = 0;
-			}
-		}
+		struct GlrCorners raw;
+		rawCorners(r, w, op, &raw);
+		triangle(n, g, r, &raw);
 		return;
 	}
 	if (op == 0x36) {
@@ -1848,16 +1885,6 @@ void glrForget(struct N64* n) {
 	if (n->glr) {
 		memset(&n->glr->applied, 0xFF, sizeof(n->glr->applied));
 	}
-}
-
-void glrEnd(struct N64* n) {
-	glrSync(n);
-	glrDestroy(n->glr);
-	n->glr = NULL;
-	n->rdpGl = n->glrStop = false;
-	n->rdpThreads = n->rdpThreadsAsked;
-	// Compiled loads check the RDP's pages as the renderers need.
-	blocksFree(n);
 }
 
 void glrDestroy(struct Glr* g) {

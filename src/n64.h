@@ -398,15 +398,6 @@ struct N64 {
 	struct Glr* glr;
 	// How many times the RDP's resolution the GL renderer draws at (N64_GL_SCALE).
 	int glrScale;
-	// Many RDP triangles in a field (a microcode left to the RSP): the GL renderer gives way to the
-	// RDP threads asked for, between slices.
-	int rdpThreadsAsked;
-	// With the GL renderer, graphics tasks lately and those the RSP ran (microcodes the HLE doesn't
-	// know): mostly those, and the RDP threads take over (the GPU would only add syncs).
-	uint32_t glTasks, glRspTasks;
-	bool glrStop;
-	// Why the GL renderer stopped, for the frontend to say.
-	const char* glrStopReason;
 	struct FrameSkip skip;
 	// The last picture made, shown again for a skipped frame.
 	uint32_t* lastPicture;
@@ -666,7 +657,6 @@ void hleUcodeName(struct N64*, char* out, size_t size);
 bool audioHle(struct N64*);
 void audioCheckStart(struct N64*);
 void audioCheckEnd(struct N64*);
-void glrEnd(struct N64*);
 // The GL state the renderer last set is unknown (the frontend drew in its context).
 void glrForget(struct N64*);
 // A task waiting where its display list branches to itself (the CPU still writing it); a look

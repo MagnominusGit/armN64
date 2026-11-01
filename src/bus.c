@@ -117,16 +117,6 @@ static void spWriteStatus(struct N64* n, uint32_t v) {
 				hleUcodeName(n, n->stats.gfxRspUcode, sizeof(n->stats.gfxRspUcode));
 			}
 			audioCheckStart(n);
-			if (n->rdpGl && graphics) {
-				++n->glRspTasks;
-			}
-		}
-		if (n->rdpGl && graphics && ++n->glTasks == 64) {
-			if (n->glRspTasks * 2 > n->glTasks) {
-				n->glrStop = true;
-				n->glrStopReason = "most graphics tasks run on the RSP";
-			}
-			n->glTasks = n->glRspTasks = 0;
 		}
 		*s &= ~1u;
 		// N64TASKDUMP=number,file: the RSP's memories, registers and RDRAM as that task starts.
