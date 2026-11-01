@@ -24,7 +24,8 @@ typedef unsigned char GLboolean;
 enum {
 	GL_TEXTURE_2D = 0x0DE1, GL_RGBA = 0x1908, GL_RGBA8 = 0x8058, GL_UNSIGNED_BYTE = 0x1401, GL_FLOAT = 0x1406,
 	GL_FRAMEBUFFER = 0x8D40, GL_READ_FRAMEBUFFER = 0x8CA8, GL_DRAW_FRAMEBUFFER = 0x8CA9, GL_COLOR_ATTACHMENT0 = 0x8CE0, GL_DEPTH_ATTACHMENT = 0x8D00, GL_RENDERBUFFER = 0x8D41,
-	GL_DEPTH_COMPONENT24 = 0x81A6, GL_FRAMEBUFFER_COMPLETE = 0x8CD5,
+	GL_DEPTH_COMPONENT24 = 0x81A6, GL_FRAMEBUFFER_COMPLETE = 0x8CD5, GL_DEPTH_STENCIL_ATTACHMENT = 0x821A, GL_DEPTH24_STENCIL8 = 0x88F0,
+	GL_STENCIL_TEST = 0x0B90, GL_STENCIL_BUFFER_BIT = 0x400, GL_KEEP = 0x1E00, GL_REPLACE = 0x1E01, GL_EQUAL = 0x202, GL_GEQUAL = 0x206,
 	GL_TEXTURE_MIN_FILTER = 0x2801, GL_TEXTURE_MAG_FILTER = 0x2800, GL_NEAREST = 0x2600, GL_TEXTURE_WRAP_S = 0x2802,
 	GL_TEXTURE_WRAP_T = 0x2803, GL_CLAMP_TO_EDGE = 0x812F, GL_TEXTURE0 = 0x84C0,
 	GL_ARRAY_BUFFER = 0x8892, GL_STREAM_DRAW = 0x88E0, GL_TRIANGLES = 4, GL_MAP_WRITE_BIT = 2, GL_MAP_UNSYNCHRONIZED_BIT = 0x20,
@@ -70,6 +71,10 @@ struct Gl {
 	void (*BlendFuncSeparate)(GLenum, GLenum, GLenum, GLenum);
 	void (*BlendColor)(float, float, float, float);
 	void (*PolygonOffset)(float, float);
+	void (*StencilFunc)(GLenum, GLint, GLuint);
+	void (*StencilOp)(GLenum, GLenum, GLenum);
+	void (*ColorMask)(GLboolean, GLboolean, GLboolean, GLboolean);
+	void (*ClearStencil)(GLint);
 	void (*ReadPixels)(GLint, GLint, GLsizei, GLsizei, GLenum, GLenum, void*);
 	void (*PixelStorei)(GLenum, GLint);
 	GLuint (*CreateShader)(GLenum);
@@ -197,6 +202,8 @@ struct Glr {
 	size_t vertexOffset;
 	uint64_t rawField;
 	int rawTriangles;
+	// The stencil value the last decal batch marked its pixels with.
+	int stencilRef;
 	// The HLE's corners for triangles it has sent and the RDP hasn't reached yet (a ring).
 	struct GlrCorners* queue;
 	uint32_t queueRead, queueWrite;
@@ -286,7 +293,7 @@ static bool loadGl(struct Glr* g) {
 	       GLFN(RenderbufferStorage) && GLFN(GenTextures) && GLFN(DeleteTextures) && GLFN(BindTexture) && GLFN(ActiveTexture) &&
 	       GLFN(TexImage2D) && GLFN(TexSubImage2D) && GLFN(TexParameteri) && GLFN(Viewport) && GLFN(Scissor) && GLFN(Enable) &&
 	       GLFN(Disable) && GLFN(ClearColor) && GLFN(ClearDepthf) && GLFN(Clear) && GLFN(DepthFunc) && GLFN(DepthMask) &&
-	       GLFN(BlendFunc) && GLFN(BlendFuncSeparate) && GLFN(BlendColor) && GLFN(PolygonOffset) && GLFN(ReadPixels) && GLFN(PixelStorei) && GLFN(CreateShader) &&
+	       GLFN(BlendFunc) && GLFN(BlendFuncSeparate) && GLFN(BlendColor) && GLFN(PolygonOffset) && GLFN(StencilFunc) && GLFN(StencilOp) && GLFN(ColorMask) && GLFN(ClearStencil) && GLFN(ReadPixels) && GLFN(PixelStorei) && GLFN(CreateShader) &&
 	       GLFN(ShaderSource) && GLFN(CompileShader) && GLFN(GetShaderiv) && GLFN(GetShaderInfoLog) && GLFN(DeleteShader) &&
 	       GLFN(CreateProgram) && GLFN(AttachShader) && GLFN(LinkProgram) && GLFN(GetProgramiv) && GLFN(GetProgramInfoLog) &&
 	       GLFN(UseProgram) && GLFN(DeleteProgram) && GLFN(GetUniformLocation) && GLFN(Uniform1i) && GLFN(Uniform1f) &&
@@ -772,7 +779,7 @@ static struct Target* target(struct N64* n, struct Glr* g, uint32_t addr, uint32
 		gl->TexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_NEAREST);
 		useFramebuffer(g, t->framebuffer);
 		gl->FramebufferTexture2D(GL_FRAMEBUFFER, GL_COLOR_ATTACHMENT0, GL_TEXTURE_2D, t->texture, 0);
-		gl->FramebufferRenderbuffer(GL_FRAMEBUFFER, GL_DEPTH_ATTACHMENT, GL_RENDERBUFFER, g->depth);
+		gl->FramebufferRenderbuffer(GL_FRAMEBUFFER, GL_DEPTH_STENCIL_ATTACHMENT, GL_RENDERBUFFER, g->depth);
 		t->addr = addr, t->width = width, t->size = size;
 		t->loadedRows = 0;
 		t->dirtyFrom = t->dirtyTo = 0;
@@ -1091,7 +1098,36 @@ static void flushBatch(struct N64* n, struct Glr* g) {
 	if (to) {
 		memcpy(to, g->batch, bytes);
 		gl->UnmapBuffer(GL_ARRAY_BUFFER);
-		gl->DrawArrays(GL_TRIANGLES, (GLint) (g->vertexOffset / (VERTEX_FLOATS * 4)), g->batchCount);
+		GLint first = (GLint) (g->vertexOffset / (VERTEX_FLOATS * 4));
+		if (s->decal) {
+			// The RDP's decal passes only within the depth slope either way (rdp.c, z mode 3): first
+			// the pixels no more than that in front marked, then those no more than that behind drawn.
+			if (++g->stencilRef > 255) {
+				useScissor(g, false, 0, 0, 0, 0);
+				gl->ClearStencil(0);
+				gl->Clear(GL_STENCIL_BUFFER_BIT);
+				useScissor(g, true, s->scissor[0], s->scissor[1], s->scissor[2] - s->scissor[0], s->scissor[3] - s->scissor[1]);
+				g->stencilRef = 1;
+			}
+			gl->Enable(GL_STENCIL_TEST);
+			gl->ColorMask(0, 0, 0, 0);
+			gl->DepthMask(0);
+			gl->DepthFunc(GL_GEQUAL);
+			gl->PolygonOffset(1, 1);
+			gl->StencilFunc(GL_ALWAYS, g->stencilRef, 0xFF);
+			gl->StencilOp(GL_KEEP, GL_KEEP, GL_REPLACE);
+			gl->DrawArrays(GL_TRIANGLES, first, g->batchCount);
+			gl->ColorMask(1, 1, 1, 1);
+			gl->DepthMask(s->depthWrite);
+			gl->DepthFunc(GL_LEQUAL);
+			gl->PolygonOffset(-1, -1);
+			gl->StencilFunc(GL_EQUAL, g->stencilRef, 0xFF);
+			gl->StencilOp(GL_KEEP, GL_KEEP, GL_KEEP);
+			gl->DrawArrays(GL_TRIANGLES, first, g->batchCount);
+			gl->Disable(GL_STENCIL_TEST);
+		} else {
+			gl->DrawArrays(GL_TRIANGLES, first, g->batchCount);
+		}
 		++n->stats.glBatches;
 		g->vertexOffset += bytes;
 	}
@@ -1578,7 +1614,7 @@ struct Glr* glrCreate(struct N64* n) {
 	const char* scale = n->settings ? n->settings("N64_GL_SCALE") : getenv("N64_GL_SCALE");
 	g->scale = scale && *scale >= '1' && *scale <= '8' ? *scale - '0' : 1;
 	n->glrScale = g->scale;
-	gl->RenderbufferStorage(GL_RENDERBUFFER, GL_DEPTH_COMPONENT24, 1024 * g->scale, TARGET_ROWS * g->scale);
+	gl->RenderbufferStorage(GL_RENDERBUFFER, GL_DEPTH24_STENCIL8, 1024 * g->scale, TARGET_ROWS * g->scale);
 	if (g->scale > 1) {
 		gl->GenTextures(1, &g->native);
 		uploadTexture(g, g->native);
