@@ -62,6 +62,9 @@ struct Hle {
 	// (G_TEXTURE's word, then the one G_MOVEWORD sets at fog + 0x10) plus the offset at fog + 0x0C.
 	bool am;
 	uint32_t amScale[3];
+	// The NoN microcodes (Star Fox 64's F3DEX, Ocarina of Time's F3DZEX) don't clip at the near
+	// plane: what lies in front of it is drawn, its depth held at the near end.
+	bool noNear;
 	// S2DEX: the 2D matrix (A to D, the offset in pixels, the base scales), the object render mode,
 	// the state words texture loads and G_SELECT_DL test, and G_RDPHALF_0's half of a selection.
 	float objA, objB, objC, objD, objX, objY, objBaseX, objBaseY;
@@ -557,13 +560,14 @@ static void drawTriangle(struct N64* n, struct Hle* h, int i0, int i1, int i2) {
 	int count = 3;
 	poly[0][0] = h->v[i0], poly[0][1] = h->v[i1], poly[0][2] = h->v[i2];
 	int cur = 0;
-	// Planes as (x, y, z, w) weights: near, then x and y within four screens.
+	// Planes as (x, y, z, w) weights: near (for NoN, just ahead of the eye), then x and y within four
+	// screens.
 	static const float planes[5][4] = { { 0, 0, 1, 1 }, { 1, 0, 0, 4 }, { -1, 0, 0, 4 }, { 0, 1, 0, 4 }, { 0, -1, 0, 4 } };
 	// Corners inside every plane leave nothing to clip.
 	bool inside = true;
 	for (int k = 0; k < 3 && inside; ++k) {
 		const struct Vertex* v = &poly[0][k];
-		inside = isfinite(v->z) && v->z + v->w + 1e-4f * fabsf(v->w) >= 0 && fabsf(v->x) <= 4 * v->w && fabsf(v->y) <= 4 * v->w;
+		inside = isfinite(v->z) && (h->noNear ? v->w >= 1e-4f : v->z + v->w + 1e-4f * fabsf(v->w) >= 0) && fabsf(v->x) <= 4 * v->w && fabsf(v->y) <= 4 * v->w;
 	}
 	for (int p = inside ? 5 : 0; p < 5 && count >= 3; ++p) {
 		const float* pl = planes[p];
@@ -573,6 +577,9 @@ static void drawTriangle(struct N64* n, struct Hle* h, int i0, int i1, int i2) {
 			// The near plane keeps what lies on it (2D layers at z = -w), give or take rounding.
 			float da = a->x * pl[0] + a->y * pl[1] + a->z * pl[2] + a->w * pl[3] + (p == 0 ? 1e-4f * fabsf(a->w) : 0);
 			float db = b->x * pl[0] + b->y * pl[1] + b->z * pl[2] + b->w * pl[3] + (p == 0 ? 1e-4f * fabsf(b->w) : 0);
+			if (p == 0 && h->noNear) {
+				da = a->w - 1e-4f, db = b->w - 1e-4f;
+			}
 			if (da >= 0) {
 				poly[cur ^ 1][out++] = *a;
 			}
@@ -1450,6 +1457,7 @@ static void ucodeFlags(struct N64* n, struct Hle* h, uint32_t data, uint32_t siz
 	h->lines = name && !strncmp(name, "L3DEX", 5);
 	h->texa = name && !strncmp(name, "F3DTEX/A", 8);
 	h->am = name && !strncmp(name, "F3DAM", 5);
+	h->noNear = name && strstr(name, ".NoN");
 }
 
 static bool isFlx(struct N64* n, uint32_t data, uint32_t size) {
