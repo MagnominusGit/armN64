@@ -2233,7 +2233,7 @@ static void submit(struct N64* n, struct RDP* r, const uint64_t* w, int op, int 
 #include "rdp_gpu_glsl.h"
 
 enum {
-	GPU_PRIM_SIZE = 24, GPU_TRI_SIZE = 35, GPU_TILE_FIELDS = 15, GPU_STATE_SIZE = 19 + 8 * GPU_TILE_FIELDS + 4,
+	GPU_PRIM_SIZE = 25, GPU_TRI_SIZE = 35, GPU_TILE_FIELDS = 15, GPU_STATE_SIZE = 19 + 8 * GPU_TILE_FIELDS + 4,
 	GPU_TILES = 64, GPU_PRIMS_MAX = 4000, GPU_LAST_SIZE = 1 << 20, GPU_BATCHES_MAX = 4096,
 	// Tiles times primitives in one dispatch: a long dispatch trips the kernel's GPU hang check.
 	GPU_ENTRIES_MAX = 1024,
@@ -3139,8 +3139,7 @@ static void gpuCommand(struct N64* n, struct RDP* r, const uint64_t* w, int op) 
 	bool overlap = depth && z < color + colorLen && color < z + zLen;
 	bool shades = !(op == 0x36 && r->cycleType == 3) && !((op == 0x24 || op == 0x25) && r->cycleType == 2);
 	const struct Stage* firstStage = &r->stage[r->cycleType == 1 ? 0 : 1];
-	bool alone = right - 1 > r->colorWidth || overlap ||
-	             (shades && (firstStage->readsCombined || usesNoise(r)));
+	bool alone = right - 1 > r->colorWidth || overlap || (shades && firstStage->readsCombined);
 	if (alone || y1 >= GPU_TILES * 16) {
 		gpuSync(n, r);
 		// execute counts the primitive itself (its noise from the same number as on the CPU).
@@ -3168,6 +3167,7 @@ static void gpuCommand(struct N64* n, struct RDP* r, const uint64_t* w, int op) 
 	memset(p, 0, GPU_PRIM_SIZE * sizeof(int32_t));
 	p[22] = r->dzpix;
 	p[23] = r->primDz;
+	p[24] = (int32_t) r->seq;
 	if (op >= 0x08 && op <= 0x0F) {
 		if (!gpuTriangle(g, r, w, op, p)) {
 			return;

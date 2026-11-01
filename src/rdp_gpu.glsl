@@ -50,9 +50,9 @@ const int TILES_ACROSS = 64;
 // Primitive kinds and record fields (rdp.c GPU_*).
 const int KIND_TRIANGLE = 0, KIND_TEXRECT = 1, KIND_FILL = 2, KIND_RECT = 3;
 const int P_KIND = 0, P_STATE = 1, P_X0 = 2, P_Y0 = 3, P_X1 = 4, P_Y1 = 5, P_TILE = 6, P_MAXLEVEL = 7;
-const int P_TRI = 8, P_FLAGS = 10, P_SDX = 11, P_TDX = 15, P_TDY = 18, P_ZDX = 21;
+const int P_TRI = 8, P_FLAGS = 10, P_SDX = 11, P_TDX = 15, P_TDY = 18, P_ZDX = 21, P_SEQ = 24;
 const int P_S0 = 8, P_T0 = 9, P_DSDX = 10, P_DTDY = 11, P_CX0 = 12, P_CY0 = 13, P_FLIP = 14;
-const int PRIM_SIZE = 24;
+const int PRIM_SIZE = 25;
 // A triangle's record (rdp.c gpuTriangle): its edges, the scissor, and the shade, texture and depth
 // values at its top.
 const int T_YL = 0, T_YM = 1, T_YH = 2, T_XL = 3, T_DXL = 4, T_XH = 5, T_DXH = 6, T_XM = 7, T_DXM = 8, T_SCISSOR = 9;
@@ -66,16 +66,25 @@ const int S_K4 = 15, S_K5 = 16, S_FILL = 17, S_TMEM = 18, S_TILES = 19, TILE_SIZ
 int gS;
 uint omLo, omHi, cbLo, cbHi;
 ivec4 gFog, gBlend, gPrim, gEnv;
-int gPrimLod, gK4, gK5, gTmem, gMaxLevel, gMinLevel;
+int gPrimLod, gK4, gK5, gTmem, gMaxLevel, gMinLevel, gSeq;
 ivec4 gKConv;
 
 // ---- The pixel
 ivec4 pShade, pTex0, pTex1, pCombined;
-int pZ, pLodFrac, pCvg, pDz, pPrimDz;
+int pX, pY, pZ, pLodFrac, pCvg, pDz, pPrimDz;
 bool pCvbit;
 int blShiftA, blShiftB;
 ivec4 lastCombined;
 bool shaded;
+
+// rdp.c's pixelNoise: a hash of the pixel and the primitive's number.
+int pixelNoise(int x, int y, uint tag) {
+	uint h = uint(x) * 0x9E3779B1u ^ uint(y) * 0x85EBCA77u ^ uint(gSeq) * 0xC2B2AE3Du ^ tag;
+	h ^= h >> 15;
+	h *= 0x2C1B3C6Du;
+	h ^= h >> 12;
+	return int(h & 0x7FFFFFFFu);
+}
 
 ivec4 unpackColor(int v) {
 	uint u = uint(v);
@@ -502,6 +511,9 @@ int rgbScalar(int sel, int which) {
 }
 
 ivec3 rgbIn(int sel, int which) {
+	if (which == 0 && sel == 7) {
+		return ivec3(pixelNoise(pX, pY, 0u), pixelNoise(pX, pY, 1u), pixelNoise(pX, pY, 2u)) & 255;
+	}
 	switch (sel) {
 	case 0: return pCombined.rgb;
 	case 1: return pTex0.rgb;
@@ -635,16 +647,17 @@ int dzEncode(int v) {
 	return ((v & 0xFF00) != 0 ? 8 : 0) | ((v & 0xF0F0) != 0 ? 4 : 0) | ((v & 0xCCCC) != 0 ? 2 : 0) | ((v & 0xAAAA) != 0 ? 1 : 0);
 }
 
-// The magic square and Bayer dither matrices (paraLLEl-RDP's dither.h, MIT). Noise dither is drawn
-// on the CPU (rdp.c usesNoise).
+// The magic square and Bayer dither matrices (paraLLEl-RDP's dither.h, MIT).
 const int ditherMatrix[32] = int[32](0, 6, 1, 7, 4, 2, 5, 3, 3, 5, 2, 4, 7, 1, 6, 0, 0, 4, 1, 5, 4, 0, 5, 1, 3, 7, 2, 6, 7, 3, 6, 2);
 
 void ditherAt(int x, int y, out int rgb, out int alpha) {
 	int modeRgb = int(omHi >> 6) & 3, modeAlpha = int(omHi >> 4) & 3;
 	int i = (y & 3) * 4 + (x & 3);
-	rgb = modeRgb < 2 ? ditherMatrix[modeRgb * 16 + i] * 0x49 : 0;
-	if (modeAlpha >= 2) {
+	rgb = modeRgb < 2 ? ditherMatrix[modeRgb * 16 + i] * 0x49 : modeRgb == 2 ? pixelNoise(x, y, 4u) & 0x1FF : 0;
+	if (modeAlpha == 3) {
 		alpha = 0;
+	} else if (modeAlpha == 2) {
+		alpha = pixelNoise(x, y, 5u) & 7;
 	} else {
 		alpha = modeRgb >= 2 ? ditherMatrix[(modeRgb & 1) * 16 + i] : rgb & 7;
 		alpha = modeAlpha == 1 ? ~alpha & 7 : alpha;
@@ -652,6 +665,7 @@ void ditherAt(int x, int y, out int rgb, out int alpha) {
 }
 
 void shadePixel(int x, int y) {
+	pX = x, pY = y;
 	int cycleType = int(omHi >> 20) & 3;
 	bool zPrim = ((omLo >> 2) & 1u) != 0u;
 	int z = zPrim ? data[gS + S_PRIMZ] : pZ;
@@ -755,7 +769,7 @@ void shadePixel(int x, int y) {
 		blShiftB = dzEnc < 11 ? 4 : 15 - dzEnc;
 		blend = force || (!overflow && antialias);
 	}
-	if ((omLo & 1u) != 0u && reference < gBlend.a) {
+	if ((omLo & 1u) != 0u && reference < ((omLo & 2u) != 0u ? pixelNoise(x, y, 6u) & 255 : gBlend.a)) {
 		return;
 	}
 	if (antialias ? cvg == 0 : !pCvbit) {
@@ -909,6 +923,7 @@ void loadState(int p) {
 	gKConv = ivec4(data[gS + S_KCONV], data[gS + S_KCONV + 1], data[gS + S_KCONV + 2], data[gS + S_KCONV + 3]);
 	gTmem = data[gS + S_TMEM];
 	gMaxLevel = data[p + P_MAXLEVEL];
+	gSeq = data[p + P_SEQ];
 }
 
 void clearPixel() {
