@@ -2241,7 +2241,7 @@ enum {
 	GPU_PATCHES_MAX = 1 << 20,
 	GPU_KIND_TRIANGLE = 0, GPU_KIND_TEXRECT = 1, GPU_KIND_FILL = 2, GPU_KIND_RECT = 3,
 	GPU_PAGE_BATCH = 1, GPU_PAGE_OWNED = 2, GPU_PAGE_MARKED = 4,
-	GPU_VARIANTS = 48, GPU_RANGES = 64,
+	GPU_VARIANTS = 48, GPU_RANGES = 256,
 };
 
 // What a batch's primitives use, for the shader variant that leaves out the rest (rdp_gpu.glsl's
