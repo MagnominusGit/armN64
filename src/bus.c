@@ -239,10 +239,25 @@ static void piRdramByte(struct N64* n, uint32_t addr, uint8_t v) {
 	}
 }
 
+// The PI is about to write len bytes from its 24-bit RDRAM address: code there goes, the RDP is
+// waited for. Exactly those bytes: with the GPU drawing, the rest of a range would go to it as
+// the CPU's copy has them.
+static void piWillWrite(struct N64* n, uint32_t dram, uint32_t len) {
+	dram &= 0xFFFFFF;
+	if (dram + len > 0x1000000) {
+		piWillWrite(n, 0, dram + len - 0x1000000);
+		len = 0x1000000 - dram;
+	}
+	if (len && dram < RDRAM_SIZE) {
+		n64RdramWrite(n, dram, dram + len > RDRAM_SIZE ? RDRAM_SIZE - dram : len);
+	}
+}
+
 // Cartridge to RDRAM goes through the RCP's 128-byte buffer, a block at a time, never crossing a
 // 2 KiB RDRAM page.
 static void piDmaToRdram(struct N64* n, uint32_t len) {
 	if (n->emulatorLike) {
+		piWillWrite(n, n->pi.dramAddr, len);
 		for (uint32_t i = 0; i < len; ++i) {
 			piRdramByte(n, n->pi.dramAddr + i, cartByte(n, n->pi.cartAddr + i));
 		}
@@ -267,10 +282,12 @@ static void piDmaToRdram(struct N64* n, uint32_t len) {
 			length -= 2;
 		}
 		if (first && cur < 127 - mis) {
+			piWillWrite(n, dram, cur > mis ? (uint32_t) (cur - mis) : 0);
 			for (int32_t i = 0; i < cur - mis; ++i) {
 				piRdramByte(n, dram++, mem[i]);
 			}
 		} else {
+			piWillWrite(n, dram, cur > mis ? (uint32_t) (cur - mis + 1) & ~1u : 0);
 			for (int32_t i = 0; i < cur - mis; i += 2) {
 				piRdramByte(n, dram++, mem[i]);
 				piRdramByte(n, dram++, mem[i + 1]);
@@ -283,11 +300,6 @@ static void piDmaToRdram(struct N64* n, uint32_t len) {
 	}
 	n->pi.dramAddr = dram & 0xFFFFFF;
 	n->pi.cartAddr = cart;
-}
-
-// Throws away code a PI DMA of len bytes into RDRAM is about to cover, and waits for the RDP there.
-static void piDmaCode(struct N64* n, uint32_t len) {
-	n64RdramWrite(n, n->pi.dramAddr & 0xFFFFF8, len + 16);
 }
 
 // A DMA's time in RCP cycles, as ares has it: per bus page the domain's latency and a setup, per
@@ -327,7 +339,6 @@ static uint64_t piDmaCycles(struct N64* n, uint32_t cart, uint32_t len) {
 static void piDma(struct N64* n, uint32_t len, bool toRdram) {
 	uint32_t const cart = n->pi.cartAddr;
 	if (toRdram) {
-		piDmaCode(n, len);
 		piDmaToRdram(n, len);
 	} else {
 		uint32_t dram = n->pi.dramAddr & 0xFFFFFE, cart = n->pi.cartAddr & ~1u;

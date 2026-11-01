@@ -535,6 +535,7 @@ int main(int argc, char** argv) {
 		free(out);
 	}
 	if (getenv("N64RAMDUMP")) {
+		rdpWait(n);
 		FILE* f = fopen(getenv("N64RAMDUMP"), "wb");
 		if (f) {
 			fwrite(n->rdram, 1, RDRAM_SIZE, f);
