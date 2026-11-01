@@ -118,8 +118,8 @@ static struct retro_core_option_v2_definition optionDefinitions[] = {
 	  "The video interface's antialiasing, divot and dither filters, which soften edges and smooth 16-bit colour as a TV showed it. Auto turns them on for MLE and LLE and off for HLE, where they cost speed.",
 	  NULL, "system", { { "auto", "Auto" }, { "on", "On" }, { "off", "Off" }, { NULL, NULL } }, "auto" },
 	{ "armn64_aspect", "Aspect Ratio", NULL,
-	  "TV 4:3 shows the picture as a TV did: the whole screen is 4:3 and the game's window keeps its shape in it. Fill 4:3 stretches the window to 4:3. Square Pixels shows each pixel square.",
-	  NULL, "system", { { "tv", "TV 4:3" }, { "fill", "Fill 4:3" }, { "square", "Square Pixels" }, { NULL, NULL } }, "tv" },
+	  "Fill 4:3 stretches the game's window to 4:3. TV 4:3 shows the picture as a TV did: the whole screen is 4:3 and the game's window keeps its shape in it. Square Pixels shows each pixel square.",
+	  NULL, "system", { { "fill", "Fill 4:3" }, { "tv", "TV 4:3" }, { "square", "Square Pixels" }, { NULL, NULL } }, "fill" },
 	{ "armn64_frameskip", "Frame Skip (Restart)", NULL, "Leaves out the drawing of frames that are never shown, as many games make more than the screen can show.",
 	  NULL, "system", { { "disabled", "Off" }, { "enabled", "On" }, { NULL, NULL } }, "disabled" },
 	{ "armn64_pak1", "Player 1 Pak (Restart)", NULL, "What is in controller 1's slot: a Controller Pak for saves, a Rumble Pak, or a Transfer Pak with the Game Boy ROM in system/armN64/TransferPak1 (its .sav beside it).",
@@ -820,9 +820,9 @@ static void playAudio(void) {
 
 // The picture's size and shape to the frontend when either changes.
 static void setGeometry(int width, int height) {
-	float aspect = optionIs(environment, "armn64_aspect", "fill") ? 4.0f / 3.0f
+	float aspect = optionIs(environment, "armn64_aspect", "tv")       ? n64TvAspect(machine)
 	               : optionIs(environment, "armn64_aspect", "square") ? (float) width / (float) height
-	                                                                  : n64TvAspect(machine);
+	                                                                  : 4.0f / 3.0f;
 	if (width != pictureWidth || height != pictureHeight || aspect != pictureAspect) {
 		pictureWidth = width, pictureHeight = height, pictureAspect = aspect;
 		struct retro_game_geometry geometry = { (unsigned) width, (unsigned) height, 640, 480, aspect };
