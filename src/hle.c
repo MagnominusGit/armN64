@@ -563,14 +563,16 @@ static void drawTriangle(struct N64* n, struct Hle* h, int i0, int i1, int i2) {
 	int count = 3;
 	poly[0][0] = h->v[i0], poly[0][1] = h->v[i1], poly[0][2] = h->v[i2];
 	int cur = 0;
-	// Planes as (x, y, z, w) weights: near (for NoN, just ahead of the eye), then x and y within four
-	// screens.
+	// Planes as (x, y, z, w) weights: near, then x and y within four screens.
 	static const float planes[5][4] = { { 0, 0, 1, 1 }, { 1, 0, 0, 4 }, { -1, 0, 0, 4 }, { 0, 1, 0, 4 }, { 0, -1, 0, 4 } };
+	// NoN skips the near plane only for a triangle wholly in front of the eye (one reaching behind it is
+	// clipped there as usual: Conker's floors).
+	bool const noNear = h->noNear && poly[0][0].w > 0 && poly[0][1].w > 0 && poly[0][2].w > 0;
 	// Corners inside every plane leave nothing to clip.
 	bool inside = true;
 	for (int k = 0; k < 3 && inside; ++k) {
 		const struct Vertex* v = &poly[0][k];
-		inside = isfinite(v->z) && (h->noNear ? v->w >= 1e-4f : v->z + v->w + 1e-4f * fabsf(v->w) >= 0) && fabsf(v->x) <= 4 * v->w && fabsf(v->y) <= 4 * v->w;
+		inside = isfinite(v->z) && (noNear || v->z + v->w + 1e-4f * fabsf(v->w) >= 0) && fabsf(v->x) <= 4 * v->w && fabsf(v->y) <= 4 * v->w;
 	}
 	for (int p = inside ? 5 : 0; p < 5 && count >= 3; ++p) {
 		const float* pl = planes[p];
@@ -580,8 +582,8 @@ static void drawTriangle(struct N64* n, struct Hle* h, int i0, int i1, int i2) {
 			// The near plane keeps what lies on it (2D layers at z = -w), give or take rounding.
 			float da = a->x * pl[0] + a->y * pl[1] + a->z * pl[2] + a->w * pl[3] + (p == 0 ? 1e-4f * fabsf(a->w) : 0);
 			float db = b->x * pl[0] + b->y * pl[1] + b->z * pl[2] + b->w * pl[3] + (p == 0 ? 1e-4f * fabsf(b->w) : 0);
-			if (p == 0 && h->noNear) {
-				da = a->w - 1e-4f, db = b->w - 1e-4f;
+			if (p == 0 && noNear) {
+				da = db = 1;
 			}
 			if (da >= 0) {
 				poly[cur ^ 1][out++] = *a;
