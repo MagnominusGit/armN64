@@ -120,12 +120,16 @@ static uint32_t dcacheLine(struct N64* n, uint64_t vaddr, uint32_t paddr) {
 // For compiled code: a load from a page the RDP may still be drawing to waits for it, as the
 // interpreter's does.
 void cpuRdpWaitRead(struct N64* n, uint32_t paddr, uint32_t len) {
-	n64RdramRead(n, paddr, len);
+	if (paddr < RDRAM_SIZE) {
+		n64RdramRead(n, paddr, len);
+	}
 }
 
 // And a store, as n64RdramWrite has it for the RDP.
 void cpuRdpWaitWrite(struct N64* n, uint32_t paddr, uint32_t len) {
-	rdpWaitFor(n, paddr, len);
+	if (paddr < RDRAM_SIZE) {
+		rdpWaitFor(n, paddr, len);
+	}
 }
 
 // For compiled code: a D-cache miss as dcacheLine has it; the cycles it costs. UINT32_MAX, with

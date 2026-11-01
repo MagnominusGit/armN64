@@ -1829,7 +1829,10 @@ void* jitCompile(struct N64* n, const uint32_t* ops, uint32_t count, uint32_t va
 	for (int i = 0; i < j->codeCheckCount; ++i) {
 		struct Miss* k = &j->codeChecks[i];
 		patchHere(e, k->site);
-		// On a page the RDP draws to or reads, it waits for the RDP there in C first.
+		// Past RDRAM, the interpreter. On a page the RDP draws to or reads, it waits for the RDP
+		// there in C first.
+		aLsrImm(e, 2, 6, 23);
+		k->slow->site[k->slow->sites++] = aCbnz(e, 2, NULL);
 		aLogicImm(e, A_ANDS_IMM, ZR, 1, PAGE_RDP);
 		uint8_t* noRdp = aBcond(e, C_EQ, NULL);
 		rdpWaitCall(e, (const void*) cpuRdpWaitWrite, k->size);

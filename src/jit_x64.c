@@ -1050,7 +1050,10 @@ void* jitCompile(struct N64* n, const uint32_t* ops, uint32_t count, uint32_t va
 	for (int i = 0; i < j->codeCheckCount; ++i) {
 		struct Miss* k = &j->codeChecks[i];
 		patchHere(e, k->site);
-		// On a page the RDP draws to or reads, it waits for the RDP there in C first.
+		// Past RDRAM, the interpreter. On a page the RDP draws to or reads, it waits for the RDP
+		// there in C first.
+		xTestI(e, 4, R(RAX), ~(uint32_t) (RDRAM_SIZE - 1));
+		k->slow->site[k->slow->sites++] = xJcc(e, CC_NE, NULL);
 		xTestI(e, 1, MI(RBX, RCX, 1, (int32_t) offsetof(struct N64, pageFlags)), PAGE_RDP);
 		uint8_t* noRdp = xJcc(e, CC_E, NULL);
 		rdpWaitCall(e, (const void*) cpuRdpWaitWrite, k->size);
