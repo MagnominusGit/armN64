@@ -323,6 +323,7 @@ static const char fragmentHead[] =
 	"in vec3 vTex;\n"
 	"uniform vec4 uPrim, uEnv, uFog, uBlend;\n"
 	"uniform float uPrimLod, uPrimDepth;\n"
+	"uniform int uPersp;\n"
 	"uniform ivec4 uTile0[3], uTile1[3];\n"
 	"uniform ivec4 uImage0, uImage1;\n"
 	"uniform highp sampler2D uTex0, uTex1;\n"
@@ -356,10 +357,50 @@ static const char fragmentHead[] =
 	"	h ^= h >> 12;\n"
 	"	return vec3(uvec3(h, h >> 8, h >> 16) & 255u) / 255.0;\n"
 	"}\n"
+	// The RDP's divide (rdp.c texCoords): w's top 15 bits normalized, a table's reciprocal, the
+	// products saturating outside 16 bits.
+	"const ivec2 rcpTable[64] = ivec2[64](\n"
+	"	ivec2(0x4000, -1008), ivec2(0x3f04, -976), ivec2(0x3e10, -952), ivec2(0x3d22, -920), ivec2(0x3c3c, -892), ivec2(0x3b5d, -872),\n"
+	"	ivec2(0x3a83, -840), ivec2(0x39b1, -820), ivec2(0x38e4, -800), ivec2(0x381c, -776), ivec2(0x375a, -756), ivec2(0x369d, -736),\n"
+	"	ivec2(0x35e5, -716), ivec2(0x3532, -700), ivec2(0x3483, -680), ivec2(0x33d9, -664), ivec2(0x3333, -648), ivec2(0x3291, -628),\n"
+	"	ivec2(0x31f4, -620), ivec2(0x3159, -600), ivec2(0x30c3, -588), ivec2(0x3030, -572), ivec2(0x2fa1, -560), ivec2(0x2f15, -548),\n"
+	"	ivec2(0x2e8c, -536), ivec2(0x2e06, -524), ivec2(0x2d83, -512), ivec2(0x2d03, -500), ivec2(0x2c86, -492), ivec2(0x2c0b, -480),\n"
+	"	ivec2(0x2b93, -468), ivec2(0x2b1e, -460), ivec2(0x2aab, -452), ivec2(0x2a3a, -440), ivec2(0x29cc, -432), ivec2(0x2960, -424),\n"
+	"	ivec2(0x28f6, -416), ivec2(0x288e, -408), ivec2(0x2828, -400), ivec2(0x27c4, -392), ivec2(0x2762, -384), ivec2(0x2702, -376),\n"
+	"	ivec2(0x26a4, -368), ivec2(0x2648, -364), ivec2(0x25ed, -356), ivec2(0x2594, -348), ivec2(0x253d, -344), ivec2(0x24e7, -340),\n"
+	"	ivec2(0x2492, -332), ivec2(0x243f, -324), ivec2(0x23ee, -320), ivec2(0x239e, -316), ivec2(0x234f, -308), ivec2(0x2302, -304),\n"
+	"	ivec2(0x22b6, -296), ivec2(0x226c, -296), ivec2(0x2222, -288), ivec2(0x21da, -284), ivec2(0x2193, -280), ivec2(0x214d, -276),\n"
+	"	ivec2(0x2108, -268), ivec2(0x20c5, -268), ivec2(0x2082, -260), ivec2(0x2041, -260));\n"
+	"int rdpDivide(int st, int w, bool carry, int shift, int rcp) {\n"
+	"	if (carry) return 0x7FFF;\n"
+	"	int prod = int(uint(st) * uint(rcp));\n"
+	"	int mask = ((1 << 30) - 1) & -((1 << 29) >> shift);\n"
+	"	int outside = prod & mask;\n"
+	"	if (outside != mask && outside != 0) {\n"
+	"		int shifted = shift != 14 ? prod >> (13 - shift) : prod;\n"
+	"		return (shifted & (1 << 29)) == 0 ? 0x7FFF : -0x8000;\n"
+	"	}\n"
+	"	return shift != 14 ? prod >> (13 - shift) : int(uint(prod) << 1);\n"
+	"}\n"
 	"vec4 sampleTile(sampler2D t, ivec4 a, ivec4 b, ivec4 c, ivec4 image) {\n"
 	"	vec3 top = vTex - 0.5 * dFdx(vTex) - 0.5 * dFdy(vTex);\n"
-	"	vec2 st = top.xy / top.z;\n"
-	"	int s = int(floor(st.x * 32.0 + 0.01)), tt = int(floor(st.y * 32.0 + 0.01));\n"
+	"	int s, tt;\n"
+	"	if (uPersp != 0) {\n"
+	"		int w = int(floor(top.z * 32767.0));\n"
+	"		bool carry = w <= 0;\n"
+	"		w &= 0x7FFF;\n"
+	"		int msb = 14;\n"
+	"		while (msb >= 0 && (w >> msb) == 0) --msb;\n"
+	"		int shift = min(14 - msb, 14);\n"
+	"		int norm = (w << shift) & 0x3FFF;\n"
+	"		ivec2 e = rcpTable[norm >> 8];\n"
+	"		int rcp = ((e.y * (norm & 0xFF)) >> 10) + e.x;\n"
+	"		s = rdpDivide(int(floor(top.x * 32.0 + 0.01)), w, carry, shift, rcp);\n"
+	"		tt = rdpDivide(int(floor(top.y * 32.0 + 0.01)), w, carry, shift, rcp);\n"
+	"	} else {\n"
+	"		s = int(floor(top.x * 32.0 + 0.01)), tt = int(floor(top.y * 32.0 + 0.01));\n"
+	"	}\n"
+	"	s = clamp(s, -0x10000, 0xFFFF), tt = clamp(tt, -0x10000, 0xFFFF);\n"
 	"	int fs, ft, f;\n"
 	"	int s0 = wrapCoord(s, a.x, a.z, b.x, b.z, c.x, fs);\n"
 	"	int t0 = wrapCoord(tt, a.y, a.w, b.y, b.w, c.y, ft);\n"
@@ -1189,8 +1230,11 @@ void glrDraw(struct N64* n, struct RDP* r, const uint64_t* w, int op) {
 		if (!drawState(n, g, r, tex, shade, z, (c >> 8) & 7, persp, (int) floorf(top), (int) ceilf(bottom) + 1)) {
 			return;
 		}
-		for (int k = 0; k < 3; ++k) {
-			vertex(g, v[k][0], v[k][1], v[k][2], v[k][3], &v[k][4], v[k][8], v[k][9]);
+		// 1/w scaled as the microcodes send it, the corners' largest a half (hle.c triangle).
+		float maxW = fmaxf(v[0][3], fmaxf(v[1][3], v[2][3]));
+		float k = maxW > 0 ? 0.5f / maxW : 0.5f;
+		for (int i = 0; i < 3; ++i) {
+			vertex(g, v[i][0], v[i][1], v[i][2], v[i][3] * k, &v[i][4], v[i][8], v[i][9]);
 		}
 		return;
 	}
