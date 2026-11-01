@@ -31,6 +31,7 @@ enum {
 	GL_SHADER_STORAGE_BUFFER = 0x90D2, GL_DYNAMIC_DRAW = 0x88E8, GL_MAP_READ_BIT = 0x0001,
 	GL_STREAM_READ = 0x88E1, GL_COPY_READ_BUFFER = 0x8F36, GL_COPY_WRITE_BUFFER = 0x8F37,
 	GL_SHADER_STORAGE_BARRIER_BIT = 0x2000, GL_BUFFER_UPDATE_BARRIER_BIT = 0x0200, GL_RENDERER = 0x1F01,
+	GL_VERSION = 0x1F02, GL_PROGRAM_BINARY_RETRIEVABLE_HINT = 0x8257, GL_PROGRAM_BINARY_LENGTH = 0x8741,
 };
 
 struct Gles {
@@ -97,6 +98,10 @@ struct Gles {
 	void (*glMemoryBarrier)(GLbitfield);
 	void (*glFlush)(void);
 	void (*glCopyBufferSubData)(GLenum, GLenum, GLintptr, GLintptr, GLsizeiptr);
+	// Optional: programs kept compiled on disk.
+	void (*glGetProgramBinary)(GLuint, GLsizei, GLsizei*, GLenum*, void*);
+	void (*glProgramBinary)(GLuint, GLenum, const void*, GLsizei);
+	void (*glProgramParameteri)(GLuint, GLenum, GLint);
 	const unsigned char* (*glGetString)(GLenum);
 };
 
@@ -136,6 +141,7 @@ static bool loadAll(struct Gles* g) {
 }
 
 static bool loadGl(struct Gles* g) {
+	(void) (LOAD(glGetProgramBinary) && LOAD(glProgramBinary) && LOAD(glProgramParameteri));
 	return LOAD(glCreateShader) && LOAD(glShaderSource) && LOAD(glCompileShader) && LOAD(glGetShaderiv) &&
 	       LOAD(glGetShaderInfoLog) && LOAD(glDeleteShader) && LOAD(glCreateProgram) && LOAD(glAttachShader) &&
 	       LOAD(glLinkProgram) && LOAD(glGetProgramiv) && LOAD(glGetProgramInfoLog) && LOAD(glUseProgram) &&
@@ -304,7 +310,94 @@ static bool context(struct Gles* g, char* error, size_t errorSize) {
 }
 
 // A compute program from source, in use after; 0 when it doesn't build.
+// A program just made, now the one in use and in the list.
+static GLuint useNew(struct Gles* g, GLuint p) {
+	g->glUseProgram(p);
+	g->program = p;
+	g->uniforms = g->glGetUniformLocation(p, "u");
+	g->programs[g->programCount] = p;
+	g->programUniforms[g->programCount++] = g->uniforms;
+	return p;
+}
+
+// Compiled programs kept on disk (glesCacheDir), by their source and the driver: Mali's compiler
+// takes seconds a program, every time.
+static char cacheDir[4096];
+
+void glesCacheDir(const char* dir) {
+	snprintf(cacheDir, sizeof(cacheDir), "%s", dir ? dir : "");
+}
+
+static bool cachePath(struct Gles* g, const char* source, char* path, size_t size) {
+	if (!cacheDir[0] || !g->glGetProgramBinary || !g->glProgramBinary || !g->glProgramParameteri) {
+		return false;
+	}
+	const char* parts[3] = { (const char*) g->glGetString(GL_RENDERER), (const char*) g->glGetString(GL_VERSION), source };
+	uint64_t h = 14695981039346656037ull;
+	for (int i = 0; i < 3; ++i) {
+		for (const char* c = parts[i] ? parts[i] : ""; *c; ++c) {
+			h = (h ^ (uint8_t) *c) * 1099511628211ull;
+		}
+	}
+	snprintf(path, size, "%s/%016llx.bin", cacheDir, (unsigned long long) h);
+	return true;
+}
+
+static GLuint cachedProgram(struct Gles* g, const char* path) {
+	FILE* f = fopen(path, "rb");
+	if (!f) {
+		return 0;
+	}
+	GLenum format = 0;
+	void* binary = NULL;
+	long size = fseek(f, 0, SEEK_END) == 0 ? ftell(f) - (long) sizeof(format) : -1;
+	GLuint p = 0;
+	if (size > 0 && fseek(f, 0, SEEK_SET) == 0 && fread(&format, sizeof(format), 1, f) == 1 && (binary = malloc((size_t) size)) &&
+	    fread(binary, 1, (size_t) size, f) == (size_t) size) {
+		p = g->glCreateProgram();
+		g->glProgramBinary(p, format, binary, (GLsizei) size);
+		GLint ok = 0;
+		g->glGetProgramiv(p, GL_LINK_STATUS, &ok);
+		if (!ok) {
+			g->glDeleteProgram(p);
+			p = 0;
+		}
+	}
+	free(binary);
+	fclose(f);
+	return p;
+}
+
+static void saveProgram(struct Gles* g, GLuint p, const char* path) {
+	GLint size = 0;
+	g->glGetProgramiv(p, GL_PROGRAM_BINARY_LENGTH, &size);
+	void* binary = size > 0 ? malloc((size_t) size) : NULL;
+	GLenum format = 0;
+	GLsizei length = 0;
+	if (binary) {
+		g->glGetProgramBinary(p, size, &length, &format, binary);
+	}
+	char temporary[4210];
+	snprintf(temporary, sizeof(temporary), "%s.tmp", path);
+	FILE* f = length > 0 ? fopen(temporary, "wb") : NULL;
+	if (f) {
+		bool ok = fwrite(&format, sizeof(format), 1, f) == 1 && fwrite(binary, 1, (size_t) length, f) == (size_t) length;
+		if (fclose(f) == 0 && ok) {
+			rename(temporary, path);
+		} else {
+			remove(temporary);
+		}
+	}
+	free(binary);
+}
+
 static GLuint compileProgram(struct Gles* g, const char* source, char* error, size_t errorSize) {
+	char path[4200];
+	bool cached = cachePath(g, source, path, sizeof(path));
+	GLuint p = cached ? cachedProgram(g, path) : 0;
+	if (p) {
+		return useNew(g, p);
+	}
 	GLuint shader = g->glCreateShader(GL_COMPUTE_SHADER);
 	g->glShaderSource(shader, 1, &source, NULL);
 	g->glCompileShader(shader);
@@ -315,7 +408,10 @@ static GLuint compileProgram(struct Gles* g, const char* source, char* error, si
 		g->glDeleteShader(shader);
 		return 0;
 	}
-	GLuint p = g->glCreateProgram();
+	p = g->glCreateProgram();
+	if (cached) {
+		g->glProgramParameteri(p, GL_PROGRAM_BINARY_RETRIEVABLE_HINT, 1);
+	}
 	g->glAttachShader(p, shader);
 	g->glLinkProgram(p);
 	g->glDeleteShader(shader);
@@ -325,12 +421,10 @@ static GLuint compileProgram(struct Gles* g, const char* source, char* error, si
 		g->glDeleteProgram(p);
 		return 0;
 	}
-	g->glUseProgram(p);
-	g->program = p;
-	g->uniforms = g->glGetUniformLocation(p, "u");
-	g->programs[g->programCount] = p;
-	g->programUniforms[g->programCount++] = g->uniforms;
-	return p;
+	if (cached) {
+		saveProgram(g, p, path);
+	}
+	return useNew(g, p);
 }
 
 static bool program(struct Gles* g, const char* source, char* error, size_t errorSize) {

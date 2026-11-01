@@ -25,6 +25,8 @@ void glesResume(void);
 void glesFrontend(void* (*getProc)(const char* name));
 void glesDestroy(struct Gles*);
 const char* glesRenderer(struct Gles*);
+// Where compiled programs are kept, by their source and the driver (none: "" or NULL).
+void glesCacheDir(const char* dir);
 // Whether contexts are the frontend's (glesFrontend).
 bool glesInFrontend(void);
 // Gives a buffer new storage of size bytes (data may be NULL).

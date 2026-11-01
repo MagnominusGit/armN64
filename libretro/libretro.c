@@ -15,6 +15,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include <strings.h>
+#include <sys/stat.h>
 #include <unistd.h>
 
 enum {
@@ -166,6 +167,19 @@ static const char* settings(const char* name) {
 	}
 	if (!strcmp(name, "N64_GL_SCALE")) {
 		return optionValue(environment, "armn64_resolution");
+	}
+	// Compiled GPU programs in system/armN64/cache.
+	if (!strcmp(name, "N64_SHADER_CACHE")) {
+		static char cache[4096];
+		const char* system = NULL;
+		if (!environment(RETRO_ENVIRONMENT_GET_SYSTEM_DIRECTORY, &system) || !system) {
+			return NULL;
+		}
+		snprintf(cache, sizeof(cache), "%s/armN64", system);
+		mkdir(cache, 0755);
+		snprintf(cache, sizeof(cache), "%s/armN64/cache", system);
+		mkdir(cache, 0755);
+		return cache;
 	}
 	if (!strcmp(name, "N64_SLICE")) {
 		return optionIs(environment, "armn64_accuracy", "hle") ? "8192" : "1024";

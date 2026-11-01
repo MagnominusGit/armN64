@@ -179,6 +179,7 @@ static void start(struct N64* n) {
 	n->useBlocks = n->useJit || (n->slice && blocks && blocks[0] == '1');
 	const char* rdpThreads = setting(n, "N64_RDP_THREADS");
 	n->rdpThreads = n->rdpThreadsAsked = rdpThreads ? atoi(rdpThreads) : 0;
+	glesCacheDir(setting(n, "N64_SHADER_CACHE"));
 	const char* rdpGpu = setting(n, "N64_RDP_GPU");
 	n->rdpGpu = rdpGpu && rdpGpu[0] == '1';
 	if (n->rdpGpu && !n->rdpThreads) {
