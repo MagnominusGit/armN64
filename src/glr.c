@@ -215,6 +215,7 @@ struct Glr {
 	uint32_t seq;
 	// The shader reads the image (EXT_shader_framebuffer_fetch): it blends as the RDP does.
 	bool fetch;
+	bool depthReady;
 	// The HLE's corners for triangles it has sent and the RDP hasn't reached yet (a ring).
 	struct GlrCorners* queue;
 	uint32_t queueRead, queueWrite;
@@ -921,6 +922,15 @@ static struct Target* target(struct N64* n, struct Glr* g, uint32_t addr, uint32
 		useFramebuffer(g, t->framebuffer);
 		gl->FramebufferTexture2D(GL_FRAMEBUFFER, GL_COLOR_ATTACHMENT0, GL_TEXTURE_2D, t->texture, 0);
 		gl->FramebufferRenderbuffer(GL_FRAMEBUFFER, GL_DEPTH_STENCIL_ATTACHMENT, GL_RENDERBUFFER, g->depth);
+		if (!g->depthReady) {
+			// The depth the targets share starts at the far plane, not as the driver left it.
+			useScissor(g, false, 0, 0, 0, 0);
+			useDepthMask(g, true);
+			gl->ClearDepthf(1.0f);
+			gl->ClearStencil(0);
+			gl->Clear(GL_DEPTH_BUFFER_BIT | GL_STENCIL_BUFFER_BIT);
+			g->depthReady = true;
+		}
 		t->addr = addr, t->width = width, t->size = size;
 		t->loadedRows = 0;
 		t->dirtyFrom = t->dirtyTo = 0;
