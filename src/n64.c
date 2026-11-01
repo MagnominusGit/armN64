@@ -449,6 +449,7 @@ static void viRestoreRow(int16_t* restrict out, const uint8_t* restrict at, cons
 struct ViSetup {
 	uint32_t origin, stride;
 	int w, h;
+	float tvAspect;
 	bool wide, gammaOn, divot, dither, aa;
 };
 
@@ -490,6 +491,9 @@ static bool viSetup(struct N64* n, struct ViSetup* s) {
 	if (type < 2 || w <= 0 || h <= 0 || s->stride == 0) {
 		return false;
 	}
+	// The window's shape on a TV, whose 640 dots by 480 half-lines (576 in PAL) show as 4:3.
+	bool pal = n->fieldCycles == hwCycles(n, CPU_HZ / 50);
+	s->tvAspect = 4.0f / 3.0f * ((float) (hEnd - hStart) / 640.0f) / ((float) (vEnd - vStart) / (pal ? 576.0f : 480.0f));
 	s->w = w > 640 ? 640 : w;
 	s->h = h > 480 ? 480 : h;
 	s->gammaOn = v[0] & 8, s->divot = v[0] & 16, s->dither = v[0] & 0x10000, s->aa = ((v[0] >> 8) & 3) <= 1, s->wide = type == 3;
@@ -594,6 +598,11 @@ bool n64GlPicture(struct N64* n, unsigned* framebuffer, int* x, int* y, int* wid
 	*width = s.w;
 	*height = s.h;
 	return *framebuffer != 0;
+}
+
+float n64TvAspect(struct N64* n) {
+	struct ViSetup s;
+	return viSetup(n, &s) ? s.tvAspect : 4.0f / 3.0f;
 }
 
 bool n64PictureStart(struct N64* n, int* width, int* height) {

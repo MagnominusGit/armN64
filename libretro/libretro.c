@@ -49,6 +49,7 @@ static bool disk;
 static bool pal;
 static uint32_t picture[640 * 480];
 static int pictureWidth = 320, pictureHeight = 240;
+static float pictureAspect = 4.0f / 3.0f;
 static int16_t captured[CAPTURE_SAMPLES];
 static int16_t played[OUT_FRAMES * 2];
 // Where resampling is between the last frame kept from the run before and the next.
@@ -116,6 +117,9 @@ static struct retro_core_option_v2_definition optionDefinitions[] = {
 	{ "armn64_vi_filters", "VI Filters", NULL,
 	  "The video interface's antialiasing, divot and dither filters, which soften edges and smooth 16-bit colour as a TV showed it. Auto turns them on for MLE and LLE and off for HLE, where they cost speed.",
 	  NULL, "system", { { "auto", "Auto" }, { "on", "On" }, { "off", "Off" }, { NULL, NULL } }, "auto" },
+	{ "armn64_aspect", "Aspect Ratio", NULL,
+	  "TV 4:3 shows the picture as a TV did: the whole screen is 4:3 and the game's window keeps its shape in it. Fill 4:3 stretches the window to 4:3. Square Pixels shows each pixel square.",
+	  NULL, "system", { { "tv", "TV 4:3" }, { "fill", "Fill 4:3" }, { "square", "Square Pixels" }, { NULL, NULL } }, "tv" },
 	{ "armn64_frameskip", "Frame Skip (Restart)", NULL, "Leaves out the drawing of frames that are never shown, as many games make more than the screen can show.",
 	  NULL, "system", { { "disabled", "Off" }, { "enabled", "On" }, { NULL, NULL } }, "disabled" },
 	{ "armn64_pak1", "Player 1 Pak (Restart)", NULL, "What is in controller 1's slot: a Controller Pak for saves, a Rumble Pak, or a Transfer Pak with the Game Boy ROM in system/armN64/TransferPak1 (its .sav beside it).",
@@ -250,7 +254,7 @@ void retro_get_system_av_info(struct retro_system_av_info* info) {
 	// The GL renderer's pictures are up to its scale times the largest.
 	const char* scale = optionValue(environment, "armn64_resolution");
 	unsigned k = scale && *scale >= '1' && *scale <= '4' ? (unsigned) (*scale - '0') : 1;
-	info->geometry = (struct retro_game_geometry) { (unsigned) pictureWidth, (unsigned) pictureHeight, 640 * k, 480 * k, 4.0f / 3.0f };
+	info->geometry = (struct retro_game_geometry) { (unsigned) pictureWidth, (unsigned) pictureHeight, 640 * k, 480 * k, pictureAspect };
 	info->timing = (struct retro_system_timing) { pal ? 50.0 : 60.0, OUT_RATE };
 }
 
@@ -814,13 +818,21 @@ static void playAudio(void) {
 	}
 }
 
-// A picture made on the CPU (0x00RRGGBB) to the frontend.
-static void showPicture(int width, int height, bool shared) {
-	if (width != pictureWidth || height != pictureHeight) {
-		pictureWidth = width, pictureHeight = height;
-		struct retro_game_geometry geometry = { (unsigned) width, (unsigned) height, 640, 480, 4.0f / 3.0f };
+// The picture's size and shape to the frontend when either changes.
+static void setGeometry(int width, int height) {
+	float aspect = optionIs(environment, "armn64_aspect", "fill") ? 4.0f / 3.0f
+	               : optionIs(environment, "armn64_aspect", "square") ? (float) width / (float) height
+	                                                                  : n64TvAspect(machine);
+	if (width != pictureWidth || height != pictureHeight || aspect != pictureAspect) {
+		pictureWidth = width, pictureHeight = height, pictureAspect = aspect;
+		struct retro_game_geometry geometry = { (unsigned) width, (unsigned) height, 640, 480, aspect };
 		environment(RETRO_ENVIRONMENT_SET_GEOMETRY, &geometry);
 	}
+}
+
+// A picture made on the CPU (0x00RRGGBB) to the frontend.
+static void showPicture(int width, int height, bool shared) {
+	setGeometry(width, height);
 	if (!shared) {
 		videoRefresh(picture, (unsigned) width, (unsigned) height, (size_t) width * 4);
 	} else if (hwReady) {
@@ -897,18 +909,10 @@ void retro_run(void) {
 	int x = 0, y = 0;
 	if (shared && hwReady && n64GlPicture(machine, &framebuffer, &x, &y, &width, &height) && width && height) {
 		width *= machine->glrScale, height *= machine->glrScale;
-		if (width != pictureWidth || height != pictureHeight) {
-			pictureWidth = width, pictureHeight = height;
-			struct retro_game_geometry geometry = { (unsigned) width, (unsigned) height, 640, 480, 4.0f / 3.0f };
-			environment(RETRO_ENVIRONMENT_SET_GEOMETRY, &geometry);
-		}
+		setGeometry(width, height);
 		presentGl(framebuffer, x, y, width, height);
 	} else if (shared && hwReady && n64PictureStart(machine, &width, &height) && width && height && (buffer = n64PictureBuffer(machine))) {
-		if (width != pictureWidth || height != pictureHeight) {
-			pictureWidth = width, pictureHeight = height;
-			struct retro_game_geometry geometry = { (unsigned) width, (unsigned) height, 640, 480, 4.0f / 3.0f };
-			environment(RETRO_ENVIRONMENT_SET_GEOMETRY, &geometry);
-		}
+		setGeometry(width, height);
 		present(width, height, buffer);
 	} else if (n64Picture(machine, picture, &width, &height) && width && height) {
 		showPicture(width, height, shared);

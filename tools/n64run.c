@@ -449,6 +449,7 @@ int main(int argc, char** argv) {
 			printf(" %d=%x", i, n->rsp.r[i]);
 		}
 		printf("\ndp start %06x current %06x end %06x\n", n->dp.start, n->dp.current, n->dp.end);
+		printf("tv aspect %.4f\n", n64TvAspect(n));
 		printf("vi:");
 		for (int i = 0; i < 14; ++i) {
 			printf(" %08x", n->vi.reg[i]);

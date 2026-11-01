@@ -492,6 +492,8 @@ void aiUpdate(struct N64*);
 int n64Picture(struct N64*, uint32_t* out, int* width, int* height);
 // With N64_VI_GPU, starts the picture on the GPU and returns without waiting for it (a frontend
 // shows it from there); false when the VI shows nothing or the GPU isn't used.
+// The shape the VI's window has on a TV (width over height), for the frontend's aspect ratio.
+float n64TvAspect(struct N64*);
 bool n64PictureStart(struct N64*, int* width, int* height);
 // After n64PictureStart, the GL buffer holding the picture in RGBA bytes (with the GPU RDP, in its
 // context); 0 when it is elsewhere.
