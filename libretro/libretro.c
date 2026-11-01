@@ -120,6 +120,9 @@ static struct retro_core_option_v2_definition optionDefinitions[] = {
 	{ "armn64_aspect", "Aspect Ratio", NULL,
 	  "Fill 4:3 stretches the game's window to 4:3. TV 4:3 shows the picture as a TV did: the whole screen is 4:3 and the game's window keeps its shape in it. Square Pixels shows each pixel square.",
 	  NULL, "system", { { "fill", "Fill 4:3" }, { "tv", "TV 4:3" }, { "square", "Square Pixels" }, { NULL, NULL } }, "fill" },
+	{ "armn64_crop_overscan", "Crop Overscan", NULL,
+	  "Hides a thirtieth of the picture at each edge, as a TV's frame did: the black lines many games leave there (Super Mario 64's at the top and bottom).",
+	  NULL, "system", { { "enabled", "On" }, { "disabled", "Off" }, { NULL, NULL } }, "enabled" },
 	{ "armn64_frameskip", "Frame Skip (Restart)", NULL, "Leaves out the drawing of frames that are never shown, as many games make more than the screen can show.",
 	  NULL, "system", { { "disabled", "Off" }, { "enabled", "On" }, { NULL, NULL } }, "disabled" },
 	{ "armn64_pak1", "Player 1 Pak (Restart)", NULL, "What is in controller 1's slot: a Controller Pak for saves, a Rumble Pak, or a Transfer Pak with the Game Boy ROM in system/armN64/TransferPak1 (its .sav beside it).",
@@ -497,6 +500,15 @@ static bool askHardwareContext(void) {
 	return true;
 }
 
+static void setGeometry(int width, int height);
+
+// The columns and rows hidden at each edge of a picture made at k times its size (Crop Overscan).
+static void overscan(int width, int height, int k, int* x, int* y) {
+	bool const crop = !optionIs(environment, "armn64_crop_overscan", "disabled");
+	*x = crop ? width / k / 30 * k : 0;
+	*y = crop ? height / k / 30 * k : 0;
+}
+
 // The VI's picture into the frontend's framebuffer, upside down as GL keeps it: from the GL buffer
 // the GPU made it in, else from picture.
 static void present(int width, int height, unsigned buffer) {
@@ -514,11 +526,15 @@ static void present(int width, int height, unsigned buffer) {
 		}
 		gl.TexSubImage2D(GL_TEXTURE_2D, 0, 0, 0, width, height, GL_RGBA, GL_UNSIGNED_BYTE, presentRgba);
 	}
+	int cx, cy;
+	overscan(width, height, 1, &cx, &cy);
+	int const w = width - 2 * cx, h = height - 2 * cy;
+	setGeometry(w, h);
 	gl.BindFramebuffer(GL_READ_FRAMEBUFFER, presentFramebuffer);
 	gl.BindFramebuffer(GL_DRAW_FRAMEBUFFER, (unsigned) hw.get_current_framebuffer());
-	gl.BlitFramebuffer(0, 0, width, height, 0, height, width, 0, GL_COLOR_BUFFER_BIT, GL_NEAREST);
+	gl.BlitFramebuffer(cx, cy, cx + w, cy + h, 0, h, w, 0, GL_COLOR_BUFFER_BIT, GL_NEAREST);
 	glrForget(machine);
-	videoRefresh(RETRO_HW_FRAME_BUFFER_VALID, (unsigned) width, (unsigned) height, 0);
+	videoRefresh(RETRO_HW_FRAME_BUFFER_VALID, (unsigned) w, (unsigned) h, 0);
 }
 
 // The GL renderer's picture from its framebuffer into the frontend's, upside down as GL keeps it, at
@@ -526,11 +542,15 @@ static void present(int width, int height, unsigned buffer) {
 static void presentGl(unsigned framebuffer, int x, int y, int width, int height) {
 	int const k = machine->glrScale;
 	gl.Disable(GL_SCISSOR_TEST);
+	int cx, cy;
+	overscan(width, height, k, &cx, &cy);
+	int const w = width - 2 * cx, h = height - 2 * cy;
+	setGeometry(w, h);
 	gl.BindFramebuffer(GL_READ_FRAMEBUFFER, framebuffer);
 	gl.BindFramebuffer(GL_DRAW_FRAMEBUFFER, (unsigned) hw.get_current_framebuffer());
-	gl.BlitFramebuffer(x * k, y * k, x * k + width, y * k + height, 0, height, width, 0, GL_COLOR_BUFFER_BIT, GL_NEAREST);
+	gl.BlitFramebuffer(x * k + cx, y * k + cy, x * k + cx + w, y * k + cy + h, 0, h, w, 0, GL_COLOR_BUFFER_BIT, GL_NEAREST);
 	glrForget(machine);
-	videoRefresh(RETRO_HW_FRAME_BUFFER_VALID, (unsigned) width, (unsigned) height, 0);
+	videoRefresh(RETRO_HW_FRAME_BUFFER_VALID, (unsigned) w, (unsigned) h, 0);
 }
 
 // A notice on screen for a few seconds.
@@ -832,9 +852,11 @@ static void setGeometry(int width, int height) {
 
 // A picture made on the CPU (0x00RRGGBB) to the frontend.
 static void showPicture(int width, int height, bool shared) {
-	setGeometry(width, height);
 	if (!shared) {
-		videoRefresh(picture, (unsigned) width, (unsigned) height, (size_t) width * 4);
+		int cx, cy;
+		overscan(width, height, 1, &cx, &cy);
+		setGeometry(width - 2 * cx, height - 2 * cy);
+		videoRefresh(picture + (size_t) cy * width + cx, (unsigned) (width - 2 * cx), (unsigned) (height - 2 * cy), (size_t) width * 4);
 	} else if (hwReady) {
 		present(width, height, 0);
 	}
@@ -909,10 +931,8 @@ void retro_run(void) {
 	int x = 0, y = 0;
 	if (shared && hwReady && n64GlPicture(machine, &framebuffer, &x, &y, &width, &height) && width && height) {
 		width *= machine->glrScale, height *= machine->glrScale;
-		setGeometry(width, height);
 		presentGl(framebuffer, x, y, width, height);
 	} else if (shared && hwReady && n64PictureStart(machine, &width, &height) && width && height && (buffer = n64PictureBuffer(machine))) {
-		setGeometry(width, height);
 		present(width, height, buffer);
 	} else if (n64Picture(machine, picture, &width, &height) && width && height) {
 		showPicture(width, height, shared);
