@@ -3143,8 +3143,9 @@ static void gpuCommand(struct N64* n, struct RDP* r, const uint64_t* w, int op) 
 	             (shades && (firstStage->readsCombined || usesNoise(r)));
 	if (alone || y1 >= GPU_TILES * 16) {
 		gpuSync(n, r);
-		execute(n, r, w, op);
+		// execute counts the primitive itself (its noise from the same number as on the CPU).
 		--r->seq;
+		execute(n, r, w, op);
 		// Drawn here, so newer than the GPU's copy.
 		FOR_PAGES(color, colorLen, p) {
 			g->page[p] &= ~GPU_PAGE_OWNED;
