@@ -418,7 +418,7 @@ static const char fragmentHead[] =
 	"}\n";
 
 // modes: cycle type (bits 0-1), alpha compare (2), textured (3), shaded (4), the RDP's dither in
-// the shader (5) with the Bayer matrix (6) into a 16-bit image (7), the blender's first
+// the shader (5) with the Bayer matrix (6) or noise (31) into a 16-bit image (7), the blender's first
 // cycle and last cycle selections (8-15, 16-23), blending with memory (24), depth from prim (25),
 // coverage times alpha with antialiasing (26), alpha as coverage (27), the last cycle's blend formula
 // in the shader (28).
@@ -590,8 +590,15 @@ static struct Program* program(struct Glr* g, struct ProgramKey key) {
 		strcat(source, line);
 	}
 	if (key.modes & MODE_DITHER) {
-		snprintf(line, sizeof(line), "	ivec2 px = ivec2(gl_FragCoord.xy) / %d;\n	int ditherM = %s[(px.y & 3) * 4 + (px.x & 3)];\n	bool dithered = %s;\n", g->scale,
-		         key.modes & MODE_BAYER ? "int[16](0, 4, 1, 5, 4, 0, 5, 1, 3, 7, 2, 6, 7, 3, 6, 2)" : "int[16](0, 6, 1, 7, 4, 2, 5, 3, 3, 5, 2, 4, 7, 1, 6, 0)",
+		// The matrix's value for all three channels, or three bits of noise for each.
+		char matrix[256];
+		if (key.modes & MODE_NOISE) {
+			snprintf(matrix, sizeof(matrix), "uint h = uint(px.x) * 0x9E3779B1u ^ uint(px.y) * 0x85EBCA77u ^ 4u; h ^= h >> 15; h *= 0x2C1B3C6Du; h ^= h >> 12;\n	ivec3 ditherM = ivec3(uvec3(h, h >> 3, h >> 6) & 7u)");
+		} else {
+			snprintf(matrix, sizeof(matrix), "ivec3 ditherM = ivec3(%s[(px.y & 3) * 4 + (px.x & 3)])",
+			         key.modes & MODE_BAYER ? "int[16](0, 4, 1, 5, 4, 0, 5, 1, 3, 7, 2, 6, 7, 3, 6, 2)" : "int[16](0, 6, 1, 7, 4, 2, 5, 3, 3, 5, 2, 4, 7, 1, 6, 0)");
+		}
+		snprintf(line, sizeof(line), "	ivec2 px = ivec2(gl_FragCoord.xy) / %d;\n	%s;\n	bool dithered = %s;\n", g->scale, matrix,
 		         key.modes & MODE_BLEND ? "false" : "true");
 		strcat(source, line);
 	}
@@ -636,7 +643,7 @@ static struct Program* program(struct Glr* g, struct ProgramKey key) {
 		// rdp.c's dither: a channel whose low 3 bits are above the matrix's value rounds up; a 16-bit
 		// image keeps 5 bits, as the RDP's would read back.
 		strcat(source, "	if (dithered) { ivec3 o = ivec3(floor(oColor.rgb * 255.0 + 0.5));\n"
-		               "	for (int i = 0; i < 3; ++i) if ((o[i] & 7) > ditherM) o[i] = min((o[i] & 0xF8) + 8, 255);\n");
+		               "	for (int i = 0; i < 3; ++i) if ((o[i] & 7) > ditherM[i]) o[i] = min((o[i] & 0xF8) + 8, 255);\n");
 		strcat(source, key.modes & MODE_IMAGE16 ? "	o = (o >> 3) << 3 | o >> 5;\n	oColor.rgb = vec3(o) / 255.0; }\n" : "	oColor.rgb = vec3(o) / 255.0; }\n");
 	}
 	if (!(key.modes & MODE_BLEND) && (key.modes & (MODE_BLEND_MEMORY_FIRST | MODE_BLEND_CONSTANT)) != MODE_BLEND_MEMORY_FIRST) {
@@ -1129,8 +1136,8 @@ static bool drawState(struct N64* n, struct Glr* g, struct RDP* r, bool textured
 		modes |= MODE_BLEND;
 	}
 	// The dither where the shader makes the image's color, or the GPU blends into a 16-bit image.
-	if (cycleType < 2 && r->ditherRgb < 2 && !(modes & MODE_BLEND_MEMORY_FIRST) && (!(modes & MODE_BLEND) || r->colorSize == 2)) {
-		modes |= MODE_DITHER | (r->ditherRgb ? MODE_BAYER : 0) | (r->colorSize == 2 ? MODE_IMAGE16 : 0);
+	if (cycleType < 2 && r->ditherRgb < 3 && !(modes & MODE_BLEND_MEMORY_FIRST) && (!(modes & MODE_BLEND) || r->colorSize == 2)) {
+		modes |= MODE_DITHER | (r->ditherRgb == 1 ? MODE_BAYER : 0) | (r->ditherRgb == 2 ? MODE_NOISE : 0) | (r->colorSize == 2 ? MODE_IMAGE16 : 0);
 	}
 	if (depth && r->zPrim) {
 		modes |= MODE_PRIM_DEPTH;
