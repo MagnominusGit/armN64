@@ -1400,6 +1400,14 @@ static void runList(struct N64* n, struct Hle* h, uint32_t pc) {
 	}
 }
 
+// The name in a microcode's ID string: "RSP Gfx ucode NAME", or a tag in place of "ucode" (Ocarina
+// of Time's "RSP Gfx[Safe] S2DEX").
+static const char* gfxName(const char* text) {
+	const char* id = strstr(text, "RSP Gfx");
+	const char* name = id && (id[7] == ' ' || id[7] == '[') ? strchr(id + 8, ' ') : NULL;
+	return name ? name + 1 : NULL;
+}
+
 // The microcode family from the first ID string in its data (the block may run on into the next
 // microcode's data, and its string).
 // A microcode by the name its data gives (a Fast3D or F3DEX family line), else by the hash of its
@@ -1412,8 +1420,7 @@ static void ucodeName(struct N64* n, uint32_t code, uint32_t data, uint32_t data
 		text[i] = c >= 32 && c < 127 ? (char) c : ' ';
 	}
 	text[length] = 0;
-	const char* name = strstr(text, "RSP Gfx ucode ");
-	name = name ? name : strstr(text, "RSP SW Version");
+	const char* name = gfxName(text) ? strstr(text, "RSP Gfx") : strstr(text, "RSP SW Version");
 	if (name) {
 		snprintf(out, size, "%.*s", (int) (size - 1), name);
 		return;
@@ -1437,17 +1444,19 @@ void hleUcodeName(struct N64* n, char* out, size_t size) {
 
 // The line microcodes, F3DTEX/A and F3DAM, by name.
 static void ucodeFlags(struct N64* n, struct Hle* h, uint32_t data, uint32_t size) {
-	char name[48];
-	ucodeName(n, 0, data, size, name, sizeof(name));
-	h->lines = !strncmp(name, "RSP Gfx ucode L3DEX", 19);
-	h->texa = !strncmp(name, "RSP Gfx ucode F3DTEX/A", 22);
-	h->am = !strncmp(name, "RSP Gfx ucode F3DAM", 19);
+	char text[48];
+	ucodeName(n, 0, data, size, text, sizeof(text));
+	const char* name = gfxName(text);
+	h->lines = name && !strncmp(name, "L3DEX", 5);
+	h->texa = name && !strncmp(name, "F3DTEX/A", 8);
+	h->am = name && !strncmp(name, "F3DAM", 5);
 }
 
 static bool isFlx(struct N64* n, uint32_t data, uint32_t size) {
-	char name[48];
-	ucodeName(n, 0, data, size, name, sizeof(name));
-	return !strncmp(name, "RSP Gfx ucode F3DFLX", 20);
+	char text[48];
+	ucodeName(n, 0, data, size, text, sizeof(text));
+	const char* name = gfxName(text);
+	return name && !strncmp(name, "F3DFLX", 6);
 }
 
 static int family(struct N64* n, uint32_t data, uint32_t size) {
@@ -1460,15 +1469,14 @@ static int family(struct N64* n, uint32_t data, uint32_t size) {
 		text[i] = c >= 32 && c < 127 ? (char) c : ' ';
 	}
 	text[size] = 0;
-	const char* id = strstr(text, "RSP Gfx ucode ");
+	const char* name = gfxName(text);
 	const char* sw = strstr(text, "RSP SW Version");
-	if (sw && (!id || sw < id)) {
+	if (sw && (!name || sw < name)) {
 		return FAMILY_F3D;
 	}
-	if (!id) {
+	if (!name) {
 		return FAMILY_NONE;
 	}
-	const char* name = id + 14;
 	if (!strncmp(name, "L3DEX", 5) || !strncmp(name, "F3DTEX/A", 8)) {
 		for (const char* c = name; *c && c < name + 48; ++c) {
 			if (c[0] == ' ' && c[1] >= '0' && c[1] <= '9' && c[2] == '.' && c[3] >= '0' && c[3] <= '9') {
