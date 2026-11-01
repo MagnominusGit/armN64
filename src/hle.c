@@ -983,8 +983,8 @@ static void ucodeFlags(struct N64* n, struct Hle* h, uint32_t data, uint32_t siz
 static void ucodeName(struct N64* n, uint32_t code, uint32_t data, uint32_t dataSize, char* out, size_t size);
 
 // G_LOAD_UCODE: the list goes on in another microcode (its data named by G_RDPHALF_1); F3DEX's takes
-// the new data's other modes with it, F3DEX2's keeps its own. One of no family here leaves the task
-// to the RSP.
+// the new data's other modes with it, F3DEX2's and S2DEX2's keep their own (Kirby 64's menus). One of
+// no family here leaves the task to the RSP.
 static bool loadMicrocode(struct N64* n, struct Hle* h, uint32_t code, uint32_t dataSize) {
 	int f = family(n, address(h, h->half1), dataSize);
 	h->flx = isFlx(n, address(h, h->half1), dataSize);
@@ -996,7 +996,7 @@ static bool loadMicrocode(struct N64* n, struct Hle* h, uint32_t code, uint32_t 
 		reject(h);
 		return false;
 	}
-	if (h->family != FAMILY_F3DEX2) {
+	if (h->family != FAMILY_F3DEX2 && h->family != FAMILY_S2DEX2) {
 		h->modeH = 0x080CFF, h->modeL = 0;
 	}
 	h->family = f;
