@@ -163,7 +163,7 @@ struct DrawState {
 	int tile[2][12];
 	float prim[4], env[4], fog[4], blend[4], primLod, primDepth;
 	int scissor[4];
-	bool depthTest, depthWrite, decal, blendOn, persp;
+	bool depthTest, depthWrite, decal, depthLess, blendOn, persp;
 	int blendB;
 	// Memory as P: 1 with a per-pixel A, 2 with a constant one (blendConstant).
 	int memoryFirst;
@@ -305,7 +305,8 @@ static const char vertexSource[] =
 	"out vec4 vShade;\n"
 	"out vec3 vTex;\n"
 	"void main() {\n"
-	"	gl_Position = vec4(aPos.x / uSize.x * 2.0 - 1.0, aPos.y / uSize.y * 2.0 - 1.0, aPos.z * 2.0 - 1.0, 1.0);\n"
+	// Depth as the RDP's 18 bits over a cleared pixel's 0x3FFFF (the corners' z is 15.3 over 0x7FFF).
+	"	gl_Position = vec4(aPos.x / uSize.x * 2.0 - 1.0, aPos.y / uSize.y * 2.0 - 1.0, aPos.z * (262136.0 / 262143.0) * 2.0 - 1.0, 1.0);\n"
 	"	float q = uPersp != 0 ? aPos.w : 1.0;\n"
 	"	vShade = aShade;\n"
 	"	vTex = vec3(aTex * q, q);\n"
@@ -947,12 +948,13 @@ static void flushBatch(struct N64* n, struct Glr* g) {
 			}
 		}
 	}
-	// The RDP passes what is no farther (within its depth slope), and anything on a cleared depth.
-	int depth = s->depthTest ? 1 : s->depthWrite ? 2 : 0;
+	// The RDP passes what is in front (decals what is no farther, within the depth slope), and
+	// anything on a cleared depth.
+	int depth = s->depthLess ? 3 : s->depthTest ? 1 : s->depthWrite ? 2 : 0;
 	if (a->depth != depth) {
 		depth ? gl->Enable(GL_DEPTH_TEST) : gl->Disable(GL_DEPTH_TEST);
 		if (depth) {
-			gl->DepthFunc(depth == 1 ? GL_LEQUAL : GL_ALWAYS);
+			gl->DepthFunc(depth == 1 ? GL_LEQUAL : depth == 3 ? GL_LESS : GL_ALWAYS);
 		}
 		a->depth = depth;
 	}
@@ -1072,10 +1074,13 @@ static bool drawState(struct N64* n, struct Glr* g, struct RDP* r, bool textured
 	}
 	colorOf(&r->prim, s.prim), colorOf(&r->env, s.env), colorOf(&r->fog, s.fog), colorOf(&r->blend, s.blend);
 	s.primLod = r->primLod / 255.0f;
-	s.primDepth = (float) (r->primZ >> 3) / 0x7FFF;
+	s.primDepth = (float) r->primZ / 0x3FFFF;
 	s.depthTest = depth && r->zCompare;
 	s.depthWrite = depth && r->zUpdate;
 	s.decal = s.depthTest && r->zMode == 3;
+	// Outside decal mode a covered pixel passes only what is in front of it (no second pass over
+	// one's own shadow, NFL Quarterback Club 99).
+	s.depthLess = s.depthTest && r->zMode != 3;
 	s.persp = persp;
 	s.scissor[0] = r->scissorX0 >> 2, s.scissor[1] = r->scissorY0 >> 2;
 	s.scissor[2] = (r->scissorX1 + 3) >> 2, s.scissor[3] = rows;
@@ -1153,7 +1158,8 @@ void glrDraw(struct N64* n, struct RDP* r, const uint64_t* w, int op) {
 	glesUse(g->gles);
 	uint64_t c = w[0];
 	if (op == 0x01) {
-		bool z = c & 1, tex = c & 2, shade = c & 4, persp = (c >> 16) & 1;
+		// Depth from the primitive's needs no depth per corner (NFL Quarterback Club 99's shadows).
+		bool z = (c & 1) || (r->zAddr && r->zPrim), tex = c & 2, shade = c & 4, persp = (c >> 16) & 1;
 		float v[3][10];
 		float top = 1e9f, bottom = -1e9f;
 		for (int k = 0; k < 3; ++k) {
