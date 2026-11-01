@@ -1296,6 +1296,12 @@ static void runList(struct N64* n, struct Hle* h, uint32_t pc) {
 					for (uint32_t a1 = w1, a0 = w0; a1; a1 >>= 8, a0 >>= 4) {
 						drawTriangle(n, h, a1 & 15, (a1 >> 4) & 15, a0 & 15);
 					}
+				} else if (h->family == FAMILY_F3D) {
+					// Rare's TRI4 (GoldenEye, as GLideN64 has it): four triangles, each a nibble of w0 and
+					// two of w1.
+					for (int k = 0; k < 4; ++k) {
+						drawTriangle(n, h, (w0 >> (4 * k)) & 15, (w1 >> (8 * k)) & 15, (w1 >> (8 * k + 4)) & 15);
+					}
 				}
 				break;
 			case 0x07:
