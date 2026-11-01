@@ -360,8 +360,15 @@ int main(int argc, char** argv) {
 			lastOrigin = n->vi.reg[1];
 			++flips;
 		}
+		// With N64AUDIODUMP, the AI's samples a second too.
+		static size_t heard;
 		if (getenv("N64FPS") && (f + 1) % 300 == 0) {
-			printf("fields %d-%d: %.1f game frames a second\n", f - 298, f + 1, flips / 5.0);
+			printf("fields %d-%d: %.1f game frames a second", f - 298, f + 1, flips / 5.0);
+			if (n->audio) {
+				printf(", %.0f samples a second at %u Hz", (n->audioCount - heard) / 2 / 5.0, n->audioRate);
+				heard = n->audioCount;
+			}
+			printf("\n");
 			flips = 0;
 		}
 		if (pics) {
