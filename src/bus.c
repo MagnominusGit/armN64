@@ -30,11 +30,7 @@ static void spDma(struct N64* n, uint32_t lenReg, bool toRdram) {
 	uint32_t base = mem & 0x1000;
 	uint32_t dram = n->sp.dramAddr & 0xFFFFF8;
 	for (uint32_t row = 0; row < count; ++row) {
-		if (toRdram) {
-			n64RdramWrite(n, dram, len);
-		} else {
-			n64RdramRead(n, dram, len);
-		}
+		spDmaPages(n, dram, len, toRdram);
 		if ((mem & 0xFFF) + len <= 0x1000 && (dram & 0xFFFFFF) + len <= RDRAM_SIZE) {
 			// The row wraps neither memory.
 			uint8_t* sp = &n->sp.mem[base | (mem & 0xFFF)];
@@ -142,10 +138,10 @@ static void spWriteStatus(struct N64* n, uint32_t v) {
 		*s &= ~2u;
 	}
 	if (v & 8) {
-		n64Interrupt(n, MI_SP, false);
+		spInterrupt(n, false);
 	}
 	if (v & 16) {
-		n64Interrupt(n, MI_SP, true);
+		spInterrupt(n, true);
 	}
 	if (v & 32) {
 		*s &= ~0x20u;
@@ -383,11 +379,12 @@ static uint32_t viCurrent(struct N64* n) {
 	return (line % lines & ~1u) | field;
 }
 
-// SP memory and registers, DP and MI registers: what the RSP (and the RDP it drives) can change or see.
 enum { RDRAM_INIT_CYCLES = 2000000 };
 
-static inline bool rspShared(uint32_t addr) {
-	return addr >= 0x04000000 && addr < 0x04400000;
+// SP memory and registers, DP and MI registers: what the RSP (and the RDP it drives) can change or see.
+// With the RSP on its own thread its interrupt reaches MI only as it is caught up: MI is the CPU's.
+static inline bool rspShared(const struct N64* n, uint32_t addr) {
+	return addr >= 0x04000000 && addr < (n->rspThread ? 0x04300000u : 0x04400000u);
 }
 
 uint32_t busRead32(struct N64* n, uint32_t addr) {
@@ -408,7 +405,7 @@ uint32_t busRead32(struct N64* n, uint32_t addr) {
 		}
 		return be32(&n->rdram[addr & ~3u]);
 	}
-	if (rspShared(addr)) {
+	if (rspShared(n, addr)) {
 		rspCatchUp(n);
 	}
 	if (addr >= 0x04000000 && addr < 0x04040000) {
@@ -568,7 +565,7 @@ void busWrite32(struct N64* n, uint32_t addr, uint32_t v) {
 		ddWrite32(n, addr, v);
 		return;
 	}
-	if (rspShared(addr)) {
+	if (rspShared(n, addr)) {
 		rspCatchUp(n);
 	}
 	if (addr < RDRAM_SIZE) {
@@ -632,7 +629,7 @@ void busWrite32(struct N64* n, uint32_t addr, uint32_t v) {
 				n->dp.current = n->dp.start;
 				n->dp.status &= ~DP_START_VALID;
 			}
-			rdpRun(n);
+			rdpKick(n);
 			break;
 		case 0x0C:
 			if (v & 1) {
@@ -647,7 +644,7 @@ void busWrite32(struct N64* n, uint32_t addr, uint32_t v) {
 			}
 			if (v & 4) {
 				n->dp.status &= ~2u;
-				rdpRun(n);
+				rdpKick(n);
 			}
 			if (v & 0x40) {
 				n->dp.tmemBusy = 0;

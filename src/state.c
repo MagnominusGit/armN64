@@ -40,6 +40,9 @@ bool n64StateSave(struct N64* n, void* data, size_t size, bool quick) {
 	if (size < n64StateSize()) {
 		return false;
 	}
+	if (n->rspThread) {
+		rspThreadJoin(n);
+	}
 	// What the renderers and the GPU drew goes to RDRAM first.
 	bool const keepGl = quick && n->glr;
 	if (!keepGl) {
@@ -115,6 +118,7 @@ bool n64StateLoad(struct N64* n, const void* data, size_t size, bool quick) {
 	memcpy(n->rspVariants, was->rspVariants, sizeof(n->rspVariants));
 	n->rdpTap = was->rdpTap, n->rdpThreads = was->rdpThreads, n->rdpGpu = was->rdpGpu, n->rdpGl = was->rdpGl;
 	n->glr = was->glr, n->glrScale = was->glrScale;
+	n->rspThread = was->rspThread, n->rspWindow = was->rspWindow;
 	n->viGpu = was->viGpu, n->viFilters = was->viFilters, n->viGles = was->viGles, n->viSharedProgram = was->viSharedProgram;
 	n->pictureGles = was->pictureGles, n->pictureBinding = was->pictureBinding, n->pictureRgba = was->pictureRgba;
 	n->skip.on = was->skip.on;

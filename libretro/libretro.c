@@ -111,6 +111,9 @@ static struct retro_core_option_v2_definition optionDefinitions[] = {
 	  NULL, "system", { { "hle", "HLE" }, { "mle", "MLE" }, { "lle", "LLE" }, { NULL, NULL } }, "hle" },
 	{ "armn64_rdp_threads", "Renderer Threads (Restart)", NULL, "Threads beside the emulation that draw the RDP's pictures. Auto takes the cores there are, up to 3.",
 	  NULL, "system", { { "auto", "Auto" }, { "0", "None" }, { "1", "1" }, { "2", "2" }, { "3", "3" }, { NULL, NULL } }, "auto" },
+	{ "armn64_rsp_thread", "RSP Thread (Restart)", NULL,
+	  "Runs the RSP on a thread of its own beside the CPU: faster for the games whose microcode HLE leaves to the RSP (Rogue Squadron, Indiana Jones), at the cost of a core. HLE only.",
+	  NULL, "system", { { "disabled", "Off" }, { "enabled", "On" }, { NULL, NULL } }, "disabled" },
 	{ "armn64_renderer", "Renderer (Restart)", NULL,
 	  "With the Custom preset. GPU draws with OpenGL ES 3.1: HLE with the GL renderer, MLE and LLE with the RDP in compute shaders (exact). CPU draws with the renderer threads.",
 	  NULL, "system", { { "gpu", "GPU" }, { "cpu", "CPU" }, { NULL, NULL } }, "gpu" },
@@ -272,6 +275,9 @@ static const char* settings(const char* name) {
 	// VI runs in the frontend's context.
 	if (!strcmp(name, "N64_VI_GPU")) {
 		return (hwWanted && strcmp(accuracy(), "hle")) || viInContext ? "1" : "0";
+	}
+	if (!strcmp(name, "N64_RSP_THREAD")) {
+		return optionIs(environment, "armn64_rsp_thread", "enabled") ? "1" : "0";
 	}
 	if (!strcmp(name, "N64_FRAMESKIP")) {
 		return optionIs(environment, "armn64_frameskip", "enabled") ? "1" : "0";

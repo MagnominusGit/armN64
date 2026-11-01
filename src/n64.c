@@ -56,6 +56,7 @@ static void viPoolStop(struct ViPool* p);
 
 void n64Destroy(struct N64* n) {
 	if (n) {
+		rspThreadStop(n);
 		blocksFree(n);
 		jitFree(n);
 		rspJitFree(n);
@@ -199,6 +200,17 @@ static void start(struct N64* n) {
 	n->viFilters = filters ? filters[0] == '1' : n->accuracy != ACCURACY_HLE;
 	rspJitFree(n);
 	++n->rspCodeGen;
+	// The RSP's thread, in HLE, a slice at a time. A longer window holds the RSP back further and
+	// games notice (Perfect Dark draws at 60 frames a second instead of 30 with 4096 cycles in MLE);
+	// MLE's 1024 are too short for the thread to gain.
+	rspThreadStop(n);
+	const char* rspThread = setting(n, "N64_RSP_THREAD");
+	if (n->accuracy == ACCURACY_HLE && n->slice && rspThread && rspThread[0] == '1') {
+		const char* window = setting(n, "N64_RSP_WINDOW");
+		n->rspWindow = window ? strtoull(window, NULL, 0) : n->slice;
+		n->rspWindowAt = 0;
+		rspThreadStart(n);
+	}
 }
 
 bool n64LoadDisk(struct N64* n, const uint8_t* ipl, size_t iplSize, const uint8_t* disk, size_t diskSize) {
@@ -220,7 +232,22 @@ void n64Interrupt(struct N64* n, uint32_t line, bool set) {
 	cpuCheckInterrupts(n);
 }
 
+void rspRunTo(struct N64* n, uint64_t until) {
+	while (n->rsp.clock < until && !(n->sp.status & 1)) {
+		// Compiled code from the start of a block, and not from a delay slot.
+		void* code;
+		if (n->useRspJit && n->rsp.nextPc == ((n->sp.pc + 4) & 0xFFC) && (code = rspJitLookup(n, n->sp.pc & 0xFFC))) {
+			n->rspEnter(n, code, until);
+		} else {
+			rspStep(n);
+		}
+	}
+}
+
 void rspCatchUp(struct N64* n) {
+	if (n->rspThread) {
+		rspThreadJoin(n);
+	}
 	if (n->catchingUp) {
 		return;
 	}
@@ -231,15 +258,7 @@ void rspCatchUp(struct N64* n) {
 		return;
 	}
 	n->catchingUp = true;
-	while (n->rsp.clock < rspNow && !(n->sp.status & 1)) {
-		// Compiled code from the start of a block, and not from a delay slot.
-		void* code;
-		if (n->useRspJit && n->rsp.nextPc == ((n->sp.pc + 4) & 0xFFC) && (code = rspJitLookup(n, n->sp.pc & 0xFFC))) {
-			n->rspEnter(n, code, rspNow);
-		} else {
-			rspStep(n);
-		}
-	}
+	rspRunTo(n, rspNow);
 	n->catchingUp = false;
 }
 
@@ -323,7 +342,14 @@ void n64RunField(struct N64* n) {
 			n->cycles += 1 + n->cpu.stall;
 			n->cpu.stall = 0;
 		} while (n->slice && n->cycles < n->eventAt);
-		rspCatchUp(n);
+		if (n->rspThread) {
+			rspThreadSlice(n);
+		} else {
+			rspCatchUp(n);
+		}
+	}
+	if (n->rspThread) {
+		rspThreadJoin(n);
 	}
 	uint64_t intrAt = viIntrAt(n, start);
 	if (intrAt >= passed && intrAt < n->nextVi) {

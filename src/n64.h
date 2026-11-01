@@ -324,6 +324,10 @@ struct N64 {
 	bool rspPlainTiming;
 	// The RSP is being caught up: its own accesses to the shared registers must not catch it up again.
 	bool catchingUp;
+	// The RSP on its own thread (rspthread.c), or none; it is caught up a window at a time, from when
+	// the CPU reaches rspWindowAt.
+	struct RspThread* rspThread;
+	uint64_t rspWindow, rspWindowAt;
 	uint64_t nextVi;
 	// Instruction blocks (blocks.c): one table of blocks per 4 KB RDRAM page that has any, and
 	// what each page holds (PAGE_*): a write to compiled code throws it away.
@@ -614,6 +618,20 @@ static inline void n64RdramRead(struct N64* n, uint32_t addr, uint32_t len) {
 
 // The RSP runs to the CPU's time: before the CPU touches its registers, memory or MI, and once a slice.
 void rspCatchUp(struct N64*);
+// The RSP runs to until (its own cycles), or until it halts.
+void rspRunTo(struct N64*, uint64_t until);
+
+// rspthread.c
+void rspThreadStart(struct N64*);
+void rspThreadStop(struct N64*);
+// The end of a slice: the window done and the next started, when one is due.
+void rspThreadSlice(struct N64*);
+// The RSP's window done, and what it did to the rest of the machine.
+void rspThreadJoin(struct N64*);
+// The SP interrupt, DP_END and the RDRAM pages of a DMA, from the RSP or the CPU.
+void spInterrupt(struct N64*, bool on);
+void rdpKick(struct N64*);
+void spDmaPages(struct N64*, uint32_t addr, uint32_t len, bool write);
 static inline void n64Event(struct N64* n, uint64_t at) {
 	if (at < n->eventAt) {
 		n->eventAt = at;
@@ -649,6 +667,7 @@ void busWriteLine(struct N64*, uint32_t addr, const uint8_t* in, int len);
 // rdp.c
 void rdpRun(struct N64*);
 void rdpCommands(struct N64*, const uint64_t* list, size_t count);
+void rdpFeed(struct N64*, const uint64_t* words, size_t count);
 
 // hle.c
 bool hleGraphics(struct N64*, bool dry);

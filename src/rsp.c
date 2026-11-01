@@ -286,7 +286,7 @@ static void halt(struct N64* n) {
 	audioCheckEnd(n);
 	n->sp.status |= 3;
 	if (n->sp.status & 0x40) {
-		n64Interrupt(n, MI_SP, true);
+		spInterrupt(n, true);
 	}
 }
 

@@ -3458,6 +3458,28 @@ void rdpRun(struct N64* n) {
 	endCommands(n, r, begin);
 }
 
+// Runs command words the RSP's thread took from DP_CURRENT (rspthread.c), as rdpRun would have.
+void rdpFeed(struct N64* n, const uint64_t* words, size_t count) {
+	n->dp.status |= DP_RUNNING;
+	uint64_t begin;
+	struct RDP* r = beginCommands(n, &begin);
+	struct DP* d = &n->dp;
+	for (size_t i = 0; i < count; ++i) {
+		d->partial[d->partialWords++] = words[i];
+		int op = (d->partial[0] >> 56) & 0x3F;
+		int size = commandWords(op);
+		if (d->partialWords < size) {
+			continue;
+		}
+		d->partialWords = 0;
+		if (n->rdpTap) {
+			n->rdpTap(n, d->partial, size);
+		}
+		command(n, r, d->partial, op, size, begin);
+	}
+	endCommands(n, r, begin);
+}
+
 // Runs a list of commands made outside RDRAM (hle.c).
 void rdpCommands(struct N64* n, const uint64_t* list, size_t count) {
 	n->dp.status |= DP_RUNNING;
