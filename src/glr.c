@@ -128,6 +128,9 @@ struct Target {
 struct ProgramKey {
 	uint64_t combine;
 	uint32_t modes;
+	// The level of detail: worked out (bit 0), picking the tiles (1), sharpen (2), detail (3), the
+	// primitive's levels (4-6) and the least (8-12).
+	uint32_t lod;
 };
 
 // A program's uniforms as last set.
@@ -392,7 +395,7 @@ static const char fragmentHead[] =
 	"	}\n"
 	"	return shift != 14 ? prod >> (13 - shift) : int(uint(prod) << 1);\n"
 	"}\n"
-	"vec4 sampleTile(sampler2D t, ivec4 a, ivec4 b, ivec4 c, ivec4 image) {\n"
+	"ivec2 texCoord() {\n"
 	"	vec3 top = vTex - 0.5 * dFdx(vTex) - 0.5 * dFdy(vTex);\n"
 	"	int s, tt;\n"
 	"	if (uPersp != 0) {\n"
@@ -410,8 +413,10 @@ static const char fragmentHead[] =
 	"	} else {\n"
 	"		s = int(floor(top.x * 32.0 + 0.01)), tt = int(floor(top.y * 32.0 + 0.01));\n"
 	"	}\n"
-	"	s = clamp(s, -0x10000, 0xFFFF), tt = clamp(tt, -0x10000, 0xFFFF);\n"
-	"	int fs, ft, f;\n"
+	"	return ivec2(clamp(s, -0x10000, 0xFFFF), clamp(tt, -0x10000, 0xFFFF));\n"
+	"}\n"
+	"vec4 sampleTile(sampler2D t, ivec4 a, ivec4 b, ivec4 c, ivec4 image, ivec2 st) {\n"
+	"	int s = st.x, tt = st.y, fs, ft, f;\n"
 	"	int s0 = wrapCoord(s, a.x, a.z, b.x, b.z, c.x, fs);\n"
 	"	int t0 = wrapCoord(tt, a.y, a.w, b.y, b.w, c.y, ft);\n"
 	"	vec4 c0 = tap(t, image, s0, t0);\n"
@@ -443,7 +448,7 @@ static const char* rgbInput(int which, int sel) {
 	}
 	if (which == 2) {
 		static const char* mul[10] = { "vec3(0.0)", "vec3(combined.a)", "vec3(tex0.a)", "vec3(tex1.a)", "vec3(uPrim.a)", "vec3(shade.a)",
-		                               "vec3(uEnv.a)", "vec3(0.0)", "vec3(uPrimLod)", "vec3(0.0)" };
+		                               "vec3(uEnv.a)", "vec3(lodFrac)", "vec3(uPrimLod)", "vec3(0.0)" };
 		return sel < 16 ? mul[sel - 6] : "vec3(0.0)";
 	}
 	if (which == 0 && sel == 7) {
@@ -455,7 +460,7 @@ static const char* rgbInput(int which, int sel) {
 static const char* alphaInput(int sel, bool multiplier) {
 	static const char* common[6] = { "combined.a", "tex0.a", "tex1.a", "uPrim.a", "shade.a", "uEnv.a" };
 	if (sel == 0 && multiplier) {
-		return "0.0";
+		return "lodFrac";
 	}
 	if (sel < 6) {
 		return common[sel];
@@ -540,7 +545,7 @@ static GLuint compile(struct Glr* g, GLenum type, const char* source) {
 
 static struct Program* program(struct Glr* g, struct ProgramKey key) {
 	for (int i = 0; i < g->programCount; ++i) {
-		if (g->programs[i].key.combine == key.combine && g->programs[i].key.modes == key.modes) {
+		if (g->programs[i].key.combine == key.combine && g->programs[i].key.modes == key.modes && g->programs[i].key.lod == key.lod) {
 			return &g->programs[i];
 		}
 	}
@@ -566,9 +571,46 @@ static struct Program* program(struct Glr* g, struct ProgramKey key) {
 	strcat(source, line);
 	strcat(source, "void main() {\n	vec4 combined = vec4(0.0);\n");
 	strcat(source, key.modes & MODE_SHADED ? "	vec4 shade = vShade;\n" : "	vec4 shade = vec4(0.0);\n");
+	strcat(source, "	float lodFrac = 0.0;\n");
 	if (key.modes & MODE_TEXTURED) {
-		strcat(source, "	vec4 tex0 = sampleTile(uTex0, uTile0[0], uTile0[1], uTile0[2], uImage0);\n");
-		strcat(source, cycleType == 1 ? "	vec4 tex1 = sampleTile(uTex1, uTile1[0], uTile1[1], uTile1[2], uImage1);\n" : "	vec4 tex1 = tex0;\n");
+		strcat(source, "	ivec2 st = texCoord();\n	vec4 tex0 = sampleTile(uTex0, uTile0[0], uTile0[1], uTile0[2], uImage0, st);\n");
+		bool second = cycleType == 1 || (key.lod & 2);
+		strcat(source, second ? "	vec4 tex1 = sampleTile(uTex1, uTile1[0], uTile1[1], uTile1[2], uImage1, st);\n" : "	vec4 tex1 = tex0;\n");
+		if (key.lod & 1) {
+			// rdp.c levelOfDetail: the texel step to the next pixel and line, its level, the fraction
+			// between levels and the tiles; this has the primitive's tile and the next one.
+			int maxLevel = (int) (key.lod >> 4) & 7, minLevel = (int) (key.lod >> 8) & 31;
+			bool sharpen = key.lod & 4, detail = key.lod & 8;
+			snprintf(line, sizeof(line),
+			         "	{ vec2 fst = vec2(st);\n"
+			         "	int l = int(max(max(abs(dFdx(fst.x)), abs(dFdx(fst.y))), max(abs(dFdy(fst.x)), abs(dFdy(fst.y)))));\n"
+			         "	l = l >= 0x4000 ? (l & 0x3FFF) | 0x4000 : l;\n"
+			         "	bool magnify = l < 32;\n"
+			         "	int level = 0;\n"
+			         "	for (int v = (l >> 5) & 0xFF; !magnify && v > 1; v >>= 1) ++level;\n"
+			         "	bool distant = (l & 0x4000) != 0 || %d == 0 || (!magnify && ((l & 0x6000) != 0 || level >= %d));\n"
+			         "	int frac = (l & 0x4000) != 0 ? 0xFF : magnify ? %s : %s;\n"
+			         "	lodFrac = float(frac) / 255.0;\n",
+			         maxLevel, maxLevel, !sharpen && !detail ? "(distant ? 0xFF : 0)" : sharpen ? "(max(l, %d) << 3) | 0x100" : "max(l, %d) << 3",
+			         !sharpen && !detail ? "(distant ? 0xFF : ((l << 3) >> level) & 0xFF)" : "((l << 3) >> level) & 0xFF");
+			if (sharpen || detail) {
+				// The minimum level goes where the format has it.
+				char with[1024];
+				snprintf(with, sizeof(with), line, minLevel);
+				snprintf(line, sizeof(line), "%s", with);
+			}
+			strcat(source, line);
+			if ((key.lod & 2) && !detail) {
+				snprintf(line, sizeof(line),
+				         "	int t1 = distant ? %d : level, t2 = distant || %s ? t1 : t1 + 1;\n"
+				         "	vec4 base = tex0, next = tex1;\n"
+				         "	tex0 = t1 == 0 ? base : next;\n"
+				         "	tex1 = t2 == 0 ? base : next;\n",
+				         maxLevel, sharpen ? "false" : "magnify");
+				strcat(source, line);
+			}
+			strcat(source, "	}\n");
+		}
 	} else {
 		strcat(source, "	vec4 tex0 = vec4(0.0), tex1 = vec4(0.0);\n");
 	}
@@ -1198,18 +1240,26 @@ static bool drawState(struct N64* n, struct Glr* g, struct RDP* r, bool textured
 	if (r->cvgAlpha && !r->cvgTimesAlpha) {
 		modes |= MODE_ALPHA_CVG;
 	}
-	struct ProgramKey key = { cycleType < 2 ? r->combine : 0, modes };
+	// The level of detail where the combiner reads its fraction or it picks the tiles.
+	uint64_t m = r->otherModes, cmb = r->combine;
+	bool lodTiles = textured && cycleType < 2 && ((m >> 48) & 1);
+	bool lodRead = ((cmb >> 47) & 31) == 13 || ((cmb >> 41) & 7) == 0 || (cycleType == 1 && (((cmb >> 32) & 31) == 13 || ((cmb >> 18) & 7) == 0));
+	uint32_t lod = textured && cycleType < 2 && (lodTiles || lodRead)
+	                   ? 1 | (lodTiles ? 2 : 0) | (uint32_t) ((m >> 49) & 1) << 2 | (uint32_t) ((m >> 50) & 1) << 3 | (uint32_t) r->maxLevel << 4 |
+	                         (uint32_t) (r->minLevel & 31) << 8
+	                   : 0;
+	struct ProgramKey key = { cycleType < 2 ? r->combine : 0, modes, lod };
 	s.program = program(g, key);
 	if (!s.program) {
 		return false;
 	}
 	if (textured) {
-		for (int k = 0; k < (cycleType == 1 ? 2 : 1); ++k) {
+		for (int k = 0; k < (cycleType == 1 || lodTiles ? 2 : 1); ++k) {
 			// Without filtering a cycle converts its texels from YUV. With the level of detail and
 			// one level, both texels are that level's (rdp.c levelOfDetail: always distant).
 			bool oneLevel = ((r->otherModes >> 48) & 1) && !((r->otherModes >> 50) & 1) && r->maxLevel == 0;
 			int index = (tile + (oneLevel ? 0 : k)) & 7, w, h;
-			bool filter = k == 0 ? cycleType >= 2 || ((r->otherModes >> 43) & 1) : (r->otherModes >> 42) & 1;
+			bool filter = k == 0 || cycleType != 1 ? cycleType >= 2 || ((r->otherModes >> 43) & 1) : (r->otherModes >> 42) & 1;
 			s.texture[k] = texture(n, g, r, index, !filter, &w, &h);
 			const struct Tile* t = &r->tile[index];
 			bool bilinear = filter && ((r->otherModes >> 45) & 1) && cycleType < 2;
