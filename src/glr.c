@@ -586,6 +586,12 @@ static struct Program* program(struct Glr* g, struct ProgramKey key) {
 		blendFormula(line, sizeof(line), first);
 		strcat(source, line);
 	}
+	if (key.modes & MODE_DITHER) {
+		snprintf(line, sizeof(line), "	ivec2 px = ivec2(gl_FragCoord.xy) / %d;\n	int ditherM = %s[(px.y & 3) * 4 + (px.x & 3)];\n	bool dithered = %s;\n", g->scale,
+		         key.modes & MODE_BAYER ? "int[16](0, 4, 1, 5, 4, 0, 5, 1, 3, 7, 2, 6, 7, 3, 6, 2)" : "int[16](0, 6, 1, 7, 4, 2, 5, 3, 3, 5, 2, 4, 7, 1, 6, 0)",
+		         key.modes & MODE_BLEND ? "false" : "true");
+		strcat(source, line);
+	}
 	if (cycleType < 2) {
 		// The last cycle: with force blend and memory as M the GPU blends P with the image, other
 		// inputs here; without, P passes.
@@ -605,8 +611,17 @@ static struct Program* program(struct Glr* g, struct ProgramKey key) {
 			// 32nd of the image, rounded up, would show on dark colors over light ones).
 			char factors[384];
 			blendFactors(factors, sizeof(factors), last, "memoryKeep");
-			snprintf(line, sizeof(line), "	{ %s oColor = vec4(%s * blendA - (1.0 - reject) * 0.49 / 255.0, mix(blendA8 / 255.0, 1.0, reject)); }\n", factors,
+			snprintf(line, sizeof(line), "	{ %s oColor = vec4(%s * blendA - (1.0 - reject) * 0.49 / 255.0, mix(blendA8 / 255.0, 1.0, reject));\n", factors,
 			         blendColorInput(last));
+			strcat(source, line);
+			// Where the GPU's blend leaves the image none of its own (B zero, or 1 - A with A whole: no
+			// blend), the color is the shader's to dither.
+			int keep = (last >> 6) & 3;
+			if ((key.modes & MODE_DITHER) && (keep == 3 || keep == 0)) {
+				snprintf(line, sizeof(line), "	dithered = %s;\n", keep == 3 ? "true" : "reject == 1.0");
+				strcat(source, line);
+			}
+			snprintf(line, sizeof(line), "	}\n");
 		} else {
 			snprintf(line, sizeof(line), "	oColor = vec4(%s, %s * memoryKeep);\n", blendColorInput(last), blendAlphaInput(last >> 2));
 		}
@@ -617,13 +632,8 @@ static struct Program* program(struct Glr* g, struct ProgramKey key) {
 	if (key.modes & MODE_DITHER) {
 		// rdp.c's dither: a channel whose low 3 bits are above the matrix's value rounds up; a 16-bit
 		// image keeps 5 bits, as the RDP's would read back.
-		snprintf(line, sizeof(line),
-		         "	{ ivec2 px = ivec2(gl_FragCoord.xy) / %d;\n"
-		         "	int m = %s[(px.y & 3) * 4 + (px.x & 3)];\n"
-		         "	ivec3 o = ivec3(floor(oColor.rgb * 255.0 + 0.5));\n"
-		         "	for (int i = 0; i < 3; ++i) if ((o[i] & 7) > m) o[i] = min((o[i] & 0xF8) + 8, 255);\n",
-		         g->scale, key.modes & MODE_BAYER ? "int[16](0, 4, 1, 5, 4, 0, 5, 1, 3, 7, 2, 6, 7, 3, 6, 2)" : "int[16](0, 6, 1, 7, 4, 2, 5, 3, 3, 5, 2, 4, 7, 1, 6, 0)");
-		strcat(source, line);
+		strcat(source, "	if (dithered) { ivec3 o = ivec3(floor(oColor.rgb * 255.0 + 0.5));\n"
+		               "	for (int i = 0; i < 3; ++i) if ((o[i] & 7) > ditherM) o[i] = min((o[i] & 0xF8) + 8, 255);\n");
 		strcat(source, key.modes & MODE_IMAGE16 ? "	o = (o >> 3) << 3 | o >> 5;\n	oColor.rgb = vec3(o) / 255.0; }\n" : "	oColor.rgb = vec3(o) / 255.0; }\n");
 	}
 	if (!(key.modes & MODE_BLEND) && (key.modes & (MODE_BLEND_MEMORY_FIRST | MODE_BLEND_CONSTANT)) != MODE_BLEND_MEMORY_FIRST) {
@@ -1115,8 +1125,8 @@ static bool drawState(struct N64* n, struct Glr* g, struct RDP* r, bool textured
 	if (s.blendOn) {
 		modes |= MODE_BLEND;
 	}
-	// The dither where the shader makes the image's color (not the GPU's blend with it).
-	if (cycleType < 2 && r->ditherRgb < 2 && !(modes & (MODE_BLEND | MODE_BLEND_MEMORY_FIRST))) {
+	// The dither where the shader makes the image's color, or the GPU blends into a 16-bit image.
+	if (cycleType < 2 && r->ditherRgb < 2 && !(modes & MODE_BLEND_MEMORY_FIRST) && (!(modes & MODE_BLEND) || r->colorSize == 2)) {
 		modes |= MODE_DITHER | (r->ditherRgb ? MODE_BAYER : 0) | (r->colorSize == 2 ? MODE_IMAGE16 : 0);
 	}
 	if (depth && r->zPrim) {
