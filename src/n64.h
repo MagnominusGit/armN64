@@ -400,7 +400,8 @@ struct N64 {
 	int pictureBinding;
 	// The picture is RGBA bytes for a texture (in the frontend's context), else 0x00RRGGBB.
 	bool pictureRgba;
-	// N64_RDP_GL (with hle): the GL renderer draws what the HLE makes (glr.c).
+	// N64_RDP_GL: the GL renderer draws the RDP's commands (glr.c), with the HLE's corners where it
+	// makes them.
 	bool rdpGl;
 	struct Glr* glr;
 	// How many times the RDP's resolution the GL renderer draws at (N64_GL_SCALE).

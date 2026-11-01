@@ -191,7 +191,7 @@ static void start(struct N64* n) {
 	const char* skip = setting(n, "N64_FRAMESKIP");
 	n->skip.on = skip && skip[0] == '1';
 	const char* rdpGl = setting(n, "N64_RDP_GL");
-	n->rdpGl = n->accuracy == ACCURACY_HLE && rdpGl && rdpGl[0] == '1';
+	n->rdpGl = rdpGl && rdpGl[0] == '1';
 	if (n->rdpGl) {
 		n->rdpThreads = 0;
 		n->rdpGpu = false;
@@ -199,7 +199,7 @@ static void start(struct N64* n) {
 	const char* viGpu = setting(n, "N64_VI_GPU");
 	n->viGpu = viGpu && viGpu[0] == '1';
 	const char* filters = setting(n, "N64_VI_FILTERS");
-	n->viFilters = filters ? filters[0] == '1' : n->accuracy != ACCURACY_HLE;
+	n->viFilters = filters ? filters[0] == '1' : n->accuracy != ACCURACY_HLE && !n->rdpGl;
 	rspJitFree(n);
 	++n->rspCodeGen;
 	// The RSP's thread, in HLE, a slice at a time. A longer window holds the RSP back further and

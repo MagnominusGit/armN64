@@ -102,34 +102,36 @@ static struct retro_core_option_v2_definition optionDefinitions[] = {
 	  "Shapes the stick's range like the N64 controller's octagonal gate: full right reaches 85, and the diagonals the gate's corners (69, 69) instead of a circle's.",
 	  NULL, "input", { { "disabled", "Off" }, { "enabled", "On" }, { NULL, NULL } }, "disabled" },
 	{ "armn64_preset", "Preset (Restart)", NULL,
-	  "Speed: HLE drawn on the GPU. Balanced: MLE on the GPU. Accurate: LLE on the CPU. Overclocked: MLE on the GPU at twice the CPU, RSP and RDP clocks. "
+	  "Speed: HLE with the GL renderer. Balanced: MLE with the exact RDP on the GPU. Accurate: LLE with the exact RDP on the CPU. Overclocked: Balanced at twice the CPU, RSP and RDP clocks. "
 	  "Custom uses the Graphics, Renderer and Overclock options below.",
 	  NULL, "system", { { "speed", "Speed" }, { "balanced", "Balanced" }, { "accurate", "Accurate" }, { "overclocked", "Overclocked" }, { "custom", "Custom" }, { NULL, NULL } }, "speed" },
 	{ "armn64_accuracy", "Graphics (Restart)", NULL,
-	  "With the Custom preset. HLE draws the game's display lists without its microcode and puts speed first. MLE and LLE run the microcode on the RSP: "
-	  "LLE is the hardware cycle for cycle, MLE the middle ground that also runs hacks made on other emulators.",
+	  "With the Custom preset. HLE puts speed first: the library microcodes (Fast3D, F3DEX and the like) run in C and the rest on the RSP, with the timing kept loosely. "
+	  "MLE and LLE run every microcode on the RSP: LLE is the hardware cycle for cycle, MLE the middle ground that also runs hacks made on other emulators.",
 	  NULL, "system", { { "hle", "HLE" }, { "mle", "MLE" }, { "lle", "LLE" }, { NULL, NULL } }, "hle" },
-	{ "armn64_rdp_threads", "Renderer Threads (Restart)", NULL, "Threads beside the emulation that draw the RDP's pictures. Auto takes the cores there are, up to 3.",
+	{ "armn64_rdp_threads", "Renderer Threads (Restart)", NULL,
+	  "With the CPU renderer, threads beside the emulation that draw the RDP's pictures (the GPU renderer has one feed the GPU, the GL renderer none). Auto takes the cores there are, up to 3.",
 	  NULL, "system", { { "auto", "Auto" }, { "0", "None" }, { "1", "1" }, { "2", "2" }, { "3", "3" }, { NULL, NULL } }, "auto" },
 	{ "armn64_rsp_thread", "RSP Thread (Restart)", NULL,
 	  "Runs the RSP on a thread of its own beside the CPU: faster for the games whose microcode HLE leaves to the RSP (Rogue Squadron, Indiana Jones), at the cost of a core. HLE only.",
 	  NULL, "system", { { "disabled", "Off" }, { "enabled", "On" }, { NULL, NULL } }, "disabled" },
 	{ "armn64_gfx_rsp", "HLE Graphics Microcode (Restart)", NULL,
-	  "Library runs the games' library microcodes (Fast3D, F3DEX and the like) in C, the fastest. RSP runs every game's own microcode on the RSP, as MLE does, "
-	  "and still draws on the GPU: slower, for when a library microcode's C version gets something wrong. Microcodes that aren't a library's always run on the RSP. HLE only.",
+	  "Library runs the library microcodes (Fast3D, F3DEX and the like) in C, the fastest. RSP runs them on the RSP as MLE does: slower, for when a library "
+	  "microcode's C version gets something wrong. Other microcodes always run on the RSP. HLE only.",
 	  NULL, "system", { { "library", "Library" }, { "rsp", "RSP" }, { NULL, NULL } }, "library" },
 	{ "armn64_renderer", "Renderer (Restart)", NULL,
-	  "With the Custom preset. GPU draws with OpenGL ES 3.1: HLE with the GL renderer, MLE and LLE with the RDP in compute shaders (exact). CPU draws with the renderer threads.",
-	  NULL, "system", { { "gpu", "GPU" }, { "cpu", "CPU" }, { NULL, NULL } }, "gpu" },
+	  "With the Custom preset. GL draws the RDP's triangles with OpenGL ES 3.1, also at higher resolutions: the fastest, close to the hardware but not exact. "
+	  "GPU runs the exact RDP in OpenGL ES 3.1 compute shaders, CPU the same on the renderer threads.",
+	  NULL, "system", { { "gl", "GL" }, { "gpu", "GPU (Exact)" }, { "cpu", "CPU (Exact)" }, { NULL, NULL } }, "gl" },
 	{ "armn64_overclock", "Overclock (Restart)", NULL,
 	  "With the Custom preset. Runs the CPU, RSP and RDP faster than the hardware while video, audio and the game's timers keep real time: less slowdown, and room for ROM hacks made on emulators. Some games depend on the hardware's timing. MLE and HLE only.",
 	  NULL, "system", { { "1", "Off" }, { "1.5", "1.5x" }, { "2", "2x" }, { "2.5", "2.5x" }, { "3", "3x" }, { "4", "4x" }, { NULL, NULL } }, "1" },
 	{ "armn64_resolution", "Resolution (Restart)", NULL,
-	  "HLE's GL renderer draws at this many times the game's resolution: sharper edges and textures, at a GPU cost. Auto fits the display (2x on a 640x480 screen, 4x at 1080p). "
+	  "The GL renderer draws at this many times the game's resolution: sharper edges and textures, at a GPU cost. Auto fits the display (2x on a 640x480 screen, 4x at 1080p). "
 	  "What the game reads back from its framebuffer stays at its own resolution.",
 	  NULL, "system", { { "auto", "Auto" }, { "1", "Native" }, { "2", "2x" }, { "3", "3x" }, { "4", "4x" }, { "5", "5x" }, { "6", "6x" }, { "7", "7x" }, { "8", "8x" }, { NULL, NULL } }, "auto" },
 	{ "armn64_vi_filters", "VI Filters", NULL,
-	  "The video interface's antialiasing, divot and dither filters, which soften edges and smooth 16-bit colour as a TV showed it. Auto turns them on for MLE and LLE and off for HLE, where they cost speed.",
+	  "The video interface's antialiasing, divot and dither filters, which soften edges and smooth 16-bit colour as a TV showed it. Auto turns them on for MLE and LLE and off for HLE, where they cost speed. The GL renderer's pictures don't use them.",
 	  NULL, "system", { { "auto", "Auto" }, { "on", "On" }, { "off", "Off" }, { NULL, NULL } }, "auto" },
 	{ "armn64_aspect", "Aspect Ratio", NULL,
 	  "Fill 4:3 stretches the game's window to 4:3. TV 4:3 shows the picture as a TV did: the whole screen is 4:3 and the game's window keeps its shape in it. Square Pixels shows each pixel square.",
@@ -193,9 +195,10 @@ static const char* accuracy(void) {
 	                                                              : "hle";
 }
 
-static bool gpuRenderer(void) {
+static const char* renderer(void) {
 	const char* p = preset();
-	return !strcmp(p, "custom") ? !optionIs(environment, "armn64_renderer", "cpu") : strcmp(p, "accurate") != 0;
+	const char* custom = optionValue(environment, "armn64_renderer");
+	return !strcmp(p, "speed") ? "gl" : !strcmp(p, "accurate") ? "cpu" : strcmp(p, "custom") ? "gpu" : custom ? custom : "gl";
 }
 
 static const char* overclock(void) {
@@ -273,12 +276,12 @@ static const char* settings(const char* name) {
 		return "1";
 	}
 	if (!strcmp(name, "N64_RDP_GL") || !strcmp(name, "N64_RDP_GPU")) {
-		return hwWanted ? "1" : "0";
+		return hwWanted && !strcmp(renderer(), strcmp(name, "N64_RDP_GL") ? "gpu" : "gl") ? "1" : "0";
 	}
 	// The GPU RDP's pictures stay on the GPU (the VI in its context); beside the renderer threads the
 	// VI runs in the frontend's context.
 	if (!strcmp(name, "N64_VI_GPU")) {
-		return (hwWanted && strcmp(accuracy(), "hle")) || viInContext ? "1" : "0";
+		return (hwWanted && !strcmp(renderer(), "gpu")) || viInContext ? "1" : "0";
 	}
 	if (!strcmp(name, "N64_GFX_RSP")) {
 		return optionIs(environment, "armn64_gfx_rsp", "rsp") ? "1" : "0";
@@ -712,7 +715,7 @@ bool retro_load_game(const struct retro_game_info* info) {
 	}
 	// The GPU renderers, in the frontend's GL context if it has one, else in the core's own (beside a
 	// Vulkan frontend, say). With the renderer threads, the VI's filters use the GL context.
-	hwWanted = gpuRenderer();
+	hwWanted = strcmp(renderer(), "cpu") != 0;
 	bool context = askHardwareContext();
 	viInContext = context && !hwWanted;
 	if (hwWanted && !context) {
