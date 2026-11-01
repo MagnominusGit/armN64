@@ -126,6 +126,8 @@ void glrSyncRange(struct N64*, uint32_t addr, uint32_t len);
 unsigned glrPicture(struct N64*, uint32_t origin, uint32_t stride, int size, int rows, int* x, int* y);
 // The RDP's own drawing of a primitive, into RDRAM.
 void rdpDrawSoftware(struct N64*, struct RDP*, const uint64_t* w, int op);
+// The depth image's depth at a pixel, 0 to 1.
+float rdpDepthAt(struct N64*, struct RDP*, int x, int y);
 
 // The RGBA8 texels (red in the low byte) of a tile's first w x h, as the samplers read TMEM.
 void rdpTileImage(struct RDP*, int tile, int w, int h, bool convert, uint32_t* out);

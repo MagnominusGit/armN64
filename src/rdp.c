@@ -3294,6 +3294,11 @@ void rdpDrawSoftware(struct N64* n, struct RDP* r, const uint64_t* w, int op) {
 	execute(n, r, w, op);
 }
 
+float rdpDepthAt(struct N64* n, struct RDP* r, int x, int y) {
+	x = x < 0 ? 0 : x >= (int) r->colorWidth ? (int) r->colorWidth - 1 : x;
+	return (float) zDecompress(zRead(n, r, x, y < 0 ? 0 : y)) / 0x3FFFF;
+}
+
 // Starts a run of commands: the renderers or the GPU on first use, and when the RDP can take them.
 static struct RDP* beginCommands(struct N64* n, uint64_t* begin) {
 	struct RDP* r = state(n);

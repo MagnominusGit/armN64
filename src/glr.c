@@ -177,6 +177,8 @@ struct DrawState {
 	float prim[4], env[4], fog[4], blend[4], primLod, primDepth;
 	int scissor[4];
 	bool depthTest, depthWrite, decal, depthLess, blendOn, persp;
+	// Into the GPU's depth only (depthTriangle).
+	bool depthOnly;
 	int blendB;
 	// Memory as P: 1 with a per-pixel A, 2 with a constant one (blendConstant).
 	int memoryFirst;
@@ -191,6 +193,8 @@ struct Glr {
 	struct Gl gl;
 	struct Target target[TARGETS];
 	GLuint depth, vertexArray, vertexBuffer, vertexShader;
+	// Drawing a triangle into the depth image (depthTriangle).
+	bool depthImage;
 	// Targets drawn at scale times the RDP's resolution (N64_GL_SCALE); their pixels go to and from
 	// RDRAM through a texture at its resolution.
 	int scale;
@@ -1276,7 +1280,13 @@ static void flushBatch(struct N64* n, struct Glr* g) {
 			gl->DrawArrays(GL_TRIANGLES, first, g->batchCount);
 			gl->Disable(GL_STENCIL_TEST);
 		} else {
+			if (s->depthOnly) {
+				gl->ColorMask(0, 0, 0, 0);
+			}
 			gl->DrawArrays(GL_TRIANGLES, first, g->batchCount);
+			if (s->depthOnly) {
+				gl->ColorMask(1, 1, 1, 1);
+			}
 		}
 		++n->stats.glBatches;
 		g->vertexOffset += bytes;
@@ -1301,10 +1311,14 @@ static bool drawState(struct N64* n, struct Glr* g, struct RDP* r, bool textured
 	memset(&s, 0, sizeof(s));
 	int rows = (r->scissorY1 + 3) >> 2;
 	rows = rows < 1 ? 1 : rows > TARGET_ROWS ? TARGET_ROWS : rows;
-	if (g->stateSet && g->state.target && (g->state.target->addr != r->colorAddr || g->state.target->width != r->colorWidth)) {
+	// Into the depth image: the GPU's depth, which the color images share, through the last of them.
+	if (g->depthImage && !g->stateSet) {
+		return false;
+	}
+	if (!g->depthImage && g->stateSet && g->state.target && (g->state.target->addr != r->colorAddr || g->state.target->width != r->colorWidth)) {
 		flushBatch(n, g);
 	}
-	s.target = target(n, g, r->colorAddr, r->colorWidth, r->colorSize, rows);
+	s.target = g->depthImage ? g->state.target : target(n, g, r->colorAddr, r->colorWidth, r->colorSize, rows);
 	int cycleType = r->cycleType;
 	uint32_t modes = (uint32_t) cycleType | (r->alphaCompare ? MODE_ALPHA_COMPARE : 0) | (textured ? MODE_TEXTURED : 0) | (shaded ? MODE_SHADED : 0);
 	int lastCycle = cycleType == 1 ? 1 : 0;
@@ -1335,7 +1349,7 @@ static bool drawState(struct N64* n, struct Glr* g, struct RDP* r, bool textured
 	if (g->fetch && r->colorSize == 2) {
 		modes |= MODE_IMAGE16;
 	}
-	if (depth && r->zPrim) {
+	if (depth && r->zPrim && !g->depthImage) {
 		modes |= MODE_PRIM_DEPTH;
 	}
 	if (r->cvgTimesAlpha && r->antialias) {
@@ -1381,6 +1395,11 @@ static bool drawState(struct N64* n, struct Glr* g, struct RDP* r, bool textured
 	// Outside decal mode a covered pixel passes only what is in front of it (no second pass over
 	// one's own shadow, NFL Quarterback Club 99).
 	s.depthLess = s.depthTest && r->zMode != 3;
+	if (g->depthImage) {
+		s.depthOnly = s.depthWrite = true;
+		s.depthTest = s.decal = s.depthLess = s.blendOn = false;
+		s.memoryFirst = 0;
+	}
 	s.persp = persp;
 	s.scissor[0] = r->scissorX0 >> 2, s.scissor[1] = r->scissorY0 >> 2;
 	s.scissor[2] = (r->scissorX1 + 3) >> 2, s.scissor[3] = rows;
@@ -1400,6 +1419,9 @@ static bool drawState(struct N64* n, struct Glr* g, struct RDP* r, bool textured
 static bool drawRows(struct N64* n, struct Glr* g, struct RDP* r, int rows, int y0, int y1) {
 	if (g->batchCount + 6 > BATCH_VERTICES) {
 		flushBatch(n, g);
+	}
+	if (g->state.depthOnly) {
+		return true;
 	}
 	struct Target* t = g->state.target;
 	y0 = y0 < 0 ? 0 : y0;
@@ -1563,12 +1585,36 @@ static void rawCorners(const struct RDP* r, const uint64_t* w, int op, struct Gl
 	#undef SPLIT
 }
 
+// A triangle into the depth image (Pilotwings 64's shadow masks): in RDRAM as the RDP draws it, and
+// into the GPU's depth at the depth it left in the middle.
+static void depthTriangle(struct N64* n, struct Glr* g, struct RDP* r, const uint64_t* w, int op, const struct GlrCorners* q) {
+	rdpDrawSoftware(n, r, w, op);
+	struct GlrCorners at = *q;
+	int const x = (int) ((q->v[0][0] + q->v[1][0] + q->v[2][0]) / 3), y = (int) ((q->v[0][1] + q->v[1][1] + q->v[2][1]) / 3);
+	float const z = rdpDepthAt(n, r, x, y) * 0x3FFFF / 0x3FFF8;
+	for (int k = 0; k < 3; ++k) {
+		at.v[k][2] = z;
+	}
+	g->depthImage = true, g->fastValid = false;
+	triangle(n, g, r, &at);
+	g->depthImage = false, g->fastValid = false;
+}
+
 void glrDraw(struct N64* n, struct RDP* r, const uint64_t* w, int op) {
 	struct Glr* g = n->glr;
 	glesUse(g->gles);
 	g->seq = r->seq;
 	uint64_t c = w[0];
 	const struct GlrCorners* q = op >= 0x08 && op <= 0x0F ? queued(g, w) : NULL;
+	if (op >= 0x08 && op <= 0x0F && r->zAddr && r->colorAddr == r->zAddr && r->colorSize == 2) {
+		struct GlrCorners raw;
+		if (!q) {
+			rawCorners(r, w, op, &raw);
+			q = &raw;
+		}
+		depthTriangle(n, g, r, w, op, q);
+		return;
+	}
 	if (q && r->colorSize != 1) {
 		triangle(n, g, r, q);
 		return;
