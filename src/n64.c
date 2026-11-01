@@ -133,6 +133,8 @@ static void start(struct N64* n) {
 	const char* idleSkip = setting(n, "N64_IDLESKIP");
 	n->idle.enabled = n->accuracy == ACCURACY_HLE && !(idleSkip && idleSkip[0] == '0');
 	n->hleCheck = setting(n, "N64HLECHECK") != NULL;
+	const char* gfxRsp = setting(n, "N64_GFX_RSP");
+	n->gfxRsp = gfxRsp && gfxRsp[0] == '1';
 	if (setting(n, "N64ISVIEWER") && !n->isViewer) {
 		n->isViewer = calloc(1, 0x10000);
 	}

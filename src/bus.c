@@ -104,7 +104,7 @@ static void spWriteStatus(struct N64* n, uint32_t v) {
 		}
 		// A graphics or audio task run at high level: the RSP shows it running until hleDoneAt.
 		bool graphics = be32(&n->sp.mem[0xFC0]) == 1;
-		if (n->accuracy == ACCURACY_HLE && (hleGraphics(n, false) || audioHle(n))) {
+		if (n->accuracy == ACCURACY_HLE && ((!n->gfxRsp && hleGraphics(n, false)) || audioHle(n))) {
 			n64Event(n, n->sp.hleDoneAt);
 			n->stats.gfxHle += graphics;
 		} else {

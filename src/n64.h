@@ -277,6 +277,9 @@ struct N64 {
 	struct Hle* hle;
 	// The audio tasks run at high level (audio_hle/), with HLE accuracy.
 	struct hle_t* hleAudio;
+	// N64_GFX_RSP=1 (with hle): every graphics task runs its microcode on the RSP, the library ones
+	// too, and the RDP's triangles are drawn from what it sends.
+	bool gfxRsp;
 	// N64HLECHECK=1: each graphics task also runs at high level without drawing, and the RDP commands
 	// it would send are counted against those the microcode sends ([0] microcode, [1] high level).
 	bool hleCheck;

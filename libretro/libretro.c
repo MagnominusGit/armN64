@@ -114,6 +114,10 @@ static struct retro_core_option_v2_definition optionDefinitions[] = {
 	{ "armn64_rsp_thread", "RSP Thread (Restart)", NULL,
 	  "Runs the RSP on a thread of its own beside the CPU: faster for the games whose microcode HLE leaves to the RSP (Rogue Squadron, Indiana Jones), at the cost of a core. HLE only.",
 	  NULL, "system", { { "disabled", "Off" }, { "enabled", "On" }, { NULL, NULL } }, "disabled" },
+	{ "armn64_gfx_rsp", "HLE Graphics Microcode (Restart)", NULL,
+	  "Library runs the games' library microcodes (Fast3D, F3DEX and the like) in C, the fastest. RSP runs every game's own microcode on the RSP, as MLE does, "
+	  "and still draws on the GPU: slower, for when a library microcode's C version gets something wrong. Microcodes that aren't a library's always run on the RSP. HLE only.",
+	  NULL, "system", { { "library", "Library" }, { "rsp", "RSP" }, { NULL, NULL } }, "library" },
 	{ "armn64_renderer", "Renderer (Restart)", NULL,
 	  "With the Custom preset. GPU draws with OpenGL ES 3.1: HLE with the GL renderer, MLE and LLE with the RDP in compute shaders (exact). CPU draws with the renderer threads.",
 	  NULL, "system", { { "gpu", "GPU" }, { "cpu", "CPU" }, { NULL, NULL } }, "gpu" },
@@ -275,6 +279,9 @@ static const char* settings(const char* name) {
 	// VI runs in the frontend's context.
 	if (!strcmp(name, "N64_VI_GPU")) {
 		return (hwWanted && strcmp(accuracy(), "hle")) || viInContext ? "1" : "0";
+	}
+	if (!strcmp(name, "N64_GFX_RSP")) {
+		return optionIs(environment, "armn64_gfx_rsp", "rsp") ? "1" : "0";
 	}
 	if (!strcmp(name, "N64_RSP_THREAD")) {
 		return optionIs(environment, "armn64_rsp_thread", "enabled") ? "1" : "0";
