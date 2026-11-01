@@ -100,6 +100,9 @@ struct Hle {
 	bool dry;
 	uint64_t list[LIST_MAX];
 	size_t count;
+	// The list's length as the RDP's own commands fill it, the GL renderer's triangles at the size of
+	// the RDP triangles they stand for (glrRdpWords): the task's time is the same with either.
+	size_t timeCount, left, glrRdpWords;
 };
 
 static uint32_t rd32(struct N64* n, uint32_t a) {
@@ -181,6 +184,13 @@ static void emit(struct N64* n, struct Hle* h, uint64_t w) {
 		flush(n, h);
 	}
 	h->list[h->count++] = w;
+	if (!h->left) {
+		// A full list keeps the words of the command it ends in.
+		h->left = commandWords(w);
+		size_t words = ((w >> 56) & 0x3F) == 0x01 ? h->glrRdpWords : h->left;
+		h->timeCount = h->timeCount + words > LIST_MAX ? words : h->timeCount + words;
+	}
+	--h->left;
 }
 
 // ---- Matrices (row vectors: v' = v M)
@@ -372,6 +382,44 @@ static int32_t fixed16(float f) {
 	return (int32_t) floorf(f * 65536.0f);
 }
 
+// The edge setup of an RDP triangle: the corners sorted top to bottom, the command's first four
+// words, and what the coefficients need from them.
+struct EdgeSetup {
+	const struct ScreenVertex *a, *b, *c;
+	uint64_t w[4];
+	float hx, hy, mx, my, attr, ish, fy;
+};
+
+static void edgeSetup(const struct Hle* h, const struct ScreenVertex* a, const struct ScreenVertex* b, const struct ScreenVertex* c, struct EdgeSetup* e) {
+	if (a->y > b->y) {
+		const struct ScreenVertex* t = a; a = b; b = t;
+	}
+	if (b->y > c->y) {
+		const struct ScreenVertex* t = b; b = c; c = t;
+	}
+	if (a->y > b->y) {
+		const struct ScreenVertex* t = a; a = b; b = t;
+	}
+	bool shade = h->geometry & GEOM_SHADE, tex = h->texOn, z = h->geometry & GEOM_ZBUFFER;
+	int op = 0x08 | (shade ? 4 : 0) | (tex ? 2 : 0) | (z ? 1 : 0);
+	float y1 = floorf(a->y * 4) / 4, y2 = floorf(b->y * 4) / 4, y3 = floorf(c->y * 4) / 4;
+	int32_t y1f = (int32_t) floorf(a->y * 4), y2f = (int32_t) floorf(b->y * 4), y3f = (int32_t) floorf(c->y * 4);
+	y1f = y1f < -16384 ? -16384 : y1f > 16380 ? 16380 : y1f;
+	y2f = y2f < -16384 ? -16384 : y2f > 16380 ? 16380 : y2f;
+	y3f = y3f < -16384 ? -16384 : y3f > 16380 ? 16380 : y3f;
+	float hx = c->x - a->x, hy = y3 - y1, mx = b->x - a->x, my = y2 - y1, lx = c->x - b->x, ly = y3 - y2;
+	float nz = hx * my - hy * mx;
+	uint32_t lft = nz < 0;
+	float ish = fabsf(hy) > 1e-20f ? hx / hy : 0, ism = fabsf(my) > 1e-20f ? mx / my : 0, isl = fabsf(ly) > 1e-20f ? lx / ly : 0;
+	float fy = floorf(y1) - y1;
+	float xh = a->x + fy * ish, xm = a->x + fy * ism, xl = b->x;
+	*e = (struct EdgeSetup) { a, b, c, { 0 }, hx, hy, mx, my, fabsf(nz) > 1e-20f ? -1.0f / nz : 0, ish, fy };
+	e->w[0] = (uint64_t) ((uint32_t) op << 24 | lft << 23 | (uint32_t) (h->texLevel & 7) << 19 | (uint32_t) (h->texTile & 7) << 16 | (y3f & 0x3FFF)) << 32 | (uint32_t) ((y2f & 0x3FFF) << 16 | (y1f & 0x3FFF));
+	e->w[1] = (uint64_t) (uint32_t) fixed16(xl) << 32 | (uint32_t) fixed16(isl);
+	e->w[2] = (uint64_t) (uint32_t) fixed16(xh) << 32 | (uint32_t) fixed16(ish);
+	e->w[3] = (uint64_t) (uint32_t) fixed16(xm) << 32 | (uint32_t) fixed16(ism);
+}
+
 // One RDP triangle (after libdragon's rdpq_triangle_cpu): edges, then shade, texture and depth
 // coefficients as the command asks for them.
 static void triangle(struct N64* n, struct Hle* h, const struct ScreenVertex* a, const struct ScreenVertex* b, const struct ScreenVertex* c, const struct ScreenVertex* flat) {
@@ -379,8 +427,11 @@ static void triangle(struct N64* n, struct Hle* h, const struct ScreenVertex* a,
 	// RDP divides that out with perspective correction and takes S and T as they are without.
 	float maxW = a->invW > b->invW ? (a->invW > c->invW ? a->invW : c->invW) : (b->invW > c->invW ? b->invW : c->invW);
 	float k = maxW > 0 ? 0.5f / maxW : 0.5f;
+	struct EdgeSetup edge;
+	edgeSetup(h, a, b, c, &edge);
 	if (n->rdpGl) {
 		// For the GL renderer: the corners as they are (flat shading takes the one colour).
+		h->glrRdpWords = commandWords(edge.w[0]);
 		bool persp = h->modeH & 0x80000;
 		uint64_t head = (uint64_t) 0x01 << 56 | (uint64_t) ((h->geometry & GEOM_SHADE ? 4 : 0) | (h->texOn ? 2 : 0) | (h->geometry & GEOM_ZBUFFER ? 1 : 0)) |
 		                (uint64_t) (h->texTile & 7) << 8 | (uint64_t) (h->texLevel & 7) << 12 | (uint64_t) persp << 16;
@@ -402,35 +453,18 @@ static void triangle(struct N64* n, struct Hle* h, const struct ScreenVertex* a,
 				emit(n, h, (uint64_t) hi << 32 | lo);
 			}
 		}
+		// Then the RDP triangle's edges, for its time.
+		for (int i = 0; i < 4; ++i) {
+			emit(n, h, edge.w[i]);
+		}
 		return;
 	}
-	if (a->y > b->y) {
-		const struct ScreenVertex* t = a; a = b; b = t;
-	}
-	if (b->y > c->y) {
-		const struct ScreenVertex* t = b; b = c; c = t;
-	}
-	if (a->y > b->y) {
-		const struct ScreenVertex* t = a; a = b; b = t;
-	}
+	a = edge.a, b = edge.b, c = edge.c;
 	bool shade = h->geometry & GEOM_SHADE, tex = h->texOn, z = h->geometry & GEOM_ZBUFFER;
-	int op = 0x08 | (shade ? 4 : 0) | (tex ? 2 : 0) | (z ? 1 : 0);
-	float y1 = floorf(a->y * 4) / 4, y2 = floorf(b->y * 4) / 4, y3 = floorf(c->y * 4) / 4;
-	int32_t y1f = (int32_t) floorf(a->y * 4), y2f = (int32_t) floorf(b->y * 4), y3f = (int32_t) floorf(c->y * 4);
-	y1f = y1f < -16384 ? -16384 : y1f > 16380 ? 16380 : y1f;
-	y2f = y2f < -16384 ? -16384 : y2f > 16380 ? 16380 : y2f;
-	y3f = y3f < -16384 ? -16384 : y3f > 16380 ? 16380 : y3f;
-	float hx = c->x - a->x, hy = y3 - y1, mx = b->x - a->x, my = y2 - y1, lx = c->x - b->x, ly = y3 - y2;
-	float nz = hx * my - hy * mx;
-	float attr = fabsf(nz) > 1e-20f ? -1.0f / nz : 0;
-	uint32_t lft = nz < 0;
-	float ish = fabsf(hy) > 1e-20f ? hx / hy : 0, ism = fabsf(my) > 1e-20f ? mx / my : 0, isl = fabsf(ly) > 1e-20f ? lx / ly : 0;
-	float fy = floorf(y1) - y1;
-	float xh = a->x + fy * ish, xm = a->x + fy * ism, xl = b->x;
-	emit(n, h, (uint64_t) ((uint32_t) op << 24 | lft << 23 | (uint32_t) (h->texLevel & 7) << 19 | (uint32_t) (h->texTile & 7) << 16 | (y3f & 0x3FFF)) << 32 | (uint32_t) ((y2f & 0x3FFF) << 16 | (y1f & 0x3FFF)));
-	emit(n, h, (uint64_t) (uint32_t) fixed16(xl) << 32 | (uint32_t) fixed16(isl));
-	emit(n, h, (uint64_t) (uint32_t) fixed16(xh) << 32 | (uint32_t) fixed16(ish));
-	emit(n, h, (uint64_t) (uint32_t) fixed16(xm) << 32 | (uint32_t) fixed16(ism));
+	float hx = edge.hx, hy = edge.hy, mx = edge.mx, my = edge.my, attr = edge.attr, ish = edge.ish, fy = edge.fy;
+	for (int i = 0; i < 4; ++i) {
+		emit(n, h, edge.w[i]);
+	}
 	// One attribute's start, x and edge (y) slopes in s15.16 from its values at the three corners.
 	#define GRADIENT(v1, v2, v3, start, dx, de, dy) do { \
 		float m_ = (v2) - (v1), h_ = (v3) - (v1); \
@@ -1473,9 +1507,10 @@ static void finishTask(struct N64* n, struct Hle* h) {
 	if (!h->dry && h->waiting) {
 		n->sp.hleDoneAt = n->cycles + 2048;
 	} else if (!h->dry) {
-		n->sp.hleDoneAt = n->cycles + 4096 + 64 * (uint64_t) h->count;
+		n->sp.hleDoneAt = n->cycles + 4096 + 64 * (uint64_t) h->timeCount;
 	}
 	flush(n, h);
+	h->timeCount = h->count;
 	if (!h->dry && !h->waiting) {
 		n->dp.busyUntil = n->dp.busyUntil > n->sp.hleDoneAt ? n->dp.busyUntil : n->sp.hleDoneAt;
 	}

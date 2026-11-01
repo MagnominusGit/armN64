@@ -3348,7 +3348,7 @@ static void command(struct N64* n, struct RDP* r, const uint64_t* w, int op, int
 		if (!(n->skip.on && skipCommand(n, w, op))) {
 			glrDraw(n, r, w, op);
 		}
-		uint64_t clocks = op == 0x01 ? glrTriangleClocks(r, w) : primitiveClocks(r, w, op);
+		uint64_t clocks = op == 0x01 ? primitiveClocks(r, w + 16, 0x08) : primitiveClocks(r, w, op);
 		r->clocks += clocks;
 		n->dp.bufBusy += (uint32_t) clocks;
 		n->dp.pipeBusy += (uint32_t) clocks;

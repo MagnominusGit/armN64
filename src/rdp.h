@@ -92,7 +92,9 @@ struct RDP {
 	uint32_t stateGen;
 };
 
-enum { GLR_TRIANGLE_WORDS = 16 };
+// The HLE's triangle for the GL renderer: a head word, three corners of five words, then the edge
+// words of the RDP triangle it stands for.
+enum { GLR_TRIANGLE_WORDS = 20 };
 
 // The GL renderer (glr.c), for HLE: N64_RDP_GL.
 struct Glr* glrCreate(struct N64*);
@@ -107,8 +109,6 @@ bool glrRead(struct N64*, unsigned framebuffer, int x, int y, int w, int h, uint
 // without bringing it back (a frontend shows that texture).
 // A texture rectangle's pixels (inclusive, scissored) and the corner its coordinates start at.
 void rdpRectBounds(struct RDP*, uint64_t w0, int* cx0, int* cy0, int* x0, int* y0, int* x1, int* y1);
-// The RDP time of a GL triangle (op 0x01).
-uint64_t glrTriangleClocks(const struct RDP*, const uint64_t* w);
 // Whether the GPU has drawn RDRAM [addr, addr + len) and not given it back.
 bool glrDrew(struct N64*, uint32_t addr, uint32_t len);
 bool glrShows(struct N64*, uint32_t origin);
