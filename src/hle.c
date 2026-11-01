@@ -83,6 +83,14 @@ struct Hle {
 	bool cbfd, cbfdAdvanced;
 	uint32_t cbfdNormals;
 	float cbfdMod[16], lightPos[LIGHTS + 1][3], lightFalloff[LIGHTS + 1];
+	// Rare's DMA microcodes, Diddy Kong Racing's and Jet Force Gemini's (as GLideN64 has them, known by
+	// their code): matrices in slots that hold the projection too, 10-byte coloured vertices added to
+	// the buffer (a billboard's to its first vertex), triangles from memory with their own texture
+	// coordinates and culling, offsets added to matrix and vertex addresses, and a table of texture
+	// address shifts.
+	bool dkr, jfg, dkrBillboard;
+	int dkrVertex;
+	uint32_t dkrMtxOffset, dkrVtxOffset, dkrTexTable, dkrTexShift, dkrTexCount, dkrImage[2];
 	float flxDir[3];
 	uint32_t dmaIo;
 	float texScaleS, texScaleT;
@@ -277,6 +285,89 @@ static void normalize(float* v) {
 	if (l > 0) {
 		v[0] /= l, v[1] /= l, v[2] /= l;
 	}
+}
+
+// Rare's G_DMA_MTX: a matrix into a slot, or (Jet Force Gemini's) times slot 0's; the slot is the
+// one drawn with, the projection in it.
+static void dkrMatrix(struct N64* n, struct Hle* h, uint32_t w0, uint32_t w1) {
+	if ((w0 & 0xFFFF) != 64) {
+		return;
+	}
+	int index = (w0 >> 16) & 15;
+	bool mul = false;
+	if (index == 0) {
+		index = (w0 >> 22) & 3;
+	} else {
+		mul = (w0 >> 23) & 1;
+	}
+	float m[16];
+	readMatrix(n, (address(h, w1) + h->dkrMtxOffset) & (RDRAM_SIZE - 1), m);
+	if (mul) {
+		multiply(h->modelview[index], m, h->modelview[0]);
+	} else {
+		memcpy(h->modelview[index], m, sizeof(m));
+	}
+	static const float identity[16] = { 1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1 };
+	memcpy(h->projection, identity, sizeof(identity));
+	h->depth = index;
+	updateMvp(h);
+}
+
+// Rare's G_DMA_VTX: x, y, z and a colour, 10 bytes each, after the ones loaded since the last
+// triangles (a billboard's after its first vertex, and moved by it).
+static void dkrVertices(struct N64* n, struct Hle* h, uint32_t w0, uint32_t w1) {
+	if (w0 & 0x10000) {
+		h->dkrVertex = h->dkrBillboard ? 1 : h->dkrVertex;
+	} else {
+		h->dkrVertex = 0;
+	}
+	int const count = (int) ((w0 >> 19) & 31) + (h->jfg ? 0 : 1), first = h->dkrVertex + (int) ((w0 >> 9) & 31);
+	uint32_t a = address(h, w1) + h->dkrVtxOffset;
+	const float* m = h->mvp;
+	for (int i = 0; i < count && first + i < VERTICES; ++i, a += 10) {
+		struct Vertex* v = &h->v[first + i];
+		float x = rd16(n, a), y = rd16(n, a + 2), z = rd16(n, a + 4);
+		v->x = x * m[0] + y * m[4] + z * m[8] + m[12];
+		v->y = x * m[1] + y * m[5] + z * m[9] + m[13];
+		v->z = x * m[2] + y * m[6] + z * m[10] + m[14];
+		v->w = x * m[3] + y * m[7] + z * m[11] + m[15];
+		if (h->dkrBillboard) {
+			v->x += h->v[0].x, v->y += h->v[0].y, v->z += h->v[0].z, v->w += h->v[0].w;
+		}
+		v->r = n->rdram[(a + 6) & (RDRAM_SIZE - 1)] / 255.0f, v->g = n->rdram[(a + 7) & (RDRAM_SIZE - 1)] / 255.0f;
+		v->b = n->rdram[(a + 8) & (RDRAM_SIZE - 1)] / 255.0f, v->a = n->rdram[(a + 9) & (RDRAM_SIZE - 1)] / 255.0f;
+		v->s = v->t = 0;
+		if (h->geometry & GEOM_FOG) {
+			float f = (v->w != 0 ? v->z / v->w : 0) * h->fogMul + h->fogOffset;
+			v->a = (f < 0 ? 0 : f > 255 ? 255 : f) / 255.0f;
+		}
+	}
+	h->dkrVertex += count;
+}
+
+// Rare's G_DMA_TRI: 16-byte triangles (flag, three vertices, then S and T for each, s10.5), culled
+// by the viewport's facing unless the flag's 0x40 is set.
+static void drawTriangle(struct N64* n, struct Hle* h, int i0, int i1, int i2);
+static void dkrTriangles(struct N64* n, struct Hle* h, uint32_t w0, uint32_t w1) {
+	h->texOn = (w0 >> 16) & 15;
+	int const count = (int) ((w0 >> 20) & 15) + 1;
+	uint32_t a = address(h, w1);
+	for (int i = 0; i < count; ++i, a += 16) {
+		uint32_t const head = rd32(n, a);
+		int const v[3] = { (head >> 16) & 0xFF, (head >> 8) & 0xFF, head & 0xFF };
+		if (v[0] >= VERTICES || v[1] >= VERTICES || v[2] >= VERTICES) {
+			continue;
+		}
+		h->geometry &= ~(GEOM_CULL_FRONT | GEOM_CULL_BACK);
+		if (!(head & 0x40000000)) {
+			h->geometry |= h->vscale[0] > 0 ? GEOM_CULL_BACK : GEOM_CULL_FRONT;
+		}
+		for (int k = 0; k < 3; ++k) {
+			h->v[v[k]].s = rd16(n, a + 4 + 4 * (uint32_t) k) / 32.0f, h->v[v[k]].t = rd16(n, a + 6 + 4 * (uint32_t) k) / 32.0f;
+		}
+		drawTriangle(n, h, v[0], v[1], v[2]);
+	}
+	h->dkrVertex = 0;
 }
 
 // Conker's G_MW_COORD_MOD: the integer and fraction halves of the scale the light distances take, and
@@ -835,6 +926,25 @@ static uint32_t rdpCommand(struct N64* n, struct Hle* h, uint32_t pc, uint32_t w
 	if (op == 0xFD || op == 0xFE || op == 0xFF) {
 		w1 = address(h, w1);
 	}
+	// Rare's texture shifts: each RGBA image moved by the table's next entry, unless its load block
+	// doesn't come out whole lines (then the image as it was, and no more shifts).
+	if (op == 0xFD && h->dkrTexTable) {
+		if (((w0 >> 21) & 7) == 0) {
+			h->dkrTexShift = (uint16_t) rd16(n, h->dkrTexTable + h->dkrTexCount * 2);
+			h->dkrImage[0] = w0, h->dkrImage[1] = w1;
+			w1 += h->dkrTexShift;
+		} else {
+			h->dkrTexTable = 0;
+		}
+	}
+	if (op == 0xF3 && h->dkrTexTable) {
+		if (h->dkrTexShift % (((((w1 >> 12) & 0xFFF) >> 2) + 1) << 3)) {
+			emit(n, h, (uint64_t) h->dkrImage[0] << 32 | h->dkrImage[1]);
+			h->dkrTexTable = 0;
+		} else {
+			++h->dkrTexCount;
+		}
+	}
 	if (op == 0xFF) {
 		h->image8 = ((w0 >> 19) & 3) == 1;
 	}
@@ -1359,6 +1469,34 @@ static void runList(struct N64* n, struct Hle* h, uint32_t pc) {
 			}
 		} else {
 			int scale = f3dex ? 2 : h->wrus ? 5 : 10;
+			if (h->dkr && (op == 0x01 || op == 0x02 || op == 0x04 || op == 0x05 || op == 0x07 || op == 0xBF ||
+			               (op == 0xBC && ((w0 & 0xFF) == 0x02 || (w0 & 0xFF) == 0x0A)))) {
+				if (op == 0x01) {
+					dkrMatrix(n, h, w0, w1);
+				} else if (op == 0x02) {
+					h->dkrTexTable = address(h, w1), h->dkrTexShift = h->dkrTexCount = 0;
+				} else if (op == 0x04) {
+					dkrVertices(n, h, w0, w1);
+				} else if (op == 0x05) {
+					dkrTriangles(n, h, w0, w1);
+				} else if (op == 0x07) {
+					// So many commands from an address, then back.
+					if (counted < 0) {
+						counted = (w0 >> 16) & 0xFF;
+						countedReturn = next;
+						next = address(h, w1);
+					}
+				} else if (op == 0xBF) {
+					h->dkrMtxOffset = w0 & 0xFFFFFF, h->dkrVtxOffset = w1 & 0xFFFFFF;
+				} else if ((w0 & 0xFF) == 0x02) {
+					h->dkrBillboard = w1 & 1;
+				} else {
+					h->depth = (w1 >> 6) & 3;
+					updateMvp(h);
+				}
+				pc = next;
+				continue;
+			}
 			switch (op) {
 			case 0xC0:
 				emit(n, h, 0);
@@ -1737,6 +1875,10 @@ bool hleGraphics(struct N64* n, bool dry) {
 		f = FAMILY_F3D;
 	}
 	bool const wrus = f == FAMILY_F3D && ucode == 0xAC1B2CFEu;
+	bool const dkr = f == FAMILY_NONE && (ucode == 0x5277D6E7u || ucode == 0x26EDE132u);
+	if (dkr) {
+		f = FAMILY_F3D;
+	}
 	if (f == FAMILY_NONE) {
 		return false;
 	}
@@ -1753,6 +1895,8 @@ bool hleGraphics(struct N64* n, bool dry) {
 	h->wrus = wrus;
 	ucodeFlags(n, h, data, dataSize);
 	h->cbfdAdvanced = false;
+	h->dkr = dkr, h->jfg = ucode == 0x26EDE132u;
+	h->dkrBillboard = false, h->dkrVertex = 0, h->dkrMtxOffset = h->dkrVtxOffset = h->dkrTexTable = 0;
 	h->dry = dry;
 	memset(h->segments, 0, sizeof(h->segments));
 	static const float identity[16] = { 1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1 };
