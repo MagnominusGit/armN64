@@ -155,6 +155,9 @@ struct Jit {
 	// Stores to pages with compiled code, which check that they miss its words.
 	struct Miss codeChecks[64];
 	int codeCheckCount;
+	// Loads from pages the RDP may still be drawing to, which wait for it.
+	struct Miss rdpWaits[64];
+	int rdpWaitCount;
 	uint8_t* leave;
 	bool rdpThreads, rdpGl;
 	// Outside mle the D-cache holds the data cached accesses use; with HLE accuracy (fast)
@@ -1057,6 +1060,18 @@ static void markWritten(struct Emitter* e) {
 	aStrb(e, ZR, 2, N64_OFF(dirtyPages) - N64_OFF(pageFlags));
 }
 
+// cpuRdpWaitRead or cpuRdpWaitWrite for the physical address in w6 (w0 kept); the pool's
+// caller-saved registers are lost.
+static void rdpWaitCall(struct Emitter* e, const void* f, int size) {
+	aPush(e, 0, 6, 16);
+	aMovX(e, 0, N);
+	aMov(e, 1, 6);
+	aMovImm(e, 2, (uint32_t) size);
+	aMovImm64(e, IP, (uint64_t) (uintptr_t) f);
+	aBlr(e, IP);
+	aPop(e, 0, 6, 16);
+}
+
 static void emitMemory(struct Jit* j, struct Slow* slow) {
 	struct Emitter* e = &j->e;
 	uint32_t op = slow->op;
@@ -1119,11 +1134,16 @@ static void emitMemory(struct Jit* j, struct Slow* slow) {
 		k->resume = e->p;
 		k->slow = slow;
 		k->size = size;
+		k->cache = j->cache;
 		slow->keep = true;
 	} else if (j->rdpThreads) {
 		aLsrImm(e, 1, 6, 12);
 		aLdst(e, L_LDRB, 1, PAGES, 1, L_UXTW);
-		slow->site[slow->sites++] = aTbnz(e, 1, 1, NULL);
+		struct Miss* w = &j->rdpWaits[j->rdpWaitCount++];
+		w->site = aTbnz(e, 1, 1, NULL);
+		w->resume = e->p;
+		w->size = size;
+		w->cache = j->cache;
 	}
 
 	if (j->fast) {
@@ -1680,7 +1700,7 @@ void* jitCompile(struct N64* n, const uint32_t* ops, uint32_t count, uint32_t va
 	struct Jit* j = &jit;
 	uint8_t* start = arena + n->jitUsed;
 	j->e = (struct Emitter) { start, start, start + BLOCK_CODE_MAX };
-	j->exitCount = j->slowCount = j->missCount = j->codeCheckCount = 0;
+	j->exitCount = j->slowCount = j->missCount = j->codeCheckCount = j->rdpWaitCount = 0;
 	j->rdpThreads = n->rdpThreads > 0;
 	j->rdpGl = n->rdpGl;
 	j->fast = n->fast;
@@ -1809,8 +1829,15 @@ void* jitCompile(struct N64* n, const uint32_t* ops, uint32_t count, uint32_t va
 	for (int i = 0; i < j->codeCheckCount; ++i) {
 		struct Miss* k = &j->codeChecks[i];
 		patchHere(e, k->site);
-		aDpImm(e, A_SUBS_IMM, ZR, 1, PAGE_CODE);
-		k->slow->site[k->slow->sites++] = aBcond(e, C_NE, NULL);
+		// On a page the RDP draws to or reads, it waits for the RDP there in C first.
+		aLogicImm(e, A_ANDS_IMM, ZR, 1, PAGE_RDP);
+		uint8_t* noRdp = aBcond(e, C_EQ, NULL);
+		rdpWaitCall(e, (const void*) cpuRdpWaitWrite, k->size);
+		reloadPool(e, &k->cache);
+		aLsrImm(e, 1, 6, 12);
+		aLdst(e, L_LDRB, 1, PAGES, 1, L_UXTW);
+		patchHere(e, noRdp);
+		aTbz(e, 1, 0, k->resume);
 		aAddImmX(e, IP, N, N64_OFF(codeWords));
 		aLsrImm(e, 2, 6, 5);
 		aLdst(e, L_LDRB, 2, IP, 2, L_UXTW);
@@ -1819,6 +1846,16 @@ void* jitCompile(struct N64* n, const uint32_t* ops, uint32_t count, uint32_t va
 		aLogicImm(e, A_ANDS_IMM, ZR, 2, k->size == 8 ? 3 : 1);
 		k->slow->site[k->slow->sites++] = aBcond(e, C_NE, NULL);
 		aB(e, k->resume);
+	}
+
+	// Loads from pages the RDP may still be drawing to wait for it in C, then go on inline: the same
+	// path (and time) whichever renderer draws and however long it keeps the pages.
+	for (int i = 0; i < j->rdpWaitCount; ++i) {
+		struct Miss* w = &j->rdpWaits[i];
+		patchHere(e, w->site);
+		rdpWaitCall(e, (const void*) cpuRdpWaitRead, w->size);
+		reloadPool(e, &w->cache);
+		aB(e, w->resume);
 	}
 
 	// D-cache misses, filled (and a dirty line written back) in C. A misaligned address, one past
@@ -1834,10 +1871,12 @@ void* jitCompile(struct N64* n, const uint32_t* ops, uint32_t count, uint32_t va
 		m->slow->site[m->slow->sites++] = aCbnz(e, 2, NULL);
 		if (m->glLoad) {
 			// A line coming in from a page the GPU draws to (a game invalidates its cache before
-			// reading what the RDP drew): the C path waits for the GPU.
+			// reading what the RDP drew) waits for the GPU first.
 			aLsrImm(e, 3, 6, 12);
 			aLdst(e, L_LDRB, 3, PAGES, 3, L_UXTW);
-			m->slow->site[m->slow->sites++] = aTbnz(e, 3, 1, NULL);
+			uint8_t* ready = aTbz(e, 3, 1, NULL);
+			rdpWaitCall(e, (const void*) cpuRdpWaitRead, 16);
+			patchHere(e, ready);
 		}
 		aPush(e, 0, 6, 16);
 		aMov(e, 1, 0);

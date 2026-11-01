@@ -513,6 +513,8 @@ bool cpuPeekAddress(struct N64*, uint64_t vaddr, uint32_t* paddr);
 // Kernel mode, the only mode compiled code runs in.
 bool cpuPlainMode(const struct N64*);
 uint32_t cpuDcacheMiss(struct N64*, uint32_t vaddr, uint32_t paddr);
+void cpuRdpWaitRead(struct N64*, uint32_t paddr, uint32_t len);
+void cpuRdpWaitWrite(struct N64*, uint32_t paddr, uint32_t len);
 uint32_t cpuIcacheMiss(struct N64*, uint32_t vaddr, uint32_t paddr);
 uint32_t cpuCacheOp(struct N64*, uint32_t op, uint32_t vaddr);
 bool cpuCodeCoherent(struct N64*, uint32_t vaddr, uint32_t paddr, uint32_t count);
