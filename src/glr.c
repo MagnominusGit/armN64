@@ -25,7 +25,7 @@ enum {
 	GL_TEXTURE_2D = 0x0DE1, GL_RGBA = 0x1908, GL_RGBA8 = 0x8058, GL_UNSIGNED_BYTE = 0x1401, GL_UNSIGNED_INT = 0x1405, GL_FLOAT = 0x1406,
 	GL_FRAMEBUFFER = 0x8D40, GL_READ_FRAMEBUFFER = 0x8CA8, GL_DRAW_FRAMEBUFFER = 0x8CA9, GL_COLOR_ATTACHMENT0 = 0x8CE0, GL_DEPTH_ATTACHMENT = 0x8D00, GL_RENDERBUFFER = 0x8D41,
 	GL_DEPTH_COMPONENT24 = 0x81A6, GL_FRAMEBUFFER_COMPLETE = 0x8CD5, GL_DEPTH_STENCIL_ATTACHMENT = 0x821A, GL_DEPTH24_STENCIL8 = 0x88F0,
-	GL_STENCIL_TEST = 0x0B90, GL_STENCIL_BUFFER_BIT = 0x400, GL_KEEP = 0x1E00, GL_REPLACE = 0x1E01, GL_EQUAL = 0x202, GL_GEQUAL = 0x206,
+	GL_STENCIL_TEST = 0x0B90, GL_EXTENSIONS = 0x1F03, GL_STENCIL_BUFFER_BIT = 0x400, GL_KEEP = 0x1E00, GL_REPLACE = 0x1E01, GL_EQUAL = 0x202, GL_GEQUAL = 0x206,
 	GL_TEXTURE_MIN_FILTER = 0x2801, GL_TEXTURE_MAG_FILTER = 0x2800, GL_NEAREST = 0x2600, GL_TEXTURE_WRAP_S = 0x2802,
 	GL_TEXTURE_WRAP_T = 0x2803, GL_CLAMP_TO_EDGE = 0x812F, GL_TEXTURE0 = 0x84C0,
 	GL_ARRAY_BUFFER = 0x8892, GL_STREAM_DRAW = 0x88E0, GL_TRIANGLES = 4, GL_MAP_WRITE_BIT = 2, GL_MAP_UNSYNCHRONIZED_BIT = 0x20,
@@ -75,6 +75,7 @@ struct Gl {
 	void (*StencilOp)(GLenum, GLenum, GLenum);
 	void (*ColorMask)(GLboolean, GLboolean, GLboolean, GLboolean);
 	void (*ClearStencil)(GLint);
+	const unsigned char* (*GetString)(GLenum);
 	void (*ReadPixels)(GLint, GLint, GLsizei, GLsizei, GLenum, GLenum, void*);
 	void (*PixelStorei)(GLenum, GLint);
 	GLuint (*CreateShader)(GLenum);
@@ -131,6 +132,8 @@ struct ProgramKey {
 	// The level of detail: worked out (bit 0), picking the tiles (1), sharpen (2), detail (3), the
 	// primitive's levels (4-6) and the least (8-12).
 	uint32_t lod;
+	// The alpha dither (other modes bits 36-37, 3 none) where the shader blends.
+	uint32_t alphaDither;
 };
 
 // A program's uniforms as last set.
@@ -210,6 +213,8 @@ struct Glr {
 	int stencilRef;
 	// The primitive's number (the RDP's seq), for the noise.
 	uint32_t seq;
+	// The shader reads the image (EXT_shader_framebuffer_fetch): it blends as the RDP does.
+	bool fetch;
 	// The HLE's corners for triangles it has sent and the RDP hasn't reached yet (a ring).
 	struct GlrCorners* queue;
 	uint32_t queueRead, queueWrite;
@@ -299,7 +304,7 @@ static bool loadGl(struct Glr* g) {
 	       GLFN(RenderbufferStorage) && GLFN(GenTextures) && GLFN(DeleteTextures) && GLFN(BindTexture) && GLFN(ActiveTexture) &&
 	       GLFN(TexImage2D) && GLFN(TexSubImage2D) && GLFN(TexParameteri) && GLFN(Viewport) && GLFN(Scissor) && GLFN(Enable) &&
 	       GLFN(Disable) && GLFN(ClearColor) && GLFN(ClearDepthf) && GLFN(Clear) && GLFN(DepthFunc) && GLFN(DepthMask) &&
-	       GLFN(BlendFunc) && GLFN(BlendFuncSeparate) && GLFN(BlendColor) && GLFN(PolygonOffset) && GLFN(StencilFunc) && GLFN(StencilOp) && GLFN(ColorMask) && GLFN(ClearStencil) && GLFN(ReadPixels) && GLFN(PixelStorei) && GLFN(CreateShader) &&
+	       GLFN(BlendFunc) && GLFN(BlendFuncSeparate) && GLFN(BlendColor) && GLFN(PolygonOffset) && GLFN(StencilFunc) && GLFN(StencilOp) && GLFN(ColorMask) && GLFN(ClearStencil) && GLFN(GetString) && GLFN(ReadPixels) && GLFN(PixelStorei) && GLFN(CreateShader) &&
 	       GLFN(ShaderSource) && GLFN(CompileShader) && GLFN(GetShaderiv) && GLFN(GetShaderInfoLog) && GLFN(DeleteShader) &&
 	       GLFN(CreateProgram) && GLFN(AttachShader) && GLFN(LinkProgram) && GLFN(GetProgramiv) && GLFN(GetProgramInfoLog) &&
 	       GLFN(UseProgram) && GLFN(DeleteProgram) && GLFN(GetUniformLocation) && GLFN(Uniform1i) && GLFN(Uniform1f) &&
@@ -526,6 +531,25 @@ static void blendFormula(char* out, size_t size, int sel) {
 	         blendColorInput(sel), blendColorInput(sel >> 4), blendColorInput(sel));
 }
 
+// With the image's pixel (mem): the blender's P and M, and one cycle of rdp.c blendColor in its
+// integers (5-bit factors; memory alpha taken as whole, its factor shift as none). The last cycle
+// passes P where the pixel is opaque with the pixel's alpha and 1 - A.
+static const char* fetchColorInput(int sel) {
+	static const char* inputs[4] = { "combined.rgb", "mem", "uBlend.rgb", "uFog.rgb" };
+	return inputs[sel & 3];
+}
+
+static void fetchBlend(char* out, size_t size, int sel, bool last) {
+	static const char* b[4] = { "floor((255.0 - a8) / 8.0) + 1.0", "32.0", "32.0", "1.0" };
+	bool rejects = last && !((sel >> 2) & 3) && !((sel >> 6) & 3);
+	snprintf(out, size,
+	         "	{ float a8 = floor(clamp(%s, 0.0, 1.0) * 255.0 + 0.5), fa = floor(a8 / 8.0)%s, fb1 = %s;\n"
+	         "	vec3 o = mod(floor((e8(%s) * fa + e8(%s) * fb1) / 32.0), 256.0) / 255.0;\n"
+	         "	combined.rgb = %s; }\n",
+	         blendAlphaInput(sel >> 2), ((sel >> 6) & 3) == 1 ? " - mod(floor(a8 / 8.0), 4.0)" : "", b[(sel >> 6) & 3], fetchColorInput(sel),
+	         fetchColorInput(sel >> 4), rejects ? "a8 >= 255.0 ? combined.rgb : o" : "o");
+}
+
 static GLuint compile(struct Glr* g, GLenum type, const char* source) {
 	struct Gl* gl = &g->gl;
 	GLuint s = gl->CreateShader(type);
@@ -545,7 +569,8 @@ static GLuint compile(struct Glr* g, GLenum type, const char* source) {
 
 static struct Program* program(struct Glr* g, struct ProgramKey key) {
 	for (int i = 0; i < g->programCount; ++i) {
-		if (g->programs[i].key.combine == key.combine && g->programs[i].key.modes == key.modes && g->programs[i].key.lod == key.lod) {
+		if (g->programs[i].key.combine == key.combine && g->programs[i].key.modes == key.modes && g->programs[i].key.lod == key.lod &&
+		    g->programs[i].key.alphaDither == key.alphaDither) {
 			return &g->programs[i];
 		}
 	}
@@ -556,7 +581,14 @@ static struct Program* program(struct Glr* g, struct ProgramKey key) {
 	static char source[8192];
 	char line[1024];
 	int cycleType = key.modes & MODE_CYCLE;
-	snprintf(source, sizeof(source), "%s", fragmentHead);
+	if (g->fetch) {
+		// The image's pixel in oColor before the shader writes it.
+		const char* out = strstr(fragmentHead, "out vec4 oColor;");
+		snprintf(source, sizeof(source), "#version 300 es\n#extension GL_EXT_shader_framebuffer_fetch : require\n%.*sinout%s",
+		         (int) (out - fragmentHead - strlen("#version 300 es\n")), fragmentHead + strlen("#version 300 es\n"), out + 3);
+	} else {
+		snprintf(source, sizeof(source), "%s", fragmentHead);
+	}
 	// rdp.c's noise: a hash of the pixel (at the RDP's resolution), the primitive's number and what
 	// it is for (the combiner's channels 0-2, the dither 4).
 	snprintf(line, sizeof(line),
@@ -641,6 +673,62 @@ static struct Program* program(struct Glr* g, struct ProgramKey key) {
 		strcat(source, cycleType == 2 ? "	if (combined.a == 0.0) discard;\n" : "	if (combined.a < uBlend.a) discard;\n");
 	}
 	int first = (key.modes >> 8) & 0xFF, last = (key.modes >> 16) & 0xFF;
+	if (g->fetch && cycleType < 2) {
+		// rdp.c shadePixel with the image's pixel: the first of two cycles blends, the last with force
+		// blend (not at full alpha with the pixel's alpha and 1 - A), then the dither and 5 bits.
+		if (key.alphaDither != 3) {
+			// rdp.c ditherAt's alpha: noise, or the color's matrix value (inverted by mode 1), added to
+			// the pixel's and the shade's alpha.
+			int modeRgb = key.modes & MODE_NOISE ? 2 : key.modes & MODE_DITHER ? (key.modes & MODE_BAYER ? 1 : 0) : 3;
+			const char* matrix = modeRgb == 1 || modeRgb == 3 ? "int[16](0, 4, 1, 5, 4, 0, 5, 1, 3, 7, 2, 6, 7, 3, 6, 2)" : "int[16](0, 6, 1, 7, 4, 2, 5, 3, 3, 5, 2, 4, 7, 1, 6, 0)";
+			snprintf(line, sizeof(line),
+			         "	{ ivec2 ap = ivec2(gl_FragCoord.xy) / %d;\n"
+			         "	int ad = %s;\n"
+			         "	combined.a = min(floor(combined.a * 255.0 + 0.5) + float(ad), 255.0) / 255.0;\n"
+			         "	shade.a = min(floor(shade.a * 255.0 + 0.5) + float(ad), 255.0) / 255.0; }\n",
+			         g->scale, key.alphaDither == 2 ? "int(pixelNoise(5u) & 7u)" : key.alphaDither == 1 ? "~%s[(ap.y & 3) * 4 + (ap.x & 3)] & 7" : "%s[(ap.y & 3) * 4 + (ap.x & 3)]");
+			if (key.alphaDither < 2) {
+				char with[1024];
+				snprintf(with, sizeof(with), line, matrix);
+				snprintf(line, sizeof(line), "%s", with);
+			}
+			strcat(source, line);
+		}
+		// A 16-bit image's pixel as the blender reads it: its 5 bits, the low 3 bits clear.
+		strcat(source, key.modes & MODE_IMAGE16 ? "	vec3 mem = vec3((ivec3(floor(oColor.rgb * 255.0 + 0.5)) >> 3) << 3) / 255.0;\n" : "	vec3 mem = oColor.rgb;\n");
+		if (cycleType == 1) {
+			fetchBlend(line, sizeof(line), first, false);
+			strcat(source, line);
+		}
+		if (key.modes & (MODE_BLEND | MODE_BLEND_COLOR | MODE_BLEND_MEMORY_FIRST)) {
+			fetchBlend(line, sizeof(line), last, true);
+			strcat(source, line);
+		} else {
+			snprintf(line, sizeof(line), "	combined.rgb = %s;\n", fetchColorInput(last));
+			strcat(source, line);
+		}
+		strcat(source, "	oColor = vec4(combined.rgb, 1.0);\n");
+		if (key.modes & MODE_DITHER) {
+			char matrix[256];
+			if (key.modes & MODE_NOISE) {
+				snprintf(matrix, sizeof(matrix), "uint h = pixelNoise(4u);\n	ivec3 ditherM = ivec3(uvec3(h, h >> 3, h >> 6) & 7u)");
+			} else {
+				snprintf(matrix, sizeof(matrix), "ivec3 ditherM = ivec3(%s[(px.y & 3) * 4 + (px.x & 3)])",
+				         key.modes & MODE_BAYER ? "int[16](0, 4, 1, 5, 4, 0, 5, 1, 3, 7, 2, 6, 7, 3, 6, 2)" : "int[16](0, 6, 1, 7, 4, 2, 5, 3, 3, 5, 2, 4, 7, 1, 6, 0)");
+			}
+			snprintf(line, sizeof(line), "	{ ivec2 px = ivec2(gl_FragCoord.xy) / %d;\n	%s;\n	ivec3 o = ivec3(floor(oColor.rgb * 255.0 + 0.5));\n"
+			         "	for (int i = 0; i < 3; ++i) if ((o[i] & 7) > ditherM[i]) o[i] = min((o[i] & 0xF8) + 8, 255);\n%s	oColor.rgb = vec3(o) / 255.0; }\n",
+			         g->scale, matrix, key.modes & MODE_IMAGE16 ? "	o = (o >> 3) << 3 | o >> 5;\n" : "");
+			strcat(source, line);
+		} else if (key.modes & MODE_IMAGE16) {
+			strcat(source, "	{ ivec3 o = ivec3(floor(oColor.rgb * 255.0 + 0.5));\n	o = (o >> 3) << 3 | o >> 5;\n	oColor.rgb = vec3(o) / 255.0; }\n");
+		}
+		if (key.modes & MODE_PRIM_DEPTH) {
+			strcat(source, "	gl_FragDepth = uPrimDepth;\n");
+		}
+		strcat(source, "}\n");
+		goto compileFragment;
+	}
 	// The first of two cycles always blends (fog, mostly). With memory as its M (and 1 - A as B), the
 	// image's share carries to the last cycle's blend with it: P * a1 * a2 + memory * (1 - a1 * a2).
 	strcat(source, "	float memoryKeep = 1.0;\n");
@@ -716,6 +804,7 @@ static struct Program* program(struct Glr* g, struct ProgramKey key) {
 		strcat(source, "	gl_FragDepth = uPrimDepth;\n");
 	}
 	strcat(source, "}\n");
+compileFragment:;
 	GLuint fs = compile(g, GL_FRAGMENT_SHADER, source);
 	if (!fs) {
 		return NULL;
@@ -1226,9 +1315,16 @@ static bool drawState(struct N64* n, struct Glr* g, struct RDP* r, bool textured
 	if (s.blendOn) {
 		modes |= MODE_BLEND;
 	}
+	if (g->fetch) {
+		// The shader blends.
+		s.blendOn = false, s.memoryFirst = 0, s.blendConstant = 0;
+	}
 	// The dither where the shader makes the image's color, or the GPU blends into a 16-bit image.
-	if (cycleType < 2 && r->ditherRgb < 3 && !(modes & MODE_BLEND_MEMORY_FIRST) && (!(modes & MODE_BLEND) || r->colorSize == 2)) {
+	if (cycleType < 2 && r->ditherRgb < 3 && (g->fetch || (!(modes & MODE_BLEND_MEMORY_FIRST) && (!(modes & MODE_BLEND) || r->colorSize == 2)))) {
 		modes |= MODE_DITHER | (r->ditherRgb == 1 ? MODE_BAYER : 0) | (r->ditherRgb == 2 ? MODE_NOISE : 0) | (r->colorSize == 2 ? MODE_IMAGE16 : 0);
+	}
+	if (g->fetch && r->colorSize == 2) {
+		modes |= MODE_IMAGE16;
 	}
 	if (depth && r->zPrim) {
 		modes |= MODE_PRIM_DEPTH;
@@ -1248,7 +1344,7 @@ static bool drawState(struct N64* n, struct Glr* g, struct RDP* r, bool textured
 	                   ? 1 | (lodTiles ? 2 : 0) | (uint32_t) ((m >> 49) & 1) << 2 | (uint32_t) ((m >> 50) & 1) << 3 | (uint32_t) r->maxLevel << 4 |
 	                         (uint32_t) (r->minLevel & 31) << 8
 	                   : 0;
-	struct ProgramKey key = { cycleType < 2 ? r->combine : 0, modes, lod };
+	struct ProgramKey key = { cycleType < 2 ? r->combine : 0, modes, lod, g->fetch && cycleType < 2 && !r->cvgAlpha ? (uint32_t) r->ditherAlpha : 3 };
 	s.program = program(g, key);
 	if (!s.program) {
 		return false;
@@ -1704,7 +1800,15 @@ struct Glr* glrCreate(struct N64* n) {
 	gl->PixelStorei(GL_UNPACK_ALIGNMENT, 1);
 	gl->Disable(GL_DITHER);
 	memset(&g->applied, 0xFF, sizeof(g->applied));
-	fprintf(stderr, "GL renderer on %s\n", glesRenderer(g->gles));
+	const char* fetch = n->settings ? n->settings("N64_GL_FETCH") : getenv("N64_GL_FETCH");
+	const char* extensions = (const char*) gl->GetString(GL_EXTENSIONS);
+	// The coherent one, not GL_EXT_shader_framebuffer_fetch_non_coherent.
+	const char* found = extensions;
+	while (found && (found = strstr(found, "GL_EXT_shader_framebuffer_fetch")) && found[31] && found[31] != ' ') {
+		found += 31;
+	}
+	g->fetch = found && !(fetch && *fetch == '0');
+	fprintf(stderr, "GL renderer on %s%s\n", glesRenderer(g->gles), g->fetch ? " (blending in the shader)" : "");
 	if (!g->vertexShader) {
 		glrDestroy(g);
 		n->rdpGl = false;
