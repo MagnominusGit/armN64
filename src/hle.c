@@ -73,6 +73,9 @@ struct Hle {
 	// angle to the normal picks each vertex's alpha from a table at the G_DMA_IO address (in place of
 	// generated texture coordinates).
 	bool flx;
+	// Wave Race 64's Fast3D (known by its code, as GLideN64 knows it): vertex indices times 5 (G_CULLDL's
+	// offsets times 20), G_VTX's count in its length (n times 0x210, less one), and F3DEX's G_QUAD.
+	bool wrus;
 	float flxDir[3];
 	uint32_t dmaIo;
 	float texScaleS, texScaleT;
@@ -1254,7 +1257,7 @@ static void runList(struct N64* n, struct Hle* h, uint32_t pc) {
 				break;
 			}
 		} else {
-			int scale = f3dex ? 2 : 10;
+			int scale = f3dex ? 2 : h->wrus ? 5 : 10;
 			switch (op) {
 			case 0xC0:
 				emit(n, h, 0);
@@ -1283,6 +1286,8 @@ static void runList(struct N64* n, struct Hle* h, uint32_t pc) {
 			case 0x04:
 				if (f3dex) {
 					loadVertices(n, h, w1, ((w0 >> 16) & 0xFF) / 2, (w0 >> 10) & 0x3F);
+				} else if (h->wrus) {
+					loadVertices(n, h, w1, ((w0 >> 16) & 0xFF) / 5, (int) ((w0 & 0xFFFF) + 1) / 0x210);
 				} else {
 					loadVertices(n, h, w1, (w0 >> 16) & 0xF, ((w0 >> 20) & 0xF) + 1);
 				}
@@ -1355,8 +1360,9 @@ static void runList(struct N64* n, struct Hle* h, uint32_t pc) {
 				f3dex2 = h->family == FAMILY_F3DEX2 || h->family == FAMILY_S2DEX2, f3dex = h->family == FAMILY_F3DEX || h->family == FAMILY_S2DEX;
 				break;
 			case 0xB5:
-				if (f3dex) {
-					int v0 = ((w1 >> 24) & 0xFF) / 2, v1 = ((w1 >> 16) & 0xFF) / 2, v2 = ((w1 >> 8) & 0xFF) / 2, v3 = (w1 & 0xFF) / 2;
+				// F3DEX's G_QUAD, and Wave Race 64's.
+				if (f3dex || h->wrus) {
+					int v0 = ((w1 >> 24) & 0xFF) / scale, v1 = ((w1 >> 16) & 0xFF) / scale, v2 = ((w1 >> 8) & 0xFF) / scale, v3 = (w1 & 0xFF) / scale;
 					drawTriangle(n, h, v0, v1, v2);
 					drawTriangle(n, h, v0, v2, v3);
 				}
@@ -1406,12 +1412,12 @@ static void runList(struct N64* n, struct Hle* h, uint32_t pc) {
 					h->spriteScaleX = (w1 >> 16) ? (w1 >> 16) / 1024.0f : 1, h->spriteScaleY = (w1 & 0xFFFF) ? (w1 & 0xFFFF) / 1024.0f : 1;
 					h->spriteFlipS = (w0 >> 8) & 0xFF, h->spriteFlipT = w0 & 0xFF;
 				} else {
-					cullOrEnd(h, (w0 & 0xFFFF) / (f3dex ? 2 : 40), (w1 & 0xFFFF) / (f3dex ? 2 : 40), &end);
+					cullOrEnd(h, (w0 & 0xFFFF) / (f3dex ? 2 : scale * 4), (w1 & 0xFFFF) / (f3dex ? 2 : scale * 4), &end);
 				}
 				break;
 			case 0xBF:
 				// Fast3D's indices are vertex numbers times 10: other ones are another microcode's.
-				if (!f3dex && (((w1 >> 16) & 0xFF) % 10 || ((w1 >> 8) & 0xFF) % 10 || (w1 & 0xFF) % 10)) {
+				if (!f3dex && (((w1 >> 16) & 0xFF) % scale || ((w1 >> 8) & 0xFF) % scale || (w1 & 0xFF) % scale)) {
 					snprintf(h->why, sizeof(h->why), "Fast3D-like %08x", h->ucode);
 					reject(h);
 					return;
@@ -1625,6 +1631,7 @@ bool hleGraphics(struct N64* n, bool dry) {
 	if (f == FAMILY_NONE && ucode == 0xE272C977u) {
 		f = FAMILY_F3D;
 	}
+	bool const wrus = f == FAMILY_F3D && ucode == 0xAC1B2CFEu;
 	if (f == FAMILY_NONE) {
 		return false;
 	}
@@ -1638,6 +1645,7 @@ bool hleGraphics(struct N64* n, bool dry) {
 	h->ucode = ucode;
 	h->family = f;
 	h->flx = isFlx(n, data, dataSize);
+	h->wrus = wrus;
 	ucodeFlags(n, h, data, dataSize);
 	h->dry = dry;
 	memset(h->segments, 0, sizeof(h->segments));
