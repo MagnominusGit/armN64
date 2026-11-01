@@ -20,10 +20,10 @@ enum { FAMILY_NONE, FAMILY_F3D, FAMILY_F3DEX, FAMILY_F3DEX2, FAMILY_F3DPD, FAMIL
 enum {
 	GEOM_ZBUFFER = 0x1, GEOM_SHADE = 0x4, GEOM_CULL_FRONT = 0x200, GEOM_CULL_BACK = 0x400,
 	GEOM_FOG = 0x10000, GEOM_LIGHTING = 0x20000, GEOM_TEXTURE_GEN = 0x40000,
-	GEOM_TEXTURE_GEN_LINEAR = 0x80000, GEOM_SHADING_SMOOTH = 0x200000,
+	GEOM_TEXTURE_GEN_LINEAR = 0x80000, GEOM_SHADING_SMOOTH = 0x200000, GEOM_POINT_LIGHTING = 0x400000,
 };
 
-enum { VERTICES = 64, MATRICES = 32, LIGHTS = 8, LIST_MAX = 1 << 16, DL_DEPTH = 18 };
+enum { VERTICES = 64, MATRICES = 32, LIGHTS = 12, LIST_MAX = 1 << 16, DL_DEPTH = 18 };
 
 struct Vertex {
 	float x, y, z, w;
@@ -76,6 +76,13 @@ struct Hle {
 	// Wave Race 64's Fast3D (known by its code, as GLideN64 knows it): vertex indices times 5 (G_CULLDL's
 	// offsets times 20), G_VTX's count in its length (n times 0x210, less one), and F3DEX's G_QUAD.
 	bool wrus;
+	// Conker's F3DEXBG (as GLideN64 has it): normals in their own buffer (two bytes a vertex, the third
+	// the low byte of the vertex's flag), vertex colours scaled by the light, 48-byte lights with a
+	// position and falloff, the coordinate modifiers the light distances go through, and four triangles
+	// a command. Its G_LOAD_UCODE turns on the advanced lighting (the last light directional).
+	bool cbfd, cbfdAdvanced;
+	uint32_t cbfdNormals;
+	float cbfdMod[16], lightPos[LIGHTS + 1][3], lightFalloff[LIGHTS + 1];
 	float flxDir[3];
 	uint32_t dmaIo;
 	float texScaleS, texScaleT;
@@ -272,6 +279,55 @@ static void normalize(float* v) {
 	}
 }
 
+// Conker's G_MW_COORD_MOD: the integer and fraction halves of the scale the light distances take, and
+// the offset added first (GLideN64's gSP.cbfd.vertexCoordMod).
+static void cbfdCoordMod(struct Hle* h, uint32_t w0, uint32_t w1) {
+	if (w0 & 8) {
+		return;
+	}
+	int const idx = (w0 >> 1) & 3, pos = w0 & 0x30;
+	float* m = h->cbfdMod;
+	if (pos == 0) {
+		m[idx] = (int16_t) (w1 >> 16), m[1 + idx] = (int16_t) w1;
+	} else if (pos == 0x10) {
+		m[4 + idx] = (w1 >> 16) / 65536.0f, m[5 + idx] = (w1 & 0xFFFF) / 65536.0f;
+		m[12 + idx] = m[idx] + m[4 + idx], m[13 + idx] = m[1 + idx] + m[5 + idx];
+	} else if (pos == 0x20) {
+		m[8 + idx] = (int16_t) (w1 >> 16), m[9 + idx] = (int16_t) w1;
+	}
+}
+
+// Conker's lighting, on the transformed position: the ambient, the last light directional (advanced
+// lighting only), the others point lights falling off with the square of the distance; the vertex's
+// colour scaled by the sum.
+static void cbfdLight(struct Hle* h, struct Vertex* v, const float* e, float dirs[][3]) {
+	const float* m = h->cbfdMod;
+	float const p[3] = { (v->x + m[8]) * m[12], (v->y + m[9]) * m[13], (v->z + m[10]) * m[14] };
+	float rgb[3] = { h->lightColor[h->lights][0], h->lightColor[h->lights][1], h->lightColor[h->lights][2] };
+	int l = h->lights - 1;
+	if (h->cbfdAdvanced && l >= 0) {
+		float d = e[0] * dirs[l][0] + e[1] * dirs[l][1] + e[2] * dirs[l][2];
+		d = d > 1 ? 1 : d;
+		if (d > 0) {
+			rgb[0] += h->lightColor[l][0] * d, rgb[1] += h->lightColor[l][1] * d, rgb[2] += h->lightColor[l][2] * d;
+		}
+	}
+	for (--l; l >= 0; --l) {
+		float const dx = p[0] - h->lightPos[l][0], dy = p[1] - h->lightPos[l][1], dz = p[2] - h->lightPos[l][2];
+		float const len = 2 * (dx * dx + dy * dy + dz * dz) / 65536.0f;
+		float k = len > 0 ? h->lightFalloff[l] / len : 1;
+		k = k > 1 ? 1 : k;
+		if (h->cbfdAdvanced && (h->geometry & GEOM_POINT_LIGHTING)) {
+			float const d = e[0] * dirs[l][0] + e[1] * dirs[l][1] + e[2] * dirs[l][2];
+			k *= d > 1 ? 1 : d;
+		}
+		if (k > 0) {
+			rgb[0] += h->lightColor[l][0] * k, rgb[1] += h->lightColor[l][1] * k, rgb[2] += h->lightColor[l][2] * k;
+		}
+	}
+	v->r *= rgb[0] > 1 ? 1 : rgb[0], v->g *= rgb[1] > 1 ? 1 : rgb[1], v->b *= rgb[2] > 1 ? 1 : rgb[2];
+}
+
 static void loadVertices(struct N64* n, struct Hle* h, uint32_t a, int first, int count) {
 	a = address(h, a);
 	const float* mv = h->modelview[h->depth];
@@ -301,7 +357,20 @@ static void loadVertices(struct N64* n, struct Hle* h, uint32_t a, int first, in
 		float s = rd16(n, a + 8), t = rd16(n, a + 10);
 		uint8_t c[4] = { n->rdram[ca & (RDRAM_SIZE - 1)], n->rdram[(ca + 1) & (RDRAM_SIZE - 1)], n->rdram[(ca + 2) & (RDRAM_SIZE - 1)], n->rdram[(ca + 3) & (RDRAM_SIZE - 1)] };
 		v->a = c[3] / 255.0f;
-		if (h->geometry & (GEOM_LIGHTING | GEOM_TEXTURE_GEN)) {
+		if (h->cbfd && (h->geometry & (GEOM_LIGHTING | GEOM_TEXTURE_GEN))) {
+			uint32_t const na = h->cbfdNormals + (uint32_t) (first + i) * 2;
+			float e[3] = { rd8(n, na), rd8(n, na + 1), rd8(n, a + 7) };
+			normalize(e);
+			v->r = c[0] / 255.0f, v->g = c[1] / 255.0f, v->b = c[2] / 255.0f;
+			if ((h->geometry & GEOM_LIGHTING) && rd16(n, a + 6) >= 0) {
+				cbfdLight(h, v, e, dirs);
+			}
+			if (h->geometry & GEOM_TEXTURE_GEN) {
+				const float* lx = dirs[h->lights], * ly = dirs[h->lights + 1];
+				float gx = e[0] * lx[0] + e[1] * lx[1] + e[2] * lx[2], gy = e[0] * ly[0] + e[1] * ly[1] + e[2] * ly[2];
+				s = (gx + 1) * 512, t = (gy + 1) * 512;
+			}
+		} else if (h->geometry & (GEOM_LIGHTING | GEOM_TEXTURE_GEN)) {
 			float e[3] = { rd8(n, ca), rd8(n, ca + 1), rd8(n, ca + 2) };
 			normalize(e);
 			if (h->geometry & GEOM_LIGHTING) {
@@ -988,6 +1057,12 @@ static void ucodeName(struct N64* n, uint32_t code, uint32_t data, uint32_t data
 // the new data's other modes with it, F3DEX2's and S2DEX2's keep their own (Kirby 64's menus). One of
 // no family here leaves the task to the RSP.
 static bool loadMicrocode(struct N64* n, struct Hle* h, uint32_t code, uint32_t dataSize) {
+	// Conker's loads its advanced lighting variant, with the same commands (its data names itself
+	// F3DEX2, or nothing).
+	if (h->cbfd) {
+		h->cbfdAdvanced = true;
+		return true;
+	}
 	int f = family(n, address(h, h->half1), dataSize);
 	h->flx = isFlx(n, address(h, h->half1), dataSize);
 	ucodeFlags(n, h, address(h, h->half1), dataSize);
@@ -1127,6 +1202,14 @@ static void runList(struct N64* n, struct Hle* h, uint32_t pc) {
 			pc = next;
 			continue;
 		}
+		if (h->cbfd && op >= 0x10 && op <= 0x1F) {
+			drawTriangle(n, h, (w0 >> 23) & 31, (w0 >> 18) & 31, ((w0 >> 15) & 7) << 2 | w1 >> 30);
+			drawTriangle(n, h, (w0 >> 10) & 31, (w0 >> 5) & 31, w0 & 31);
+			drawTriangle(n, h, (w1 >> 25) & 31, (w1 >> 20) & 31, (w1 >> 15) & 31);
+			drawTriangle(n, h, (w1 >> 10) & 31, (w1 >> 5) & 31, w1 & 31);
+			pc = next;
+			continue;
+		}
 		if (f3dex2) {
 			switch (op) {
 			case 0x00:
@@ -1177,7 +1260,10 @@ static void runList(struct N64* n, struct Hle* h, uint32_t pc) {
 			case 0xDB: {
 				int index = (w0 >> 16) & 0xFF, offset = w0 & 0xFFFF;
 				if (index == 2) {
-					h->lights = (int) (w1 / 24) > LIGHTS ? LIGHTS : (int) (w1 / 24);
+					int const l = (int) (w1 / (h->cbfd ? 48 : 24));
+					h->lights = l > LIGHTS ? LIGHTS : l;
+				} else if (index == 0x10 && h->cbfd) {
+					cbfdCoordMod(h, w0, w1);
 				} else if (index == 6) {
 					h->segments[(offset / 4) & 15] = w1 & 0xFFFFFF;
 				} else if (index == 8 && h->am && (offset & 0xFF) == 0x0C) {
@@ -1194,6 +1280,19 @@ static void runList(struct N64* n, struct Hle* h, uint32_t pc) {
 				uint32_t a = address(h, w1);
 				if (index == 8) {
 					viewport(n, h, a);
+				} else if (index == 14 && h->cbfd) {
+					h->cbfdNormals = a;
+				} else if (index == 10 && h->cbfd) {
+					int const l = offset / 48;
+					if (l < 2) {
+						readLookat(n, h, a, l);
+					} else if (l - 2 <= LIGHTS) {
+						readLight(n, h, a, l - 2);
+						for (int k = 0; k < 3; ++k) {
+							h->lightPos[l - 2][k] = rd16(n, a + 32 + 2 * (uint32_t) k);
+						}
+						h->lightFalloff[l - 2] = n->rdram[(a + 12) & (RDRAM_SIZE - 1)] / 16.0f;
+					}
 				} else if (index == 14) {
 					// gSPForceMatrix: the combined matrix itself, until the next matrix command.
 					readMatrix(n, a, h->mvp);
@@ -1489,6 +1588,7 @@ static void ucodeFlags(struct N64* n, struct Hle* h, uint32_t data, uint32_t siz
 	h->texa = name && !strncmp(name, "F3DTEX/A", 8);
 	h->am = name && !strncmp(name, "F3DAM", 5);
 	h->noNear = name && strstr(name, ".NoN");
+	h->cbfd = name && !strncmp(name, "F3DEXBG", 7);
 }
 
 static bool isFlx(struct N64* n, uint32_t data, uint32_t size) {
@@ -1531,6 +1631,9 @@ static int family(struct N64* n, uint32_t data, uint32_t size) {
 			}
 		}
 		return FAMILY_S2DEX;
+	}
+	if (!strncmp(name, "F3DEXBG", 7)) {
+		return FAMILY_F3DEX2;
 	}
 	if ((!strncmp(name, "F3DEX2", 6) || !strncmp(name, "F3DZEX", 6) || !strncmp(name, "F3DLX2", 6) || !strncmp(name, "F3DLP2", 6) ||
 	     !strncmp(name, "F3DFLX", 6)) &&
@@ -1649,6 +1752,7 @@ bool hleGraphics(struct N64* n, bool dry) {
 	h->flx = isFlx(n, data, dataSize);
 	h->wrus = wrus;
 	ucodeFlags(n, h, data, dataSize);
+	h->cbfdAdvanced = false;
 	h->dry = dry;
 	memset(h->segments, 0, sizeof(h->segments));
 	static const float identity[16] = { 1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1 };
