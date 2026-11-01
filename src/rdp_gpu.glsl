@@ -424,7 +424,7 @@ int texMask(int c, int mask, bool mirror) {
 ivec4 sampleTile(int t, int s, int tt, bool bilerp) {
 	t &= 7;
 	bool quad = ((omHi >> 13) & 1u) != 0u, tlut = ((omHi >> 15) & 1u) != 0u, midMode = ((omHi >> 8) & 1u) != 0u;
-	bool filter = HAS_BILERP && bilerp && ((omHi >> 20) & 3u) < 2u;
+	bool bilinear = HAS_BILERP && bilerp && ((omHi >> 20) & 3u) < 2u;
 	int cmS = tileField(t, T_CMS), cmT = tileField(t, T_CMT), maskS = tileField(t, T_MASKS), maskT = tileField(t, T_MASKT);
 	int cs = texClamp(s, (cmS & 2) != 0 || maskS == 0, tileField(t, T_SL), tileField(t, T_SH), tileField(t, T_SHIFTS));
 	int ct = texClamp(tt, (cmT & 2) != 0 || maskT == 0, tileField(t, T_TL), tileField(t, T_TH), tileField(t, T_SHIFTT));
@@ -437,7 +437,7 @@ ivec4 sampleTile(int t, int s, int tt, bool bilerp) {
 	int tdiff = max(t1 - t0, -255);
 	t1 = (t0 & 0xFF) + tdiff;
 	t0 &= 0xFF;
-	bool mid = midMode && filter && fs == 16 && ft == 16;
+	bool mid = midMode && bilinear && fs == 16 && ft == 16;
 	if (mid) {
 		sum = 0;
 	}
@@ -445,7 +445,7 @@ ivec4 sampleTile(int t, int s, int tt, bool bilerp) {
 		s1 = s0, t1 = t0;
 	}
 	bool upper = sum >= 32 && quad;
-	bool lerp = filter && quad;
+	bool lerp = bilinear && quad;
 	int count = mid ? 4 : lerp ? 3 : 1;
 	ivec4 b = ivec4(0), t10 = ivec4(0), t01 = ivec4(0), t11 = ivec4(0);
 	for (int k = 0; k < count; ++k) {
