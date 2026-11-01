@@ -382,6 +382,15 @@ int main(int argc, char** argv) {
 			char path[1024];
 			snprintf(path, sizeof(path), "%s-%05d.ppm", getenv("N64SHOTS"), f + 1);
 			writePicture(n, path);
+			// N64STATES=prefix: a save state with each picture too, as prefix-<field>.state.
+			void* saved = getenv("N64STATES") ? malloc(n64StateSize()) : NULL;
+			snprintf(path, sizeof(path), "%s-%05d.state", getenv("N64STATES") ? getenv("N64STATES") : "", f + 1);
+			FILE* out = saved && n64StateSave(n, saved, n64StateSize(), false) ? fopen(path, "wb") : NULL;
+			if (out) {
+				fwrite(saved, 1, n64StateSize(), out);
+				fclose(out);
+			}
+			free(saved);
 		}
 		if (getenv("N64PCLOG") && f % 60 == 59) {
 			printf("field %4d pc %08x rsp %03x%s  pi %llu (%llu KiB)  rsp tasks %llu  rdp syncs %llu  ai %llu  si %llu\n", f + 1,
