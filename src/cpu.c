@@ -687,7 +687,10 @@ static void cop0Write(struct N64* n, int r, uint64_t v) {
 	case CP0_COMPARE:
 		cop0[r] = (uint32_t) v;
 		cop0[CP0_CAUSE] &= ~0x8000ull;
-		n->cpu.lastCount = cpuCount(n);
+		// Count equal to Compare is the interrupt, so a Compare written at the Count now, before it
+		// steps, has it (an overclocked CPU, whose Count steps every several cycles: Heiwa
+		// Pachinko World 64's old libultra sets a timer of 0 at 4x).
+		n->cpu.lastCount = cpuCount(n) - 1;
 		return;
 	case CP0_CAUSE:
 		cop0[r] = (cop0[r] & ~0x300ull) | (v & 0x300);
