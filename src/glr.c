@@ -38,7 +38,7 @@ enum {
 };
 
 // LEVELS: the tiles a primitive's texels can come from (the level of detail picks up to eight), each
-// on its own texture unit; uploads use the one after.
+// on its own texture unit; uploads use the one after, and the image read back (Glr barrier) the next.
 enum { LEVELS = 8, TARGETS = 8, TARGET_ROWS = 480, PROGRAMS = 256, TEXTURES = 1024, TEXTURE_BUCKETS = 2048, BATCH_VERTICES = 1 << 16, VERTEX_FLOATS = 11,
        VERTEX_BUFFER_BYTES = BATCH_VERTICES * VERTEX_FLOATS * 4 * 2 };
 
@@ -112,6 +112,8 @@ struct Gl {
 	void (*EnableVertexAttribArray)(GLuint);
 	void (*DrawArrays)(GLenum, GLint, GLsizei);
 	void (*Flush)(void);
+	// GL_NV_texture_barrier, where there is no framebuffer fetch.
+	void (*TextureBarrierNV)(void);
 };
 
 // A color image the GPU draws into: its texture and framebuffer, whether the texture has the
@@ -150,14 +152,14 @@ struct Uniforms {
 struct Program {
 	struct ProgramKey key;
 	GLuint program;
-	GLint size, persp, prim, env, fog, blend, primLod, primDepth, k, tile[LEVELS], image[LEVELS], texture[LEVELS];
+	GLint size, persp, prim, env, fog, blend, primLod, primDepth, k, tile[LEVELS], image[LEVELS], texture[LEVELS], memory;
 	struct Uniforms set;
 	bool uniformsSet;
 };
 
 // What GL is set to (-1: not known), so a batch changes only what differs.
 struct Applied {
-	GLuint framebuffer, program, texture[LEVELS + 1];
+	GLuint framebuffer, program, texture[LEVELS + 2];
 	int unit, viewport, scissorOn, scissor[4], depth, depthMask, offset, blend;
 	float blendConstant;
 };
@@ -183,6 +185,8 @@ struct DrawState {
 	bool depthTest, depthWrite, decal, depthLess, blendOn, persp;
 	// Into the GPU's depth only (depthTriangle).
 	bool depthOnly;
+	// The image's pixels read (image read, or memory in the blender).
+	bool readsImage;
 	int blendB;
 	// Memory as P: 1 with a per-pixel A, 2 with a constant one (blendConstant).
 	int memoryFirst;
@@ -222,6 +226,9 @@ struct Glr {
 	uint32_t seq;
 	// The shader reads the image (EXT_shader_framebuffer_fetch): it blends as the RDP does.
 	bool fetch;
+	// Without framebuffer fetch the shader reads the image from its texture (GL_NV_texture_barrier),
+	// a draw at a time where they may overlap.
+	bool barrier;
 	bool depthReady;
 	// The HLE's corners for triangles it has sent and the RDP hasn't reached yet (a ring).
 	struct GlrCorners* queue;
@@ -600,13 +607,13 @@ static struct Program* program(struct Glr* g, struct ProgramKey key) {
 	static char source[8192];
 	char line[1024];
 	int cycleType = key.modes & MODE_CYCLE;
-	if (g->fetch) {
+	if (g->fetch && !g->barrier) {
 		// The image's pixel in oColor before the shader writes it.
 		const char* out = strstr(fragmentHead, "out vec4 oColor;");
 		snprintf(source, sizeof(source), "#version 300 es\n#extension GL_EXT_shader_framebuffer_fetch : require\n%.*sinout%s",
 		         (int) (out - fragmentHead - strlen("#version 300 es\n")), fragmentHead + strlen("#version 300 es\n"), out + 3);
 	} else {
-		snprintf(source, sizeof(source), "%s", fragmentHead);
+		snprintf(source, sizeof(source), "%s%s", fragmentHead, g->barrier ? "uniform highp sampler2D uMemory;\n" : "");
 	}
 	// rdp.c's noise: a hash of the pixel (at the RDP's resolution), the primitive's number and what
 	// it is for (the combiner's channels 0-2, the dither 4).
@@ -635,6 +642,9 @@ static struct Program* program(struct Glr* g, struct ProgramKey key) {
 		strcat(source, "}\n");
 	}
 	strcat(source, "void main() {\n	vec4 combined = vec4(0.0);\n");
+	if (g->barrier) {
+		strcat(source, "	oColor = texelFetch(uMemory, ivec2(gl_FragCoord.xy), 0);\n");
+	}
 	strcat(source, key.modes & MODE_SHADED ? "	vec4 shade = vShade;\n" : "	vec4 shade = vec4(0.0);\n");
 	strcat(source, "	float lodFrac = 0.0;\n");
 	if (key.modes & MODE_TEXTURED) {
@@ -886,6 +896,8 @@ compileFragment:;
 		pr->texture[k] = gl->GetUniformLocation(p, name);
 		gl->Uniform1i(pr->texture[k], k);
 	}
+	pr->memory = gl->GetUniformLocation(p, "uMemory");
+	gl->Uniform1i(pr->memory, LEVELS + 1);
 	return pr;
 }
 
@@ -1321,6 +1333,13 @@ static void flushBatch(struct N64* n, struct Glr* g) {
 			gl->StencilOp(GL_KEEP, GL_KEEP, GL_KEEP);
 			gl->DrawArrays(GL_TRIANGLES, first, g->batchCount);
 			gl->Disable(GL_STENCIL_TEST);
+		} else if (g->barrier && !s->depthOnly && s->readsImage) {
+			// What each triangle reads of the image is what those before it drew.
+			useTexture(g, LEVELS + 1, s->target->texture);
+			for (int i = 0; i < g->batchCount; i += 3) {
+				gl->TextureBarrierNV();
+				gl->DrawArrays(GL_TRIANGLES, first + i, 3);
+			}
 		} else {
 			if (s->depthOnly) {
 				gl->ColorMask(0, 0, 0, 0);
@@ -1368,6 +1387,7 @@ static bool drawState(struct N64* n, struct Glr* g, struct RDP* r, bool textured
 	modes |= (uint32_t) (first[0] | first[1] << 2 | first[2] << 4 | first[3] << 6) << 8;
 	modes |= (uint32_t) (last[0] | last[1] << 2 | last[2] << 4 | last[3] << 6) << 16;
 	bool blendMemory = last[2] == 1 && last[0] != 1, memoryFirst = last[0] == 1 && last[2] != 1;
+	s.readsImage = r->imageRead || first[0] == 1 || first[2] == 1 || last[0] == 1 || last[2] == 1;
 	s.blendOn = cycleType < 2 && r->forceBlend && blendMemory;
 	s.blendB = last[3];
 	if (cycleType < 2 && r->forceBlend && memoryFirst) {
@@ -1979,7 +1999,11 @@ struct Glr* glrCreate(struct N64* n) {
 		found += 31;
 	}
 	g->fetch = found && !(fetch && *fetch == '0');
-	fprintf(stderr, "GL renderer on %s%s\n", glesRenderer(g->gles), g->fetch ? " (blending in the shader)" : "");
+	*(void**) &gl->TextureBarrierNV = glesProc(g->gles, "glTextureBarrierNV");
+	if (!g->fetch && !(fetch && *fetch == '0') && extensions && strstr(extensions, "GL_NV_texture_barrier") && gl->TextureBarrierNV) {
+		g->fetch = g->barrier = true;
+	}
+	fprintf(stderr, "GL renderer on %s%s\n", glesRenderer(g->gles), g->barrier ? " (blending in the shader, texture barriers)" : g->fetch ? " (blending in the shader)" : "");
 	if (!g->vertexShader) {
 		glrDestroy(g);
 		n->rdpGl = false;
