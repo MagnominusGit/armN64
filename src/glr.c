@@ -135,6 +135,8 @@ struct ProgramKey {
 	uint32_t lod;
 	// The alpha dither (other modes bits 36-37, 3 none) where the shader blends.
 	uint32_t alphaDither;
+	// The alpha compare against noise (other modes bit 1), not the blend color's alpha.
+	bool compareNoise;
 };
 
 // A program's uniforms as last set.
@@ -579,7 +581,7 @@ static GLuint compile(struct Glr* g, GLenum type, const char* source) {
 static struct Program* program(struct Glr* g, struct ProgramKey key) {
 	for (int i = 0; i < g->programCount; ++i) {
 		if (g->programs[i].key.combine == key.combine && g->programs[i].key.modes == key.modes && g->programs[i].key.lod == key.lod &&
-		    g->programs[i].key.alphaDither == key.alphaDither) {
+		    g->programs[i].key.alphaDither == key.alphaDither && g->programs[i].key.compareNoise == key.compareNoise) {
 			return &g->programs[i];
 		}
 	}
@@ -608,7 +610,7 @@ static struct Program* program(struct Glr* g, struct ProgramKey key) {
 	         "	h *= 0x2C1B3C6Du;\n"
 	         "	return h ^ (h >> 12);\n"
 	         "}\n"
-	         "vec3 noise() { return vec3(uvec3(pixelNoise(0u), pixelNoise(1u), pixelNoise(2u)) & 255u) / 255.0; }\n", g->scale);
+	         "vec3 noise() { return vec3(float((pixelNoise(0u) & 7u) << 6 | 32u) / 255.0); }\n", g->scale);
 	strcat(source, line);
 	strcat(source, "void main() {\n	vec4 combined = vec4(0.0);\n");
 	strcat(source, key.modes & MODE_SHADED ? "	vec4 shade = vShade;\n" : "	vec4 shade = vec4(0.0);\n");
@@ -678,8 +680,11 @@ static struct Program* program(struct Glr* g, struct ProgramKey key) {
 		strcat(source, "	combined.a = 1.0;\n");
 	}
 	if (key.modes & MODE_ALPHA_COMPARE) {
-		// Copy mode drops texels with no alpha, the other modes those below the blend alpha.
-		strcat(source, cycleType == 2 ? "	if (combined.a == 0.0) discard;\n" : "	if (combined.a < uBlend.a) discard;\n");
+		// Copy mode drops texels with no alpha, the other modes those below the blend alpha or noise
+		// (Mission: Impossible's static).
+		strcat(source, cycleType == 2         ? "	if (combined.a == 0.0) discard;\n"
+		               : key.compareNoise ? "	if (combined.a * 255.0 < float(pixelNoise(6u) & 255u)) discard;\n"
+		                                  : "	if (combined.a < uBlend.a) discard;\n");
 	}
 	int first = (key.modes >> 8) & 0xFF, last = (key.modes >> 16) & 0xFF;
 	if (g->fetch && cycleType < 2) {
@@ -1376,7 +1381,8 @@ static bool drawState(struct N64* n, struct Glr* g, struct RDP* r, bool textured
 	                   ? 1 | (lodTiles ? 2 : 0) | (uint32_t) ((m >> 49) & 1) << 2 | (uint32_t) ((m >> 50) & 1) << 3 | (uint32_t) r->maxLevel << 4 |
 	                         (uint32_t) (r->minLevel & 31) << 8
 	                   : 0;
-	struct ProgramKey key = { cycleType < 2 ? r->combine : 0, modes, lod, g->fetch && cycleType < 2 && !r->cvgAlpha ? (uint32_t) r->ditherAlpha : 3 };
+	struct ProgramKey key = { cycleType < 2 ? r->combine : 0, modes, lod, g->fetch && cycleType < 2 && !r->cvgAlpha ? (uint32_t) r->ditherAlpha : 3,
+	                          r->alphaCompare && cycleType < 2 && ((r->otherModes >> 1) & 1) };
 	s.program = program(g, key);
 	if (!s.program) {
 		return false;
