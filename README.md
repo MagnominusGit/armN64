@@ -2,6 +2,9 @@
 
 A lean, low-level Nintendo 64 emulator for x86-64 and ARM handhelds.
 
+**Status: 0.1a, experimental alpha.** Expect rendering differences and untested settings; overclocking and
+the Game's Own graphics microcode are the least tested.
+
 ## Rules
 
 - **Generalizability.** Every part emulates hardware. There is no game-specific microcode, no

@@ -367,7 +367,7 @@ unsigned retro_api_version(void) {
 }
 
 void retro_get_system_info(struct retro_system_info* info) {
-	*info = (struct retro_system_info) { "armN64", "0.1", "n64|z64|v64|ndd", false, false };
+	*info = (struct retro_system_info) { "armN64", "0.1a", "n64|z64|v64|ndd", false, false };
 }
 
 void retro_get_system_av_info(struct retro_system_av_info* info) {
