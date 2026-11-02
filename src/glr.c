@@ -37,7 +37,9 @@ enum {
 	GL_PACK_ALIGNMENT = 0x0D05, GL_UNPACK_ALIGNMENT = 0x0CF5,
 };
 
-enum { TARGETS = 8, TARGET_ROWS = 480, PROGRAMS = 256, TEXTURES = 1024, TEXTURE_BUCKETS = 2048, BATCH_VERTICES = 1 << 16, VERTEX_FLOATS = 11,
+// LEVELS: the tiles a primitive's texels can come from (the level of detail picks up to eight), each
+// on its own texture unit; uploads use the one after.
+enum { LEVELS = 8, TARGETS = 8, TARGET_ROWS = 480, PROGRAMS = 256, TEXTURES = 1024, TEXTURE_BUCKETS = 2048, BATCH_VERTICES = 1 << 16, VERTEX_FLOATS = 11,
        VERTEX_BUFFER_BYTES = BATCH_VERTICES * VERTEX_FLOATS * 4 * 2 };
 
 struct Gl {
@@ -142,20 +144,20 @@ struct ProgramKey {
 // A program's uniforms as last set.
 struct Uniforms {
 	float size[2], prim[4], env[4], fog[4], blend[4], primLod, primDepth, k[2];
-	int persp, tile[2][12], image[2][4];
+	int persp, tile[LEVELS][12], image[LEVELS][4];
 };
 
 struct Program {
 	struct ProgramKey key;
 	GLuint program;
-	GLint size, persp, prim, env, fog, blend, primLod, primDepth, k, tile[2], image[2], texture[2];
+	GLint size, persp, prim, env, fog, blend, primLod, primDepth, k, tile[LEVELS], image[LEVELS], texture[LEVELS];
 	struct Uniforms set;
 	bool uniformsSet;
 };
 
 // What GL is set to (-1: not known), so a batch changes only what differs.
 struct Applied {
-	GLuint framebuffer, program, texture[3];
+	GLuint framebuffer, program, texture[LEVELS + 1];
 	int unit, viewport, scissorOn, scissor[4], depth, depthMask, offset, blend;
 	float blendConstant;
 };
@@ -174,8 +176,8 @@ struct Texture {
 struct DrawState {
 	struct Target* target;
 	struct Program* program;
-	struct Texture* texture[2];
-	int tile[2][12];
+	struct Texture* texture[LEVELS];
+	int tile[LEVELS][12];
 	float prim[4], env[4], fog[4], blend[4], primLod, primDepth, k[2];
 	int scissor[4];
 	bool depthTest, depthWrite, decal, depthLess, blendOn, persp;
@@ -266,12 +268,12 @@ static void useTexture(struct Glr* g, int unit, GLuint texture) {
 	}
 }
 
-// Unit 2 for uploads, active.
+// The unit after the levels' for uploads, active.
 static void uploadTexture(struct Glr* g, GLuint texture) {
-	useTexture(g, 2, texture);
-	if (g->applied.unit != 2) {
-		g->gl.ActiveTexture(GL_TEXTURE0 + 2);
-		g->applied.unit = 2;
+	useTexture(g, LEVELS, texture);
+	if (g->applied.unit != LEVELS) {
+		g->gl.ActiveTexture(GL_TEXTURE0 + LEVELS);
+		g->applied.unit = LEVELS;
 	}
 }
 
@@ -356,9 +358,9 @@ static const char fragmentHead[] =
 	"uniform float uPrimLod, uPrimDepth;\n"
 	"uniform vec2 uK;\n"
 	"uniform int uPersp;\n"
-	"uniform ivec4 uTile0[3], uTile1[3];\n"
-	"uniform ivec4 uImage0, uImage1;\n"
-	"uniform highp sampler2D uTex0, uTex1;\n"
+	"uniform ivec4 uTile0[3], uTile1[3], uTile2[3], uTile3[3], uTile4[3], uTile5[3], uTile6[3], uTile7[3];\n"
+	"uniform ivec4 uImage0, uImage1, uImage2, uImage3, uImage4, uImage5, uImage6, uImage7;\n"
+	"uniform highp sampler2D uTex0, uTex1, uTex2, uTex3, uTex4, uTex5, uTex6, uTex7;\n"
 	"out vec4 oColor;\n"
 	"vec3 e8(vec3 v) { return floor(v * 255.0 + 0.5); }\n"
 	// rdp.c's clamp9: the combiner keeps 9 bits; 0x100-0x17F saturate, 0x180-0x1FF are negative.
@@ -578,6 +580,12 @@ static GLuint compile(struct Glr* g, GLenum type, const char* source) {
 	return s;
 }
 
+// The tiles the level of detail picks from: the primitive's and its levels', with detail one more.
+static int lodLevels(int maxLevel, bool detail) {
+	int const levels = maxLevel + (detail ? 2 : 1);
+	return levels < LEVELS ? levels : LEVELS;
+}
+
 static struct Program* program(struct Glr* g, struct ProgramKey key) {
 	for (int i = 0; i < g->programCount; ++i) {
 		if (g->programs[i].key.combine == key.combine && g->programs[i].key.modes == key.modes && g->programs[i].key.lod == key.lod &&
@@ -612,16 +620,34 @@ static struct Program* program(struct Glr* g, struct ProgramKey key) {
 	         "}\n"
 	         "vec3 noise() { return vec3(float((pixelNoise(0u) & 7u) << 6 | 32u) / 255.0); }\n", g->scale);
 	strcat(source, line);
+	// The level of detail picking the tiles: a texel from any of them (rdp.c levelOfDetail, with
+	// detail one further on).
+	int const levels = key.lod & 2 ? lodLevels((int) (key.lod >> 4) & 7, key.lod & 8) : 0;
+	if (levels) {
+		strcat(source, "vec4 sampleLevel(int k, ivec2 st) {\n");
+		for (int k = 0; k < levels; ++k) {
+			char const* when = k + 1 == levels ? "" : k ? "if (k == %d) " : "if (k <= %d) ";
+			char test[32];
+			snprintf(test, sizeof(test), when, k);
+			snprintf(line, sizeof(line), "	%sreturn sampleTile(uTex%d, uTile%d[0], uTile%d[1], uTile%d[2], uImage%d, st);\n", test, k, k, k, k, k);
+			strcat(source, line);
+		}
+		strcat(source, "}\n");
+	}
 	strcat(source, "void main() {\n	vec4 combined = vec4(0.0);\n");
 	strcat(source, key.modes & MODE_SHADED ? "	vec4 shade = vShade;\n" : "	vec4 shade = vec4(0.0);\n");
 	strcat(source, "	float lodFrac = 0.0;\n");
 	if (key.modes & MODE_TEXTURED) {
-		strcat(source, "	ivec2 st = texCoord();\n	vec4 tex0 = sampleTile(uTex0, uTile0[0], uTile0[1], uTile0[2], uImage0, st);\n");
-		bool second = cycleType == 1 || (key.lod & 2);
-		strcat(source, second ? "	vec4 tex1 = sampleTile(uTex1, uTile1[0], uTile1[1], uTile1[2], uImage1, st);\n" : "	vec4 tex1 = tex0;\n");
+		strcat(source, "	ivec2 st = texCoord();\n");
+		if (levels) {
+			strcat(source, "	vec4 tex0, tex1;\n");
+		} else {
+			strcat(source, "	vec4 tex0 = sampleTile(uTex0, uTile0[0], uTile0[1], uTile0[2], uImage0, st);\n");
+			strcat(source, cycleType == 1 ? "	vec4 tex1 = sampleTile(uTex1, uTile1[0], uTile1[1], uTile1[2], uImage1, st);\n" : "	vec4 tex1 = tex0;\n");
+		}
 		if (key.lod & 1) {
 			// rdp.c levelOfDetail: the texel step to the next pixel and line, its level, the fraction
-			// between levels and the tiles; this has the primitive's tile and the next one.
+			// between levels and the tiles.
 			int maxLevel = (int) (key.lod >> 4) & 7, minLevel = (int) (key.lod >> 8) & 31;
 			bool sharpen = key.lod & 4, detail = key.lod & 8;
 			snprintf(line, sizeof(line),
@@ -643,14 +669,13 @@ static struct Program* program(struct Glr* g, struct ProgramKey key) {
 				snprintf(line, sizeof(line), "%s", with);
 			}
 			strcat(source, line);
-			if ((key.lod & 2) && !detail) {
+			if (levels) {
 				snprintf(line, sizeof(line),
-				         "	int t1 = distant ? %d : level, t2 = distant || %s ? t1 : t1 + 1;\n"
-				         "	vec4 base = tex0, next = tex1;\n"
-				         "	tex0 = t1 == 0 ? base : next;\n"
-				         "	tex1 = t2 == 0 ? base : next;\n",
+				         detail ? "	int at = distant ? %d : level, t1 = at + (magnify ? 0 : 1), t2 = at + (!distant && !magnify ? 2 : 1);\n"
+				                : "	int t1 = distant ? %d : level, t2 = distant || %s ? t1 : t1 + 1;\n",
 				         maxLevel, sharpen ? "false" : "magnify");
 				strcat(source, line);
+				strcat(source, "	tex0 = sampleLevel(t1, st);\n	tex1 = sampleLevel(t2, st);\n");
 			}
 			strcat(source, "	}\n");
 		}
@@ -849,16 +874,18 @@ compileFragment:;
 	pr->primLod = gl->GetUniformLocation(p, "uPrimLod");
 	pr->primDepth = gl->GetUniformLocation(p, "uPrimDepth");
 	pr->k = gl->GetUniformLocation(p, "uK");
-	pr->tile[0] = gl->GetUniformLocation(p, "uTile0");
-	pr->tile[1] = gl->GetUniformLocation(p, "uTile1");
-	pr->image[0] = gl->GetUniformLocation(p, "uImage0");
-	pr->image[1] = gl->GetUniformLocation(p, "uImage1");
-	pr->texture[0] = gl->GetUniformLocation(p, "uTex0");
-	pr->texture[1] = gl->GetUniformLocation(p, "uTex1");
 	gl->UseProgram(p);
 	g->applied.program = p;
-	gl->Uniform1i(pr->texture[0], 0);
-	gl->Uniform1i(pr->texture[1], 1);
+	for (int k = 0; k < LEVELS; ++k) {
+		char name[16];
+		snprintf(name, sizeof(name), "uTile%d", k);
+		pr->tile[k] = gl->GetUniformLocation(p, name);
+		snprintf(name, sizeof(name), "uImage%d", k);
+		pr->image[k] = gl->GetUniformLocation(p, name);
+		snprintf(name, sizeof(name), "uTex%d", k);
+		pr->texture[k] = gl->GetUniformLocation(p, name);
+		gl->Uniform1i(pr->texture[k], k);
+	}
 	return pr;
 }
 
@@ -1115,8 +1142,11 @@ static struct Texture* texture(struct N64* n, struct Glr* g, struct RDP* r, int 
 	}
 	struct Gl* gl = &g->gl;
 	// The slot may be in the batch waiting to be drawn.
-	if (g->batchCount && (g->state.texture[0] == slot || g->state.texture[1] == slot)) {
-		flushBatch(n, g);
+	for (int k = 0; k < LEVELS; ++k) {
+		if (g->batchCount && g->state.texture[k] == slot) {
+			flushBatch(n, g);
+			break;
+		}
 	}
 	// A row's texels depend on it through its TMEM address (line * 8 bytes a row, wrapping at 4 KiB, or
 	// 2 KiB for the halves 32-bit and YUV texels use) and whether it is odd: rows repeat after that.
@@ -1200,7 +1230,7 @@ static void flushBatch(struct N64* n, struct Glr* g) {
 	uniform(g, p->primLod, 1, &s->primLod, &u->primLod);
 	uniform(g, p->primDepth, 1, &s->primDepth, &u->primDepth);
 	uniform(g, p->k, 2, s->k, u->k);
-	for (int k = 0; k < 2; ++k) {
+	for (int k = 0; k < LEVELS; ++k) {
 		if (s->texture[k]) {
 			useTexture(g, k, s->texture[k]->texture);
 			if (memcmp(u->tile[k], s->tile[k], sizeof(u->tile[k]))) {
@@ -1388,11 +1418,10 @@ static bool drawState(struct N64* n, struct Glr* g, struct RDP* r, bool textured
 		return false;
 	}
 	if (textured) {
-		for (int k = 0; k < (cycleType == 1 || lodTiles ? 2 : 1); ++k) {
-			// Without filtering a cycle converts its texels from YUV. With the level of detail and
-			// one level, both texels are that level's (rdp.c levelOfDetail: always distant).
-			bool oneLevel = ((r->otherModes >> 48) & 1) && !((r->otherModes >> 50) & 1) && r->maxLevel == 0;
-			int index = (tile + (oneLevel ? 0 : k)) & 7, w, h;
+		int const levels = lodTiles ? lodLevels(r->maxLevel, (m >> 50) & 1) : cycleType == 1 ? 2 : 1;
+		for (int k = 0; k < levels; ++k) {
+			// Without filtering a cycle converts its texels from YUV.
+			int index = (tile + k) & 7, w, h;
 			bool filter = k == 0 || cycleType != 1 ? cycleType >= 2 || ((r->otherModes >> 43) & 1) : (r->otherModes >> 42) & 1;
 			s.texture[k] = texture(n, g, r, index, !filter, &w, &h);
 			const struct Tile* t = &r->tile[index];
