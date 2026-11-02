@@ -10,7 +10,9 @@
 #include "paks.h"
 
 #include <dirent.h>
+#ifndef __ANDROID__
 #include <glob.h>
+#endif
 #include <math.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -242,6 +244,8 @@ static int glScale(void) {
 	static int display;
 	if (!display) {
 		display = 1;
+#ifndef __ANDROID__
+		// Android's apps can't read DRM's state (and its glob comes only with API 28).
 		glob_t found;
 		if (glob("/sys/class/drm/card*-*/status", 0, NULL, &found) == 0) {
 			for (size_t i = 0; i < found.gl_pathc; ++i) {
@@ -264,6 +268,7 @@ static int glScale(void) {
 			}
 			globfree(&found);
 		}
+#endif
 		display = display > 8 ? 8 : display;
 	}
 	return display;
