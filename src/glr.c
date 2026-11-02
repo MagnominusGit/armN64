@@ -1542,54 +1542,79 @@ static void triangle(struct N64* n, struct Glr* g, struct RDP* r, const struct G
 	}
 }
 
-// An RDP triangle without the HLE's corners (from a microcode run on the RSP): its corners and their
-// values found back from the command. Each attribute is planar from its start on the major edge at
-// the top scanline, along that edge by its edge slope and across by its x slope (hle.c triangle).
-static void rawCorners(const struct RDP* r, const uint64_t* w, int op, struct GlrCorners* q) {
+// An RDP triangle without the HLE's corners (from a microcode run on the RSP): its outline and the
+// values at its corners found back from the command, as up to four triangles. The command draws
+// between the major edge and the minor one down to the middle, then the low one: a quad when the
+// edges start apart (Madden 64's stadium lights and WinBack's map lines are thin strips). Each
+// attribute is planar from its start on the major edge at the top scanline, along that edge by its
+// edge slope and across by its x slope (hle.c triangle). Returns how many.
+static int rawCorners(const struct RDP* r, const uint64_t* w, int op, struct GlrCorners out[4]) {
 	#define FIX(v) ((float) (int32_t) (v) / 65536.0f)
 	#define PART(word, k) ((uint32_t) ((word) >> (48 - 16 * (k))) & 0xFFFF)
 	#define SPLIT(hi, lo, k) FIX(PART(hi, k) << 16 | PART(lo, k))
 	float const y1 = (float) ((int32_t) ((uint32_t) w[0] << 18) >> 18) / 4;
 	float const y2 = (float) ((int32_t) ((uint32_t) (w[0] >> 16) << 18) >> 18) / 4;
 	float const y3 = (float) ((int32_t) ((uint32_t) (w[0] >> 32) << 18) >> 18) / 4;
-	float const xl = FIX(w[1] >> 32), xh = FIX(w[2] >> 32), ish = FIX(w[2]);
+	float const xl = FIX(w[1] >> 32), isl = FIX(w[1]), xh = FIX(w[2] >> 32), ish = FIX(w[2]), xm = FIX(w[3] >> 32), ism = FIX(w[3]);
 	float const top = floorf(y1);
-	float const x[3] = { xh + (y1 - top) * ish, xl, xh + (y3 - top) * ish }, y[3] = { y1, y2, y3 };
-	*q = (struct GlrCorners) { { w[0], w[1], w[2], w[3] },
-	                           (uint32_t) (op & 7) | (uint32_t) ((w[0] >> 48) & 7) << 8 | (uint32_t) ((w[0] >> 51) & 7) << 12 | (uint32_t) ((r->otherModes >> 51) & 1) << 16,
-	                           { { 0 } } };
+	// Down the minor and low edges, then up the major one.
+	float const x[6] = { xh + (y1 - top) * ish, xm + (y1 - top) * ism, xm + (y2 - top) * ism, xl, xl + (y3 - y2) * isl, xh + (y3 - top) * ish };
+	float const y[6] = { y1, y1, y2, y2, y3, y3 };
+	uint32_t const flags = (uint32_t) (op & 7) | (uint32_t) ((w[0] >> 48) & 7) << 8 | (uint32_t) ((w[0] >> 51) & 7) << 12 | (uint32_t) ((r->otherModes >> 51) & 1) << 16;
+	bool const persp = (flags >> 16) & 1;
 	// One attribute at each corner, from its start, x slope and edge slope.
-	float at[3][9];
+	float v[6][10];
 	int const shadeAt = 4, texAt = 4 + (op & 4 ? 8 : 0), zAt = texAt + (op & 2 ? 8 : 0);
-	for (int k = 0; k < 3; ++k) {
+	for (int k = 0; k < 6; ++k) {
 		float const across = x[k] - (xh + (y[k] - top) * ish), down = y[k] - top;
+		float at[8];
 		for (int a = 0; a < 4 && (op & 4); ++a) {
 			const uint64_t* c = &w[shadeAt];
-			at[k][a] = SPLIT(c[0], c[2], a) + SPLIT(c[4], c[6], a) * down + SPLIT(c[1], c[3], a) * across;
+			at[a] = SPLIT(c[0], c[2], a) + SPLIT(c[4], c[6], a) * down + SPLIT(c[1], c[3], a) * across;
 		}
 		for (int a = 0; a < 3 && (op & 2); ++a) {
 			const uint64_t* c = &w[texAt];
-			at[k][4 + a] = SPLIT(c[0], c[2], a) + SPLIT(c[4], c[6], a) * down + SPLIT(c[1], c[3], a) * across;
+			at[4 + a] = SPLIT(c[0], c[2], a) + SPLIT(c[4], c[6], a) * down + SPLIT(c[1], c[3], a) * across;
 		}
 		if (op & 1) {
-			at[k][7] = FIX(w[zAt] >> 32) + FIX(w[zAt + 1] >> 32) * down + FIX(w[zAt]) * across;
+			at[7] = FIX(w[zAt] >> 32) + FIX(w[zAt + 1] >> 32) * down + FIX(w[zAt]) * across;
 		}
-	}
-	for (int k = 0; k < 3; ++k) {
-		float* v = q->v[k];
-		v[0] = x[k], v[1] = y[k];
-		v[2] = op & 1 ? fminf(fmaxf(at[k][7] / 0x7FFF, 0), 1) : 0;
+		v[k][0] = x[k], v[k][1] = y[k];
+		v[k][2] = op & 1 ? fminf(fmaxf(at[7] / 0x7FFF, 0), 1) : 0;
 		for (int a = 0; a < 4; ++a) {
-			v[4 + a] = op & 4 ? fminf(fmaxf(at[k][a] / 255, 0), 1) : 0;
+			v[k][4 + a] = op & 4 ? fminf(fmaxf(at[a] / 255, 0), 1) : 0;
 		}
 		// S and T come times the corner's 1/w (W, a 0x7FFF fraction) with perspective, as they are
 		// without.
-		float const invW = op & 2 ? at[k][6] / 0x7FFF : 1;
-		bool const persp = (q->flags >> 16) & 1;
-		v[3] = invW > 1e-6f ? invW : 1e-6f;
-		v[8] = op & 2 ? at[k][4] / 32 / (persp ? v[3] : 1) : 0;
-		v[9] = op & 2 ? at[k][5] / 32 / (persp ? v[3] : 1) : 0;
+		float const invW = op & 2 ? at[6] / 0x7FFF : 1;
+		v[k][3] = invW > 1e-6f ? invW : 1e-6f;
+		v[k][8] = op & 2 ? at[4] / 32 / (persp ? v[k][3] : 1) : 0;
+		v[k][9] = op & 2 ? at[5] / 32 / (persp ? v[k][3] : 1) : 0;
 	}
+	// The corners of the parts it draws, as a fan from the major edge's top without the triangles
+	// that have no area.
+	int corner[6], corners = 0, count = 0;
+	corner[corners++] = 0;
+	if (y2 > y1) {
+		corner[corners++] = 1, corner[corners++] = 2;
+	}
+	if (y3 > y2) {
+		corner[corners++] = 3, corner[corners++] = 4;
+	}
+	corner[corners++] = 5;
+	for (int i = 1; i + 1 < corners; ++i) {
+		int const b = corner[i], c = corner[i + 1];
+		float const area = (x[b] - x[0]) * (y[c] - y[0]) - (x[c] - x[0]) * (y[b] - y[0]);
+		if (fabsf(area) < 1e-3f) {
+			continue;
+		}
+		out[count] = (struct GlrCorners) { { w[0], w[1], w[2], w[3] }, flags, { { 0 } } };
+		memcpy(out[count].v[0], v[0], sizeof(v[0]));
+		memcpy(out[count].v[1], v[b], sizeof(v[0]));
+		memcpy(out[count].v[2], v[c], sizeof(v[0]));
+		++count;
+	}
+	return count;
 	#undef FIX
 	#undef PART
 	#undef SPLIT
@@ -1597,16 +1622,18 @@ static void rawCorners(const struct RDP* r, const uint64_t* w, int op, struct Gl
 
 // A triangle into the depth image (Pilotwings 64's shadow masks): in RDRAM as the RDP draws it, and
 // into the GPU's depth at the depth it left in the middle.
-static void depthTriangle(struct N64* n, struct Glr* g, struct RDP* r, const uint64_t* w, int op, const struct GlrCorners* q) {
+static void depthTriangle(struct N64* n, struct Glr* g, struct RDP* r, const uint64_t* w, int op, const struct GlrCorners* q, int count) {
 	rdpDrawSoftware(n, r, w, op);
-	struct GlrCorners at = *q;
-	int const x = (int) ((q->v[0][0] + q->v[1][0] + q->v[2][0]) / 3), y = (int) ((q->v[0][1] + q->v[1][1] + q->v[2][1]) / 3);
-	float const z = rdpDepthAt(n, r, x, y) * 0x3FFFF / 0x3FFF8;
-	for (int k = 0; k < 3; ++k) {
-		at.v[k][2] = z;
-	}
 	g->depthImage = true, g->fastValid = false;
-	triangle(n, g, r, &at);
+	for (int i = 0; i < count; ++i) {
+		struct GlrCorners at = q[i];
+		int const x = (int) ((at.v[0][0] + at.v[1][0] + at.v[2][0]) / 3), y = (int) ((at.v[0][1] + at.v[1][1] + at.v[2][1]) / 3);
+		float const z = rdpDepthAt(n, r, x, y) * 0x3FFFF / 0x3FFF8;
+		for (int k = 0; k < 3; ++k) {
+			at.v[k][2] = z;
+		}
+		triangle(n, g, r, &at);
+	}
 	g->depthImage = false, g->fastValid = false;
 }
 
@@ -1617,12 +1644,8 @@ void glrDraw(struct N64* n, struct RDP* r, const uint64_t* w, int op) {
 	uint64_t c = w[0];
 	const struct GlrCorners* q = op >= 0x08 && op <= 0x0F ? queued(g, w) : NULL;
 	if (op >= 0x08 && op <= 0x0F && r->zAddr && r->colorAddr == r->zAddr && r->colorSize == 2) {
-		struct GlrCorners raw;
-		if (!q) {
-			rawCorners(r, w, op, &raw);
-			q = &raw;
-		}
-		depthTriangle(n, g, r, w, op, q);
+		struct GlrCorners raw[4];
+		depthTriangle(n, g, r, w, op, q ? q : raw, q ? 1 : rawCorners(r, w, op, raw));
 		return;
 	}
 	if (q && r->colorSize != 1) {
@@ -1638,9 +1661,11 @@ void glrDraw(struct N64* n, struct RDP* r, const uint64_t* w, int op) {
 		return;
 	}
 	if (op >= 0x08 && op <= 0x0F) {
-		struct GlrCorners raw;
-		rawCorners(r, w, op, &raw);
-		triangle(n, g, r, &raw);
+		struct GlrCorners raw[4];
+		int const count = rawCorners(r, w, op, raw);
+		for (int i = 0; i < count; ++i) {
+			triangle(n, g, r, &raw[i]);
+		}
 		return;
 	}
 	if (op == 0x36) {
