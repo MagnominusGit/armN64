@@ -543,8 +543,9 @@ static int rgbInput(struct RDP* r, struct Pixel* p, int sel, int channel, int wh
 		}
 		if (which == 0 && sel == 7) {
 			// Noise: a hash of the pixel and the primitive (the hardware's sequence isn't known), the
-			// same however many renderers draw and after a save state.
-			return (int) (pixelNoise(r, p->x, p->y, (uint32_t) channel) & 255);
+			// same however many renderers draw and after a save state. As the hardware's: eight levels,
+			// the same in each channel (angrylion, paraLLEl-RDP).
+			return (int) ((pixelNoise(r, p->x, p->y, 0) & 7) << 6 | 0x20);
 		}
 		if (which == 1 && sel == 7) {
 			return r->k4;

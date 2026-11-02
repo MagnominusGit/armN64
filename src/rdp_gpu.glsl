@@ -512,7 +512,7 @@ int rgbScalar(int sel, int which) {
 
 ivec3 rgbIn(int sel, int which) {
 	if (which == 0 && sel == 7) {
-		return ivec3(pixelNoise(pX, pY, 0u), pixelNoise(pX, pY, 1u), pixelNoise(pX, pY, 2u)) & 255;
+		return ivec3((pixelNoise(pX, pY, 0u) & 7) << 6 | 0x20);
 	}
 	switch (sel) {
 	case 0: return pCombined.rgb;
