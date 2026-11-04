@@ -19,7 +19,8 @@ static uint64_t rcpNow(struct N64* n) {
 static void spDma(struct N64* n, uint32_t lenReg, bool toRdram) {
 	uint32_t len = ((lenReg & 0xFFF) | 7) + 1;
 	uint32_t count = ((lenReg >> 12) & 0xFF) + 1;
-	uint32_t skip = lenReg >> 20;
+	// The skip is in doublewords too, between rows (Lemon's DMAAlignment-SP, ares).
+	uint32_t skip = (lenReg >> 20) & 0xFF8;
 	// Its time in RCP cycles (hacktarux's n64-systembench): a setup, then each row by its bytes, the
 	// later ones taking a least time; a DMA asked for while one is under way waits for it.
 	uint64_t const row = toRdram ? (len * 150) >> 10 : (len * 157) >> 10, least = toRdram ? 10 : 14;
@@ -48,11 +49,11 @@ static void spDma(struct N64* n, uint32_t lenReg, bool toRdram) {
 			}
 		}
 		mem = base | ((mem + len) & 0xFFF);
-		dram += len + skip;
+		dram += len + (row + 1 < count ? skip : 0);
 	}
-	n->sp.memAddr = mem;
-	n->sp.dramAddr = dram;
-	n->sp.length = 0xFF8 | (lenReg & 0xFFF00000u);
+	n->sp.memAt = mem;
+	n->sp.dramAt = dram;
+	n->sp.length = 0xFF8 | (lenReg & 0xFF800000u);
 	if (!toRdram && base) {
 		++n->rspCodeGen;
 	}
@@ -453,9 +454,9 @@ uint32_t busRead32(struct N64* n, uint32_t addr) {
 		}
 		switch (addr & 0x1F) {
 		case 0x00:
-			return n->sp.memAddr;
+			return n->sp.memAt;
 		case 0x04:
-			return n->sp.dramAddr;
+			return n->sp.dramAt;
 		case 0x08:
 		case 0x0C:
 			return n->sp.length;

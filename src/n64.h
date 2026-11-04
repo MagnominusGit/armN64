@@ -86,6 +86,9 @@ struct SP {
 	uint32_t memAddr, dramAddr, status, semaphore, pc;
 	// The length registers as they read: the last DMA's length (0xFF8 once done), count and skip.
 	uint32_t length;
+	// The addresses as they read: where the last DMA got to. A DMA starts from those last written
+	// (Lemon's DMAAlignment-SP, ares).
+	uint32_t memAt, dramAt;
 	// RCP cycles when the DMAs under way are done, and when a queued one starts (DMA full until then).
 	uint64_t dmaUntil, dmaFullUntil;
 	// A task hleGraphics ran: the RSP shows it running (doing nothing) until then.
