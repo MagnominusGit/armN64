@@ -1113,9 +1113,10 @@ static void objLoad(struct N64* n, struct Hle* h, uint32_t a) {
 		emit(n, h, (uint64_t) 0x35 << 56 | (uint64_t) 2 << 51 | (uint64_t) w8 << 32 | (uint64_t) 7 << 24);
 		emit(n, h, (uint64_t) 0x33 << 56 | (uint64_t) 7 << 24 | (uint64_t) (w10 & 0xFFF) << 12 | (w12 & 0xFFF));
 	} else if (type == 0xFC1034) {
-		emit(n, h, (uint64_t) 0x3D << 56 | (uint64_t) 2 << 51 | (uint64_t) ((w10 + 1) >> 2) << 32 | image);
-		emit(n, h, (uint64_t) 0x35 << 56 | (uint64_t) 2 << 51 | (uint64_t) ((w10 + 1) >> 4) << 41 | (uint64_t) w8 << 32 | (uint64_t) 7 << 24);
-		emit(n, h, (uint64_t) 0x34 << 56 | (uint64_t) 7 << 24 | (uint64_t) (w10 & 0xFFF) << 12 | (w12 & 0xFFF));
+		// A tile: twidth + 1 16-bit texels a row (a line of a quarter of that), theight its 10.2 height.
+		emit(n, h, (uint64_t) 0x3D << 56 | (uint64_t) 2 << 51 | (uint64_t) (w10 & 0x3FF) << 32 | image);
+		emit(n, h, (uint64_t) 0x35 << 56 | (uint64_t) 2 << 51 | (uint64_t) ((w10 + 1) >> 2) << 41 | (uint64_t) w8 << 32 | (uint64_t) 7 << 24);
+		emit(n, h, (uint64_t) 0x34 << 56 | (uint64_t) 7 << 24 | (uint64_t) ((w10 << 2) & 0xFFF) << 12 | (w12 & 0xFFF));
 	} else if (type == 0x30) {
 		emit(n, h, (uint64_t) 0x3D << 56 | (uint64_t) 2 << 51 | image);
 		emit(n, h, (uint64_t) 0x35 << 56 | (uint64_t) w8 << 32 | (uint64_t) 7 << 24);
