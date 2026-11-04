@@ -1642,23 +1642,54 @@ static void loadTile(struct N64* n, struct RDP* r, uint64_t w, bool block) {
 	t->th = th;
 }
 
-// The bytes of a row of the texture image.
-static uint32_t tlutRow(const struct RDP* r) {
-	return r->texSize == 0 ? r->texWidth / 2 : r->texWidth << (r->texSize - 1);
-}
-
+// LoadTLUT as parallel-RDP has it from hardware (Copyright (c) 2020 Themaister, MIT licence): TMEM's
+// halfwords from the tile's address on take the image's texels by how the image's size compares
+// with the tile's; a 4-bit load tile (libultra's) puts each texel in a word's four halfwords. A
+// 4-bit image crashes the RDP and a 32-bit tile isn't known: nothing is loaded.
 static void loadTlut(struct N64* n, struct RDP* r, uint64_t w) {
 	struct Tile* t = &r->tile[(w >> 24) & 7];
-	int sl = ((w >> 44) & 0xFFF) >> 2, sh = ((w >> 12) & 0xFFF) >> 2;
+	int const vs = r->texSize, ts = t->size;
+	int const sl = ((w >> 44) & 0xFFF) >> 2, tl = ((w >> 32) & 0xFFF) >> 2, sh = ((w >> 12) & 0xFFF) >> 2;
+	int const width = (sh - sl + 1) & 0xFFF;
+	if (vs == 0 || ts == 3 || !width) {
+		return;
+	}
+	int const texels = vs == 1 ? (width + 7) & ~7 : vs == 2 ? width : (width + 1) & ~1;
 	// From row tl of the image, as a tile load reads (GoldenEye 007's faces).
-	uint32_t const first = r->texAddr + (uint32_t) (((w >> 32) & 0xFFF) >> 2) * tlutRow(r);
-	for (int i = sl; i <= sh; ++i) {
-		uint32_t src = (first + i * 2) & (RDRAM_SIZE - 2);
-		uint32_t dst = t->tmem * 8 + (i - sl) * 8;
-		for (int copy = 0; copy < 4; ++copy) {
-			tmemPut(n, r, (dst + copy * 2) & 0xFFF, src);
-			tmemPut(n, r, (dst + copy * 2 + 1) & 0xFFF, src + 1);
+	uint32_t const base = r->texAddr + ((uint32_t) (r->texWidth * tl + sl) << (vs - 1));
+	uint32_t const offset = (t->tmem * 8 & 0xFFF) >> 1;
+	for (int at = 0; at < 0x800; ++at) {
+		int texel;
+		if (vs - ts == 2) {
+			texel = (at >> 2) << (vs - 2);
+		} else if (vs - ts == 1) {
+			if (at & 4) {
+				continue;
+			}
+			texel = (at & ~7) >> (ts + (vs == 2 ? 2 : 0));
+		} else if (vs == ts) {
+			if (at & 0xC) {
+				continue;
+			}
+			texel = (at & ~3) >> (ts + (vs == 2 ? 2 : 0));
+		} else if (vs - ts == -1) {
+			if (at & 0x1C) {
+				continue;
+			}
+			texel = (at >> ts) & ~7;
+		} else {
+			// A 4-bit tile from a 32-bit image: the texels in turn, mirrored.
+			texel = (at >> 2) * 4;
+			texel += texel + 2 < texels ? 2 : 0;
 		}
+		if (texel >= texels) {
+			break;
+		}
+		uint32_t from = base + ((uint32_t) texel << (vs - 1));
+		from += 2 * (from & 1) * (uint32_t) (at & 3);
+		uint32_t const to = ((offset + (uint32_t) at) & 0x7FF) * 2;
+		tmemPut(n, r, to, from & (RDRAM_SIZE - 1));
+		tmemPut(n, r, to + 1, (from + 1) & (RDRAM_SIZE - 1));
 	}
 }
 
@@ -2166,8 +2197,9 @@ static void loadSource(struct RDP* r, const uint64_t* w, int op, uint32_t* addr,
 	int sl = (c >> 44) & 0xFFF, tl = (c >> 32) & 0xFFF, sh = (c >> 12) & 0xFFF, th = c & 0xFFF;
 	uint32_t bpp = r->texSize == 0 ? 0 : 1u << (r->texSize - 1);
 	if (op == 0x30) {
-		*addr = r->texAddr + (uint32_t) (tl >> 2) * tlutRow(r) + (uint32_t) (sl >> 2) * 2;
-		*len = (uint32_t) ((sh >> 2) - (sl >> 2) + 1) * 2;
+		int const size = r->texSize ? r->texSize : 1;
+		*addr = r->texAddr + ((uint32_t) (r->texWidth * (tl >> 2) + (sl >> 2)) << (size - 1));
+		*len = (uint32_t) ((sh >> 2) - (sl >> 2) + 1 + 8) << (size - 1);
 	} else if (op == 0x33) {
 		uint32_t count = (uint32_t) (sh - sl + 1);
 		*addr = r->texAddr + (tl * r->texWidth + sl) * bpp;
