@@ -14,7 +14,8 @@
 // normal comes from a table (0x07 sets its base), and TRIX (0xB1) for up to eight triangles.
 // S2DEX and S2DEX2 are the 2D microcodes (F3DEX's and F3DEX2's command numbers for what they share):
 // backgrounds so far, other commands leave the task to the RSP.
-enum { FAMILY_NONE, FAMILY_F3D, FAMILY_F3DEX, FAMILY_F3DEX2, FAMILY_F3DPD, FAMILY_S2DEX, FAMILY_S2DEX2 };
+// ZSort draws objects the game sorted from vertices it transformed here first (its DMEM in between).
+enum { FAMILY_NONE, FAMILY_F3D, FAMILY_F3DEX, FAMILY_F3DEX2, FAMILY_F3DPD, FAMILY_S2DEX, FAMILY_S2DEX2, FAMILY_ZSORT };
 
 // Geometry mode bits, kept in the F3DEX2 layout.
 enum {
@@ -51,6 +52,11 @@ struct Hle {
 	struct Vertex v[VERTICES];
 	float vscale[3], vtrans[3];
 	int lights;
+	// ZSort: its DMEM (the data first), the viewport in quarter pixels, and the RDP lists last run for
+	// an object's three.
+	uint8_t zDmem[0x1000];
+	float zScale[2], zTrans[2];
+	uint32_t zRdp[3];
 	float lightColor[LIGHTS + 1][3], lightDir[LIGHTS + 1][3], lookat[2][3];
 	uint32_t geometry;
 	// F3DPD's table of vertex colours.
@@ -1252,6 +1258,288 @@ static bool loadMicrocode(struct N64* n, struct Hle* h, uint32_t code, uint32_t 
 	return true;
 }
 
+// ---- ZSort (as GLideN64 has it): DMEM fields carry a 0x400 bias; matrices are loaded and combined
+// on command; the game reads back what it had transformed, sorts, and sends objects in screen space.
+
+static uint32_t zField(uint32_t field) {
+	return (field - 0x400) & 0xFFF;
+}
+
+static uint32_t zRd16(const struct Hle* h, uint32_t a) {
+	return (uint32_t) h->zDmem[a & 0xFFF] << 8 | h->zDmem[(a + 1) & 0xFFF];
+}
+
+static void zWr16(struct Hle* h, uint32_t a, uint32_t v) {
+	h->zDmem[a & 0xFFF] = (uint8_t) (v >> 8), h->zDmem[(a + 1) & 0xFFF] = (uint8_t) v;
+}
+
+// An RDP command list in RDRAM, to the end command (0xDF).
+static void zsortRdp(struct N64* n, struct Hle* h, uint32_t a) {
+	for (int k = 0; a && k < 0x10000; ++k) {
+		uint32_t const w0 = rd32(n, a), w1 = rd32(n, a + 4);
+		int const op = w0 >> 24;
+		if (op == 0xDF) {
+			break;
+		}
+		if (op == 0xE2 || op == 0xE3) {
+			otherMode(n, h, op == 0xE3, (w0 >> 8) & 0xFF, w0 & 0xFF, w1);
+			a += 8;
+		} else {
+			a = rdpCommand(n, h, a, w0, w1);
+		}
+	}
+}
+
+// One object's triangle or quad (a strip): screen positions (10.2), colours and, textured, S and T
+// (10.5 with perspective, else 10.6) and the 1/w the transform gave (as 0x7FFFFFFF / (w * 31)).
+static void zsortDraw(struct N64* n, struct Hle* h, uint32_t a, int type) {
+	bool const textured = type == 2 || type == 4;
+	int const count = type <= 2 ? 3 : 4, size = textured ? 16 : 8;
+	bool const persp = h->modeH & 0x80000;
+	struct ScreenVertex v[4];
+	for (int i = 0; i < count; ++i, a += (uint32_t) size) {
+		float w = 1;
+		if (textured) {
+			int32_t const invw = (int32_t) rd32(n, a + 12);
+			w = invw ? (float) (0x7FFFFFFF / invw) / 31.0f : 1;
+		}
+		v[i] = (struct ScreenVertex) { rd16(n, a) / 4.0f, rd16(n, a + 2) / 4.0f, 0, w != 0 ? 1 / w : 1,
+		                               n->rdram[(a + 4) & (RDRAM_SIZE - 1)] / 255.0f, n->rdram[(a + 5) & (RDRAM_SIZE - 1)] / 255.0f,
+		                               n->rdram[(a + 6) & (RDRAM_SIZE - 1)] / 255.0f, n->rdram[(a + 7) & (RDRAM_SIZE - 1)] / 255.0f,
+		                               textured ? rd16(n, a + 8) / (persp ? 32.0f : 64.0f) : 0, textured ? rd16(n, a + 10) / (persp ? 32.0f : 64.0f) : 0 };
+	}
+	bool const texOn = h->texOn;
+	h->texOn = textured;
+	triangle(n, h, &v[0], &v[1], &v[2], NULL);
+	if (count == 4) {
+		triangle(n, h, &v[2], &v[1], &v[3], NULL);
+	}
+	h->texOn = texOn;
+}
+
+// G_ZOBJ: a list of objects, each with its RDP lists (run when they changed) and its vertices.
+static void zsortObjects(struct N64* n, struct Hle* h, uint32_t header) {
+	for (int k = 0; header && k < 0x10000; ++k) {
+		uint32_t const a = header & ~7u;
+		int const type = header & 7;
+		int const lists = type == 1 || type == 3 ? 1 : 3;
+		for (int i = 0; i < lists; ++i) {
+			uint32_t const w1 = rd32(n, a + 4 + 4 * (uint32_t) i);
+			if (w1 != h->zRdp[i]) {
+				h->zRdp[i] = w1;
+				zsortRdp(n, h, address(h, w1));
+			}
+		}
+		if (type >= 1 && type <= 4) {
+			zsortDraw(n, h, a + (lists == 1 ? 8 : 16), type);
+		}
+		uint32_t const next = rd32(n, a);
+		header = next ? address(h, next) : 0;
+	}
+}
+
+// G_ZMULT_MPMTX: vertices (three s16 each) through the combined matrix into screen records: x and y
+// on screen (10.2), 1/w, x, y and w as integers, the clip flags and fog.
+static void zsortTransform(struct Hle* h, uint32_t w1) {
+	int const count = 1 + (int) (w1 >> 24);
+	uint32_t src = zField((w1 >> 12) & 0xFFF), dst = zField(w1 & 0xFFF);
+	const float* m = h->mvp;
+	for (int i = 0; i < count; ++i, src += 6, dst += 16) {
+		float const x = (int16_t) zRd16(h, src), y = (int16_t) zRd16(h, src + 2), z = (int16_t) zRd16(h, src + 4);
+		float const X = x * m[0] + y * m[4] + z * m[8] + m[12], Y = x * m[1] + y * m[5] + z * m[9] + m[13];
+		float const Z = x * m[2] + y * m[6] + z * m[10] + m[14], W = x * m[3] + y * m[7] + z * m[11] + m[15];
+		int const sx = W != 0 ? (int) (h->zTrans[0] + X / W * h->zScale[0]) : 0, sy = W != 0 ? (int) (h->zTrans[1] + Y / W * h->zScale[1]) : 0;
+		int const w31 = (int) (W * 31.0f);
+		uint32_t const invw = w31 ? (uint32_t) (0x7FFFFFFF / w31) : 0x7FFFFFFFu;
+		int fog = 0;
+		if (W >= 0 && W != 0) {
+			fog = (int) (Z / W * h->fogMul + h->fogOffset);
+			fog = fog > 255 ? 255 : fog < 0 ? 0 : fog;
+		}
+		int const cc = (X < -W ? 0x10 : 0) | (X > W ? 0x01 : 0) | (Y < -W ? 0x20 : 0) | (Y > W ? 0x02 : 0) | (W < 0.1f ? 0x04 : 0);
+		zWr16(h, dst, (uint32_t) sx), zWr16(h, dst + 2, (uint32_t) sy);
+		zWr16(h, dst + 4, invw >> 16), zWr16(h, dst + 6, invw);
+		zWr16(h, dst + 8, (uint32_t) (int) X), zWr16(h, dst + 10, (uint32_t) (int) Y);
+		h->zDmem[(dst + 12) & 0xFFF] = (uint8_t) cc, h->zDmem[(dst + 13) & 0xFFF] = (uint8_t) fog;
+		zWr16(h, dst + 14, (uint32_t) (int) W);
+	}
+}
+
+static float* zsortMatrix(struct Hle* h, int which) {
+	return which == 4 ? h->modelview[h->depth] : which == 6 ? h->projection : which == 8 ? h->mvp : NULL;
+}
+
+// G_ZXFMLIGHT: the ambient colour, the lights (colour, direction) and the two lookat directions, from
+// DMEM.
+static void zsortLights(struct Hle* h, uint32_t w1) {
+	int const count = 1 + (int) ((w1 >> 12) & 0xFF);
+	uint32_t a = zField(w1 & 0xFFF);
+	h->lights = count > LIGHTS ? LIGHTS : count;
+	for (int k = 0; k < 3; ++k) {
+		h->lightColor[h->lights][k] = h->zDmem[(a + (uint32_t) k) & 0xFFF] / 255.0f;
+	}
+	a += 8;
+	for (int l = 0; l < count; ++l, a += 24) {
+		for (int k = 0; l < LIGHTS && k < 3; ++k) {
+			h->lightColor[l][k] = h->zDmem[(a + (uint32_t) k) & 0xFFF] / 255.0f;
+			h->lightDir[l][k] = (int8_t) h->zDmem[(a + 8 + (uint32_t) k) & 0xFFF];
+		}
+		if (l < LIGHTS) {
+			normalize(h->lightDir[l]);
+		}
+	}
+	for (int l = 0; l < 2; ++l, a += 24) {
+		for (int k = 0; k < 3; ++k) {
+			h->lookat[l][k] = (int8_t) h->zDmem[(a + 8 + (uint32_t) k) & 0xFFF];
+		}
+		normalize(h->lookat[l]);
+	}
+}
+
+// G_ZLIGHTING: each vertex's normal through the model matrix, lit, times its material colour; S and T
+// from the normal through the projection against the lookat directions (sphere mapping).
+static void zsortLighting(struct Hle* h, uint32_t w0, uint32_t w1) {
+	int const count = 1 + (int) (w1 >> 24);
+	uint32_t csrs = zField((w0 >> 12) & 0xFFF), nsrs = zField(w0 & 0xFFF), cdest = zField((w1 >> 12) & 0xFFF), tdest = zField(w1 & 0xFFF);
+	const float* mv = h->modelview[h->depth];
+	const float* pr = h->projection;
+	for (int i = 0; i < count; ++i, nsrs += 3, csrs += 4, cdest += 4, tdest += 4) {
+		float const nx = (int8_t) h->zDmem[nsrs & 0xFFF], ny = (int8_t) h->zDmem[(nsrs + 1) & 0xFFF], nz = (int8_t) h->zDmem[(nsrs + 2) & 0xFFF];
+		float e[3] = { nx * mv[0] + ny * mv[4] + nz * mv[8], nx * mv[1] + ny * mv[5] + nz * mv[9], nx * mv[2] + ny * mv[6] + nz * mv[10] };
+		normalize(e);
+		float rgb[3] = { h->lightColor[h->lights][0], h->lightColor[h->lights][1], h->lightColor[h->lights][2] };
+		for (int l = 0; l < h->lights; ++l) {
+			float const d = e[0] * h->lightDir[l][0] + e[1] * h->lightDir[l][1] + e[2] * h->lightDir[l][2];
+			if (d > 0) {
+				rgb[0] += d * h->lightColor[l][0], rgb[1] += d * h->lightColor[l][1], rgb[2] += d * h->lightColor[l][2];
+			}
+		}
+		float p[3] = { e[0] * pr[0] + e[1] * pr[4] + e[2] * pr[8], e[0] * pr[1] + e[1] * pr[5] + e[2] * pr[9], e[0] * pr[2] + e[1] * pr[6] + e[2] * pr[10] };
+		normalize(p);
+		float const x = p[0] * h->lookat[0][0] + p[1] * h->lookat[0][1] + p[2] * h->lookat[0][2];
+		float const y = p[0] * h->lookat[1][0] + p[1] * h->lookat[1][1] + p[2] * h->lookat[1][2];
+		for (int k = 0; k < 3; ++k) {
+			float const c = (rgb[k] > 1 ? 1 : rgb[k]) * h->zDmem[(csrs + (uint32_t) k) & 0xFFF] / 255.0f;
+			h->zDmem[(cdest + (uint32_t) k) & 0xFFF] = (uint8_t) (c * 255.0f);
+		}
+		h->zDmem[(cdest + 3) & 0xFFF] = h->zDmem[(csrs + 3) & 0xFFF];
+		zWr16(h, tdest, (uint32_t) (int) ((x + 1) * 512 * 32)), zWr16(h, tdest + 2, (uint32_t) (int) ((y + 1) * 512 * 32));
+	}
+}
+
+// G_ZMOVEMEM: DMEM loaded from or saved to RDRAM, a matrix, or the viewport (which also turns on the
+// texture and smooth shading the objects take).
+static void zsortMoveMem(struct N64* n, struct Hle* h, uint32_t w0, uint32_t w1) {
+	int const index = w0 & 0x0E;
+	uint32_t const offset = ((w0 >> 6) & 0x1FF) << 3, length = 1 + (((w0 >> 15) & 0x1FF) << 3), a = address(h, w1);
+	if (index == 0) {
+		if (!(w0 & 1)) {
+			for (uint32_t i = 0; i < length; ++i) {
+				h->zDmem[(offset + i) & 0xFFF] = n->rdram[(a + i) & (RDRAM_SIZE - 1)];
+			}
+		} else if (!h->dry) {
+			n64RdramWrite(n, a, length);
+			for (uint32_t i = 0; i < length; ++i) {
+				n->rdram[(a + i) & (RDRAM_SIZE - 1)] = h->zDmem[(offset + i) & 0xFFF];
+			}
+		}
+	} else if (zsortMatrix(h, index)) {
+		readMatrix(n, a, zsortMatrix(h, index));
+	} else if (index == 12) {
+		viewport(n, h, a);
+		h->fogMul = rd16(n, a + 6), h->fogOffset = rd16(n, a + 14);
+		for (int k = 0; k < 2; ++k) {
+			h->zScale[k] = h->vscale[k] * 4, h->zTrans[k] = h->vtrans[k] * 4;
+		}
+		h->texScaleS = h->texScaleT = 1, h->texLevel = 0, h->texTile = 0, h->texOn = true;
+		h->geometry |= GEOM_SHADE | GEOM_SHADING_SMOOTH;
+	}
+}
+
+static void zsortList(struct N64* n, struct Hle* h, uint32_t pc) {
+	int sp = 0;
+	for (int steps = 0; pc && steps < 1 << 20; ++steps) {
+		uint32_t const w0 = rd32(n, pc), w1 = rd32(n, pc + 4);
+		uint32_t next = pc + 8;
+		int const op = w0 >> 24;
+		switch (op) {
+		case 0x80:
+			zsortObjects(n, h, address(h, w0));
+			zsortObjects(n, h, address(h, w1));
+			break;
+		case 0x81:
+			zsortRdp(n, h, address(h, w1));
+			break;
+		case 0xDC:
+			zsortMoveMem(n, h, w0, w1);
+			break;
+		case 0xD6:
+			zsortTransform(h, w1);
+			break;
+		case 0xD5: {
+			float* s = zsortMatrix(h, w0 & 15), * t = zsortMatrix(h, (w1 >> 16) & 15), * d = zsortMatrix(h, w1 & 15);
+			if (s && t && d) {
+				float m[16];
+				multiply(m, s, t);
+				memcpy(d, m, sizeof(m));
+			}
+			break;
+		}
+		case 0xD1:
+			zsortLights(h, w1);
+			break;
+		case 0xD2:
+			zsortLighting(h, w0, w1);
+			break;
+		case 0xDE:
+			if (!((w0 >> 16) & 0xFF) && sp < DL_DEPTH) {
+				h->stack[sp++] = next;
+			}
+			next = address(h, w1);
+			break;
+		case 0xDF:
+			if (!sp) {
+				return;
+			}
+			next = h->stack[--sp];
+			break;
+		case 0xDB:
+			if ((w0 & 0xFF) == 6) {
+				h->segments[((w0 >> 8) & 0xFFFF) / 4 & 15] = w1 & 0xFFFFFF;
+			} else if ((w0 & 0xFF) == 8) {
+				h->fogMul = (int16_t) (w1 >> 16), h->fogOffset = (int16_t) w1;
+			}
+			break;
+		case 0xBB:
+			h->texScaleS = (w1 >> 16) / 65536.0f, h->texScaleT = (w1 & 0xFFFF) / 65536.0f;
+			h->texLevel = (w0 >> 11) & 7, h->texTile = (w0 >> 8) & 7, h->texOn = w0 & 0xFF;
+			break;
+		case 0xB6:
+		case 0xB7:
+			setGeometry(h, op == 0xB6 ? w1 : 0, op == 0xB7 ? w1 : 0, false);
+			break;
+		case 0xE2:
+		case 0xE3:
+			otherMode(n, h, op == 0xE3, (w0 >> 8) & 0xFF, w0 & 0xFF, w1);
+			break;
+		// Interpolation, the transpose, sub-lists and signals (as GLideN64 has them), the RDP halves,
+		// G_CULLDL and no-ops: nothing here.
+		case 0x00: case 0xB2: case 0xB3: case 0xB4: case 0xBE:
+		case 0xD0: case 0xD3: case 0xD4: case 0xD7: case 0xD8: case 0xD9: case 0xDA:
+			break;
+		default:
+			if (op >= 0xE4) {
+				next = rdpCommand(n, h, pc, w0, w1);
+				break;
+			}
+			snprintf(h->why, sizeof(h->why), "ZSort op %02X", op);
+			reject(h);
+			return;
+		}
+		pc = next;
+	}
+}
+
 static void runList(struct N64* n, struct Hle* h, uint32_t pc) {
 	uint32_t* stack = h->stack;
 	int sp = h->sp;
@@ -1841,6 +2129,9 @@ static int family(struct N64* n, uint32_t data, uint32_t size) {
 		}
 		return FAMILY_F3DEX;
 	}
+	if (!strncmp(name, "ZSortp", 6)) {
+		return FAMILY_ZSORT;
+	}
 	if (!strncmp(name, "S2DEX", 5) && (name[5] == ' ' || name[5] == '.' || name[5] == '_')) {
 		for (const char* c = name; *c && c < name + 48; ++c) {
 			if (c[0] == ' ' && c[1] >= '0' && c[1] <= '9' && c[2] == '.' && c[3] >= '0' && c[3] <= '9') {
@@ -2005,7 +2296,16 @@ bool hleGraphics(struct N64* n, bool dry) {
 	h->rejectedNow = false;
 	h->why[0] = 0;
 	h->objBaseX = h->objBaseY = 1024, h->objA = h->objD = 1, h->objB = h->objC = 0, h->objX = h->objY = 0;
-	runList(n, h, address(h, be32(task + 0x30)));
+	if (f == FAMILY_ZSORT) {
+		for (uint32_t i = 0; i < sizeof(h->zDmem); ++i) {
+			h->zDmem[i] = i < dataSize ? n->rdram[(data + i) & (RDRAM_SIZE - 1)] : 0;
+		}
+		h->zRdp[0] = h->zRdp[1] = h->zRdp[2] = 0;
+		h->zScale[0] = h->zScale[1] = h->zTrans[0] = h->zTrans[1] = 0;
+		zsortList(n, h, address(h, be32(task + 0x30)));
+	} else {
+		runList(n, h, address(h, be32(task + 0x30)));
+	}
 	if (h->rejectedNow) {
 		// The RSP runs this task from the start (what the list made so far goes).
 		h->count = 0;
