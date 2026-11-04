@@ -52,6 +52,8 @@ struct CPU {
 	uint64_t cop2Latch;
 	// A compiled poll loop tried to skip its passes since it was entered (a64).
 	bool pollTried;
+	// An interrupt an MTC0 to Status or Cause made due waits for the instruction after it.
+	bool intHold;
 	uint64_t cop0[32];
 	struct TLBEntry tlb[32];
 	uint64_t countBase;
@@ -737,25 +739,75 @@ static inline uint64_t hwCycles(const struct N64* n, uint64_t cycles) {
 // operation; rs only for an FPU load or store, whose rt is an FPU register), and MTC0 or DMTC0 after
 // any load, as nemu64-test measures on hardware. A load's mark:
 // 0x40 and its register; 0 for anything else.
+// A COP1 operation (not a move or branch).
+static inline bool cpuFpuOp(uint32_t op) {
+	return op >> 26 == 0x11 && (op >> 21 & 0x10);
+}
+
+// The mark an instruction leaves for the next (CPU.loadMark): a load's or MFC0's register with 0x40,
+// a COP1 operation's result register with 0x80.
 static inline uint8_t cpuLoadMark(uint32_t op) {
 	switch (op >> 26) {
 	case 0x1A: case 0x1B: case 0x20: case 0x21: case 0x22: case 0x23: case 0x24: case 0x25: case 0x26: case 0x27:
 	case 0x30: case 0x34: case 0x37:
 		return (uint8_t) (0x40 | ((op >> 16) & 31));
+	case 0x10:
+		return (op >> 21 & 31) <= 1 ? (uint8_t) (0x40 | ((op >> 16) & 31)) : 0;
 	}
-	return 0;
+	return cpuFpuOp(op) ? (uint8_t) (0x80 | ((op >> 6) & 31)) : 0;
+}
+
+// The marks after which op waits a cycle (nemu64-test): a load's register in its rt (the
+// coprocessors' and FPU memory operations' rs only) or rs (FPU memory operations' rt never), any load
+// before MTC0 and DMTC0; a COP1 operation's result in another's fs or ft field, used or not.
+static inline int cpuStallMarks(uint32_t op, uint8_t* marks) {
+	uint32_t const code = op >> 26, rs = (op >> 21) & 31, rt = (op >> 16) & 31;
+	int count = 0;
+	if (cpuFpuOp(op)) {
+		uint32_t const fs = (op >> 11) & 31;
+		marks[count++] = (uint8_t) (0x80 | fs);
+		if (rt != fs) {
+			marks[count++] = (uint8_t) (0x80 | rt);
+		}
+		return count;
+	}
+	bool const cop = code >= 0x10 && code <= 0x12, fpuMemory = code == 0x31 || code == 0x35 || code == 0x39 || code == 0x3D;
+	if (rt && !fpuMemory) {
+		marks[count++] = (uint8_t) (0x40 | rt);
+	}
+	if (rs && !cop && (fpuMemory || rs != rt)) {
+		marks[count++] = (uint8_t) (0x40 | rs);
+	}
+	return count;
+}
+
+// An MTC0 or DMTC0 to Random, EntryLo0, EntryLo1, 7 or EntryHi, which takes a cycle more.
+static inline bool cpuSlowMtc0(uint32_t op) {
+	uint32_t const rd = (op >> 11) & 31;
+	return op >> 26 == 0x10 && ((op >> 21 & 31) == 0x04 || (op >> 21 & 31) == 0x05) && (rd == 1 || rd == 2 || rd == 3 || rd == 7 || rd == 10);
+}
+
+// Whether op, an MTC0 or DMTC0 but the slow ones, waits for any load (the slow ones' own cycle
+// covers that, so they wait only for their rt).
+static inline bool cpuAfterAnyLoad(uint32_t op) {
+	return op >> 26 == 0x10 && ((op >> 21 & 31) == 0x04 || (op >> 21 & 31) == 0x05) && !cpuSlowMtc0(op);
 }
 
 static inline bool cpuLoadStall(uint32_t op, uint8_t mark) {
-	uint32_t const code = op >> 26, rs = (op >> 21) & 31, rt = (op >> 16) & 31, loaded = mark & 31u;
 	if (!mark) {
 		return false;
 	}
-	if (code == 0x10 && (rs == 0x04 || rs == 0x05)) {
-		return true;
+	if (cpuAfterAnyLoad(op)) {
+		return mark & 0x40;
 	}
-	bool const cop = code >= 0x10 && code <= 0x12, fpuMemory = code == 0x31 || code == 0x35 || code == 0x39 || code == 0x3D;
-	return loaded != 0 && ((!fpuMemory && rt == loaded) || (!cop && rs == loaded));
+	uint8_t marks[2];
+	int const count = cpuStallMarks(op, marks);
+	for (int i = 0; i < count; ++i) {
+		if (marks[i] == mark) {
+			return true;
+		}
+	}
+	return false;
 }
 
 static inline uint64_t hwNow(const struct N64* n) {

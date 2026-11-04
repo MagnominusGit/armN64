@@ -626,7 +626,7 @@ static bool emitInline(struct Jit* j, uint32_t op, uint64_t pc, enum Kind* kind)
 			aAsrImmX(e, 0, 0, 32);
 			aSxtw(e, 0, 0);
 			aStrX(e, 0, CPU, CPU_OFF(hi));
-			j->extraCycles = 3;
+			j->extraCycles = 4;
 			return true;
 		}
 		case 0x1A: case 0x1B: {
@@ -990,30 +990,22 @@ static void chain(struct Jit* j);
 // at the end of the block goes on to the next.
 // A block's first instruction: the load cycle from the mark the CPU comes in with (cpuLoadStall).
 static void loadStallCheck(struct Emitter* e, uint32_t op) {
-	uint32_t const code = op >> 26, rs = (op >> 21) & 31, rt = (op >> 16) & 31;
 	aLdrb(e, IP, CPU, CPU_OFF(loadMark));
-	if (code == 0x10 && (rs == 0x04 || rs == 0x05)) {
+	if (cpuAfterAnyLoad(op)) {
 		aLogicImm(e, A_ANDS_IMM, ZR, IP, 0x40);
 		uint8_t* none = aBcond(e, C_EQ, NULL);
 		aDpImm(e, A_SUB_IMM | W64, LEFT, LEFT, 1);
 		patchHere(e, none);
 		return;
 	}
-	bool const cop = code >= 0x10 && code <= 0x12, fpuMemory = code == 0x31 || code == 0x35 || code == 0x39 || code == 0x3D;
-	uint32_t regs[2];
-	int count = 0;
-	if (rt && !fpuMemory) {
-		regs[count++] = rt;
-	}
-	if (rs && !cop && (fpuMemory || rs != rt)) {
-		regs[count++] = rs;
-	}
+	uint8_t marks[2];
+	int const count = cpuStallMarks(op, marks);
 	if (!count) {
 		return;
 	}
 	uint8_t* stall[2];
 	for (int i = 0; i < count; ++i) {
-		aDpImm(e, A_SUBS_IMM, ZR, IP, 0x40 | regs[i]);
+		aDpImm(e, A_SUBS_IMM, ZR, IP, marks[i]);
 		stall[i] = aBcond(e, C_EQ, NULL);
 	}
 	uint8_t* none = aB(e, NULL);
@@ -2001,7 +1993,7 @@ void* jitCompile(struct N64* n, const uint32_t* ops, uint32_t count, uint32_t va
 			continue;
 		}
 		if (x->skip) {
-			aDpImm(e, A_SUB_IMM | W64, LEFT, LEFT, 1);
+			aDpImm(e, A_SUB_IMM | W64, LEFT, LEFT, 2);
 			storeConst(e, CPU_OFF(pc), x->pc + 8);
 			storeConst(e, CPU_OFF(nextPc), x->pc + 12);
 		} else if (x->delay) {

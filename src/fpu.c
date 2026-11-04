@@ -298,9 +298,9 @@ uint32_t fpuCycles(int fmt, int func) {
 	case 4:
 		return dbl ? 57 : 28;
 	case 32:
-		return fmt == 17 ? 1 : 4;
+		return fmt == 17 ? 1 : fmt == 16 ? 0 : 4;
 	case 33:
-		return fmt == 16 ? 0 : 4;
+		return fmt == 16 || fmt == 17 ? 0 : 4;
 	default:
 		return (func >= 8 && func <= 15) || func == 36 || func == 37 ? 4 : 0;
 	}
@@ -491,6 +491,51 @@ static void integer(struct N64* n, uint32_t op, int fmt, int func) {
 	}
 }
 
+// Whether an operation is done in 2 cycles, as nemu64-test measures it: when an operand is zero,
+// infinite, NaN or denormal (for MUL also a power of two, for SQRT also negative), a conversion of
+// zero to a float, one to an integer of an infinite, NaN or denormal value or one past the range
+// checked by its first step (2^32 for a word, 2^53 for a long), and the operations W and L have none
+// of. An exception then comes after those 2.
+static bool trivialS(uint32_t v, bool mul) {
+	uint32_t const e = v >> 23 & 0xFF, m = v & 0x7FFFFF;
+	return e == 0 || e == 0xFF || (mul && !m);
+}
+
+static bool trivialD(uint64_t v, bool mul) {
+	uint64_t const e = v >> 52 & 0x7FF, m = v & 0xFFFFFFFFFFFFFull;
+	return e == 0 || e == 0x7FF || (mul && !m);
+}
+
+static bool early(struct N64* n, uint32_t op, int fmt, int func) {
+	if (fmt == 20 || fmt == 21) {
+		int64_t const v = fmt == 20 ? (int32_t) (uint32_t) n->cpu.fpr[fr(n) ? FS : FS & ~1] : (int64_t) getT64(n, FS);
+		return (func != 0x20 && func != 0x21) || v == 0 || (fmt == 21 && (v >= 0x0080000000000000ll || v < -0x0080000000000000ll));
+	}
+	bool const dbl = fmt == 17;
+	uint64_t a, b;
+	if (dbl) {
+		a = n->cpu.fpr[fr(n) ? FS : FS & ~1];
+		b = n->cpu.fpr[FT];
+	} else {
+		a = (uint32_t) n->cpu.fpr[fr(n) ? FS : FS & ~1];
+		b = (uint32_t) n->cpu.fpr[FT];
+	}
+	bool const ta = dbl ? trivialD(a, func == 2) : trivialS((uint32_t) a, func == 2);
+	if (func <= 3) {
+		return ta || (dbl ? trivialD(b, func == 2) : trivialS((uint32_t) b, func == 2));
+	}
+	if (func == 4) {
+		return ta || a >> (dbl ? 63 : 31);
+	}
+	if ((func >= 8 && func <= 15) || func == 0x24 || func == 0x25) {
+		bool const word = func >= 12 || func == 0x24;
+		double const v = dbl ? dOf(n, FS) : sOf(n, FS);
+		int const k = dbl ? fpclassify(v) : fpclassify(sOf(n, FS));
+		return (k != FP_NORMAL && k != FP_ZERO) || fabs(v) >= (word ? 0x1p32 : 0x1p53);
+	}
+	return false;
+}
+
 // CTC1 FCR31: the host's rounding mode follows; a cause written with its exception enabled, or the
 // unimplemented one, raises it.
 static void writeFcr31(struct N64* n, uint32_t v) {
@@ -543,7 +588,8 @@ void fpuExecute(struct N64* n, uint32_t op) {
 	}
 	c->fcr31 &= ~CAUSES;
 	if (fmt == 16 || fmt == 17 || fmt == 20 || fmt == 21) {
-		c->stall += fpuCycles(fmt, func);
+		uint32_t const cycles = fpuCycles(fmt, func);
+		c->stall += cycles > 1 && early(n, op, fmt, func) ? 1 : cycles;
 	}
 	if (fmt == 16) {
 		single(n, op, func);

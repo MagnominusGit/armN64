@@ -337,7 +337,7 @@ static bool emitInline(struct Jit* j, uint32_t op, uint64_t pc, enum Kind* kind)
 			xShiftI(e, X_SAR, 8, R(RAX), 32);
 			xMovsxd(e, RAX, R(RAX));
 			xStore(e, 8, CPU_AT(hi), RAX);
-			j->extraCycles = 3;
+			j->extraCycles = 4;
 			return true;
 		case 0x20: case 0x22: case 0x2C: case 0x2E: {
 			// Overflow raises an exception, through the interpreter, before rd changes.
@@ -600,30 +600,22 @@ static void chain(struct Jit* j);
 // at the end of the block goes on to the next.
 // A block's first instruction: the load cycle from the mark the CPU comes in with (cpuLoadStall).
 static void loadStallCheck(struct Emitter* e, uint32_t op) {
-	uint32_t const code = op >> 26, rs = (op >> 21) & 31, rt = (op >> 16) & 31;
-	if (code == 0x10 && (rs == 0x04 || rs == 0x05)) {
+	if (cpuAfterAnyLoad(op)) {
 		xTestI(e, 1, CPU_AT(loadMark), 0x40);
 		uint8_t* none = xJcc(e, CC_E, NULL);
 		xAluI(e, X_ADD, 8, R(R13), 1);
 		patchHere(e, none);
 		return;
 	}
-	bool const cop = code >= 0x10 && code <= 0x12, fpuMemory = code == 0x31 || code == 0x35 || code == 0x39 || code == 0x3D;
-	uint32_t regs[2];
-	int count = 0;
-	if (rt && !fpuMemory) {
-		regs[count++] = rt;
-	}
-	if (rs && !cop && (fpuMemory || rs != rt)) {
-		regs[count++] = rs;
+	uint8_t marks[2];
+	int const count = cpuStallMarks(op, marks);
+	if (!count) {
+		return;
 	}
 	uint8_t* stall[2];
 	for (int i = 0; i < count; ++i) {
-		xAluI(e, X_CMP, 1, CPU_AT(loadMark), (int32_t) (0x40 | regs[i]));
+		xAluI(e, X_CMP, 1, CPU_AT(loadMark), (int8_t) marks[i]);
 		stall[i] = xJcc(e, CC_E, NULL);
-	}
-	if (!count) {
-		return;
 	}
 	uint8_t* none = xJmp(e, NULL);
 	for (int i = 0; i < count; ++i) {
@@ -1199,7 +1191,7 @@ void* jitCompile(struct N64* n, const uint32_t* ops, uint32_t count, uint32_t va
 			continue;
 		}
 		if (x->skip) {
-			xAluI(e, X_ADD, 8, R(R13), 1);
+			xAluI(e, X_ADD, 8, R(R13), 2);
 			storeConst(e, CPU_AT(pc), x->pc + 8);
 			storeConst(e, CPU_AT(nextPc), x->pc + 12);
 		} else if (x->delay) {

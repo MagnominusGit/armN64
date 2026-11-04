@@ -344,6 +344,9 @@ void cpuException(struct N64* n, int code, int coprocessor) {
 	}
 	cop0[CP0_CAUSE] = (cop0[CP0_CAUSE] & ~0x3000007Cull) | (uint64_t) code << 2 | (uint64_t) coprocessor << 28;
 	cop0[CP0_STATUS] |= ST_EXL;
+	// The pipeline flushed (nemu64-test): 3 cycles for what RF finds, 4 for what EX and DC find.
+	c->stall += code == EXC_SYS || code == EXC_BP || code == EXC_RI || code == EXC_CPU ? 3
+	          : code != EXC_INT ? 4 : 0;
 	uint64_t base = cop0[CP0_STATUS] & ST_BEV ? 0xFFFFFFFFBFC00200ull : 0xFFFFFFFF80000000ull;
 	c->pc = base + (refill ? refillAt : 0x180);
 	c->nextPc = c->pc + 4;
@@ -588,6 +591,8 @@ static void branchLikely(struct CPU* c, bool taken, uint64_t target) {
 		c->nextPc = target;
 		c->nextInDelay = true;
 	} else {
+		// The skipped delay slot still takes its cycle (nemu64-test).
+		c->stall += 1;
 		c->pc = c->nextPc;
 		c->nextPc += 4;
 	}
@@ -743,10 +748,15 @@ static void cop0Execute(struct N64* n, uint32_t op) {
 	case 0x01:
 		c->gpr[RT] = cop0Read(n, RD);
 		return;
-	// MTC0 writes the whole register, as DMTC0 does.
+	// MTC0 writes the whole register, as DMTC0 does; to Random, EntryLo0, EntryLo1, 7 and EntryHi a
+	// cycle longer (nemu64-test).
 	case 0x04:
 	case 0x05:
+		c->stall += cpuSlowMtc0(op);
 		cop0Write(n, RD, c->gpr[RT]);
+		if (RD == CP0_STATUS || RD == CP0_CAUSE) {
+			c->intHold = interruptPending(n);
+		}
 		return;
 	// CFC0, CTC0 and BC0 do nothing.
 	case 0x02:
@@ -994,14 +1004,14 @@ static void special(struct N64* n, uint32_t op) {
 	// MULT: rs whole times rt sign-extended from 35 bits, as hardware does with operands that aren't
 	// sign-extended 32-bit ones.
 	case 0x18: {
-		c->stall += 3;
+		c->stall += 4;
 		int64_t p = (int64_t) ((uint64_t) s * (uint64_t) ((int64_t) (t << 29) >> 29));
 		c->lo = sext32((uint32_t) p);
 		c->hi = sext32((uint32_t) (p >> 32));
 		return;
 	}
 	case 0x19: {
-		c->stall += 3;
+		c->stall += 4;
 		uint64_t p = (uint64_t) (uint32_t) s * (uint32_t) t;
 		c->lo = sext32((uint32_t) p);
 		c->hi = sext32((uint32_t) (p >> 32));
@@ -1035,21 +1045,21 @@ static void special(struct N64* n, uint32_t op) {
 		return;
 	}
 	case 0x1C: {
-		c->stall += 6;
+		c->stall += 7;
 		__int128 p = (__int128) (int64_t) s * (int64_t) t;
 		c->lo = (uint64_t) p;
 		c->hi = (uint64_t) (p >> 64);
 		return;
 	}
 	case 0x1D: {
-		c->stall += 6;
+		c->stall += 7;
 		unsigned __int128 p = (unsigned __int128) s * t;
 		c->lo = (uint64_t) p;
 		c->hi = (uint64_t) (p >> 64);
 		return;
 	}
 	case 0x1E: {
-		c->stall += 67;
+		c->stall += 68;
 		int64_t a = (int64_t) s, b = (int64_t) t;
 		if (b == 0) {
 			c->lo = a < 0 ? 1 : ~0ull;
@@ -1064,7 +1074,7 @@ static void special(struct N64* n, uint32_t op) {
 		return;
 	}
 	case 0x1F:
-		c->stall += 67;
+		c->stall += 68;
 		if (t == 0) {
 			c->lo = ~0ull;
 			c->hi = s;
@@ -1682,7 +1692,8 @@ void cpuStepOp(struct N64* n, uint32_t op, uint32_t paddr) {
 	c->inDelay = c->nextInDelay;
 	c->nextInDelay = false;
 	c->curPc = c->pc;
-	bool const taken = interruptPending(n);
+	bool const taken = !c->intHold && interruptPending(n);
+	c->intHold = false;
 	if (taken) {
 		cpuException(n, EXC_INT, 0);
 		c->curPc = c->pc;
@@ -1717,7 +1728,7 @@ bool cpuJitReady(struct N64* n) {
 		c->cop0[CP0_CAUSE] |= 0x8000;
 	}
 	c->lastCount = now;
-	if (interruptPending(n)) {
+	if (c->intHold || interruptPending(n)) {
 		return false;
 	}
 	uint32_t delta = (uint32_t) c->cop0[CP0_COMPARE] - now;
@@ -1777,10 +1788,11 @@ void cpuStep(struct N64* n) {
 	c->inDelay = c->nextInDelay;
 	c->nextInDelay = false;
 	c->curPc = c->pc;
-	if (interruptPending(n)) {
+	if (!c->intHold && interruptPending(n)) {
 		cpuException(n, EXC_INT, 0);
 		c->curPc = c->pc;
 	}
+	c->intHold = false;
 	uint32_t p;
 	if (!address(n, c->curPc, 4, false, &p)) {
 		return;
