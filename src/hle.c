@@ -2240,9 +2240,14 @@ bool hleGraphics(struct N64* n, bool dry) {
 	if (f == FAMILY_NONE && ucode == 0xB0811E2Fu) {
 		f = FAMILY_F3DPD;
 	}
-	// Eikou no Saint Andrews' Fast3D has no name either (GLideN64 knows it by its code too).
-	if (f == FAMILY_NONE && ucode == 0xE272C977u) {
+	// Eikou no Saint Andrews' Fast3D has no name either (GLideN64 knows it by its code too), nor do
+	// Saikyou Habu Shougi's and Tetris 64's, or Pachinko 365 Nichi's and Morita Shougi 64's F3DEX (each
+	// matches the microcode's pictures as that).
+	if (f == FAMILY_NONE && (ucode == 0xE272C977u || ucode == 0x6F15E8F7u || ucode == 0x112F868Fu)) {
 		f = FAMILY_F3D;
+	}
+	if (f == FAMILY_NONE && ucode == 0x67E5A46Fu) {
+		f = FAMILY_F3DEX;
 	}
 	// Power League 64's is F3DEX under Fast3D's name (as GLideN64 has it).
 	if (f == FAMILY_F3D && ucode == 0x7754FFF8u) {
