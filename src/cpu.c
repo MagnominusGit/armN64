@@ -87,7 +87,8 @@ static void dcacheWriteBack(struct N64* n, uint32_t i) {
 
 static void dcacheFill(struct N64* n, uint32_t i, uint32_t paddr) {
 	struct CPU* c = &n->cpu;
-	c->stall += DCACHE_FILL + rowCost(c, paddr);
+	// While the VI fetches a picture, a line waits a cycle on average for its turn (nemu64-test).
+	c->stall += DCACHE_FILL + rowCost(c, paddr) + ((n->vi.reg[0] & 3) >= 2);
 	dcacheSet(c, i, paddr, true);
 	c->dcacheDirty[i] = false;
 	if (!n->compat) {
