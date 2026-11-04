@@ -547,7 +547,17 @@ static void writeFcr31(struct N64* n, uint32_t v) {
 		fesetround(roundModes[hostMode]);
 	}
 	if ((c->fcr31 >> 12 & c->fcr31 >> 7 & 0x1F) || (c->fcr31 & CAUSE_E)) {
-		raise(n);
+		// Cause.CE then names the coprocessor of the instruction after, when it is a coprocessor
+		// instruction (nemu64-test).
+		uint32_t p, next = 0;
+		if (!probing && cpuPeekAddress(n, c->pc, &p) && p < RDRAM_SIZE) {
+			next = be32(&n->rdram[p]);
+		}
+		if (probing) {
+			raised = true;
+		} else {
+			cpuException(n, EXC_FPE, next >> 28 == 4 ? (int) (next >> 26 & 3) : 0);
+		}
 	}
 }
 
