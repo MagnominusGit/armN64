@@ -391,6 +391,7 @@ void n64RunField(struct N64* n) {
 	if (intrAt >= passed && intrAt < n->nextVi) {
 		n64Interrupt(n, MI_VI, true);
 	}
+	aiUpdate(n);
 	n->nextVi += n->fieldCycles;
 	++n->fields;
 }

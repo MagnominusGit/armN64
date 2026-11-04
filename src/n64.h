@@ -163,9 +163,11 @@ struct FrameSkip {
 
 struct AI {
 	uint32_t dramAddr, len, control, dacrate, bitrate;
-	// Up to two buffers: the one playing and one queued behind it.
+	// Up to two buffers: the one playing and one queued behind it; how much of the playing one a
+	// frontend has been given, the address the DMA reads next and its late carry into bit 13.
 	int queued;
-	uint32_t queueLen[2];
+	uint32_t queueLen[2], queueAddr[2], kept, playAddr;
+	bool carry;
 	uint64_t startedAt, endsAt;
 };
 

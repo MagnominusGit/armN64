@@ -177,28 +177,36 @@ static uint64_t aiDuration(struct N64* n, uint32_t len) {
 	return rate ? hwCycles(n, (uint64_t) (len / 4) * CPU_HZ / rate) : 0;
 }
 
-// A buffer the game queued, kept for a frontend as it is now in RDRAM.
-static void aiKeep(struct N64* n, uint32_t addr, uint32_t len) {
+// What the AI has played of the buffer, for a frontend as it was in RDRAM then (games fill the buffer
+// while it plays). The DMA's address carries from bit 12 into bit 13 a sample late, so a buffer
+// that ends on an 8 KB boundary moves the next one 8 KB on (ares).
+static void aiKeep(struct N64* n, uint32_t played) {
+	if (!n->audioCapacity || played <= n->ai.kept) {
+		return;
+	}
 	n->audioRate = (uint32_t) (viClock(n) / (n->ai.dacrate + 1));
-	for (uint32_t i = 0; i < len && n->audioCount < n->audioCapacity; i += 2) {
-		n->audio[n->audioCount++] = (int16_t) (n->rdram[(addr + i) & (RDRAM_SIZE - 1)] << 8 | n->rdram[(addr + i + 1) & (RDRAM_SIZE - 1)]);
+	for (; n->ai.kept < played; n->ai.kept += 4) {
+		uint32_t a = n->ai.playAddr;
+		if (n->ai.carry) {
+			a = (a & 0x1FFF) | ((a + 0x2000) & 0xFFE000);
+		}
+		rdpWaitRead(n, a, 4);
+		if (n->audioCount + 2 <= n->audioCapacity) {
+			n->audio[n->audioCount++] = (int16_t) (n->rdram[a & (RDRAM_SIZE - 1)] << 8 | n->rdram[(a + 1) & (RDRAM_SIZE - 1)]);
+			n->audio[n->audioCount++] = (int16_t) (n->rdram[(a + 2) & (RDRAM_SIZE - 1)] << 8 | n->rdram[(a + 3) & (RDRAM_SIZE - 1)]);
+		}
+		n->ai.playAddr = (a & ~0x1FFFu) | ((a + 4) & 0x1FFF);
+		n->ai.carry = (n->ai.playAddr & 0x1FFF) == 0;
 	}
 }
 
 static void aiStartNext(struct N64* n) {
 	n->ai.startedAt = n->cycles;
 	n->ai.endsAt = n->cycles + aiDuration(n, n->ai.queueLen[0]);
+	n->ai.kept = 0;
+	n->ai.playAddr = n->ai.queueAddr[0];
 	n64Event(n, n->ai.endsAt);
 	n64Interrupt(n, MI_AI, true);
-}
-
-void aiUpdate(struct N64* n) {
-	while (n->ai.queued && n->cycles >= n->ai.endsAt) {
-		n->ai.queueLen[0] = n->ai.queueLen[1];
-		if (--n->ai.queued) {
-			aiStartNext(n);
-		}
-	}
 }
 
 static uint32_t aiRemaining(struct N64* n) {
@@ -208,6 +216,20 @@ static uint32_t aiRemaining(struct N64* n) {
 	uint64_t total = n->ai.endsAt - n->ai.startedAt;
 	uint64_t left = n->ai.endsAt > n->cycles ? n->ai.endsAt - n->cycles : 0;
 	return total ? (uint32_t) ((uint64_t) n->ai.queueLen[0] * left / total) & ~7u : 0;
+}
+
+void aiUpdate(struct N64* n) {
+	while (n->ai.queued && n->cycles >= n->ai.endsAt) {
+		aiKeep(n, n->ai.queueLen[0]);
+		n->ai.queueLen[0] = n->ai.queueLen[1];
+		n->ai.queueAddr[0] = n->ai.queueAddr[1];
+		if (--n->ai.queued) {
+			aiStartNext(n);
+		}
+	}
+	if (n->ai.queued) {
+		aiKeep(n, n->ai.queueLen[0] - aiRemaining(n));
+	}
 }
 
 static uint8_t cartByte(struct N64* n, uint32_t c) {
@@ -724,12 +746,9 @@ void busWrite32(struct N64* n, uint32_t addr, uint32_t v) {
 			aiUpdate(n);
 			n->ai.len = v & 0x3FFF8;
 			if (n->ai.len && n->ai.queued < 2) {
+				n->ai.queueAddr[n->ai.queued] = n->ai.dramAddr;
 				n->ai.queueLen[n->ai.queued++] = n->ai.len;
 				++n->stats.aiBuffers;
-				if (n->audioCapacity) {
-					rdpWaitRead(n, n->ai.dramAddr, n->ai.len);
-					aiKeep(n, n->ai.dramAddr, n->ai.len);
-				}
 				if (n->ai.queued == 1) {
 					aiStartNext(n);
 				}
