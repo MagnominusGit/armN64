@@ -428,6 +428,11 @@ static void cbfdLight(struct Hle* h, struct Vertex* v, const float* e, float dir
 
 static void loadVertices(struct N64* n, struct Hle* h, uint32_t a, int first, int count) {
 	a = address(h, a);
+	// Vertices before the buffer (a start the list can't mean) go nowhere.
+	if (first < 0) {
+		a += (uint32_t) -first * (h->family == FAMILY_F3DPD ? 12 : 16);
+		count += first, first = 0;
+	}
 	const float* mv = h->modelview[h->depth];
 	// Lighting in model space, as the microcodes light: the lights' and lookat's directions through
 	// the modelview's transpose, against the normal as it is.
