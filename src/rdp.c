@@ -1637,11 +1637,18 @@ static void loadTile(struct N64* n, struct RDP* r, uint64_t w, bool block) {
 	t->th = th;
 }
 
+// The bytes of a row of the texture image.
+static uint32_t tlutRow(const struct RDP* r) {
+	return r->texSize == 0 ? r->texWidth / 2 : r->texWidth << (r->texSize - 1);
+}
+
 static void loadTlut(struct N64* n, struct RDP* r, uint64_t w) {
 	struct Tile* t = &r->tile[(w >> 24) & 7];
 	int sl = ((w >> 44) & 0xFFF) >> 2, sh = ((w >> 12) & 0xFFF) >> 2;
+	// From row tl of the image, as a tile load reads (GoldenEye 007's faces).
+	uint32_t const first = r->texAddr + (uint32_t) (((w >> 32) & 0xFFF) >> 2) * tlutRow(r);
 	for (int i = sl; i <= sh; ++i) {
-		uint32_t src = (r->texAddr + i * 2) & (RDRAM_SIZE - 2);
+		uint32_t src = (first + i * 2) & (RDRAM_SIZE - 2);
 		uint32_t dst = t->tmem * 8 + (i - sl) * 8;
 		for (int copy = 0; copy < 4; ++copy) {
 			tmemPut(n, r, (dst + copy * 2) & 0xFFF, src);
@@ -2154,7 +2161,7 @@ static void loadSource(struct RDP* r, const uint64_t* w, int op, uint32_t* addr,
 	int sl = (c >> 44) & 0xFFF, tl = (c >> 32) & 0xFFF, sh = (c >> 12) & 0xFFF, th = c & 0xFFF;
 	uint32_t bpp = r->texSize == 0 ? 0 : 1u << (r->texSize - 1);
 	if (op == 0x30) {
-		*addr = r->texAddr + (uint32_t) (sl >> 2) * 2;
+		*addr = r->texAddr + (uint32_t) (tl >> 2) * tlutRow(r) + (uint32_t) (sl >> 2) * 2;
 		*len = (uint32_t) ((sh >> 2) - (sl >> 2) + 1) * 2;
 	} else if (op == 0x33) {
 		uint32_t count = (uint32_t) (sh - sl + 1);
