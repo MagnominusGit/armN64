@@ -1469,10 +1469,19 @@ static bool wideOp(uint32_t op) {
 	return false;
 }
 
+// The cycle an instruction waits after a load (cpuLoadStall), and its own mark for the next.
+static void loadInterlock(struct CPU* c, uint32_t op) {
+	if (cpuLoadStall(op, c->loadMark)) {
+		c->stall += 1;
+	}
+	c->loadMark = cpuLoadMark(op);
+}
+
 static void execute(struct N64* n, uint32_t op) {
 	struct CPU* c = &n->cpu;
 	uint64_t* r = c->gpr;
 	uint64_t s = r[RS];
+	loadInterlock(c, op);
 	if ((c->cop0[CP0_STATUS] & 0x18) && cpuMode(c) != MODE_KERNEL && !cpuWide(c) && wideOp(op)) {
 		cpuException(n, EXC_RI, 0);
 		return;
@@ -1731,6 +1740,7 @@ static bool uncachedWord(struct N64* n, uint32_t op) {
 		return false;
 	}
 	uint32_t p = (uint32_t) vaddr & 0x1FFFFFFF;
+	loadInterlock(c, op);
 	if (op >> 26 == 0x23) {
 		readTiming(n, p, 4);
 		c->gpr[RT] = sext32(busRead32(n, p));

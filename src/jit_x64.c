@@ -67,6 +67,8 @@ struct Exit {
 	bool skip;
 	bool last;
 	bool jumped;
+	// The load mark the CPU leaves with.
+	uint8_t mark;
 };
 
 // A load or store that left its inline path: for the helper, or for a D-cache line fill.
@@ -79,6 +81,8 @@ struct Slow {
 	bool delay, lineStart, last;
 	// Kept even with no site yet: a D-cache miss path may add one.
 	bool keep;
+	// The load mark before it (cpuLoadMark), or -1 when it's the block's first.
+	int prevMark;
 };
 
 struct Miss {
@@ -98,6 +102,8 @@ struct Jit {
 	// leaves an interrupt due).
 	struct Slow* slow;
 	int extraCycles;
+	// The load mark of the instruction being compiled (cpuLoadMark).
+	uint8_t mark;
 	bool interruptCheck;
 	struct Exit exits[3 * 64];
 	int exitCount;
@@ -121,7 +127,7 @@ struct Jit {
 };
 
 static void exitAt(struct Jit* j, uint8_t* site, uint64_t pc, enum Kind kind, bool delay, bool skip) {
-	j->exits[j->exitCount++] = (struct Exit) { site, pc, kind, delay, skip, false, false };
+	j->exits[j->exitCount++] = (struct Exit) { site, pc, kind, delay, skip, false, false, j->mark };
 }
 
 // Sets the flags for a branch condition and returns the condition code under which it is taken.
@@ -592,8 +598,48 @@ static void chain(struct Jit* j);
 
 // The instruction through cpuJitStep, which adds its cycles. Leaves if it asks to or at the limit;
 // at the end of the block goes on to the next.
-static void emitHelper(struct Jit* j, uint32_t op, uint64_t pc, uint32_t paddr, bool delay, bool lineStart, bool last) {
+// A block's first instruction: the load cycle from the mark the CPU comes in with (cpuLoadStall).
+static void loadStallCheck(struct Emitter* e, uint32_t op) {
+	uint32_t const code = op >> 26, rs = (op >> 21) & 31, rt = (op >> 16) & 31;
+	if (code == 0x10 && (rs == 0x04 || rs == 0x05)) {
+		xTestI(e, 1, CPU_AT(loadMark), 0x40);
+		uint8_t* none = xJcc(e, CC_E, NULL);
+		xAluI(e, X_ADD, 8, R(R13), 1);
+		patchHere(e, none);
+		return;
+	}
+	bool const cop = code >= 0x10 && code <= 0x12, fpuMemory = code == 0x31 || code == 0x35 || code == 0x39 || code == 0x3D;
+	uint32_t regs[2];
+	int count = 0;
+	if (rt && !fpuMemory) {
+		regs[count++] = rt;
+	}
+	if (rs && !cop && (fpuMemory || rs != rt)) {
+		regs[count++] = rs;
+	}
+	uint8_t* stall[2];
+	for (int i = 0; i < count; ++i) {
+		xAluI(e, X_CMP, 1, CPU_AT(loadMark), (int32_t) (0x40 | regs[i]));
+		stall[i] = xJcc(e, CC_E, NULL);
+	}
+	if (!count) {
+		return;
+	}
+	uint8_t* none = xJmp(e, NULL);
+	for (int i = 0; i < count; ++i) {
+		patchHere(e, stall[i]);
+	}
+	xAluI(e, X_ADD, 8, R(R13), 1);
+	patchHere(e, none);
+}
+
+static void emitHelper(struct Jit* j, uint32_t op, uint64_t pc, uint32_t paddr, bool delay, bool lineStart, bool last, int prevMark) {
 	struct Emitter* e = &j->e;
+	// The interpreter takes the load cycle (cpuLoadStall) from the mark before: the CPU's own at the
+	// block's start, else the previous instruction's.
+	if (prevMark >= 0) {
+		xStoreI(e, 1, CPU_AT(loadMark), prevMark);
+	}
 	if (lineStart) {
 		if (!j->fast) {
 			icacheCheck(e, (uint32_t) pc, paddr, true);
@@ -999,7 +1045,9 @@ void* jitCompile(struct N64* n, const uint32_t* ops, uint32_t count, uint32_t va
 		int exits = j->exitCount, misses = j->missCount, codeChecks = j->codeCheckCount;
 		bool branch = isBranchOp(op);
 		struct Slow* slow = &j->slows[j->slowCount];
-		*slow = (struct Slow) { .op = op, .paddr = p, .pc = pc, .delay = delay, .lineStart = lineStart, .last = last };
+		int const prevMark = k ? cpuLoadMark(ops[k - 1]) : -1;
+		j->mark = cpuLoadMark(op);
+		*slow = (struct Slow) { .op = op, .paddr = p, .pc = pc, .delay = delay, .lineStart = lineStart, .last = last, .prevMark = prevMark };
 		j->slow = slow;
 		j->extraCycles = 0;
 		j->interruptCheck = false;
@@ -1012,6 +1060,11 @@ void* jitCompile(struct N64* n, const uint32_t* ops, uint32_t count, uint32_t va
 		if (!(delay && branch) && emitInline(j, op, pc, &kind)) {
 			if (lineStart && !branch && !j->fast) {
 				icacheCheck(e, (uint32_t) pc, p, false);
+			}
+			if (prevMark >= 0) {
+				j->extraCycles += cpuLoadStall(op, (uint8_t) prevMark);
+			} else {
+				loadStallCheck(e, op);
 			}
 			xAluI(e, X_ADD, 8, R(R13), 1 + j->extraCycles);
 			if (j->interruptCheck) {
@@ -1041,7 +1094,7 @@ void* jitCompile(struct N64* n, const uint32_t* ops, uint32_t count, uint32_t va
 		j->exitCount = exits;
 		j->missCount = misses;
 		j->codeCheckCount = codeChecks;
-		emitHelper(j, op, pc, p, delay, lineStart, last);
+		emitHelper(j, op, pc, p, delay, lineStart, last, prevMark);
 		delay = branch;
 	}
 
@@ -1127,7 +1180,7 @@ void* jitCompile(struct N64* n, const uint32_t* ops, uint32_t count, uint32_t va
 		for (int k = 0; k < sl->sites; ++k) {
 			patchHere(e, sl->site[k]);
 		}
-		emitHelper(j, sl->op, sl->pc, sl->paddr, sl->delay, sl->lineStart, sl->last);
+		emitHelper(j, sl->op, sl->pc, sl->paddr, sl->delay, sl->lineStart, sl->last, sl->prevMark);
 		if (!sl->last) {
 			xJmp(e, sl->resume);
 		}
@@ -1137,6 +1190,7 @@ void* jitCompile(struct N64* n, const uint32_t* ops, uint32_t count, uint32_t va
 	for (int i = 0; i < j->exitCount; ++i) {
 		struct Exit* x = &j->exits[i];
 		patchHere(e, x->site);
+		xStoreI(e, 1, CPU_AT(loadMark), x->mark);
 		storeConst(e, CPU_AT(curPc), x->pc);
 		xStoreI(e, 1, CPU_AT(inDelay), x->delay);
 		xStoreI(e, 1, CPU_AT(nextInDelay), x->kind != PLAIN && !x->skip);

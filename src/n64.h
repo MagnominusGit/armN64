@@ -46,6 +46,8 @@ struct CPU {
 	bool inDelay;
 	bool nextInDelay;
 	bool llBit;
+	// The last instruction's load mark (cpuLoadMark).
+	uint8_t loadMark;
 	// COP2's moves read and write one 64-bit latch, whatever register they name.
 	uint64_t cop2Latch;
 	// A compiled poll loop tried to skip its passes since it was entered (a64).
@@ -730,6 +732,32 @@ static inline uint64_t hwCycles(const struct N64* n, uint64_t cycles) {
 }
 
 // The time since power-on in the hardware's cycles.
+// The VR4300 holds an instruction a cycle when the one before it loaded a register its rs or rt field
+// names, whatever it does with it (rt only for a coprocessor instruction, whose rs field picks the
+// operation; rs only for an FPU load or store, whose rt is an FPU register), and MTC0 or DMTC0 after
+// any load, as nemu64-test measures on hardware. A load's mark:
+// 0x40 and its register; 0 for anything else.
+static inline uint8_t cpuLoadMark(uint32_t op) {
+	switch (op >> 26) {
+	case 0x1A: case 0x1B: case 0x20: case 0x21: case 0x22: case 0x23: case 0x24: case 0x25: case 0x26: case 0x27:
+	case 0x30: case 0x34: case 0x37:
+		return (uint8_t) (0x40 | ((op >> 16) & 31));
+	}
+	return 0;
+}
+
+static inline bool cpuLoadStall(uint32_t op, uint8_t mark) {
+	uint32_t const code = op >> 26, rs = (op >> 21) & 31, rt = (op >> 16) & 31, loaded = mark & 31u;
+	if (!mark) {
+		return false;
+	}
+	if (code == 0x10 && (rs == 0x04 || rs == 0x05)) {
+		return true;
+	}
+	bool const cop = code >= 0x10 && code <= 0x12, fpuMemory = code == 0x31 || code == 0x35 || code == 0x39 || code == 0x3D;
+	return loaded != 0 && ((!fpuMemory && rt == loaded) || (!cop && rs == loaded));
+}
+
 static inline uint64_t hwNow(const struct N64* n) {
 	return n->ocHwAt + (n->cycles - n->ocAt) * n->ocDen / n->ocNum;
 }
