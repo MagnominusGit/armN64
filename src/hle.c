@@ -521,6 +521,21 @@ static void loadVertices(struct N64* n, struct Hle* h, uint32_t a, int first, in
 // G_MODIFYVTX (and F3DEX's G_MOVEWORD to the points): a loaded vertex's colour, texture
 // coordinates (already scaled) or position on screen (x and y s13.2, z 16.16 in the viewport's range,
 // kept by moving it in clip space at its own w).
+// G_MW_MATRIX: a word into the combined matrix as the microcode keeps it (16 s15.16 elements, their
+// integer halves then their fractions): two elements' integer or fraction halves.
+static void insertMatrix(struct Hle* h, int where, uint32_t value) {
+	if ((where & 3) || where > 0x3C) {
+		return;
+	}
+	int const e = (where & 0x1F) >> 1;
+	for (int k = 0; k < 2; ++k) {
+		uint32_t const half = k ? value & 0xFFFF : value >> 16;
+		int32_t fixed = (int32_t) lrintf(h->mvp[e + k] * 65536.0f);
+		fixed = where < 0x20 ? (int32_t) (half << 16 | (fixed & 0xFFFF)) : (int32_t) (((uint32_t) fixed & 0xFFFF0000u) | half);
+		h->mvp[e + k] = fixed / 65536.0f;
+	}
+}
+
 static void modifyVertex(struct Hle* h, int index, int where, uint32_t value) {
 	if (index >= VERTICES) {
 		return;
@@ -1421,7 +1436,9 @@ static void runList(struct N64* n, struct Hle* h, uint32_t pc) {
 			}
 			case 0xDB: {
 				int index = (w0 >> 16) & 0xFF, offset = w0 & 0xFFFF;
-				if (index == 2) {
+				if (index == 0) {
+					insertMatrix(h, offset, w1);
+				} else if (index == 2) {
 					int const l = (int) (w1 / (h->cbfd ? 48 : 24));
 					h->lights = l > LIGHTS ? LIGHTS : l;
 				} else if (index == 0x10 && h->cbfd) {
@@ -1685,7 +1702,9 @@ static void runList(struct N64* n, struct Hle* h, uint32_t pc) {
 				break;
 			case 0xBC: {
 				int index = w0 & 0xFF, offset = (w0 >> 8) & 0xFFFF;
-				if (index == 2) {
+				if (index == 0) {
+					insertMatrix(h, offset, w1);
+				} else if (index == 2) {
 					int l = (int) (((w1 - 0x80000000u) >> 5) - 1);
 					h->lights = l < 0 ? 0 : l > LIGHTS ? LIGHTS : l;
 				} else if (index == 6) {
