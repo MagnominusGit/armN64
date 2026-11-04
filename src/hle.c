@@ -73,8 +73,9 @@ struct Hle {
 	// angle to the normal picks each vertex's alpha from a table at the G_DMA_IO address (in place of
 	// generated texture coordinates).
 	bool flx;
-	// Wave Race 64's Fast3D (known by its code, as GLideN64 knows it): vertex indices times 5 (G_CULLDL's
-	// offsets times 20), G_VTX's count in its length (n times 0x210, less one), and F3DEX's G_QUAD.
+	// The early Fast3D of Wave Race 64 and Shadows of the Empire (known by their code; GLideN64's
+	// F3DBETA): vertex indices times 5 (G_CULLDL's offsets times 20), G_VTX's count in its length (n times
+	// 0x210, less one), F3DEX's G_QUAD, a G_TRI2 at 0xB1 and G_RDPHALF_1 at 0xB3.
 	bool wrus;
 	// Conker's F3DEXBG (as GLideN64 has it): normals in their own buffer (two bytes a vertex, the third
 	// the low byte of the vertex's flag), vertex colours scaled by the light, 48-byte lights with a
@@ -1610,9 +1611,10 @@ static void runList(struct N64* n, struct Hle* h, uint32_t pc) {
 				}
 				break;
 			case 0xB1:
-				if (f3dex) {
-					drawTriangle(n, h, ((w0 >> 16) & 0xFF) / 2, ((w0 >> 8) & 0xFF) / 2, (w0 & 0xFF) / 2);
-					drawTriangle(n, h, ((w1 >> 16) & 0xFF) / 2, ((w1 >> 8) & 0xFF) / 2, (w1 & 0xFF) / 2);
+				if (f3dex || h->wrus) {
+					int const k = f3dex ? 2 : 5;
+					drawTriangle(n, h, ((w0 >> 16) & 0xFF) / k, ((w0 >> 8) & 0xFF) / k, (w0 & 0xFF) / k);
+					drawTriangle(n, h, ((w1 >> 16) & 0xFF) / k, ((w1 >> 8) & 0xFF) / k, (w1 & 0xFF) / k);
 				} else if (h->family == FAMILY_F3DPD) {
 					// TRIX: each triangle's first two vertices from w1's nibbles, its third from w0's.
 					for (uint32_t a1 = w1, a0 = w0; a1; a1 >>= 8, a0 >>= 4) {
@@ -1632,7 +1634,14 @@ static void runList(struct N64* n, struct Hle* h, uint32_t pc) {
 				}
 				break;
 			case 0xB4:
-				h->half1 = w1;
+				if (!h->wrus) {
+					h->half1 = w1;
+				}
+				break;
+			case 0xB3:
+				if (h->wrus) {
+					h->half1 = w1;
+				}
 				break;
 			case 0xB2:
 				// F3DEX's G_MODIFYVTX (Fast3D's 0xB2 is the third texture rectangle word).
@@ -1922,7 +1931,7 @@ bool hleGraphics(struct N64* n, bool dry) {
 	if (f == FAMILY_NONE && ucode == 0xE272C977u) {
 		f = FAMILY_F3D;
 	}
-	bool const wrus = f == FAMILY_F3D && ucode == 0xAC1B2CFEu;
+	bool const wrus = f == FAMILY_F3D && (ucode == 0xAC1B2CFEu || ucode == 0x106A093Eu);
 	bool const dkr = f == FAMILY_NONE && (ucode == 0x5277D6E7u || ucode == 0x26EDE132u);
 	if (dkr) {
 		f = FAMILY_F3D;
