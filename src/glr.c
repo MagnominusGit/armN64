@@ -201,6 +201,8 @@ struct Glr {
 	struct Gl gl;
 	struct Target target[TARGETS];
 	GLuint depth, vertexArray, vertexBuffer, vertexShader;
+	// The depth alone, to clear all of it: through a smaller color image only that much clears.
+	GLuint depthFramebuffer;
 	// Drawing a triangle into the depth image (depthTriangle).
 	bool depthImage;
 	// Targets drawn at scale times the RDP's resolution (N64_GL_SCALE); their pixels go to and from
@@ -1728,14 +1730,12 @@ void glrDraw(struct N64* n, struct RDP* r, const uint64_t* w, int op) {
 		if (r->cycleType == 3 && r->colorAddr == r->zAddr) {
 			// The depth image cleared (the GPU's depth, shared by the color images).
 			flushBatch(n, g);
-			if (g->stateSet) {
-				struct Gl* gl = &g->gl;
-				useFramebuffer(g, g->state.target->framebuffer);
-				useScissor(g, false, 0, 0, 0, 0);
-				useDepthMask(g, true);
-				gl->ClearDepthf(1.0f);
-				gl->Clear(GL_DEPTH_BUFFER_BIT);
-			}
+			struct Gl* gl = &g->gl;
+			useFramebuffer(g, g->depthFramebuffer);
+			useScissor(g, false, 0, 0, 0, 0);
+			useDepthMask(g, true);
+			gl->ClearDepthf(1.0f);
+			gl->Clear(GL_DEPTH_BUFFER_BIT);
 			// And in RDRAM, for the triangles the RDP draws.
 			rdpDrawSoftware(n, r, w, op);
 			return;
@@ -1964,6 +1964,9 @@ struct Glr* glrCreate(struct N64* n) {
 	}
 	n->glrScale = g->scale;
 	gl->RenderbufferStorage(GL_RENDERBUFFER, GL_DEPTH24_STENCIL8, 1024 * g->scale, TARGET_ROWS * g->scale);
+	gl->GenFramebuffers(1, &g->depthFramebuffer);
+	useFramebuffer(g, g->depthFramebuffer);
+	gl->FramebufferRenderbuffer(GL_FRAMEBUFFER, GL_DEPTH_STENCIL_ATTACHMENT, GL_RENDERBUFFER, g->depth);
 	if (g->scale > 1) {
 		gl->GenTextures(1, &g->native);
 		uploadTexture(g, g->native);
