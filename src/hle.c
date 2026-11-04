@@ -1127,6 +1127,35 @@ static void objLoad(struct N64* n, struct Hle* h, uint32_t a) {
 // An S2DEX object (uObjSprite at a) drawn from TMEM with a texture rectangle: at its place and scale,
 // or through the 2D matrix (sub: its offset and base scales; full: also A and D, when it doesn't
 // rotate). False for a rotated one.
+// An S2DEX object the 2D matrix rotates or mirrors: its corners through the matrix, drawn as two
+// textured triangles (as GLideN64 does). Copy mode draws only rectangles: false.
+static bool objRotated(struct N64* n, struct Hle* h, float objX, float objY, int width, int height, float dsdx, float dtdy, int stride, int tmem,
+                       int format, int size, int pal, int flags) {
+	if (((h->modeH >> 20) & 3) == 2) {
+		return false;
+	}
+	bool const clamp = !(h->objMode & 0x01), flipS = flags & 0x01, flipT = flags & 0x10;
+	emit(n, h, (uint64_t) 0x35 << 56 | (uint64_t) format << 53 | (uint64_t) size << 51 | (uint64_t) stride << 41 | (uint64_t) tmem << 32 |
+	           (uint64_t) pal << 20 | (uint64_t) clamp << 19 | (uint64_t) clamp << 9);
+	emit(n, h, (uint64_t) 0x32 << 56 | (uint64_t) ((width - 1) << 2) << 12 | (uint64_t) ((height - 1) << 2));
+	float const lx[2] = { objX, objX + width / dsdx }, ly[2] = { objY, objY + height / dtdy };
+	struct ScreenVertex v[4];
+	for (int i = 0; i < 4; ++i) {
+		float const px = lx[i & 1], py = ly[i >> 1];
+		v[i] = (struct ScreenVertex) { h->objA * px + h->objB * py + h->objX, h->objC * px + h->objD * py + h->objY, 0, 1, 1, 1, 1, 1,
+		                               (float) ((i & 1) != flipS ? width : 0), (float) ((i >> 1) != flipT ? height : 0) };
+	}
+	uint32_t const geometry = h->geometry;
+	bool const texOn = h->texOn;
+	int const texTile = h->texTile, texLevel = h->texLevel;
+	h->geometry &= ~(uint32_t) (GEOM_SHADE | GEOM_ZBUFFER);
+	h->texOn = true, h->texTile = 0, h->texLevel = 0;
+	triangle(n, h, &v[0], &v[1], &v[2], NULL);
+	triangle(n, h, &v[1], &v[3], &v[2], NULL);
+	h->geometry = geometry, h->texOn = texOn, h->texTile = texTile, h->texLevel = texLevel;
+	return true;
+}
+
 static bool objDraw(struct N64* n, struct Hle* h, uint32_t a, int matrix) {
 	a = address(h, a);
 	float const objX = rd16(n, a) / 4.0f, objY = rd16(n, a + 8) / 4.0f;
@@ -1144,7 +1173,7 @@ static bool objDraw(struct N64* n, struct Hle* h, uint32_t a, int matrix) {
 		dsdx *= h->objBaseX / 1024.0f, dtdy *= h->objBaseY / 1024.0f;
 	} else if (matrix == 2) {
 		if (h->objB != 0 || h->objC != 0 || h->objA <= 0 || h->objD <= 0) {
-			return false;
+			return objRotated(n, h, objX, objY, width, height, dsdx, dtdy, stride, tmem, format, size, pal, flags);
 		}
 		x = objX * h->objA + h->objX, y = objY * h->objD + h->objY;
 		dsdx /= h->objA, dtdy /= h->objD;
