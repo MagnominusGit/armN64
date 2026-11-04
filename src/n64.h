@@ -757,9 +757,9 @@ static inline uint8_t cpuLoadMark(uint32_t op) {
 	return cpuFpuOp(op) ? (uint8_t) (0x80 | ((op >> 6) & 31)) : 0;
 }
 
-// The marks after which op waits a cycle (nemu64-test): a load's register in its rt (the
-// coprocessors' and FPU memory operations' rs only) or rs (FPU memory operations' rt never), any load
-// before MTC0 and DMTC0; a COP1 operation's result in another's fs or ft field, used or not.
+// The marks after which op waits a cycle (nemu64-test): a load's register in its rt or rs field,
+// used or not (COP1's and COP2's rs never, the FPU memory operations' rt never); a COP1 operation's
+// result in another's fs or ft field, used or not.
 static inline int cpuStallMarks(uint32_t op, uint8_t* marks) {
 	uint32_t const code = op >> 26, rs = (op >> 21) & 31, rt = (op >> 16) & 31;
 	int count = 0;
@@ -771,7 +771,7 @@ static inline int cpuStallMarks(uint32_t op, uint8_t* marks) {
 		}
 		return count;
 	}
-	bool const cop = code >= 0x10 && code <= 0x12, fpuMemory = code == 0x31 || code == 0x35 || code == 0x39 || code == 0x3D;
+	bool const cop = code == 0x11 || code == 0x12, fpuMemory = code == 0x31 || code == 0x35 || code == 0x39 || code == 0x3D;
 	if (rt && !fpuMemory) {
 		marks[count++] = (uint8_t) (0x40 | rt);
 	}
@@ -781,24 +781,9 @@ static inline int cpuStallMarks(uint32_t op, uint8_t* marks) {
 	return count;
 }
 
-// An MTC0 or DMTC0 to Random, EntryLo0, EntryLo1, 7 or EntryHi, which takes a cycle more.
-static inline bool cpuSlowMtc0(uint32_t op) {
-	uint32_t const rd = (op >> 11) & 31;
-	return op >> 26 == 0x10 && ((op >> 21 & 31) == 0x04 || (op >> 21 & 31) == 0x05) && (rd == 1 || rd == 2 || rd == 3 || rd == 7 || rd == 10);
-}
-
-// Whether op, an MTC0 or DMTC0 but the slow ones, waits for any load (the slow ones' own cycle
-// covers that, so they wait only for their rt).
-static inline bool cpuAfterAnyLoad(uint32_t op) {
-	return op >> 26 == 0x10 && ((op >> 21 & 31) == 0x04 || (op >> 21 & 31) == 0x05) && !cpuSlowMtc0(op);
-}
-
 static inline bool cpuLoadStall(uint32_t op, uint8_t mark) {
 	if (!mark) {
 		return false;
-	}
-	if (cpuAfterAnyLoad(op)) {
-		return mark & 0x40;
 	}
 	uint8_t marks[2];
 	int const count = cpuStallMarks(op, marks);

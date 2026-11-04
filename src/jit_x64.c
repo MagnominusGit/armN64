@@ -604,13 +604,6 @@ static void chain(struct Jit* j);
 // at the end of the block goes on to the next.
 // A block's first instruction: the load cycle from the mark the CPU comes in with (cpuLoadStall).
 static void loadStallCheck(struct Emitter* e, uint32_t op) {
-	if (cpuAfterAnyLoad(op)) {
-		xTestI(e, 1, CPU_AT(loadMark), 0x40);
-		uint8_t* none = xJcc(e, CC_E, NULL);
-		xAluI(e, X_ADD, 8, R(R13), 1);
-		patchHere(e, none);
-		return;
-	}
 	uint8_t marks[2];
 	int const count = cpuStallMarks(op, marks);
 	if (!count) {

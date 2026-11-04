@@ -752,7 +752,7 @@ static void cop0Execute(struct N64* n, uint32_t op) {
 	// cycle longer (nemu64-test).
 	case 0x04:
 	case 0x05:
-		c->stall += cpuSlowMtc0(op);
+		c->stall += RD == 1 || RD == 2 || RD == 3 || RD == 7 || RD == 10;
 		cop0Write(n, RD, c->gpr[RT]);
 		if (RD == CP0_STATUS || RD == CP0_CAUSE) {
 			c->intHold = interruptPending(n);

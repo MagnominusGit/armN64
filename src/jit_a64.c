@@ -994,19 +994,12 @@ static void chain(struct Jit* j);
 // at the end of the block goes on to the next.
 // A block's first instruction: the load cycle from the mark the CPU comes in with (cpuLoadStall).
 static void loadStallCheck(struct Emitter* e, uint32_t op) {
-	aLdrb(e, IP, CPU, CPU_OFF(loadMark));
-	if (cpuAfterAnyLoad(op)) {
-		aLogicImm(e, A_ANDS_IMM, ZR, IP, 0x40);
-		uint8_t* none = aBcond(e, C_EQ, NULL);
-		aDpImm(e, A_SUB_IMM | W64, LEFT, LEFT, 1);
-		patchHere(e, none);
-		return;
-	}
 	uint8_t marks[2];
 	int const count = cpuStallMarks(op, marks);
 	if (!count) {
 		return;
 	}
+	aLdrb(e, IP, CPU, CPU_OFF(loadMark));
 	uint8_t* stall[2];
 	for (int i = 0; i < count; ++i) {
 		aDpImm(e, A_SUBS_IMM, ZR, IP, marks[i]);
