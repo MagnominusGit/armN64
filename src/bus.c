@@ -364,8 +364,10 @@ static void siDma(struct N64* n, bool toPif) {
 		rcp = pifDmaCycles(n, false);
 		n->pifChallenged = false;
 		pifRead(n);
-		n64RdramWrite(n, dram, 64);
-		memcpy(&n->rdram[dram], n->pifRam, 64);
+		// The data reaches RDRAM as the transfer ends (n64.c): libultra invalidates the buffer's cache
+		// lines just after starting the read, and a partial line written back then is overwritten
+		// (Madden Football 64's buffer starts mid-line).
+		n->si.status |= SI_TO_RDRAM;
 	}
 	// The PIF takes a while to run the commands; the interrupt comes when the transfer is done. Like
 	// the PI it overclocks with the RCP: Tetris 64 starts the next DMA after so much CPU work, and the
@@ -556,7 +558,7 @@ uint32_t busRead32(struct N64* n, uint32_t addr) {
 		case 0x00:
 			return n->si.dramAddr;
 		case 0x18:
-			return n->si.status | (n->cycles < n->si.ioUntil ? 2 : 0);
+			return (n->si.status & ~SI_TO_RDRAM) | (n->cycles < n->si.ioUntil ? 2 : 0);
 		}
 		return 0;
 	}

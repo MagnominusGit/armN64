@@ -336,7 +336,12 @@ void n64RunField(struct N64* n) {
 		}
 		if (n->si.busyUntil && n->cycles >= n->si.busyUntil) {
 			n->si.busyUntil = 0;
-			n->si.status = (n->si.status & ~1u) | 0x1000;
+			if (n->si.status & SI_TO_RDRAM) {
+				uint32_t dram = n->si.dramAddr & (RDRAM_SIZE - 1) & ~3u;
+				n64RdramWrite(n, dram, 64);
+				memcpy(&n->rdram[dram], n->pifRam, 64);
+			}
+			n->si.status = (n->si.status & ~(1u | SI_TO_RDRAM)) | 0x1000;
 			n64Interrupt(n, MI_SI, true);
 		}
 		if (n->pi.busyUntil && n->cycles >= n->pi.busyUntil) {

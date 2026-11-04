@@ -171,6 +171,9 @@ struct PI {
 	uint64_t romLatchUntil;
 };
 
+// SI status bit 31, not the hardware's: a read's data still on its way to RDRAM.
+enum { SI_TO_RDRAM = 0x80000000u };
+
 struct SI {
 	uint32_t dramAddr, status;
 	uint64_t busyUntil;
