@@ -1049,7 +1049,8 @@ static void bgDraw(struct N64* n, struct Hle* h, uint32_t a, bool scaled) {
 	int const loadSize = size ? size : 1, loadStride = size ? width : width / 2;
 	int const loadS0 = size ? s0 : s0 / 2, loadS1 = size ? s0 + texCols - 1 : (s0 + texCols - 1) / 2;
 	uint32_t const line = (uint32_t) ((loadS1 - loadS0 + 1) * (size == 3 ? 2 : 1 << (loadSize - 1)) + 7) / 8;
-	int const band = (int) ((format == 2 || size == 3 ? 256u : 512u) / line);
+	// A scaled band loads a row more for the filter, which has to fit too (or a palette is overwritten).
+	int const band = (int) ((format == 2 || size == 3 ? 256u : 512u) / line) - (scaled ? 1 : 0);
 	if (band < 1) {
 		return;
 	}
