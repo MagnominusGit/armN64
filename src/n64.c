@@ -168,8 +168,9 @@ static void start(struct N64* n) {
 	n->ocNum = n->ocDen = 1;
 	n->ocAt = n->ocHwAt = 0;
 	n->countCycles = 2;
-	n->fieldCycles = hwCycles(n, CPU_HZ / (n->cpu.gpr[20] == 0 ? 50 : 60));
-	n->vi.reg[6] = n->cpu.gpr[20] == 0 ? 0x271 : 0x20D;
+	n->tvType = (uint32_t) n->cpu.gpr[20];
+	n->fieldCycles = hwCycles(n, CPU_HZ / (n->tvType == 0 ? 50 : 60));
+	n->vi.reg[6] = n->tvType == 0 ? 0x271 : 0x20D;
 	n->nextVi = n->fieldCycles;
 	n->eventAt = 0;
 	const char* slice = setting(n, "N64_SLICE");

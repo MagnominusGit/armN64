@@ -166,9 +166,10 @@ static void spWriteStatus(struct N64* n, uint32_t v) {
 	}
 }
 
-// The VI clock the AI counts: a PAL console's is 49.65653 MHz, an NTSC one's 48.681812 MHz.
+// The VI clock the AI counts: a PAL console's is 49.65653 MHz, an MPAL one's 48.628316 MHz, an NTSC
+// one's 48.681812 MHz.
 static uint64_t viClock(struct N64* n) {
-	return n->fieldCycles == hwCycles(n, CPU_HZ / 50) ? 49656530ull : 48681812ull;
+	return n->tvType == 0 ? 49656530ull : n->tvType == 2 ? 48628316ull : 48681812ull;
 }
 
 // Playing time of a buffer: four bytes per stereo sample at the VI clock over (dacrate + 1).

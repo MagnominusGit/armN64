@@ -430,8 +430,10 @@ struct N64 {
 	// Threads that make bands of the VI's picture on the CPU (n64.c), as many as the renderers.
 	struct ViPool* viPool;
 	int lastWidth, lastHeight;
-	// CPU cycles per video field: 60 fields a second for NTSC and MPAL, 50 for PAL.
+	// CPU cycles per video field: 60 fields a second for NTSC and MPAL, 50 for PAL; the TV type the PIF
+	// gave the game (0 PAL, 1 NTSC, 2 MPAL).
 	uint64_t fieldCycles;
+	uint32_t tvType;
 	// Overclocking (N64_OVERCLOCK): the CPU and the RCP (RSP, RDP, PI, SI) run ocNum / ocDen times
 	// the hardware's clock, so the VI, AI, 64DD and Count, which keep real time, take that many more
 	// cycles; countCycles cycles a Count tick (2 at the hardware's clock). The boot runs at the
