@@ -1074,12 +1074,24 @@ static void bgDraw(struct N64* n, struct Hle* h, uint32_t a, bool scaled) {
 		emit(n, h, (uint64_t) 0x35 << 56 | (uint64_t) format << 53 | (uint64_t) size << 51 | (uint64_t) line << 41 | (uint64_t) pal << 20 | 2 << 18 | 2 << 8);
 		emit(n, h, (uint64_t) 0x32 << 56 | (uint64_t) ((texCols - 1) << 2) << 12 | (uint64_t) ((rowsLoaded - 1) << 2));
 		int const first = size ? 0 : s0 & 1;
-		int const xh = frameX, xl = frameX + (cols << 2) - (copy ? 4 : 0);
-		int const yh = frameY + (y << 2), yl = frameY + ((y + screen) << 2) - (copy ? 4 : 0);
-		int const s = (flipS ? first + texCols - 1 : first) << 5, tt = (int) ((tWrapped & 1023) >> 5);
-		int const ds = flipS ? -dsdx : dsdx;
+		int xh = frameX, yh = frameY + (y << 2);
+		int const xl = frameX + (cols << 2) - (copy ? 4 : 0), yl = frameY + ((y + screen) << 2) - (copy ? 4 : 0);
+		int s = (flipS ? first + texCols - 1 : first) << 5, tt = (int) ((tWrapped & 1023) >> 5);
+		int const ds = flipS ? -dsdx : dsdx, dt = copy ? 1 << 10 : scaleH;
+		// A frame starting left of or above the screen: the rectangle from the edge, its texture as far on.
+		if (xh < 0) {
+			s += -xh * ds / 128, xh = 0;
+		}
+		if (yh < 0) {
+			tt += -yh * dt / 128, yh = 0;
+		}
+		if (xl <= xh || yl < yh) {
+			y += screen;
+			t += (int64_t) screen * (copy ? 1024 : scaleH);
+			continue;
+		}
 		emit(n, h, (uint64_t) 0x24 << 56 | (uint64_t) (xl & 0xFFF) << 44 | (uint64_t) (yl & 0xFFF) << 32 | (uint64_t) (xh & 0xFFF) << 12 | (uint64_t) (yh & 0xFFF));
-		emit(n, h, (uint64_t) (s & 0xFFFF) << 48 | (uint64_t) (tt & 0xFFFF) << 32 | (uint64_t) (ds & 0xFFFF) << 16 | (uint64_t) ((copy ? 1 << 10 : scaleH) & 0xFFFF));
+		emit(n, h, (uint64_t) (s & 0xFFFF) << 48 | (uint64_t) (tt & 0xFFFF) << 32 | (uint64_t) (ds & 0xFFFF) << 16 | (uint64_t) (dt & 0xFFFF));
 		y += screen;
 		t += (int64_t) screen * (copy ? 1024 : scaleH);
 	}
