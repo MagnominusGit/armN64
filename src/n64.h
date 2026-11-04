@@ -71,6 +71,9 @@ struct CPU {
 	uint32_t stall;
 	// Count when the timer was last checked, so a Compare value passed during a stall still fires.
 	uint32_t lastCount;
+	// The D-cache line filled last (DCACHE_FILLING in its tag until an access waits for the rest of it)
+	// and the cycle it is all in, in the low bits of the cycle count.
+	uint32_t fillLine, fillReady;
 	// The row each RDRAM bank has open, and when the CPU's posted uncached writes are done.
 	uint32_t openRow[8];
 	uint64_t writesDone;
@@ -207,6 +210,7 @@ struct RspBlock;
 // Virtual 4 KB pages (vpages), and how many filled pages are listed for emptying them again.
 enum { VPAGES = 1 << 20, VPAGE_FILLED = 1024 };
 #define DCACHE_NONE 0xFFFFFFFFu
+#define DCACHE_FILLING 0x80000000u
 
 // Compiled code for a virtual address, good while blockGen is unchanged.
 enum { JIT_TABLE_SIZE = 1 << 14 };
@@ -523,7 +527,7 @@ uint32_t cpuCount(struct N64*);
 bool cpuPeekAddress(struct N64*, uint64_t vaddr, uint32_t* paddr);
 // Kernel mode, the only mode compiled code runs in.
 bool cpuPlainMode(const struct N64*);
-uint32_t cpuDcacheMiss(struct N64*, uint32_t vaddr, uint32_t paddr);
+uint32_t cpuDcacheMiss(struct N64*, uint32_t vaddr, uint32_t paddr, uint64_t now, bool store);
 void cpuRdpWaitRead(struct N64*, uint32_t paddr, uint32_t len);
 void cpuRdpWaitWrite(struct N64*, uint32_t paddr, uint32_t len);
 uint32_t cpuIcacheMiss(struct N64*, uint32_t vaddr, uint32_t paddr);

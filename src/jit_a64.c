@@ -1930,6 +1930,8 @@ void* jitCompile(struct N64* n, const uint32_t* ops, uint32_t count, uint32_t va
 		aMov(e, 1, 0);
 		aMov(e, 2, 6);
 		aMovX(e, 0, N);
+		aDp(e, A_SUB | W64, 3, LIMIT, LEFT, S_LSL, 0);
+		aMovImm(e, 4, (m->slow->op >> 26) >= 0x28);
 		aMovImm64(e, IP, (uint64_t) (uintptr_t) cpuDcacheMiss);
 		aBlr(e, IP);
 		aMov(e, 4, 0);

@@ -104,15 +104,29 @@ static void icacheFill(struct N64* n, uint32_t i, uint32_t paddr) {
 	}
 }
 
-// The D-cache line a cached access uses, written back if dirty and filled when it misses.
-static uint32_t dcacheLine(struct N64* n, uint64_t vaddr, uint32_t paddr) {
+// The D-cache line a cached access at cycle now uses, written back if dirty and filled when it
+// misses. A line comes in critical word first: the rest of it is in 4 cycles after the access that
+// missed (3 after a store), and an access to the line before then waits for it (n64-systembench).
+static uint32_t dcacheLine(struct N64* n, uint64_t vaddr, uint32_t paddr, uint64_t now, bool store) {
 	struct CPU* c = &n->cpu;
 	uint32_t i = ((uint32_t) vaddr >> 4) & 511;
-	if (c->dcacheTag[i] != (paddr & ~0xFu)) {
-		if (c->dcacheTag[i] != DCACHE_NONE && c->dcacheDirty[i]) {
+	uint32_t const tag = c->dcacheTag[i];
+	if (tag == ((paddr & ~0xFu) | DCACHE_FILLING)) {
+		c->dcacheTag[i] = tag & ~DCACHE_FILLING;
+		uint32_t const wait = c->fillReady - (uint32_t) now;
+		c->stall += wait <= 4 ? wait : 0;
+	} else if (tag != (paddr & ~0xFu)) {
+		uint32_t const before = c->stall;
+		if (tag != DCACHE_NONE && c->dcacheDirty[i]) {
 			dcacheWriteBack(n, i);
 		}
 		dcacheFill(n, i, paddr);
+		if (c->dcacheTag[c->fillLine] != DCACHE_NONE) {
+			c->dcacheTag[c->fillLine] &= ~DCACHE_FILLING;
+		}
+		c->dcacheTag[i] |= DCACHE_FILLING;
+		c->fillLine = i;
+		c->fillReady = (uint32_t) now + 1 + (c->stall - before) + (store ? 3 : 4);
 	}
 	return i;
 }
@@ -135,13 +149,13 @@ void cpuRdpWaitWrite(struct N64* n, uint32_t paddr, uint32_t len) {
 // For compiled code: a D-cache miss as dcacheLine has it; the cycles it costs. UINT32_MAX, with
 // nothing done, when writing the old line back could throw compiled code away (or reach the RCP): the
 // interpreter then runs the access.
-uint32_t cpuDcacheMiss(struct N64* n, uint32_t vaddr, uint32_t paddr) {
+uint32_t cpuDcacheMiss(struct N64* n, uint32_t vaddr, uint32_t paddr, uint64_t now, bool store) {
 	struct CPU* c = &n->cpu;
 	uint32_t const i = (vaddr >> 4) & 511, back = dcacheAddress(c, i);
 	if (!n->compat && c->dcacheTag[i] != DCACHE_NONE && c->dcacheDirty[i] && (back >= RDRAM_SIZE || (n->pageFlags[back >> 12] & PAGE_CODE))) {
 		return UINT32_MAX;
 	}
-	dcacheLine(n, vaddr, paddr);
+	dcacheLine(n, vaddr, paddr, now, store);
 	uint32_t stall = n->cpu.stall;
 	n->cpu.stall = 0;
 	return stall;
@@ -229,6 +243,9 @@ static void cacheOp(struct N64* n, uint32_t op, uint64_t vaddr) {
 		return;
 	}
 	uint32_t const di = ((uint32_t) vaddr >> 4) & 511, ii = ((uint32_t) vaddr >> 5) & 511;
+	if (c->dcacheTag[di] != DCACHE_NONE) {
+		c->dcacheTag[di] &= ~DCACHE_FILLING;
+	}
 	bool const dvalid = c->dcacheTag[di] != DCACHE_NONE, dhit = c->dcacheTag[di] == (p & ~0xFu);
 	bool const ihit = c->icacheTag[ii] == (p & ~31u);
 	switch ((op >> 16) & 31) {
@@ -867,7 +884,7 @@ static bool loadAt(struct N64* n, uint64_t vaddr, int size, uint64_t* out, uint3
 	if (p >= RDRAM_SIZE || !c->cachedAccess) {
 		readTiming(n, p, size);
 	} else if (!n->fast) {
-		uint32_t i = dcacheLine(n, vaddr, p);
+		uint32_t i = dcacheLine(n, vaddr, p, n->cycles, false);
 		if (!n->compat) {
 			*out = bytesBE(&c->dcacheData[i][p & (16 - size)], size);
 			if (n->idle.tracing) {
@@ -914,7 +931,7 @@ static bool store(struct N64* n, uint64_t vaddr, int size, uint64_t v) {
 		idleStore(n, p, size, v);
 	}
 	if (p < RDRAM_SIZE && c->cachedAccess && !n->fast) {
-		uint32_t i = dcacheLine(n, vaddr, p);
+		uint32_t i = dcacheLine(n, vaddr, p, n->cycles, true);
 		c->dcacheDirty[i] = true;
 		if (!n->compat) {
 			putBE(&c->dcacheData[i][p & (16 - size)], size, v);

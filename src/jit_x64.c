@@ -1153,6 +1153,8 @@ void* jitCompile(struct N64* n, const uint32_t* ops, uint32_t count, uint32_t va
 		xMovRR(e, 8, RDI, RBX);
 		xMovRR(e, 4, RSI, R8);
 		xMovRR(e, 4, RDX, RAX);
+		xMovRR(e, 8, RCX, R13);
+		xMovI(e, R8, (m->slow->op >> 26) >= 0x28);
 		xMovI64(e, RAX, (uint64_t) (uintptr_t) cpuDcacheMiss);
 		xCallR(e, RAX);
 		xMovRR(e, 4, RDX, RAX);
