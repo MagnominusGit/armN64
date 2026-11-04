@@ -2244,6 +2244,10 @@ bool hleGraphics(struct N64* n, bool dry) {
 	if (f == FAMILY_NONE && ucode == 0xE272C977u) {
 		f = FAMILY_F3D;
 	}
+	// Power League 64's is F3DEX under Fast3D's name (as GLideN64 has it).
+	if (f == FAMILY_F3D && ucode == 0x7754FFF8u) {
+		f = FAMILY_F3DEX;
+	}
 	bool const wrus = f == FAMILY_F3D && (ucode == 0xAC1B2CFEu || ucode == 0x106A093Eu);
 	bool const dkr = f == FAMILY_NONE && (ucode == 0x5277D6E7u || ucode == 0x26EDE132u);
 	if (dkr) {
