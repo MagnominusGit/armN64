@@ -189,11 +189,19 @@ static struct Block* compile(struct N64* n, uint32_t vaddr, uint32_t paddr) {
 	b->code = NULL;
 	size_t before = n->jitUsed;
 	// Code the I-cache holds otherwise than memory is run by the interpreter, from the I-cache.
-	if (n->useJit && cpuCodeCoherent(n, vaddr, paddr, count) && !(b->code = jitCompile(n, b->ops, count, vaddr, paddr))) {
-		// The code arena is full: start it again, and run this instruction on its own.
-		free(b);
-		blocksFree(n);
-		return NULL;
+	if (n->useJit && cpuCodeCoherent(n, vaddr, paddr, count)) {
+		// Code too long for one block is compiled as a shorter block; when even a short one doesn't
+		// fit, the code arena is full: start it again, and run this instruction on its own.
+		while (!(b->code = jitCompile(n, b->ops, count, vaddr, paddr))) {
+			if (count <= 8) {
+				free(b);
+				blocksFree(n);
+				return NULL;
+			}
+			count /= 2;
+			count += isBranch(b->ops[count - 1]);
+		}
+		b->count = count;
 	}
 	if (b->code) {
 		perfMapAdd(b->code, n->jitUsed - before, "n64", vaddr);
