@@ -2144,7 +2144,7 @@ static int family(struct N64* n, uint32_t data, uint32_t size) {
 		return FAMILY_F3DEX2;
 	}
 	if ((!strncmp(name, "F3DEX2", 6) || !strncmp(name, "F3DZEX", 6) || !strncmp(name, "F3DLX2", 6) || !strncmp(name, "F3DLP2", 6) ||
-	     !strncmp(name, "F3DFLX", 6)) &&
+	     !strncmp(name, "F3DFLX", 6) || !strncmp(name, "F3DPEX", 6)) &&
 	    (name[6] == ' ' || name[6] == '.' || name[6] == '_')) {
 		return FAMILY_F3DEX2;
 	}
