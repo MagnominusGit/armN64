@@ -219,6 +219,11 @@ static void start(struct N64* n) {
 }
 
 bool n64LoadDisk(struct N64* n, const uint8_t* ipl, size_t iplSize, const uint8_t* disk, size_t diskSize) {
+	// An IPL given as the disk (some sets have patched IPLs as .ndd) boots with the drive empty.
+	if (disk && diskSize == 0x400000 && !memcmp(disk + 0x20, "64DD IPL", 8)) {
+		ipl = disk, iplSize = diskSize;
+		disk = NULL, diskSize = 0;
+	}
 	if (!ddLoad(n, ipl, iplSize, disk, diskSize)) {
 		return false;
 	}
