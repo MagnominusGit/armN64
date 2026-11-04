@@ -806,6 +806,8 @@ static void cop0Execute(struct N64* n, uint32_t op) {
 		}
 		c->nextPc = c->pc + 4;
 		c->llBit = false;
+		// The pipeline refilled (nemu64-test's SYSCALL and BREAK round trips).
+		c->stall += 2;
 		return;
 	// RFE, the R3000's; the other functions do nothing (nemu64-test's emulator probes).
 	case 0x10:

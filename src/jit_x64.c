@@ -207,6 +207,7 @@ static bool emitCop0(struct Jit* j, uint32_t op) {
 		xAluI(e, X_ADD, 8, R(RCX), 4);
 		xStore(e, 8, CPU_AT(nextPc), RCX);
 		xStoreI(e, 1, CPU_AT(llBit), 0);
+		j->extraCycles = 2;
 		j->jumped = true;
 		return true;
 	}

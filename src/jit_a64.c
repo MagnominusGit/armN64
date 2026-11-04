@@ -506,6 +506,7 @@ static bool emitCop0(struct Jit* j, uint32_t op) {
 		aDpImm(e, A_ADD_IMM | W64, 1, 1, 4);
 		aStrX(e, 1, CPU, CPU_OFF(nextPc));
 		aStrb(e, ZR, CPU, CPU_OFF(llBit));
+		j->extraCycles = 2;
 		j->jumped = true;
 		return true;
 	}
