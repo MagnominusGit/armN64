@@ -1046,8 +1046,10 @@ static void bgDraw(struct N64* n, struct Hle* h, uint32_t a, bool scaled) {
 	}
 	int texCols = (int) (((int64_t) cols * scaleW + 1023) >> 10) + (scaled ? 1 : 0);
 	texCols = s0 + texCols > width ? width - s0 : texCols;
-	// 4-bit texels load as 8-bit pairs; 32-bit and color-indexed ones have half of TMEM.
-	int const loadSize = size ? size : 1, loadStride = size ? width : width / 2;
+	// 4-bit texels load as 8-bit pairs; 32-bit and color-indexed ones have half of TMEM. A row of the
+	// image is its bytes rounded down to a whole 8 (the microcode's step; a 1-cycle image's width has a
+	// texel more for the filter).
+	int const loadSize = size ? size : 1, loadStride = ((((width << size) >> 1) & ~7) >> (loadSize - 1));
 	int const loadS0 = size ? s0 : s0 / 2, loadS1 = size ? s0 + texCols - 1 : (s0 + texCols - 1) / 2;
 	uint32_t const line = (uint32_t) ((loadS1 - loadS0 + 1) * (size == 3 ? 2 : 1 << (loadSize - 1)) + 7) / 8;
 	// A scaled band loads a row more for the filter, which has to fit too (or a palette is overwritten).
