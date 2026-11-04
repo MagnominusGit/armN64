@@ -165,15 +165,20 @@ static void spWriteStatus(struct N64* n, uint32_t v) {
 	}
 }
 
+// The VI clock the AI counts: a PAL console's is 49.65653 MHz, an NTSC one's 48.681812 MHz.
+static uint64_t viClock(struct N64* n) {
+	return n->fieldCycles == hwCycles(n, CPU_HZ / 50) ? 49656530ull : 48681812ull;
+}
+
 // Playing time of a buffer: four bytes per stereo sample at the VI clock over (dacrate + 1).
 static uint64_t aiDuration(struct N64* n, uint32_t len) {
-	uint64_t rate = 48681812ull / (n->ai.dacrate + 1);
+	uint64_t rate = viClock(n) / (n->ai.dacrate + 1);
 	return rate ? hwCycles(n, (uint64_t) (len / 4) * CPU_HZ / rate) : 0;
 }
 
 // A buffer the game queued, kept for a frontend as it is now in RDRAM.
 static void aiKeep(struct N64* n, uint32_t addr, uint32_t len) {
-	n->audioRate = (uint32_t) (48681812ull / (n->ai.dacrate + 1));
+	n->audioRate = (uint32_t) (viClock(n) / (n->ai.dacrate + 1));
 	for (uint32_t i = 0; i < len && n->audioCount < n->audioCapacity; i += 2) {
 		n->audio[n->audioCount++] = (int16_t) (n->rdram[(addr + i) & (RDRAM_SIZE - 1)] << 8 | n->rdram[(addr + i + 1) & (RDRAM_SIZE - 1)]);
 	}
