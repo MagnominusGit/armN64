@@ -69,6 +69,8 @@ struct Exit {
 	bool jumped;
 	// The load mark the CPU leaves with.
 	uint8_t mark;
+	// A likely branch not taken: its load cycle (cpuLoadStall), or -1 to check the CPU's mark.
+	int8_t stall;
 };
 
 // A load or store that left its inline path: for the helper, or for a D-cache line fill.
@@ -102,6 +104,8 @@ struct Jit {
 	// leaves an interrupt due).
 	struct Slow* slow;
 	int extraCycles;
+	// The load cycle of the branch being compiled, for its exit when a likely one isn't taken.
+	int8_t branchStall;
 	// The load mark of the instruction being compiled (cpuLoadMark).
 	uint8_t mark;
 	bool interruptCheck;
@@ -127,7 +131,7 @@ struct Jit {
 };
 
 static void exitAt(struct Jit* j, uint8_t* site, uint64_t pc, enum Kind kind, bool delay, bool skip) {
-	j->exits[j->exitCount++] = (struct Exit) { site, pc, kind, delay, skip, false, false, j->mark };
+	j->exits[j->exitCount++] = (struct Exit) { site, pc, kind, delay, skip, false, false, j->mark, skip ? j->branchStall : 0 };
 }
 
 // Sets the flags for a branch condition and returns the condition code under which it is taken.
@@ -1039,6 +1043,7 @@ void* jitCompile(struct N64* n, const uint32_t* ops, uint32_t count, uint32_t va
 		struct Slow* slow = &j->slows[j->slowCount];
 		int const prevMark = k ? cpuLoadMark(ops[k - 1]) : -1;
 		j->mark = cpuLoadMark(op);
+		j->branchStall = prevMark >= 0 ? (int8_t) cpuLoadStall(op, (uint8_t) prevMark) : -1;
 		*slow = (struct Slow) { .op = op, .paddr = p, .pc = pc, .delay = delay, .lineStart = lineStart, .last = last, .prevMark = prevMark };
 		j->slow = slow;
 		j->extraCycles = 0;
@@ -1182,6 +1187,11 @@ void* jitCompile(struct N64* n, const uint32_t* ops, uint32_t count, uint32_t va
 	for (int i = 0; i < j->exitCount; ++i) {
 		struct Exit* x = &j->exits[i];
 		patchHere(e, x->site);
+		if (x->stall < 0) {
+			loadStallCheck(e, ops[((uint32_t) x->pc - vaddr) >> 2]);
+		} else if (x->stall) {
+			xAluI(e, X_ADD, 8, R(R13), x->stall);
+		}
 		xStoreI(e, 1, CPU_AT(loadMark), x->mark);
 		storeConst(e, CPU_AT(curPc), x->pc);
 		xStoreI(e, 1, CPU_AT(inDelay), x->delay);
