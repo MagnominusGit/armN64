@@ -376,12 +376,14 @@ uint32_t pifDmaCycles(struct N64* n, bool write) {
 	return cycles;
 }
 
-// A block written to PIF RAM: the CIC challenge, or Joybus commands to run.
+// A block written to PIF RAM: the CIC challenge, or Joybus commands to run. Without the run bit the
+// PIF keeps its commands and runs them as they now are when the RAM is read back: libultra sends a
+// Controller Pak's next read or write that way, with only the address changed.
 void pifRun(struct N64* n) {
 	uint8_t* ram = n->pifRam;
-	n->pifJoybus = false;
 	n->pifChallenged = ram[63] == 2;
 	if (ram[63] == 2) {
+		n->pifJoybus = false;
 		cicChallenge(ram);
 		return;
 	}
