@@ -1700,6 +1700,12 @@ void glrDraw(struct N64* n, struct RDP* r, const uint64_t* w, int op) {
 	g->seq = r->seq;
 	uint64_t c = w[0];
 	const struct GlrCorners* q = op >= 0x08 && op <= 0x0F ? queued(g, w) : NULL;
+	// A triangle in fill mode: the RDP's own pixels, in the fill colour.
+	if (op >= 0x08 && op <= 0x0F && r->cycleType == 3) {
+		glrSync(n);
+		rdpDrawSoftware(n, r, w, op);
+		return;
+	}
 	if (op >= 0x08 && op <= 0x0F && r->zAddr && r->colorAddr == r->zAddr && r->colorSize == 2) {
 		struct GlrCorners raw[4];
 		depthTriangle(n, g, r, w, op, q ? q : raw, q ? 1 : rawCorners(r, w, op, raw));

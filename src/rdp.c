@@ -1447,6 +1447,11 @@ static void triangle(struct N64* n, struct RDP* r, const uint64_t* w, int op) {
 		if (!ownsRow(r, y) || !span(r, &e, y, &sp)) {
 			continue;
 		}
+		// In fill mode a row takes the fill colour, as a fill rectangle's does (Lemon's FillTriangle).
+		if (r->cycleType == 3) {
+			fillRect(n, r, sp.x0, y, sp.x1, y);
+			continue;
+		}
 		int32_t row[8];
 		int baseX;
 		rowAttributes(&e, &a, y, r->cycleType == 2, row, &baseX);
@@ -3174,7 +3179,8 @@ static void gpuCommand(struct N64* n, struct RDP* r, const uint64_t* w, int op) 
 	// on the next row (Puyo Puyo, Tarzan, Virtual Pool's copies to x = width).
 	bool wraps = right > r->colorWidth;
 	bool wrapOnce = wraps && (op == 0x24 || op == 0x25 || op == 0x36) && right <= 2 * r->colorWidth && y1 + 1 < GPU_TILES * 16;
-	bool alone = (wraps && !wrapOnce) || overlap || (shades && readsLastPixel(r));
+	// The CPU draws a triangle in fill mode.
+	bool alone = (wraps && !wrapOnce) || overlap || (shades && readsLastPixel(r)) || (op <= 0x0F && r->cycleType == 3);
 	if (alone || y1 >= GPU_TILES * 16) {
 		gpuSync(n, r);
 		// execute counts the primitive itself (its noise from the same number as on the CPU).
