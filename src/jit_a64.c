@@ -128,6 +128,8 @@ struct Slow {
 	struct Cache cache;
 	// The load mark before it (cpuLoadMark), or -1 when it's the block's first.
 	int prevMark;
+	// Whether the next instruction in the block counts a load cycle after it.
+	bool nextStall;
 };
 
 struct Miss {
@@ -1014,7 +1016,7 @@ static void loadStallCheck(struct Emitter* e, uint32_t op) {
 	patchHere(e, none);
 }
 
-static void emitHelper(struct Jit* j, uint32_t op, uint64_t pc, uint32_t paddr, bool delay, bool lineStart, bool last, int prevMark) {
+static void emitHelper(struct Jit* j, uint32_t op, uint64_t pc, uint32_t paddr, bool delay, bool lineStart, bool last, int prevMark, bool nextStall) {
 	struct Emitter* e = &j->e;
 	// The interpreter takes the load cycle (cpuLoadStall) from the mark before: the CPU's own at the
 	// block's start, else the previous instruction's.
@@ -1047,6 +1049,14 @@ static void emitHelper(struct Jit* j, uint32_t op, uint64_t pc, uint32_t paddr, 
 	aCbnz(e, 0, j->leave);
 	aDp(e, A_SUBS | W64, ZR, LEFT, ZR, S_LSL, 0);
 	aBcond(e, C_LE, j->leave);
+	if (nextStall) {
+		// An uncached load (its mark cleared) leaves no load cycle for the next instruction, which
+		// counts one.
+		aLdrb(e, 0, CPU, CPU_OFF(loadMark));
+		uint8_t* cached = aCbnz(e, 0, NULL);
+		aDpImm(e, A_ADD_IMM | W64, LEFT, LEFT, 1);
+		patchHere(e, cached);
+	}
 	if (last) {
 		aLdrb(e, 0, CPU, CPU_OFF(nextInDelay));
 		aCbnz(e, 0, j->leave);
@@ -1816,7 +1826,8 @@ void* jitCompile(struct N64* n, const uint32_t* ops, uint32_t count, uint32_t va
 		int const prevMark = k ? cpuLoadMark(ops[k - 1]) : -1;
 		j->mark = cpuLoadMark(op);
 		j->branchStall = prevMark >= 0 ? (int8_t) cpuLoadStall(op, (uint8_t) prevMark) : -1;
-		*slow = (struct Slow) { .op = op, .paddr = p, .pc = pc, .delay = delay, .lineStart = lineStart, .last = last, .prevMark = prevMark };
+		*slow = (struct Slow) { .op = op, .paddr = p, .pc = pc, .delay = delay, .lineStart = lineStart, .last = last, .prevMark = prevMark,
+		                    .nextStall = k + 1 < count && cpuLoadStall(ops[k + 1], cpuLoadMark(op)) };
 		j->slow = slow;
 		j->extraCycles = 0;
 		j->interruptCheck = false;
@@ -1863,7 +1874,7 @@ void* jitCompile(struct N64* n, const uint32_t* ops, uint32_t count, uint32_t va
 		j->missCount = misses;
 		j->codeCheckCount = codeChecks;
 		j->cache = cache;
-		emitHelper(j, op, pc, p, delay, lineStart, last, prevMark);
+		emitHelper(j, op, pc, p, delay, lineStart, last, prevMark, slow->nextStall);
 		// The interpreter may have changed any register, and the call the scratch ones.
 		cacheClear(&j->cache);
 		delay = branch;
@@ -1948,7 +1959,7 @@ void* jitCompile(struct N64* n, const uint32_t* ops, uint32_t count, uint32_t va
 		for (int k = 0; k < sl->sites; ++k) {
 			patchHere(e, sl->site[k]);
 		}
-		emitHelper(j, sl->op, sl->pc, sl->paddr, sl->delay, sl->lineStart, sl->last, sl->prevMark);
+		emitHelper(j, sl->op, sl->pc, sl->paddr, sl->delay, sl->lineStart, sl->last, sl->prevMark, sl->nextStall);
 		if (!sl->last) {
 			// The registers the fast path holds from here, as the interpreter left them.
 			for (int k = 0; k < POOL; ++k) {

@@ -884,6 +884,8 @@ static bool loadAt(struct N64* n, uint64_t vaddr, int size, uint64_t* out, uint3
 	*paddr = p;
 	if (p >= RDRAM_SIZE || !c->cachedAccess) {
 		readTiming(n, p, size);
+		// The pipeline waited for the data: no load cycle for the next instruction (n64-systembench).
+		c->loadMark = 0;
 	} else if (!n->fast) {
 		uint32_t i = dcacheLine(n, vaddr, p, n->cycles, false);
 		if (!n->compat) {
@@ -1774,6 +1776,7 @@ static bool uncachedWord(struct N64* n, uint32_t op) {
 	loadInterlock(c, op);
 	if (op >> 26 == 0x23) {
 		readTiming(n, p, 4);
+		c->loadMark = 0;
 		c->gpr[RT] = sext32(busRead32(n, p));
 	} else {
 		writeTiming(n, p);

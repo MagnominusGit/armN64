@@ -85,6 +85,8 @@ struct Slow {
 	bool keep;
 	// The load mark before it (cpuLoadMark), or -1 when it's the block's first.
 	int prevMark;
+	// Whether the next instruction in the block counts a load cycle after it.
+	bool nextStall;
 };
 
 struct Miss {
@@ -623,7 +625,7 @@ static void loadStallCheck(struct Emitter* e, uint32_t op) {
 	patchHere(e, none);
 }
 
-static void emitHelper(struct Jit* j, uint32_t op, uint64_t pc, uint32_t paddr, bool delay, bool lineStart, bool last, int prevMark) {
+static void emitHelper(struct Jit* j, uint32_t op, uint64_t pc, uint32_t paddr, bool delay, bool lineStart, bool last, int prevMark, bool nextStall) {
 	struct Emitter* e = &j->e;
 	// The interpreter takes the load cycle (cpuLoadStall) from the mark before: the CPU's own at the
 	// block's start, else the previous instruction's.
@@ -655,6 +657,14 @@ static void emitHelper(struct Jit* j, uint32_t op, uint64_t pc, uint32_t paddr, 
 	xJcc(e, CC_NE, j->leave);
 	xAluRR(e, X_CMP, 8, R(R13), R14);
 	xJcc(e, CC_AE, j->leave);
+	if (nextStall) {
+		// An uncached load (its mark cleared) leaves no load cycle for the next instruction, which
+		// counts one.
+		xAluI(e, X_CMP, 1, CPU_AT(loadMark), 0);
+		uint8_t* cached = xJcc(e, CC_NE, NULL);
+		xAluI(e, X_SUB, 8, R(R13), 1);
+		patchHere(e, cached);
+	}
 	if (last) {
 		xAluI(e, X_CMP, 1, CPU_AT(nextInDelay), 0);
 		xJcc(e, CC_NE, j->leave);
@@ -1038,7 +1048,8 @@ void* jitCompile(struct N64* n, const uint32_t* ops, uint32_t count, uint32_t va
 		int const prevMark = k ? cpuLoadMark(ops[k - 1]) : -1;
 		j->mark = cpuLoadMark(op);
 		j->branchStall = prevMark >= 0 ? (int8_t) cpuLoadStall(op, (uint8_t) prevMark) : -1;
-		*slow = (struct Slow) { .op = op, .paddr = p, .pc = pc, .delay = delay, .lineStart = lineStart, .last = last, .prevMark = prevMark };
+		*slow = (struct Slow) { .op = op, .paddr = p, .pc = pc, .delay = delay, .lineStart = lineStart, .last = last, .prevMark = prevMark,
+		                    .nextStall = k + 1 < count && cpuLoadStall(ops[k + 1], cpuLoadMark(op)) };
 		j->slow = slow;
 		j->extraCycles = 0;
 		j->interruptCheck = false;
@@ -1085,7 +1096,7 @@ void* jitCompile(struct N64* n, const uint32_t* ops, uint32_t count, uint32_t va
 		j->exitCount = exits;
 		j->missCount = misses;
 		j->codeCheckCount = codeChecks;
-		emitHelper(j, op, pc, p, delay, lineStart, last, prevMark);
+		emitHelper(j, op, pc, p, delay, lineStart, last, prevMark, slow->nextStall);
 		delay = branch;
 	}
 
@@ -1173,7 +1184,7 @@ void* jitCompile(struct N64* n, const uint32_t* ops, uint32_t count, uint32_t va
 		for (int k = 0; k < sl->sites; ++k) {
 			patchHere(e, sl->site[k]);
 		}
-		emitHelper(j, sl->op, sl->pc, sl->paddr, sl->delay, sl->lineStart, sl->last, sl->prevMark);
+		emitHelper(j, sl->op, sl->pc, sl->paddr, sl->delay, sl->lineStart, sl->last, sl->prevMark, sl->nextStall);
 		if (!sl->last) {
 			xJmp(e, sl->resume);
 		}
