@@ -1275,6 +1275,11 @@ static void runList(struct N64* n, struct Hle* h, uint32_t pc) {
 				pc = next;
 				continue;
 			}
+			// The 3D microcodes' geometry mode and texture commands: S2DEX has nothing they set.
+			if (two ? op == 0xD7 || op == 0xD9 : op == 0xB6 || op == 0xB7 || op == 0xBB) {
+				pc = next;
+				continue;
+			}
 			bool const shared = two ? op == 0x00 || (op >= 0xDB && op <= 0xDF && op != 0xDC) || op == 0xE1 || op == 0xE2 || op == 0xE3
 			                        : op == 0x00 || op == 0x06 || op == 0xAF || op == 0xB4 || op == 0xB8 || op == 0xB9 || op == 0xBA || op == 0xBC || op == 0xC0;
 			if (!shared) {
