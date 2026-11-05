@@ -206,6 +206,11 @@ static size_t commandWords(uint64_t w) {
 }
 
 static void flush(struct N64* n, struct Hle* h, bool canStall) {
+	// A FIFO microcode waiting on a frozen RDP keeps waiting, its list as it is.
+	if (!h->dry && canStall && h->fifoEnd > h->fifoStart && h->count && (n->dp.status & 2) && n->dp.current < n->dp.end) {
+		h->stalled = true;
+		return;
+	}
 	// Whole commands only: a full list may end inside one, which waits for the next flush.
 	size_t total = h->count, whole = 0, sent;
 	while (whole < total && whole + commandWords(h->list[whole]) <= total) {
