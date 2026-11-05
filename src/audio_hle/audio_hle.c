@@ -113,8 +113,9 @@ static ucode_func_t try_audio_task_detection(struct hle_t* hle)
     return NULL;
 }
 
-/* armN64: the video microcodes of re2.c (graphics tasks), from hle.c's try_normal_task_detection. */
-static ucode_func_t try_re2_task_detection(struct hle_t* hle)
+/* armN64: the video microcodes of re2.c and hvqm.c (graphics tasks), from hle.c's
+ * try_normal_task_detection. */
+static ucode_func_t try_video_task_detection(struct hle_t* hle)
 {
     uint32_t ucode = *dmem_u32(hle, TASK_UCODE);
     unsigned int sum = 0;
@@ -135,10 +136,22 @@ static ucode_func_t try_re2_task_detection(struct hle_t* hle)
         return &fill_video_double_buffer_task;
     }
 
+    /* HVQM */
+    sum = 0;
+    for (uint32_t i = 0; i < 1488; ++i)
+        sum += dram_r8(hle, ucode + i);
+    switch (sum) {
+    case 0x19495:
+        return &hvqm2_decode_sp1_task;
+
+    case 0x19728:
+        return &hvqm2_decode_sp2_task;
+    }
+
     return NULL;
 }
 
-/* The audio task in DMEM (type 2), or a graphics task of re2.c's, run on dram when its microcode is
+/* The audio task in DMEM (type 2), or a graphics task of re2.c's or hvqm.c's, run on dram when its microcode is
  * known; false leaves it alone. */
 static bool audioHleRun(struct N64* n, uint8_t* dram)
 {
@@ -158,7 +171,7 @@ static bool audioHleRun(struct N64* n, uint8_t* dram)
     for (unsigned i = 0; i < 0x1000; ++i) {
         hle->dmem[i ^ S8] = n->sp.mem[i];
     }
-    ucode_func_t run = type == 2 ? try_audio_task_detection(hle) : try_re2_task_detection(hle);
+    ucode_func_t run = type == 2 ? try_audio_task_detection(hle) : try_video_task_detection(hle);
     if (!run) {
         return false;
     }
