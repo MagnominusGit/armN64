@@ -15,7 +15,7 @@
 // S2DEX and S2DEX2 are the 2D microcodes (F3DEX's and F3DEX2's command numbers for what they share):
 // backgrounds so far, other commands leave the task to the RSP.
 // ZSort draws objects the game sorted from vertices it transformed here first (its DMEM in between).
-enum { FAMILY_NONE, FAMILY_F3D, FAMILY_F3DEX, FAMILY_F3DEX2, FAMILY_F3DPD, FAMILY_S2DEX, FAMILY_S2DEX2, FAMILY_ZSORT, FAMILY_TURBO3D, FAMILY_T3DUX, FAMILY_ZSORTBOSS, FAMILY_F5ROGUE };
+enum { FAMILY_NONE, FAMILY_F3D, FAMILY_F3DEX, FAMILY_F3DEX2, FAMILY_F3DPD, FAMILY_S2DEX, FAMILY_S2DEX2, FAMILY_ZSORT, FAMILY_TURBO3D, FAMILY_T3DUX, FAMILY_ZSORTBOSS, FAMILY_F5ROGUE, FAMILY_F5INDI };
 
 // Geometry mode bits, kept in the F3DEX2 layout.
 enum {
@@ -94,7 +94,15 @@ struct Hle {
 	int16_t bossTable[8][8];
 	// Factor 5's: each list level's jump target (its first word), the vertex colour table, the texture
 	// coordinate scales, and where the viewport and the projection matrix were.
-	uint32_t f5Jump[DL_DEPTH + 1], f5Colors, f5TexScale[2], f5Viewport, f5Persp;
+	uint32_t f5Jump[DL_DEPTH + 2], f5Colors, f5TexScale[2], f5Viewport, f5Persp;
+	// Factor 5's second: its DMEM (as GLideN64 keeps it), the matrices it generates vertices and texture
+	// coordinates through, and Battle for Naboo's terrain walk.
+	uint8_t f5iDmem[0x1000];
+	float f5iGenMtx[16];
+	int32_t f5iStMtx[16];
+	uint16_t nabooAA;
+	int16_t nabooBB, nabooEE, nabooHH;
+	uint8_t nabooDD, nabooCC, nabooTT;
 	uint32_t objMode, objStatus[4], half0w0, half0w1;
 	// F3DFLX (F-Zero X's F3DEX2): light k in slot k + 1, slot 1 its alpha light, a direction whose
 	// angle to the normal picks each vertex's alpha from a table at the G_DMA_IO address (in place of
@@ -2576,6 +2584,1357 @@ static void f5List(struct N64* n, struct Hle* h, uint32_t pc) {
 	}
 }
 
+// ---- Factor 5's second microcode (Indiana Jones and Battle for Naboo; GLideN64's F5Indi_Naboo.cpp,
+// olivieryuyu's decoding). Its DMEM is kept as GLideN64 keeps it (each word's bytes the other way
+// round: byte a there is the RSP's byte a ^ 3), so the decoding's offsets and swaps carry over as
+// they are; RDRAM is read the same way.
+
+static uint32_t f5iWord(const struct Hle* h, uint32_t a) {
+	const uint8_t* m = h->f5iDmem;
+	return m[a & 0xFFF] | m[(a + 1) & 0xFFF] << 8 | m[(a + 2) & 0xFFF] << 16 | (uint32_t) m[(a + 3) & 0xFFF] << 24;
+}
+
+static void f5iSetWord(struct Hle* h, uint32_t a, uint32_t v) {
+	for (int k = 0; k < 4; ++k) {
+		h->f5iDmem[(a + (uint32_t) k) & 0xFFF] = (uint8_t) (v >> (8 * k));
+	}
+}
+
+static uint16_t f5iHalf(const struct Hle* h, uint32_t a) {
+	return (uint16_t) (h->f5iDmem[a & 0xFFF] | h->f5iDmem[(a + 1) & 0xFFF] << 8);
+}
+
+static void f5iSetHalf(struct Hle* h, uint32_t a, uint16_t v) {
+	h->f5iDmem[a & 0xFFF] = (uint8_t) v, h->f5iDmem[(a + 1) & 0xFFF] = (uint8_t) (v >> 8);
+}
+
+static uint64_t f5iQuad(const struct Hle* h, uint32_t a) {
+	return f5iWord(h, a) | (uint64_t) f5iWord(h, a + 4) << 32;
+}
+
+// RDRAM as GLideN64 reads it: a word as it is, a halfword or byte from the other end of its word.
+static uint16_t f5iRdHalf(struct N64* n, uint32_t a) {
+	return (uint16_t) rd16(n, a ^ 2);
+}
+
+static uint8_t f5iRdByte(struct N64* n, uint32_t a) {
+	return n->rdram[(a ^ 3) & (RDRAM_SIZE - 1)];
+}
+
+static void f5iCopyIn(struct N64* n, struct Hle* h, uint32_t dmem, uint32_t rdram, uint32_t length) {
+	for (uint32_t i = 0; i < length; ++i) {
+		h->f5iDmem[(dmem + i) & 0xFFF] = f5iRdByte(n, rdram + i);
+	}
+}
+
+static void f5iCopyOut(struct N64* n, struct Hle* h, uint32_t rdram, uint32_t dmem, uint32_t length) {
+	if (h->dry || !length) {
+		return;
+	}
+	n64RdramWrite(n, rdram & ~7u, length + 16);
+	for (uint32_t i = 0; i < length; ++i) {
+		n->rdram[((rdram + i) ^ 3) & (RDRAM_SIZE - 1)] = h->f5iDmem[(dmem + i) & 0xFFF];
+	}
+}
+
+// A vertex as GLideN64's SWVertex has it in such memory (y, x, flag, z halfwords): through the
+// combined matrix into slot i.
+static void f5iVertexDmem(struct Hle* h, int i, uint32_t a) {
+	if (i < VERTICES) {
+		f5Vertex(h, i, (int16_t) f5iHalf(h, a + 2), (int16_t) f5iHalf(h, a), (int16_t) f5iHalf(h, a + 6));
+	}
+}
+
+static void f5iVertexRdram(struct N64* n, struct Hle* h, int i, uint32_t a) {
+	if (i < VERTICES) {
+		f5Vertex(h, i, rd16(n, a), rd16(n, a + 2), rd16(n, a + 4));
+	}
+}
+
+// GLideN64's clip flags: past each side, or w under 0.01.
+static uint32_t f5iClip(const struct Hle* h, int i) {
+	const struct Vertex* v = &h->v[i];
+	return (v->x > v->w) | (v->x < -v->w) << 1 | (v->y > v->w) << 2 | (v->y < -v->w) << 3 | (v->w < 0.01f) << 4;
+}
+
+static bool f5iClipped(const struct Hle* h, int a, int b, int c) {
+	return a >= VERTICES || b >= VERTICES || c >= VERTICES || (f5iClip(h, a) & f5iClip(h, b) & f5iClip(h, c));
+}
+
+// A triangle as this microcode draws it: shading smooth whenever shaded (its G_SHADING_SMOOTH is
+// G_SHADE), untextured ones not culled, textured ones with both culls set culled at the back only.
+static void f5iTriangle(struct N64* n, struct Hle* h, int a, int b, int c, bool textured) {
+	uint32_t const geometry = h->geometry;
+	if (h->geometry & GEOM_SHADE) {
+		h->geometry |= GEOM_SHADING_SMOOTH;
+	}
+	if (!textured) {
+		h->geometry &= ~(uint32_t) (GEOM_CULL_FRONT | GEOM_CULL_BACK);
+	} else if ((h->geometry & (GEOM_CULL_FRONT | GEOM_CULL_BACK)) == (GEOM_CULL_FRONT | GEOM_CULL_BACK)) {
+		h->geometry &= ~(uint32_t) GEOM_CULL_FRONT;
+	}
+	drawTriangle(n, h, a, b, c);
+	h->geometry = geometry;
+}
+
+static void f5iLoadStMatrix(struct Hle* h) {
+	for (uint32_t i = 0; i < 16; ++i) {
+		h->f5iStMtx[i] = (int32_t) ((uint32_t) f5iHalf(h, 0xE40 + 2 * (i ^ 1)) << 16 | f5iHalf(h, 0xE60 + 2 * (i ^ 1)));
+	}
+}
+
+static void f5iDmaDirect(struct N64* n, struct Hle* h, uint32_t w0, uint32_t w1) {
+	f5iCopyIn(n, h, (w0 >> 8) & 0xFFF, w1 & 0xFFFFFF, (((w0 & 0xFF) + 1) >> 2) * 4);
+}
+
+// The DMA from the list set up by G_SET_DLIST_ADDR (0xFD4: where, 0xFD8: the next block's link,
+// 0xFDC: what is left of this block), going on into the next block as one runs out.
+static void f5iDmaSegmented(struct N64* n, struct Hle* h, uint32_t w0, uint32_t w1) {
+	if (!(w0 & 0xFF)) {
+		return;
+	}
+	int32_t a0 = (int32_t) (w0 & 0xFF);
+	uint32_t a2 = f5iWord(h, 0xFDC);
+	int32_t a3 = a0 + 1, a1 = (int32_t) a2 - a3;
+	uint32_t v1 = (w0 >> 8) & 0xFFF;
+	for (int guard = 0; a1 < 0 && guard < 4096; ++guard) {
+		uint32_t const v0 = f5iWord(h, 0xFD4);
+		a3 = a0 - (int32_t) a2;
+		f5iCopyIn(n, h, v1, v0 & 0xFFFFFF, a2);
+		v1 += a2;
+		a0 = a3;
+		w1 = f5iWord(h, 0xFD8);
+		f5iSetWord(h, 0xFD8, rd32(n, w1 & 0xFFFFFF));
+		f5iSetWord(h, 0xFDC, 0x100);
+		f5iSetWord(h, 0xFD4, w1 + 8);
+		a2 = f5iWord(h, 0xFDC);
+		a3 = a0 + 1;
+		a1 = (int32_t) a2 - a3;
+	}
+	uint32_t const v0 = f5iWord(h, 0xFD4);
+	f5iCopyIn(n, h, v1, v0 & 0xFFFFFF, (uint32_t) (a0 + 1));
+	f5iSetWord(h, 0xFDC, (uint32_t) a1);
+	f5iSetWord(h, 0xFD4, v0 + (uint32_t) a3);
+}
+
+static uint32_t minu(uint32_t a, uint32_t b) {
+	return a < b ? a : b;
+}
+
+// The lighting overlays: colours at 0xD40 for the vertices, from their colours (at the command's
+// address), the factors at 0x158 and the lights from 0xB10 (24 bytes each, their count at 0x58B).
+static void f5iLighting1(struct Hle* h, uint32_t w0, uint32_t w1) {
+	uint32_t const size = ((((w1 >> 24) & 0x7F) << 2) + 4) & 0xFFF8;
+	for (uint32_t i = 0; i < size; ++i) {
+		h->f5iDmem[(0xD40 + i) & 0xFFF] = 0;
+	}
+	uint8_t lights = h->f5iDmem[0x58B ^ 3];
+	if (!lights) {
+		f5iSetWord(h, 0x5B0, 0), f5iSetWord(h, 0x5B4, 0);
+		return;
+	}
+	uint32_t light = 0xB10;
+	uint32_t const dataAt = (w0 >> 8) & 0xFFF;
+	uint8_t* m = h->f5iDmem;
+	for (;;) {
+		uint32_t dst = 0xD40, data = dataAt;
+		if (!m[light]) {
+			for (uint32_t i = 0; i < size >> 3; ++i) {
+				uint32_t factor = 0x158;
+				for (int half = 0; half < 2; ++half, factor += 4, dst += 4, data += 4) {
+					m[dst & 0xFFF] = (uint8_t) ((m[data & 0xFFF] * m[factor]) >> 8);
+					for (uint32_t j = 1; j < 4; ++j) {
+						m[(dst + j) & 0xFFF] = (uint8_t) minu(((m[(data + j) & 0xFFF] * m[factor + j] * m[(light + j) & 0xFFF]) >> 16) + m[(dst + j) & 0xFFF], 0xFF);
+					}
+				}
+			}
+		} else {
+			uint32_t offsetIndex = 0;
+			uint64_t positions = f5iQuad(h, 0x5B0);
+			uint32_t const factors[2] = { f5iWord(h, 0x158), f5iWord(h, 0x15C) };
+			for (uint32_t i = 0; i < size >> 3; ++i) {
+				uint32_t at[2];
+				switch (positions & 3) {
+				case 0:
+					at[0] = at[1] = light - 0x10;
+					break;
+				case 1:
+					at[0] = light - 0x08, at[1] = light - 0x10;
+					break;
+				case 2:
+					at[0] = light - 0x10, at[1] = light - 0x08;
+					break;
+				default:
+					at[0] = at[1] = light - 0x08;
+					break;
+				}
+				positions >>= 2;
+				for (int j = 0; j < 2; ++j) {
+					int16_t const x1 = (int16_t) (f5iWord(h, at[j]) >> 16), y1 = (int16_t) f5iWord(h, at[j]), z1 = (int16_t) (f5iWord(h, at[j] + 4) >> 16);
+					uint32_t const a = (0x170 + m[(0x380 + (offsetIndex ^ 3)) & 0xFFF]) & 0xFFC;
+					++offsetIndex;
+					int16_t const x = (int16_t) ((int16_t) (f5iWord(h, a) >> 16) - x1), y = (int16_t) ((int16_t) f5iWord(h, a) - y1);
+					int16_t const z = (int16_t) ((int16_t) (f5iWord(h, a + 4) >> 16) - z1);
+					uint64_t const t = 0xFFFF000000000000ull | (uint64_t) f5iWord(h, light + 4) << 16;
+					uint64_t const k = (uint64_t) (int64_t) (x * x + y * y + z * z) * t;
+					uint32_t const p = (uint32_t) (k >> 32), p1 = (p & 0xFFFF0000u) == 0xFFFF0000u ? p & 0xFFFF : 0;
+					uint32_t const v = f5iWord(h, light);
+					uint32_t d = ((v >> 24) * p1) >> 16, e = (((v >> 16) & 0xFF) * p1) >> 16, f = (((v >> 8) & 0xFF) * p1) >> 16;
+					uint32_t const jj = ((factors[j] & 0xFF) * m[data & 0xFFF]) >> 8;
+					if (m[light] == 4) {
+						m[dst & 0xFFF] = (uint8_t) jj;
+						m[(dst + 1) & 0xFFF] = (uint8_t) minu(m[(dst + 1) & 0xFFF] + f, 0xFF);
+						m[(dst + 2) & 0xFFF] = (uint8_t) minu(m[(dst + 2) & 0xFFF] + e, 0xFF);
+						m[(dst + 3) & 0xFFF] = (uint8_t) minu(m[(dst + 3) & 0xFFF] + d, 0xFF);
+					} else {
+						d += ((factors[j] >> 24) * m[(data + 3) & 0xFFF]) >> 8;
+						e += (((factors[j] >> 16) & 0xFF) * m[(data + 2) & 0xFFF]) >> 8;
+						f += (((factors[j] >> 8) & 0xFF) * m[(data + 1) & 0xFFF]) >> 8;
+						m[dst & 0xFFF] = (uint8_t) jj;
+						m[(dst + 1) & 0xFFF] = (uint8_t) minu(f >> 1, 0xFF);
+						m[(dst + 2) & 0xFFF] = (uint8_t) minu(e >> 1, 0xFF);
+						m[(dst + 3) & 0xFFF] = (uint8_t) minu(d >> 1, 0xFF);
+					}
+					dst += 4, data += 4;
+				}
+			}
+		}
+		if (!--lights) {
+			f5iSetWord(h, 0x5B0, 0), f5iSetWord(h, 0x5B4, 0);
+			if (f5iWord(h, 0x5A8) == 0xFFFFFFFFu) {
+				return;
+			}
+			for (uint32_t i = 0; i < size; ++i) {
+				m[(0xD40 + i) & 0xFFF] = (uint8_t) ((m[(0xD40 + i) & 0xFFF] * m[0x5A8 + (i & 3)]) >> 8);
+			}
+			return;
+		}
+		light += 0x18;
+	}
+}
+
+static void f5iLighting2(struct Hle* h, uint32_t w0, uint32_t w1) {
+	uint32_t const size = ((((w1 >> 24) & 0x7F) << 2) + 4) & 0xFFF8;
+	for (uint32_t i = 0; i < size + 8; ++i) {
+		h->f5iDmem[(0xD40 + i) & 0xFFF] = 0;
+	}
+	uint8_t lights = h->f5iDmem[0x58B ^ 3];
+	if (!lights) {
+		f5iSetWord(h, 0x5B0, 0), f5iSetWord(h, 0x5B4, 0);
+		return;
+	}
+	uint32_t light = 0xB10;
+	uint32_t const dataAt = (w0 >> 8) & 0xFFF;
+	uint8_t* m = h->f5iDmem;
+	for (;;) {
+		uint32_t dst = 0xD40, data = dataAt;
+		if (!m[light]) {
+			for (uint32_t i = 0; i < size >> 3; ++i) {
+				uint32_t factor = 0x158;
+				for (int half = 0; half < 2; ++half, factor += 4, dst += 4, data += 4) {
+					m[dst & 0xFFF] = (uint8_t) ((m[data & 0xFFF] * m[factor]) >> 8);
+					for (uint32_t j = 1; j < 4; ++j) {
+						m[(dst + j) & 0xFFF] = (uint8_t) minu(((m[(data + j) & 0xFFF] * m[factor + j] * m[(light + j) & 0xFFF]) >> 16) + m[(dst + j) & 0xFFF], 0xFF);
+					}
+				}
+			}
+		} else if (m[light] == 1) {
+			uint32_t factor2 = 0x380;
+			uint64_t positions = f5iQuad(h, 0x5B0);
+			uint32_t const factors[2] = { f5iWord(h, 0x158), f5iWord(h, 0x15C) };
+			for (uint32_t i = 0; i < size >> 3; ++i) {
+				uint32_t at[2];
+				switch (positions & 3) {
+				case 0:
+					at[0] = at[1] = light - 0x10;
+					break;
+				case 1:
+					at[0] = light - 0x08, at[1] = light - 0x10;
+					break;
+				case 2:
+					at[0] = light - 0x10, at[1] = light - 0x08;
+					break;
+				default:
+					at[0] = at[1] = light - 0x08;
+					break;
+				}
+				positions >>= 2;
+				for (int j = 0; j < 2; ++j, factor2 += 4) {
+					int16_t const x = (int16_t) (f5iWord(h, at[j]) >> 16), y = (int16_t) f5iWord(h, at[j]), z = (int16_t) (f5iWord(h, at[j] + 4) >> 16);
+					uint32_t v = f5iWord(h, factor2);
+					uint32_t in = (uint32_t) (((x * (int8_t) (v >> 24) + y * (int8_t) (v >> 16) + z * (int8_t) (v >> 8)) >> 8) & 0xFFFF);
+					in = in & 0x8000 ? 0 : in;
+					v = f5iWord(h, light);
+					uint32_t const d = ((v >> 24) * in) >> 8, e = (((v >> 16) & 0xFF) * in) >> 8, f = (((v >> 8) & 0xFF) * in) >> 8;
+					v = factors[j];
+					uint32_t const k = (v & 0xFF) * m[data & 0xFFF], jj = ((v >> 8) & 0xFF) * m[(data + 1) & 0xFFF];
+					uint32_t const hh = ((v >> 16) & 0xFF) * m[(data + 2) & 0xFFF], g = (v >> 24) * m[(data + 3) & 0xFFF];
+					data += 4;
+					m[dst & 0xFFF] = (uint8_t) (k >> 8);
+					m[(dst + 1) & 0xFFF] = (uint8_t) minu(m[(dst + 1) & 0xFFF] + ((f * jj) >> 22), 0xFF);
+					m[(dst + 2) & 0xFFF] = (uint8_t) minu(m[(dst + 2) & 0xFFF] + ((e * hh) >> 22), 0xFF);
+					m[(dst + 3) & 0xFFF] = (uint8_t) minu(m[(dst + 3) & 0xFFF] + ((d * g) >> 22), 0xFF);
+					dst += 4;
+				}
+			}
+		} else {
+			uint32_t offsetAt = 0x380;
+			for (uint32_t i = 0; i < size >> 3; ++i, offsetAt += 8) {
+				for (uint32_t j = 0; j < 2; ++j) {
+					uint32_t const at = light - 0x10;
+					int16_t const x1 = (int16_t) (f5iWord(h, at) >> 16), y1 = (int16_t) f5iWord(h, at), z1 = (int16_t) (f5iWord(h, at + 4) >> 16);
+					uint32_t const a = 0x170 + (f5iWord(h, offsetAt + j * 4) & 0xFF);
+					int16_t const x = (int16_t) ((int16_t) (f5iWord(h, a) >> 16) - x1), y = (int16_t) ((int16_t) f5iWord(h, a) - y1);
+					int16_t const z = (int16_t) ((int16_t) (f5iWord(h, a + 4) >> 16) - z1);
+					uint64_t const t = 0xFFFF000000000000ull | (uint64_t) f5iWord(h, light + 4) << 16;
+					uint64_t const k = (uint64_t) (int64_t) (x * x + y * y + z * z) * t;
+					uint32_t const p = (uint32_t) (k >> 32), p1 = (p & 0xFFFF0000u) == 0xFFFF0000u ? p & 0xFFFF : 0;
+					uint32_t const factor = 0x158 + j * 4;
+					m[dst & 0xFFF] = (uint8_t) ((m[data & 0xFFF] * m[factor]) >> 8);
+					for (uint32_t c = 1; c < 4; ++c) {
+						m[(dst + c) & 0xFFF] = (uint8_t) minu(((((m[(light + c) & 0xFFF] * p1) >> 16) * m[(data + c) & 0xFFF] * m[factor + c] + 0x8000) >> 16) + m[(dst + c) & 0xFFF], 0xFF);
+					}
+					dst += 4, data += 4;
+				}
+			}
+		}
+		if (!--lights) {
+			f5iSetWord(h, 0x5B0, 0), f5iSetWord(h, 0x5B4, 0);
+			return;
+		}
+		light += 0x18;
+	}
+}
+
+static void f5iLightingBasic(struct Hle* h, uint32_t w0, uint32_t w1) {
+	uint32_t dst = 0xD40, data = (w0 >> 8) & 0xFFF;
+	for (int32_t count = (int32_t) ((w1 >> 24) & 0x7F); count > 0; count -= 4) {
+		for (uint32_t j = 0; j < 16; ++j) {
+			h->f5iDmem[(dst + j) & 0xFFF] = (uint8_t) ((h->f5iDmem[(data + j) & 0xFFF] * h->f5iDmem[0x158 + (j & 7)]) >> 8);
+		}
+		dst += 16, data += 16;
+	}
+}
+
+// RGB565 colours at the address rebuilt as RGBA words in place.
+static void f5iRebuildColors(struct Hle* h, uint32_t w0, uint32_t w1) {
+	uint32_t const a = (w0 >> 8) & 0xFFF, count = minu(w1 >> 24, (0x588 - a) >> 2);
+	uint32_t colors[256];
+	for (uint32_t i = 0; i < count && i < 256; ++i) {
+		uint16_t const v = f5iHalf(h, a + 2 * (i ^ 1));
+		colors[i] = (uint32_t) ((v >> 8) & 0xF8) << 24 | (uint32_t) ((v & 0x7E0) >> 3) << 16 | (uint32_t) ((v & 0x1F) << 3) << 8 | 0xFF;
+	}
+	for (uint32_t i = 0; i < count && i < 256; ++i) {
+		f5iSetWord(h, a + 4 * i, colors[i]);
+	}
+}
+
+// The vertex base (0x128) every loaded vertex is moved by.
+static void f5iBase(const struct Hle* h, uint16_t* x, uint16_t* y, uint16_t* z) {
+	*x = f5iHalf(h, 0x128 + 2), *y = f5iHalf(h, 0x128), *z = f5iHalf(h, 0x128 + 6);
+}
+
+// Vertices by index: each six bytes into the RDRAM table at 0x154, moved by the base, into slots 0 on.
+static void f5iLoadVertices(struct N64* n, struct Hle* h, uint32_t w0, uint32_t w1) {
+	uint32_t const count = (w1 >> 24) & 0x7F, at = (w0 >> 8) & 0xFFF, base = f5iWord(h, 0x154);
+	uint16_t x0, y0, z0;
+	f5iBase(h, &x0, &y0, &z0);
+	for (uint32_t i = 0; i < count && i < VERTICES; ++i) {
+		uint32_t const a = f5iHalf(h, at + 2 * (i ^ 1)) * 6u + base, row = a & 0xFFFFF8, shift = (a & 7) >> 1;
+		uint16_t const x = (uint16_t) (f5iRdHalf(n, row + 2 * ((shift + 0) ^ 1)) + x0), y = (uint16_t) (f5iRdHalf(n, row + 2 * ((shift + 1) ^ 1)) + y0);
+		uint16_t const z = (uint16_t) (f5iRdHalf(n, row + 2 * ((shift + 2) ^ 1)) + z0);
+		f5Vertex(h, (int) i, (int16_t) x, (int16_t) y, (int16_t) z);
+	}
+}
+
+// Vertices in DMEM, moved by the base when it isn't zero.
+static void f5iAdjustVertices(struct Hle* h, uint32_t w0, uint32_t w1) {
+	uint32_t const count = (w1 >> 24) & 0x7F, at = (w0 >> 8) & 0xFFF;
+	uint16_t x0 = 0, y0 = 0, z0 = 0;
+	if (f5iQuad(h, 0x128)) {
+		f5iBase(h, &x0, &y0, &z0);
+	}
+	for (uint32_t i = 0; i < count && i < VERTICES; ++i) {
+		uint32_t const a = at + 8 * i;
+		f5Vertex(h, (int) i, (int16_t) (f5iHalf(h, a + 2) + x0), (int16_t) (f5iHalf(h, a) + y0), (int16_t) (f5iHalf(h, a + 6) + z0));
+	}
+}
+
+// G_MOVEMEM: a DMA into DMEM, then by its kind the viewport, the combined matrix, the matrix vertices
+// are generated through (and the texture coordinate matrix in DMEM), vertices, the light count or
+// the lighting.
+static void f5iMoveMem(struct N64* n, struct Hle* h, uint32_t w0, uint32_t w1) {
+	if (w1 & 0xFFFFFF) {
+		f5iDmaDirect(n, h, w0, w1);
+	} else {
+		f5iDmaSegmented(n, h, w0, w1);
+	}
+	switch (w0 & 0x00F00000) {
+	case 0x00000000:
+		if (w0 == 0x0101300F) {
+			viewport(n, h, address(h, w1));
+		} else if (w0 == 0x0105C03F) {
+			readMatrix(n, address(h, w1), h->mvp);
+		} else if (w0 == 0x010E403F) {
+			readMatrix(n, w1 & 0xFFFFFF, h->f5iGenMtx);
+			f5iLoadStMatrix(h);
+		}
+		break;
+	case 0x00100000:
+		f5iAdjustVertices(h, w0, w1);
+		break;
+	case 0x00300000:
+		h->f5iDmem[0x58B ^ 3] = (uint8_t) (w1 >> 24);
+		break;
+	case 0x00500000:
+		f5iLoadVertices(n, h, w0, w1);
+		break;
+	default:
+		if (((w0 >> 8) & 0xFFF) == 0x480) {
+			uint32_t const f = w0 >> 22;
+			if (f & 2) {
+				f5iRebuildColors(h, w0, w1);
+			}
+			if (!(((w1 >> 24) | h->f5iDmem[0x58B ^ 3]) & 0x80)) {
+				if (f & 1) {
+					f5iLighting1(h, w0, w1);
+				} else {
+					f5iLighting2(h, w0, w1);
+				}
+			} else {
+				f5iLightingBasic(h, w0, w1);
+			}
+		}
+		break;
+	}
+}
+
+// Texture coordinates from positions: the vertex (at 0x170 by the parameter's index) through the
+// texture matrix, less the eye (0x0F0), normalized and scaled (0x0EC).
+static void f5iCalcSt(struct Hle* h, const uint32_t* params, int count, uint32_t* st) {
+	const int32_t* mtx = h->f5iStMtx;
+	for (int i = 0; i < count; ++i) {
+		uint32_t const a = 0x170 + (params[i + 4] & 0xFF);
+		int32_t const x = (int16_t) f5iHalf(h, a + 2), y = (int16_t) f5iHalf(h, a), z = (int16_t) f5iHalf(h, a + 6);
+		int32_t x1 = (int32_t) ((uint32_t) x * (uint32_t) mtx[0] + (uint32_t) y * (uint32_t) mtx[4] + (uint32_t) z * (uint32_t) mtx[8] + (uint32_t) mtx[12]);
+		int32_t y1 = (int32_t) ((uint32_t) x * (uint32_t) mtx[1] + (uint32_t) y * (uint32_t) mtx[5] + (uint32_t) z * (uint32_t) mtx[9] + (uint32_t) mtx[13]);
+		int32_t z1 = (int32_t) ((uint32_t) x * (uint32_t) mtx[2] + (uint32_t) y * (uint32_t) mtx[6] + (uint32_t) z * (uint32_t) mtx[10] + (uint32_t) mtx[14]);
+		x1 = (int32_t) ((uint32_t) x1 - ((uint32_t) f5iHalf(h, 0x0F0 + 2) << 16));
+		y1 = (int32_t) ((uint32_t) y1 - ((uint32_t) f5iHalf(h, 0x0F0) << 16));
+		z1 = (int32_t) ((uint32_t) z1 - ((uint32_t) f5iHalf(h, 0x0F0 + 6) << 16));
+		uint64_t const x2 = (uint64_t) (int64_t) x1, y2 = (uint64_t) (int64_t) y1, z2 = (uint64_t) (int64_t) z1;
+		uint64_t const r = ((x2 * x2) >> 16) + ((y2 * y2) >> 16) + ((z2 * z2) >> 16);
+		uint32_t r1 = (uint32_t) r;
+		if (r > 0xFFFFFFFFull) {
+			r1 = 0x7FFF0000u | (uint32_t) (r & 0xFFFF);
+		}
+		uint32_t d = (uint32_t) sqrt((double) r1);
+		d = d ? 0xFFFFFFFFu / (d * 0x300) : 0xFFFFFFFFu;
+		uint32_t const v = (uint32_t) ((d * x2) >> 16), w = (uint32_t) ((d * y2) >> 16);
+		uint32_t const s = (v * f5iHalf(h, 0x0EC + 2)) >> 16, t = (w * f5iHalf(h, 0x0EC)) >> 16;
+		st[i] = s << 16 | t;
+	}
+}
+
+// The commands one at a time from where each list level is (shared by the main list and the sub-lists
+// a triangle or rectangle starts).
+struct F5iRun {
+	uint32_t pc[DL_DEPTH + 2];
+	int level;
+	bool halt;
+};
+
+static void f5iCommand(struct N64* n, struct Hle* h, struct F5iRun* run);
+
+// The sub-list at 0x58C, if one is set: run up to its end (0xB8 with -1) or until its next command is
+// Naboo's 0xBD (that command then kept at 0xE58).
+static void f5iSubList(struct N64* n, struct Hle* h, struct F5iRun* run) {
+	uint32_t const list = f5iWord(h, 0x58C) & 0xFFFFFF;
+	if (!list || run->level + 1 > DL_DEPTH) {
+		return;
+	}
+	int const level = ++run->level;
+	h->f5Jump[level] = rd32(n, list) & 0xFFFFFF;
+	run->pc[level] = list + 8;
+	for (int steps = 0; steps < 1 << 20 && !run->halt && run->level >= level; ++steps) {
+		uint32_t const pc = run->pc[run->level], w0 = rd32(n, pc), w1 = rd32(n, pc + 4);
+		if (w0 == 0xB8000000u && w1 == 0xFFFFFFFFu) {
+			break;
+		}
+		int const next = (int) (rd32(n, pc + 8) >> 24);
+		f5iCommand(n, h, run);
+		if (next == 0xBD) {
+			f5iSetWord(h, 0xE58, w0), f5iSetWord(h, 0xE5C, w1);
+			break;
+		}
+	}
+	run->level = level - 1;
+	f5iSetWord(h, 0x58C, 0);
+}
+
+// G_TRI1 and G_TRI2: vertices by DMEM address ((a - 0x600) / 40), colours from 0xD40 by the second
+// word's indices, texture coordinates after the command or computed; a sub-list runs before a
+// triangle is drawn.
+static uint32_t f5iTriangles(struct N64* n, struct Hle* h, struct F5iRun* run, uint32_t pc, bool two) {
+	uint32_t params[8];
+	for (int i = 0; i < 8; ++i) {
+		params[i] = rd32(n, pc + 4 * (uint32_t) i);
+	}
+	uint32_t const w0 = params[0], w1 = params[1], w2 = params[2], w3 = params[3];
+	int const v[4] = { (int) ((((w1 >> 16) & 0xFFF) - 0x600) / 40), (int) (((w1 & 0xFFF) - 0x600) / 40), (int) ((((w3 >> 16) & 0xFFF) - 0x600) / 40),
+	                   (int) (((w3 & 0xFFF) - 0x600) / 40) };
+	uint32_t const index[4] = { (w2 >> 16) & 0xFF, (w2 >> 8) & 0xFF, w2 & 0xFF, w2 >> 24 };
+	bool const textured = w0 & 0x200;
+	int const count = two ? 4 : 3;
+	uint32_t st[4];
+	if (w0 & 0x800) {
+		f5iCalcSt(h, params, count, st);
+	} else {
+		for (int i = 0; i < 4; ++i) {
+			st[i] = params[i + 4];
+		}
+	}
+	bool const persp = h->modeH & 0x80000;
+	for (int i = 0; i < count; ++i) {
+		if (v[i] < 0 || v[i] >= VERTICES) {
+			return pc + (textured ? 32 : 16);
+		}
+		struct Vertex* p = &h->v[v[i]];
+		uint32_t const c = f5iWord(h, 0xD40 + index[i]);
+		p->r = (c >> 24) / 255.0f, p->g = ((c >> 16) & 0xFF) / 255.0f, p->b = ((c >> 8) & 0xFF) / 255.0f, p->a = (c & 0xFF) / 255.0f;
+		if (textured) {
+			p->s = (int16_t) (st[i] >> 16) / (persp ? 32.0f : 16.0f), p->t = (int16_t) st[i] / (persp ? 32.0f : 16.0f);
+		}
+	}
+	int const tris[2][3] = { { v[0], v[1], v[2] }, { v[0], v[2], v[3] } };
+	bool const drawn[2] = { !f5iClipped(h, v[0], v[1], v[2]), two && !f5iClipped(h, v[0], v[2], v[3]) };
+	if (drawn[0] || drawn[1]) {
+		f5iSubList(n, h, run);
+	}
+	for (int k = 0; k < 2; ++k) {
+		if (drawn[k]) {
+			f5iTriangle(n, h, tris[k][0], tris[k][1], tris[k][2], textured);
+		}
+	}
+	return pc + (textured ? 32 : 16);
+}
+
+// G_GEOMETRY_GEN 0x18: the vertices at 0x170 the mask names, through the generating matrix.
+static void f5iGenVertices(struct Hle* h, uint32_t w0, uint32_t w1) {
+	float combined[16];
+	memcpy(combined, h->mvp, sizeof(combined));
+	memcpy(h->mvp, h->f5iGenMtx, sizeof(combined));
+	uint32_t a = (w0 & 0xFFFF) | (w1 & 0xFFFF0000u);
+	for (int i = 0; a && i < 32; ++i) {
+		uint32_t const c = a & (1u << i);
+		if (c) {
+			f5iVertexDmem(h, i, 0x170 + 8 * (uint32_t) i);
+			a ^= c;
+		}
+	}
+	memcpy(h->mvp, combined, sizeof(combined));
+}
+
+// G_GEOMETRY_GEN 0x27: particles moved along (their states in RDRAM, written back), respawned from the
+// clock where they ran out.
+static void f5iParticles(struct N64* n, struct Hle* h, uint32_t pc) {
+	uint32_t params[6];
+	for (int i = 0; i < 6; ++i) {
+		params[i] = rd32(n, pc + 4 * (uint32_t) i);
+	}
+	f5iSetWord(h, 0xC10, rd32(n, params[3] & 0xFFFFFF)), f5iSetWord(h, 0xC14, rd32(n, (params[3] & 0xFFFFFF) + 4));
+	uint32_t const live = f5iWord(h, 0xC10);
+	if (!live) {
+		return;
+	}
+	f5iCopyIn(n, h, 0x170, params[2] & 0xFFFFFF, 256);
+	uint32_t const corrector = params[0] & 0xFFFF, m = params[5] & 0xFFFF;
+	uint32_t vtx = 0x170, light = 0xB00, factorAt = 0x380, colorAt = 0x480, count = 0, gone = 0;
+	for (uint32_t u = live; u; u >>= 1, vtx += 8, light += 8, factorAt += 8, colorAt += 8, ++count) {
+		uint16_t f = (uint16_t) ((((uint32_t) f5iHalf(h, light + 2) << 12) + f5iHalf(h, light) * corrector) << 4 >> 16);
+		bool ended = false;
+		if (!(m & 0x2000)) {
+			int16_t f1;
+			do {
+				f = (uint16_t) ((((uint32_t) f5iHalf(h, light + 2) << 12) + f5iHalf(h, light) * corrector) << 4 >> 16);
+				f1 = (int16_t) (f + 0xF000);
+				if (f1 < 0) {
+					f5iSetHalf(h, light + 2, f);
+					uint16_t flag = f5iHalf(h, vtx + 4);
+					if (m & 0x40) {
+						flag = (uint16_t) ((((f >> 4) & 0xFC) << 8) | (flag & 0xFF));
+					}
+					if (m & 0x20) {
+						flag = (uint16_t) (((f >> 4) & 0xFC) | (flag & 0xFF00));
+					}
+					f5iSetHalf(h, vtx + 4, flag);
+				} else {
+					f5iSetHalf(h, light + 2, 0);
+					if (m & 0x4000) {
+						uint32_t const clock = busRead32(n, 0x04100010);
+						uint32_t const v0 = f5iWord(h, 0xC18), v1 = f5iWord(h, 0xC1C), v2 = f5iWord(h, 0xC20), v3 = f5iWord(h, 0xC24);
+						f5iSetHalf(h, vtx + 2, (uint16_t) ((clock & (v0 >> 16)) + (v2 >> 16)));
+						f5iSetHalf(h, vtx, (uint16_t) (((clock >> 3) & (v0 & 0xFFFF)) + (v2 & 0xFFFF)));
+						f5iSetHalf(h, vtx + 6, (uint16_t) (((clock >> 6) & (v1 >> 16)) + (v3 >> 16)));
+						f5iSetHalf(h, vtx + 4, (uint16_t) (f5iHalf(h, vtx + 4) & (v1 & 0xFFFF)));
+					} else {
+						gone |= 1u << count;
+						ended = true;
+						break;
+					}
+				}
+			} while (f1 >= 0);
+		}
+		if (ended) {
+			continue;
+		}
+		uint32_t x = ((uint32_t) f5iHalf(h, vtx + 2) << 12) + (uint32_t) ((int16_t) (params[4] >> 16) * (int32_t) corrector);
+		uint32_t y = ((uint32_t) f5iHalf(h, vtx) << 12) + (uint32_t) ((int16_t) params[4] * (int32_t) corrector);
+		uint32_t z = ((uint32_t) f5iHalf(h, vtx + 6) << 12) + (uint32_t) ((int16_t) (params[5] >> 16) * (int32_t) corrector);
+		if (m & 0x0380) {
+			uint32_t offset = factorAt - 0x380;
+			if (!(m & 0x0200)) {
+				offset = m & 0x080 ? (uint32_t) ((f >> 4) & 0xF8) : (f5iWord(h, light + 4) >> 24) << 3;
+			}
+			uint32_t const w0 = f5iWord(h, 0x380 + offset), w1 = f5iWord(h, 0x380 + offset + 4);
+			x += (uint32_t) ((int16_t) (w0 >> 16) * (int32_t) corrector), y += (uint32_t) ((int16_t) w0 * (int32_t) corrector);
+			z += (uint32_t) ((int16_t) (w1 >> 16) * (int32_t) corrector);
+		}
+		if (m & 0x1C00) {
+			uint32_t offset = colorAt - 0x480;
+			if (!(m & 0x1000)) {
+				offset = m & 0x0400 ? (uint32_t) ((f >> 4) & 0xF8) : ((f5iWord(h, light + 4) >> 16) & 0xFF) << 3;
+			}
+			uint32_t const w0 = f5iWord(h, 0x480 + offset), w1 = f5iWord(h, 0x480 + offset + 4);
+			x += (uint32_t) ((int16_t) (w0 >> 16) * (int32_t) corrector), y += (uint32_t) ((int16_t) w0 * (int32_t) corrector);
+			z += (uint32_t) ((int16_t) (w1 >> 16) * (int32_t) corrector);
+		}
+		int16_t vx = (int16_t) ((x << 4) >> 16), vy = (int16_t) ((y << 4) >> 16), vz = (int16_t) ((z << 4) >> 16);
+		if (m & 0x0008) {
+			uint32_t const v0 = f5iWord(h, 0xC00), v1 = f5iWord(h, 0xC04), v2 = f5iWord(h, 0xC08), v3 = f5iWord(h, 0xC0C);
+			int16_t const lo[3] = { (int16_t) (v0 >> 16), (int16_t) v0, (int16_t) (v1 >> 16) }, span[3] = { (int16_t) (v2 >> 16), (int16_t) v2, (int16_t) (v3 >> 16) };
+			int16_t* c[3] = { &vx, &vy, &vz };
+			for (int k = 0; k < 3; ++k) {
+				if (*c[k] < lo[k]) {
+					*c[k] = (int16_t) (*c[k] + span[k]);
+				}
+				if (*c[k] > lo[k] + span[k]) {
+					*c[k] = (int16_t) (*c[k] - span[k]);
+				}
+			}
+		}
+		f5iSetHalf(h, vtx + 2, (uint16_t) vx), f5iSetHalf(h, vtx, (uint16_t) vy), f5iSetHalf(h, vtx + 6, (uint16_t) vz);
+	}
+	f5iCopyOut(n, h, params[2] & 0xFFFFFF, 0x170, 256);
+	if (!(m & 0x04) && !h->dry) {
+		uint32_t const a = params[3] & 0xFFFFFF;
+		n64RdramWrite(n, a, 4);
+		uint32_t const v = live & ~gone;
+		for (int k = 0; k < 4; ++k) {
+			n->rdram[(a + (uint32_t) k) & (RDRAM_SIZE - 1)] = (uint8_t) (v >> (24 - 8 * k));
+		}
+		f5iCopyOut(n, h, (params[1] >> 8) & 0xFFFFFF, 0xB00, count * 8);
+	}
+}
+
+// A texture rectangle as gDPTextureRectangle has it: from (ulx, uly) to (lrx, lry), S and T at its
+// corner (10.5), the steps (5.10).
+static void f5iRect(struct N64* n, struct Hle* h, float ulx, float uly, float lrx, float lry, int tile, int16_t s, int16_t t, float dsdx, float dtdy, bool flip) {
+	int const xh = ulx > 0 ? (int) (ulx * 4) : 0, yh = uly > 0 ? (int) (uly * 4) : 0, xl = (int) (lrx * 4), yl = (int) (lry * 4);
+	if (xl <= xh || yl <= yh) {
+		return;
+	}
+	emit(n, h, (uint64_t) (flip ? 0x25 : 0x24) << 56 | (uint64_t) (xl & 0xFFF) << 44 | (uint64_t) (yl & 0xFFF) << 32 | (uint64_t) (tile & 7) << 24 |
+	           (uint64_t) (xh & 0xFFF) << 12 | (uint64_t) (yh & 0xFFF));
+	emit(n, h, (uint64_t) (uint16_t) s << 48 | (uint64_t) (uint16_t) t << 32 | (uint64_t) (uint16_t) (int16_t) (dsdx * 1024) << 16 | (uint16_t) (int16_t) (dtdy * 1024));
+}
+
+static void f5iPrim(struct N64* n, struct Hle* h, const struct Vertex* v, uint32_t color) {
+	float const z = v->z / v->w * h->vscale[2] + h->vtrans[2];
+	emit(n, h, (uint64_t) 0x2E << 56 | (uint64_t) (uint16_t) (int) (z * 32) << 16);
+	emit(n, h, (uint64_t) 0x3A << 56 | color);
+}
+
+// Whether a vertex (in RDRAM) lies inside the box at lim.
+static uint32_t f5iMask(struct N64* n, struct Hle* h, uint32_t mask, uint32_t lim, uint32_t vtx) {
+	int16_t const xl = (int16_t) (f5iWord(h, lim) >> 16), yl = (int16_t) f5iWord(h, lim), zl = (int16_t) (f5iWord(h, lim + 4) >> 16);
+	int16_t const xr = (int16_t) (f5iWord(h, lim + 8) >> 16), yr = (int16_t) f5iWord(h, lim + 8), zr = (int16_t) (f5iWord(h, lim + 12) >> 16);
+	uint32_t s = 0xFFFFFFFEu;
+	for (uint32_t i = 0; i < 0x20; ++i, s = s << 1 | 1) {
+		int16_t const x = rd16(n, vtx + 8 * i), y = rd16(n, vtx + 8 * i + 2), z = rd16(n, vtx + 8 * i + 4);
+		if (x > xl && x < xr && y > yl && y < yr && z > zl && z < zr) {
+			mask &= s;
+		}
+	}
+	return mask;
+}
+
+// G_GEOMETRY_GEN 0x24: Indiana Jones's sprites, a rectangle at each of up to 32 vertices a block, sized
+// over w and textured as the command and the vertex's flag (colour, size) say.
+static void f5iSprites(struct N64* n, struct Hle* h, uint32_t pc) {
+	uint32_t params[10];
+	for (int i = 0; i < 10; ++i) {
+		params[i] = rd32(n, pc + 4 * (uint32_t) i);
+	}
+	uint32_t const vp = f5iWord(h, 0x130), vpx = (vp >> 17) & 0x7FFF, vpy = (vp >> 1) & 0x7FFF;
+	uint32_t const maxX = ((params[0] & 0xFFFF) * vpx) >> 16, maxY = ((params[1] >> 16) * vpy) >> 16;
+	uint64_t const mx = (params[4] & 0xFFFF0000u) | (params[5] >> 16), xScale = mx * (params[7] >> 16) * vpx;
+	uint64_t const my = (params[4] << 16) | (params[5] & 0xFFFF), yScale = my * (params[7] & 0xFFFF) * vpy;
+	uint32_t const mp = f5iWord(h, 0x5C8);
+	uint64_t const q = (params[6] & 0xFFFF0000u) | (mp >> 16), r = (params[6] << 16) | (mp & 0xFFFF);
+	uint32_t const scale = params[3];
+	uint32_t vtx = params[2] & 0xFFFFFF;
+	for (int32_t count = (int32_t) ((params[0] >> 16) & 0xFF); count > 0; --count, vtx += 0x100) {
+		for (int i = 0; i < 0x20; ++i) {
+			f5iVertexRdram(n, h, i, vtx + 8 * (uint32_t) i);
+		}
+		uint32_t k = params[8], lim = 0xC28;
+		for (uint32_t b = params[9] & 0xFF; b; --b, lim += 0x10) {
+			k = f5iMask(n, h, k, lim, vtx);
+		}
+		for (int i = 0; i < 0x20 && i < VERTICES; ++i, k >>= 1) {
+			if (!(k & 1) || f5iClip(h, i)) {
+				continue;
+			}
+			const struct Vertex* v = &h->v[i];
+			float const sx = v->x / v->w * h->vscale[0] + h->vtrans[0], sy = -v->y / v->w * h->vscale[1] + h->vtrans[1];
+			uint32_t const w = v->w > 1 ? (uint32_t) v->w : 1, invW = 0xFFFFFFFFu / w;
+			uint16_t const flag = (uint16_t) rd16(n, vtx + 8 * (uint32_t) i + 6);
+			uint32_t const val = f5iWord(h, 0x480 + (flag >> 8)), a = val >> 16, c = val & 0xFFFF;
+			uint64_t ox = (xScale * invW) >> 32;
+			ox = (ox * a) >> 32;
+			ox = ox > maxX ? maxX : ox < 4 ? 4 : ox;
+			float const ulx = sx - ox / 4.0f, lrx = sx + ox / 4.0f > 0 ? sx + ox / 4.0f : 0;
+			int32_t const g = ulx > 0 ? 0 : (int32_t) ulx;
+			if (lrx - ulx <= 0) {
+				continue;
+			}
+			uint64_t oy = (yScale * invW) >> 32;
+			oy = (oy * c) >> 32;
+			oy = oy > maxY ? maxY : oy < 4 ? 4 : oy;
+			float const uly = sy - oy / 4.0f, lry = sy + oy / 4.0f > 0 ? sy + oy / 4.0f : 0;
+			int32_t const hh = uly > 0 ? 0 : (int32_t) uly;
+			if (lry - uly <= 0) {
+				continue;
+			}
+			uint64_t const q1 = q * 0x40 / ox, r1 = r * 0x40 / oy;
+			uint16_t const dsdx = (uint16_t) (q1 >> 16), dtdy = (uint16_t) (r1 >> 16);
+			uint64_t const u = q1 * 0x40 < 0x7FFFFFFFu ? q1 * 0x40 : 0x7FFFFFFFu, vv = r1 * 0x40 < 0x7FFFFFFFu ? r1 * 0x40 : 0x7FFFFFFFu;
+			int16_t const s = (int16_t) (((uint16_t) (((0 - u) * (uint64_t) (int64_t) g) >> 16) - 2) * 8);
+			int16_t const t = (int16_t) (((uint16_t) (((0 - vv) * (uint64_t) (int64_t) hh) >> 16) - 2) * 8);
+			uint32_t const prim = f5iWord(h, 0x380 + (flag & 0xFF));
+			uint32_t color = 0;
+			for (int ch = 24; ch >= 0; ch -= 8) {
+				color |= (((prim >> ch) & 0xFF) * ((scale >> ch) & 0xFF) >> 8) << ch;
+			}
+			f5iPrim(n, h, v, color);
+			f5iRect(n, h, ulx, uly, lrx, lry, 0, s, t, (int16_t) dsdx / 1024.0f, (int16_t) dtdy / 1024.0f, false);
+		}
+	}
+}
+
+// The state-only commands (geometry, other modes, texture, words into DMEM, RDP state), shared with the
+// pairs of commands Battle for Naboo keeps in DMEM.
+static void f5iState(struct N64* n, struct Hle* h, uint32_t w0, uint32_t w1) {
+	switch (w0 >> 24) {
+	case 0xB6:
+		setGeometry(h, ~w1, 0, false);
+		break;
+	case 0xB7:
+		setGeometry(h, 0, w1, false);
+		break;
+	case 0xB9:
+		if (((w0 >> 23) & 1) != f5iWord(h, 0x11C)) {
+			break;
+		}
+		// fall through
+	case 0xBA: {
+		uint32_t const a0 = (w0 >> 16) & 7, mask = (uint32_t) ((int32_t) 0x80000000 >> (w0 & 31)) >> ((w0 >> 8) & 31);
+		if (a0 == 0 || a0 == 4) {
+			otherModeMask(n, h, a0 == 0, mask, w1);
+		}
+		break;
+	}
+	case 0xBB:
+		h->texScaleS = (w1 >> 16) / 65536.0f, h->texScaleT = (w1 & 0xFFFF) / 65536.0f;
+		h->texLevel = (w0 >> 11) & 7, h->texTile = (w0 >> 8) & 7, h->texOn = w0 & 0xFF;
+		f5iSetWord(h, 0x148, w0);
+		break;
+	case 0xBC:
+		f5iSetWord(h, w0 & 0xFFF, w1);
+		if ((w0 & 0xFFF) == 0x160) {
+			h->fogMul = (int32_t) w1 / 256.0f;
+		} else if ((w0 & 0xFFF) == 0x164) {
+			h->fogOffset = (int32_t) w1 / 256.0f;
+		}
+		break;
+	default:
+		if (w0 >> 24 >= 0xC0 && w0 >> 24 != 0xE4 && w0 >> 24 != 0xE5) {
+			rdpCommand(n, h, 0, w0, w1);
+		}
+		break;
+	}
+}
+
+// The pair of commands kept at a: sent to the RDP as they are, the other modes the microcode keeps
+// left as they were.
+static void f5nCommands(struct N64* n, struct Hle* h, uint32_t a) {
+	uint32_t const modeH = h->modeH, modeL = h->modeL;
+	f5iState(n, h, f5iWord(h, a), f5iWord(h, a + 4));
+	f5iState(n, h, f5iWord(h, a + 8), f5iWord(h, a + 12));
+	h->modeH = modeH, h->modeL = modeL;
+}
+
+// Battle for Naboo's terrain: a triangle drawn, the commands its kind keeps at 0xE50 (by 0x100's flags)
+// first, or after the sub-list with the other modes saved there.
+static void f5nTriangle(struct N64* n, struct Hle* h, struct F5iRun* run, const int* v) {
+	if (f5iClipped(h, v[0], v[1], v[2])) {
+		return;
+	}
+	uint32_t const a = (f5iWord(h, 0x100) >> 8) & 0xFFFF, b = h->f5iDmem[0x103 ^ 3], c = a | b;
+	f5iSetHalf(h, 0x100 + 2 * (0 ^ 1), (uint16_t) c);
+	if (!(f5iWord(h, 0x58C) & 0xFFFFFF)) {
+		if ((c << 8) != b) {
+			f5nCommands(n, h, 0xE50 + b);
+		}
+		f5iTriangle(n, h, v[0], v[1], v[2], true);
+		return;
+	}
+	f5iSubList(n, h, run);
+	uint32_t const modeH = 0xEF000000u | h->modeH;
+	f5iSetWord(h, 0xE50, modeH), f5iSetWord(h, 0xE54, h->modeL);
+	uint32_t const e = modeH & 0xFFCFFFFFu;
+	f5iSetWord(h, 0xE70, e), f5iSetWord(h, 0xE60, e | 0x00100000u);
+	uint32_t const g = h->f5iDmem[0x101 ^ 3];
+	if (g) {
+		f5nCommands(n, h, 0xE50 + g);
+	}
+	f5iTriangle(n, h, v[0], v[1], v[2], true);
+}
+
+// One of a terrain cell's triangles: its corners by index (through the table at 0xD58), their colours
+// from 0xB78 and, at a transition, their alphas from 0xB00.
+static void f5nCell(struct N64* n, struct Hle* h, struct F5iRun* run, uint32_t gg) {
+	uint32_t const idx[3] = { f5iHalf(h, gg + 16) + (uint32_t) h->nabooCC, f5iHalf(h, gg + 22) + (uint32_t) h->nabooCC, f5iHalf(h, gg + 20) + (uint32_t) h->nabooCC };
+	int v[3];
+	uint32_t alphaSum = 0;
+	for (int i = 0; i < 3; ++i) {
+		uint32_t const at = f5iHalf(h, 0xD58 + 2 * ((idx[i] / 2) ^ 1));
+		v[i] = (int) ((at - 0x600) / 40);
+		if (v[i] < 0 || v[i] >= VERTICES) {
+			return;
+		}
+		uint32_t const c = 0xB78 + idx[i] * 2 + ((uint32_t) h->nabooHH & 0xFFF);
+		struct Vertex* p = &h->v[v[i]];
+		p->r = h->f5iDmem[(c + 3) & 0xFFF] / 255.0f, p->g = h->f5iDmem[(c + 2) & 0xFFF] / 255.0f;
+		p->b = h->f5iDmem[(c + 1) & 0xFFF] / 255.0f, p->a = h->f5iDmem[c & 0xFFF] / 255.0f;
+		alphaSum += h->f5iDmem[c & 0xFFF];
+	}
+	uint8_t* flags = &h->f5iDmem[0x103 ^ 3];
+	if (!h->nabooHH) {
+		f5iSetWord(h, 0x100, 0);
+	} else if (!alphaSum) {
+		*flags = 0x00;
+	} else if (h->nabooHH > 0) {
+		*flags = 0x10;
+	} else if (alphaSum != 0x2FD) {
+		*flags = 0x00;
+	} else {
+		uint8_t alphas[3];
+		uint32_t sum = 0;
+		for (int i = 0; i < 3; ++i) {
+			alphas[i] = h->f5iDmem[(0xB00 + idx[i] * 2 + ((uint32_t) h->nabooHH & 0xFFF)) & 0xFFF];
+			sum += alphas[i];
+		}
+		if (!sum) {
+			h->v[v[0]].a = alphas[0] / 255.0f;
+			*flags = 0x20;
+		} else {
+			*flags = 0x10;
+			for (int i = 0; i < 3; ++i) {
+				h->v[v[i]].a = alphas[i] / 255.0f;
+			}
+		}
+	}
+	f5nTriangle(n, h, run, v);
+}
+
+// The terrain's polygons: cells walked by the two masks (AA, BB), two triangles a cell; 0xBE sets the
+// texture coordinates of the corners first.
+static void f5nPolygons(struct N64* n, struct Hle* h, struct F5iRun* run, uint32_t pc) {
+	uint32_t const p0 = rd32(n, pc), p1 = rd32(n, pc + 4);
+	int step = 5;
+	if (p0 >> 24 == 0xBE) {
+		h->nabooHH = (int16_t) p0;
+		uint32_t const gg = (uint32_t) (h->nabooEE - h->nabooDD);
+		uint32_t const idx[4] = { (f5iHalf(h, gg + 16) + h->nabooCC) >> 1, (f5iHalf(h, gg + 22) + h->nabooCC) >> 1, (f5iHalf(h, gg + 20) + h->nabooCC) >> 1,
+		                          (f5iHalf(h, gg + 30) + h->nabooCC) >> 1 };
+		int v[4];
+		for (int i = 0; i < 4; ++i) {
+			v[i] = (int) ((f5iHalf(h, 0xD58 + 2 * (idx[i] ^ 1)) - 0x600) / 40);
+			if (v[i] < 0 || v[i] >= VERTICES) {
+				return;
+			}
+		}
+		float const t1 = (int16_t) p1 / 32.0f, s2 = (int16_t) (p1 >> 16) / 32.0f;
+		h->v[v[0]].s = 0, h->v[v[0]].t = t1;
+		h->v[v[1]].s = s2, h->v[v[1]].t = 0;
+		h->v[v[2]].s = 0, h->v[v[2]].t = 0;
+		h->v[v[3]].s = s2, h->v[v[3]].t = t1;
+		step = 3;
+	}
+	for (int guard = 0; guard < 1 << 12; ++guard) {
+		switch (step) {
+		case 3:
+			f5nCell(n, h, run, (uint32_t) (h->nabooEE - h->nabooDD));
+			f5nCell(n, h, run, (uint32_t) (h->nabooEE - h->nabooDD + 8));
+			step = 4;
+			break;
+		case 4:
+			if (h->nabooDD == 0x10) {
+				step = 6;
+			} else {
+				h->nabooCC = (uint8_t) (h->nabooCC + h->nabooTT);
+				if (!((h->nabooAA & 0xFF) | ((uint16_t) h->nabooBB & 0xFF))) {
+					return;
+				}
+				step = 5;
+			}
+			break;
+		case 5:
+			h->nabooDD = 0x10;
+			if (!(h->nabooAA & 0x80)) {
+				h->nabooAA = (uint16_t) (h->nabooAA << 1), step = 6;
+			} else if (!(h->nabooAA & 0x8000)) {
+				h->nabooAA = (uint16_t) (h->nabooAA << 1), step = 3;
+			} else {
+				h->nabooAA = (uint16_t) (h->nabooAA << 1);
+				return;
+			}
+			break;
+		default:
+			h->nabooDD = 0;
+			if (!(h->nabooBB & 0x80)) {
+				h->nabooBB = (int16_t) ((uint16_t) h->nabooBB << 1), step = 4;
+			} else if (!(h->nabooBB & 0x8000)) {
+				h->nabooBB = (int16_t) ((uint16_t) h->nabooBB << 1), step = 3;
+			} else {
+				h->nabooBB = (int16_t) ((uint16_t) h->nabooBB << 1);
+				return;
+			}
+			break;
+		}
+	}
+}
+
+// G_GEOMETRY_GEN 0x0F, first time: the terrain's tables at 0xDD0 and 0xC68 and the corner table at
+// 0xD58 set up from the command (64 bytes).
+static void f5nSetup(struct N64* n, struct Hle* h, uint32_t pc) {
+	uint32_t p[16];
+	for (int i = 0; i < 16; ++i) {
+		p[i] = rd32(n, pc + 4 * (uint32_t) i);
+	}
+	f5iSetWord(h, 0x0F8, p[3]);
+	f5iSetWord(h, 0x0FC, ((p[0] >> 16) & 0xFF) << 24 | (p[10] & 0xFF) << 16);
+	uint32_t d[32];
+	for (int i = 0; i < 32; ++i) {
+		d[i] = f5iWord(h, 0xDD0 + 4 * (uint32_t) i);
+	}
+	d[0] = (p[2] & 0xFFFF0000u) | (p[14] >> 16);
+	d[1] = (p[2] & 0xFFFF) << 16 | (d[1] & 0xFFFF);
+	d[2] = (p[2] & 0xFFFF0000u) | (p[14] & 0xFFFF);
+	d[3] = (p[2] & 0xFFFF) << 16 | 0x0100;
+	d[4] = (p[4] & 0xFFFF0000u) | (d[4] & 0xFFFF), d[6] = (p[4] & 0xFFFF0000u) | (d[6] & 0xFFFF);
+	d[8] = (p[4] & 0xFFFF) << 16 | (d[8] & 0xFFFF), d[10] = (p[4] & 0xFFFF) << 16 | (d[10] & 0xFFFF);
+	d[12] = (p[5] & 0xFFFF0000u) | (d[12] & 0xFFFF), d[14] = (p[5] & 0xFFFF0000u) | (d[14] & 0xFFFF);
+	d[16] = (p[5] & 0xFFFF) << 16 | (d[16] & 0xFFFF), d[18] = (p[5] & 0xFFFF) << 16 | (d[18] & 0xFFFF);
+	d[5] = d[7] = (p[6] & 0xFFFF0000u) | (p[8] >> 16);
+	d[9] = d[11] = (p[6] & 0xFFFF) << 16 | (p[8] & 0xFFFF);
+	d[13] = d[15] = (p[7] & 0xFFFF0000u) | (p[9] >> 16);
+	d[17] = d[19] = (p[7] & 0xFFFF) << 16 | (p[9] & 0xFFFF);
+	d[20] = (p[0] & 0xFFFF) << 16 | (p[13] >> 16);
+	d[21] = (p[15] & 0xFFFF0000u) | (d[21] & 0xFFFF);
+	d[22] = p[11] & 0xFF;
+	if (d[22] > 127) {
+		d[22] |= 0xFF00;
+	}
+	d[22] |= (((p[0] & 0xFFFF) + 0x00FF) & 0xFF00) << 16;
+	d[23] = (p[15] & 0xFFFF) << 16 | (d[23] & 0xFFFF);
+	d[24] = d[26] = 0x7FFF7FFF;
+	d[25] = d[27] = p[12];
+	d[28] = d[29] = p[10];
+	d[30] = d[31] = p[11];
+	for (int i = 0; i < 32; ++i) {
+		f5iSetWord(h, 0xDD0 + 4 * (uint32_t) i, d[i]);
+	}
+	f5iCopyIn(n, h, 0xC68, (p[1] >> 8) & 0xFFFFFF, 0xF0);
+	h->f5iDmem[0x37E ^ 3] = 0xFF;
+	static const uint32_t corners[14] = { 0x06000628, 0x06500678, 0x06A006C8, 0x06F00718, 0x07400768, 0x079007B8, 0x07E00808,
+	                                      0x08300858, 0x088008A8, 0x08D008F8, 0x09200948, 0x09700998, 0x09C009E8, 0x0A100A38 };
+	for (int i = 0; i < 14; ++i) {
+		f5iSetWord(h, 0xD58 + 4 * (uint32_t) i, corners[i]);
+	}
+	f5iSetWord(h, 0xD90, 0x0A600000u | (f5iWord(h, 0xD90) & 0xFFFF));
+}
+
+// G_GEOMETRY_GEN 0x0F, later times: the terrain's step values at 0xDB8 from the command.
+static void f5nUpdate(struct N64* n, struct Hle* h, uint32_t pc) {
+	uint32_t const p0 = rd32(n, pc), p1 = rd32(n, pc + 4), p2 = rd32(n, pc + 8), p3 = rd32(n, pc + 12);
+	f5iSetWord(h, 0x100, 0);
+	uint32_t d[30];
+	for (int i = 0; i < 30; ++i) {
+		d[i] = f5iWord(h, 0xDB8 + 4 * (uint32_t) i);
+	}
+	d[0] = d[0] & 0xFFFF;
+	d[1] = (p0 & 0xFFFF) << 16 | (d[1] & 0xFFFF);
+	uint32_t v = (p0 >> 16) & 0xFF;
+	d[2] = v << 24 | 0x00FFFF, d[3] = v * 2, d[4] = v << 24;
+	v = p1 >> 24;
+	d[5] = v, d[7] = (d[7] & 0xFFFF0000u) | (v * 2);
+	v = p2 >> 16;
+	d[10] = (d[10] & 0xFFFF0000u) | v, d[12] = (d[12] & 0xFFFF0000u) | v;
+	v = p2 & 0xFFFF;
+	d[14] = (d[14] & 0xFFFF0000u) | v, d[16] = (d[16] & 0xFFFF0000u) | v;
+	v = p3 >> 16;
+	d[18] = (d[18] & 0xFFFF0000u) | v, d[20] = (d[20] & 0xFFFF0000u) | v;
+	v = p3 & 0xFFFF;
+	d[22] = (d[22] & 0xFFFF0000u) | v, d[24] = (d[24] & 0xFFFF0000u) | v;
+	v = (p1 >> 8) & 0xFFFF;
+	d[27] = (d[27] & 0xFFFF0000u) | v, d[29] = (d[29] & 0xFFFF0000u) | v;
+	for (int i = 0; i < 30; ++i) {
+		f5iSetWord(h, 0xDB8 + 4 * (uint32_t) i, d[i]);
+	}
+}
+
+struct F5nVertex {
+	uint16_t x, y, z, flag;
+	uint32_t e;
+	uint16_t k, l, m, n, j;
+	uint8_t c1[4], c2[4];
+};
+
+static int32_t f5nMultClip(int32_t s, int32_t t, int32_t max) {
+	if (((uint32_t) s ^ (uint32_t) t) & 0x80000000u) {
+		return 0;
+	}
+	int64_t const r = ((int64_t) s * t) >> 32;
+	return (int32_t) (r < max ? r : max);
+}
+
+static uint32_t f5nColor(const uint8_t* c) {
+	return (uint32_t) c[0] << 24 | (uint32_t) c[1] << 16 | (uint32_t) c[2] << 8 | c[3];
+}
+
+// G_GEOMETRY_GEN 0x09 and 0x0C: two rows of terrain vertices from heights and colours in RDRAM, with
+// distance fades (K to N, J), written to DMEM, then loaded and the cells drawn.
+static void f5nGenerate(struct N64* n, struct Hle* h, struct F5iRun* run, uint32_t pc, bool lit) {
+	uint32_t p[6];
+	for (int i = 0; i < 6; ++i) {
+		p[i] = rd32(n, pc + 4 * (uint32_t) i);
+	}
+	if (lit) {
+		f5iCopyIn(n, h, 0x380, f5iWord(h, 0x0F8) & 0xFFFFFF, 512);
+	}
+	uint32_t const src = p[0] & 0xFFF, dst = f5iWord(h, src) >> 16, from = p[4] & 0xFFFFFF;
+	uint32_t const dst2 = f5iWord(h, src + 8) >> 16, shift = f5iWord(h, 0xDBC) >> 16;
+	f5iCopyIn(n, h, dst, from, 40);
+	f5iCopyIn(n, h, dst2, from + shift, 40);
+	if (((p[0] >> 12) & 15) > 7) {
+		uint32_t const from2 = p[5] & 0xFFFFFF;
+		f5iCopyIn(n, h, dst + 0x78, from2, 40);
+		f5iCopyIn(n, h, dst2 + 0x78, from2 + shift, 40);
+	}
+	uint32_t const c32 = (uint32_t) ((int8_t) (p[1] >> 24) * 0x10000) - (f5iWord(h, 0xDD0) >> 16);
+	int64_t const c64 = (int32_t) c32;
+	uint32_t const c2 = (uint32_t) ((c64 * c64) >> 16);
+	uint32_t g = c32 * (f5iWord(h, 0xDC4) & 0xFFFF) + ((f5iWord(h, 0xDCC) & 0xFFFF) << 16);
+	struct F5nVertex vd[2];
+	uint32_t const starts[2] = { p[1] + (f5iWord(h, 0xDC0) >> 16), p[1] }, bases[2] = { 0xDD0, 0xDD8 };
+	for (int k = 0; k < 2; ++k) {
+		uint32_t const v = starts[k];
+		memset(&vd[k], 0, sizeof(vd[k]));
+		vd[k].x = (uint16_t) (((v >> 24) & 0xFF) << 8), vd[k].z = (uint16_t) (((v >> 8) & 0xFF) << 8), vd[k].flag = (uint16_t) ((v & 0xFF) << 8);
+		int64_t const d64 = (int32_t) ((uint32_t) ((int8_t) (v >> 8) * 0x10000) - (f5iWord(h, bases[k] + 4) >> 16));
+		vd[k].e = c2 + (uint32_t) ((d64 * d64) >> 16);
+	}
+	uint32_t const e20 = f5iWord(h, 0xE20), e24 = f5iWord(h, 0xE24), e28 = f5iWord(h, 0xE28), e2c = f5iWord(h, 0xE2C);
+	uint32_t const ii = (e2c & 0xFFFF0000u) | (e24 >> 16);
+	uint32_t const de0 = f5iWord(h, 0xDE0), de4 = f5iWord(h, 0xDE4), df0 = f5iWord(h, 0xDF0), df4 = f5iWord(h, 0xDF4);
+	int32_t const kk = (int32_t) ((df0 & 0xFFFF0000u) | (de0 >> 16)), ll = (int32_t) ((df0 & 0xFFFF) << 16 | (de0 & 0xFFFF));
+	int32_t const mm = (int32_t) ((df4 & 0xFFFF0000u) | (de4 >> 16)), nn = (int32_t) ((df4 & 0xFFFF) << 16 | (de4 & 0xFFFF));
+	uint32_t const e00 = f5iWord(h, 0xE00), e04 = f5iWord(h, 0xE04), e10 = f5iWord(h, 0xE10), e14 = f5iWord(h, 0xE14);
+	int32_t const oo = (int32_t) ((e10 & 0xFFFF0000u) | (e00 >> 16)), pp = (int32_t) ((e10 & 0xFFFF) << 16 | (e00 & 0xFFFF));
+	int32_t const qq = (int32_t) ((e14 & 0xFFFF0000u) | (e04 >> 16)), rr = (int32_t) ((e14 & 0xFFFF) << 16 | (e04 & 0xFFFF));
+	uint32_t const e34 = f5iWord(h, 0xE34), e40 = f5iWord(h, 0xE40), e48 = f5iWord(h, 0xE48);
+	uint32_t const dd0 = f5iWord(h, 0xDD0), dd6 = (f5iWord(h, 0xDD4) & 0xFFFF) << 16, dd8 = f5iWord(h, 0xDD8);
+	uint8_t const shiftR = h->f5iDmem[0x0FC ^ 3], shiftH = h->f5iDmem[0x0FD ^ 3];
+	for (uint32_t at = p[4] >> 24; at <= p[5] >> 24; at += 4) {
+		for (int k = 0; k < 2; ++k) {
+			struct F5nVertex* d = &vd[k];
+			uint64_t j = ((uint64_t) d->e * ii) >> 16;
+			j *= j;
+			d->k = (uint16_t) f5nMultClip(kk - (int32_t) d->e, oo, 0x7FFF), d->l = (uint16_t) f5nMultClip(ll - (int32_t) d->e, pp, 0x7FFF);
+			d->m = (uint16_t) f5nMultClip(mm - (int32_t) d->e, qq, (int32_t) (e34 >> 16)), d->n = (uint16_t) f5nMultClip(nn - (int32_t) d->e, rr, (int32_t) (e34 & 0xFFFF));
+			uint16_t const jj = (uint16_t) (j >> 47);
+			d->j = jj < 0x7FFF ? jj : 0x7FFF;
+		}
+		for (int k = 0; k < 2; ++k) {
+			struct F5nVertex* d = &vd[k];
+			uint32_t const a = (f5iWord(h, src + 8 * (uint32_t) k) >> 16) + at;
+			uint32_t const factor = 0xFFFE - d->m - d->n, f3 = 0x7FFF - d->k;
+			if (lit) {
+				uint32_t const u1 = f5iWord(h, a), u2 = f5iWord(h, a + 0x78);
+				for (int c = 0; c < 3; ++c) {
+					int const sh = 24 - 8 * c;
+					d->c1[c] = (uint8_t) ((factor * ((u1 >> sh) & 0xFF) + d->m * ((e40 >> sh) & 0xFF) + d->n * ((e48 >> sh) & 0xFF)) >> 16);
+				}
+				uint8_t const i1 = (uint8_t) ((u1 & 0xFF) + shiftR), i2 = (uint8_t) ((u2 & 0xFF) + shiftH);
+				uint32_t const u3 = (uint32_t) (int8_t) h->f5iDmem[(0x380 + i1) ^ 3], u4 = (uint32_t) (int8_t) h->f5iDmem[(0x380 + i2) ^ 3];
+				uint32_t const l1 = (e28 & 0xFFFF) << 16 | (e20 & 0xFFFF), l2 = (dd8 & 0xFFFF) << 16 | (dd0 & 0xFFFF);
+				uint16_t const u5 = (uint16_t) ((u3 * l1 + u4 * l2) >> 16), u6 = (uint16_t) (u5 + (e20 >> 16));
+				uint16_t const u7 = (uint16_t) (((0x7FFF - d->k) * (uint32_t) u6 + d->k * (e28 >> 16)) >> 16);
+				d->y = (uint16_t) (((0x7FFF - d->j) * (uint32_t) u7 + d->j * (e24 & 0xFFFF)) >> 16);
+				uint8_t const a1 = h->f5iDmem[(0x4FF + u4) ^ 3];
+				uint16_t const f1 = (uint16_t) (0xFF - a1), f2 = (uint16_t) (0xFF * a1);
+				for (int c = 0; c < 3; ++c) {
+					int const sh = 24 - 8 * c;
+					uint8_t const vc = (uint8_t) ((f1 * ((u2 >> sh) & 0xFF) + f2) >> 8);
+					d->c2[c] = (uint8_t) ((factor * vc + d->m * ((e40 >> sh) & 0xFF) + d->n * ((e48 >> sh) & 0xFF)) >> 16);
+					d->c2[c] = (uint8_t) ((((f3 * d->c2[c] + d->k * d->c1[c]) << 1) >> 16) + 1);
+				}
+				d->c1[3] = (uint8_t) ((d->k * d->k) >> 22);
+				d->c2[3] = (uint8_t) (((((0x7FFF - d->l) * (uint32_t) a1 + d->l * 0xFFu) << 1) >> 16) + 1);
+			} else {
+				uint32_t const vv = f5iWord(h, src + 0x20 + 4 * (uint32_t) k);
+				uint32_t const a3 = (vv >> 16) + at + (at & 4), a4 = (vv & 0xFFFF) + at - (at & 4), f1 = 0x7FFF - d->l;
+				uint16_t ys[2];
+				for (int half = 0; half < 2; ++half) {
+					uint32_t const off = half ? 0x78 : 0, u = f5iWord(h, a + off);
+					uint32_t t = 0;
+					for (int b = 0; b < 4; ++b) {
+						t |= (uint32_t) ((h->f5iDmem[(a3 + off + (uint32_t) b) & 0xFFF] + h->f5iDmem[(a4 + off + (uint32_t) b) & 0xFFF]) >> 1) << (8 * b);
+					}
+					uint8_t* col = half ? d->c2 : d->c1;
+					for (int c = 0; c < 3; ++c) {
+						int const sh = 24 - 8 * c;
+						uint64_t va = (uint64_t) (f1 * ((u >> sh) & 0xFF) + d->l * ((t >> sh) & 0xFF));
+						va = (va * factor) >> 16;
+						col[c] = (uint8_t) (((va << 1) + d->m * ((e40 >> sh) & 0xFF) + d->n * ((e48 >> sh) & 0xFF)) >> 16);
+					}
+					uint32_t const ta = ((f5iWord(h, a3 + off) & 0xFF) << 7) + ((f5iWord(h, a4 + off) & 0xFF) << 7);
+					uint32_t const vy = ((f1 * ((u & 0xFF) << 8)) >> 16) + ((d->l * ta) >> 16);
+					ys[half] = (uint16_t) ((vy * (0x7FFF - d->j) + d->j * (e24 & 0xFFFF)) >> 16);
+				}
+				for (int c = 0; c < 3; ++c) {
+					d->c2[c] = (uint8_t) ((((f3 * d->c2[c] + d->k * d->c1[c]) << 1) >> 16) + 1);
+				}
+				d->y = (uint16_t) (((f3 * ys[1] + d->k * ys[0]) << 1) >> 16);
+				d->c1[3] = d->c2[3] = (uint8_t) ((d->k * d->k) >> 22);
+			}
+			f5iSetWord(h, a + 0x0F0, f5nColor(d->c1));
+			f5iSetWord(h, a + 0x168, f5nColor(d->c2));
+		}
+		for (int k = 0; k < 2; ++k) {
+			uint32_t const v = (k ? 0x1C0 : 0x170) + at * 2;
+			f5iSetHalf(h, v, vd[k].y), f5iSetHalf(h, v + 2, vd[k].x), f5iSetHalf(h, v + 4, vd[k].flag), f5iSetHalf(h, v + 6, vd[k].z);
+		}
+		uint32_t const v0 = f5iWord(h, 0xDC0);
+		vd[0].x = (uint16_t) (vd[0].x + (v0 >> 16)), vd[0].flag = (uint16_t) (vd[0].flag + (f5iWord(h, 0xDC4) & 0xFFFF));
+		vd[1].x = (uint16_t) (vd[1].x + (v0 >> 16)), vd[1].flag = (uint16_t) (vd[1].flag + (f5iWord(h, 0xDCC) & 0xFFFF));
+		vd[0].e += g, vd[1].e += g;
+		g += dd6;
+	}
+	// The rows loaded (moved by the base, x by its z too, as GLideN64 has it).
+	uint16_t x0, y0, z0;
+	f5iBase(h, &x0, &y0, &z0);
+	uint32_t const rows[2][3] = { { p[2] >> 16, 0x170, 0x10 }, { p[2] & 0xFFFF, 0x1C0, 0x18 } };
+	for (int r = 0; r < 2; ++r) {
+		uint32_t const count = rows[r][0] & 0x1F, offset = rows[r][0] >> 5;
+		uint32_t const from2 = rows[r][1] + offset, to = (f5iWord(h, src + rows[r][2]) >> 16) + offset * 5;
+		for (uint32_t i = 0; i < count; ++i) {
+			uint32_t const a = from2 + 8 * i;
+			int const slot = (int) ((to - 0x600) / 40 + i);
+			if (slot >= 0 && slot < VERTICES) {
+				f5Vertex(h, slot, (int16_t) (f5iHalf(h, a + 2) + x0 + z0), (int16_t) (f5iHalf(h, a) + y0), (int16_t) f5iHalf(h, a + 6));
+			}
+		}
+	}
+	h->nabooAA = f5iRdHalf(n, pc + 14), h->nabooBB = (int16_t) f5iRdHalf(n, pc + 12);
+	h->nabooCC = f5iRdByte(n, pc + 2), h->nabooTT = f5iRdByte(n, pc + 6);
+	h->nabooEE = (int16_t) src, h->nabooHH = (int16_t) (f5iWord(h, 0xDB8) >> 16), h->nabooDD = 0;
+	f5nPolygons(n, h, run, pc);
+}
+
+// G_GEOMETRY_GEN 0x15: Battle for Naboo's sprite at a vertex (as Rogue Squadron's G_TEXRECT_GEN, its
+// projection scale in the command), after the sub-list.
+static void f5nSprite(struct N64* n, struct Hle* h, struct F5iRun* run, uint32_t pc) {
+	uint32_t p[8];
+	for (int i = 0; i < 8; ++i) {
+		p[i] = rd32(n, pc + 4 * (uint32_t) i);
+	}
+	int const index = (int) (((p[0] >> 5) & 0x7F8) / 40);
+	if (index >= VERTICES || f5iClip(h, index)) {
+		return;
+	}
+	const struct Vertex* v = &h->v[index];
+	float const sx = v->x / v->w * h->vscale[0] + h->vtrans[0], sy = -v->y / v->w * h->vscale[1] + h->vtrans[1];
+	bool const flip = p[0] & 1;
+	uint64_t const w = v->w > 1 ? (uint64_t) v->w : 1;
+	uint32_t const vp = f5iWord(h, 0x130), viewX = (vp >> 17) & 0x7FFF, viewY = (vp >> 1) & 0x7FFF;
+	uint32_t const perspX = (p[5] & 0xFFFF0000u) | (p[6] >> 16), perspY = (p[5] & 0xFFFF) << 16 | (p[6] & 0xFFFF);
+	uint64_t p3x = p[3] >> 16, p3y = p[3] & 0xFFFF;
+	if (flip) {
+		uint64_t const t = p3x;
+		p3x = p3y, p3y = t;
+	}
+	uint32_t ox = (uint32_t) (((p3x * viewX * perspX) / w) >> 16), oy = (uint32_t) (((p3y * viewY * perspY) / w) >> 16);
+	float const ulx = sx - ox / 4.0f, lrx = sx + ox / 4.0f, uly = sy - oy / 4.0f, lry = sy + oy / 4.0f;
+	if (lrx - ulx <= 0 || lry - uly <= 0 || !ox || !oy) {
+		return;
+	}
+	float whole;
+	uint32_t const p4x = (p[4] & 0xFFFF0000u) | (uint32_t) (fabsf(modff(h->mvp[0], &whole)) * 65536.0f);
+	uint32_t const p4y = (p[4] & 0xFFFF) << 16 | (uint32_t) (fabsf(modff(h->mvp[1], &whole)) * 65536.0f);
+	if (flip) {
+		uint32_t const t = ox;
+		ox = oy, oy = t;
+	}
+	uint16_t dsdx = (uint16_t) ((p4x / ox) >> 10), dtdy = (uint16_t) ((p4y / oy) >> 10), e = 0, f = 0;
+	if (p[0] & 2) {
+		dsdx = (uint16_t) -dsdx, e = (uint16_t) (p[4] >> 16);
+	}
+	if (p[0] & 4) {
+		dtdy = (uint16_t) -dtdy, f = (uint16_t) p[4];
+	}
+	float const rectDsdx = (int16_t) dsdx / 1024.0f, rectDtdy = (int16_t) dtdy / 1024.0f;
+	if (flip) {
+		uint16_t const t = dsdx;
+		dsdx = dtdy, dtdy = t;
+	}
+	int16_t const s = (int16_t) (ulx > 0 ? (uint16_t) (e + 0xFFF0) : (uint16_t) (((0 - (dsdx << 6) * (int) (ulx * 4)) << 3) + e + 0xFFF0));
+	int16_t const t = (int16_t) (uly > 0 ? (uint16_t) (f + 0xFFF0) : (uint16_t) (((0 - (dtdy << 6) * (int) (uly * 4)) << 3) + f + 0xFFF0));
+	f5iSubList(n, h, run);
+	f5iPrim(n, h, v, p[7]);
+	if (h->geometry & GEOM_FOG) {
+		emit(n, h, (uint64_t) 0x38 << 56 | (p[7] & 0xFFFFFF00u) | (uint32_t) (v->a * 255.0f));
+	}
+	f5iRect(n, h, ulx, uly, lrx, lry, h->texTile, s, t, rectDsdx, rectDtdy, flip);
+}
+
+// One command at the current level's place; it moves that place on (or to another level).
+static void f5iCommand(struct N64* n, struct Hle* h, struct F5iRun* run) {
+	int const level = run->level;
+	uint32_t const pc = run->pc[level], w0 = rd32(n, pc), w1 = rd32(n, pc + 4);
+	uint32_t next = pc + 8;
+	switch (w0 >> 24) {
+	case 0x00:
+		break;
+	case 0x01:
+		f5iMoveMem(n, h, w0, w1);
+		break;
+	case 0x02:
+		f5iSetWord(h, 0xFD4, w1 + 8), f5iSetWord(h, 0xFD8, rd32(n, w1 & 0xFFFFFF)), f5iSetWord(h, 0xFDC, w0 & 0x1FF);
+		break;
+	case 0x05:
+		switch (w1 & 0xFF) {
+		case 0x09:
+		case 0x0C:
+			f5nGenerate(n, h, run, pc, (w1 & 0xFF) == 0x0C);
+			next = pc + 24;
+			break;
+		case 0x0F:
+			if (!h->f5iDmem[0x37E ^ 3]) {
+				f5nSetup(n, h, pc);
+				next = pc + 64;
+			} else {
+				f5nUpdate(n, h, pc);
+				next = pc + 16;
+			}
+			break;
+		case 0x15:
+			f5nSprite(n, h, run, pc);
+			next = pc + 32;
+			break;
+		case 0x18:
+			f5iGenVertices(h, w0, w1);
+			break;
+		case 0x24:
+			f5iSubList(n, h, run);
+			f5iSprites(n, h, pc);
+			next = pc + 40;
+			break;
+		case 0x27:
+			f5iParticles(n, h, pc);
+			next = pc + 24;
+			break;
+		case 0x4F:
+			h->f5iDmem[0x37E ^ 3] = 0;
+			break;
+		}
+		break;
+	case 0x06:
+	case 0x07:
+		if ((w0 >> 24) == 0x06) {
+			if (level + 1 > DL_DEPTH) {
+				break;
+			}
+			run->pc[level] = next;
+			run->level = level + 1;
+		}
+		next = address(h, w1);
+		h->f5Jump[run->level] = rd32(n, next) & 0xFFFFFF;
+		run->pc[run->level] = next + 8;
+		return;
+	case 0xB4:
+	case 0xBF:
+		next = f5iTriangles(n, h, run, pc, (w0 >> 24) == 0xB4);
+		break;
+	case 0xB5:
+		next = h->f5Jump[level];
+		h->f5Jump[level] = rd32(n, next) & 0xFFFFFF;
+		next += 8;
+		break;
+	case 0xB8:
+		if (!level) {
+			run->halt = true;
+			return;
+		}
+		run->level = level - 1;
+		return;
+	case 0xBE:
+		f5nPolygons(n, h, run, pc);
+		break;
+	case 0xE4:
+	case 0xE5:
+		if ((w0 >> 24) == 0xE4) {
+			f5iSubList(n, h, run);
+		}
+		emit(n, h, (uint64_t) w0 << 32 | w1);
+		emit(n, h, (uint64_t) rd32(n, pc + 8) << 32 | rd32(n, pc + 12));
+		next = pc + 16;
+		break;
+	default:
+		f5iState(n, h, w0, w1);
+		break;
+	}
+	if (run->level == level) {
+		run->pc[level] = next;
+	}
+}
+
+static void f5iList(struct N64* n, struct Hle* h, uint32_t pc) {
+	struct F5iRun run = { { 0 }, 0, false };
+	h->f5Jump[0] = rd32(n, pc) & 0xFFFFFF;
+	run.pc[0] = pc + 8;
+	static const uint32_t cleared[7] = { 0x11C, 0x120, 0x124, 0x37C, 0x58C, 0x5B0, 0x5B4 };
+	for (int i = 0; i < 7; ++i) {
+		f5iSetWord(h, cleared[i], 0);
+	}
+	for (int steps = 0; steps < 1 << 22 && !run.halt; ++steps) {
+		f5iCommand(n, h, &run);
+	}
+}
+
 static void zsortList(struct N64* n, struct Hle* h, uint32_t pc) {
 	int sp = 0;
 	for (int steps = 0; pc && steps < 1 << 20; ++steps) {
@@ -3407,6 +4766,10 @@ bool hleGraphics(struct N64* n, bool dry) {
 	if (f == FAMILY_NONE && ucode == 0xDB79F253u) {
 		f = FAMILY_F5ROGUE;
 	}
+	// Battle for Naboo's and Indiana Jones's.
+	if (f == FAMILY_NONE && (ucode == 0x5804274Fu || ucode == 0x3CCF37FFu)) {
+		f = FAMILY_F5INDI;
+	}
 	bool const wrus = f == FAMILY_F3D && (ucode == 0xAC1B2CFEu || ucode == 0x106A093Eu);
 	bool const dkr = f == FAMILY_NONE && (ucode == 0x5277D6E7u || ucode == 0x26EDE132u);
 	if (dkr) {
@@ -3488,6 +4851,12 @@ bool hleGraphics(struct N64* n, bool dry) {
 			n->sp.status = (n->sp.status & ~(uint32_t) (SIG1 | SIG2)) | SIG4;
 		}
 		bossRun(n, h);
+	} else if (f == FAMILY_F5INDI) {
+		// The microcode's data in DMEM, as the RSP loads it each task.
+		for (uint32_t i = 0; i < dataSize && i < 0xFC0; ++i) {
+			h->f5iDmem[i] = n->rdram[(data + (i ^ 3)) & (RDRAM_SIZE - 1)];
+		}
+		f5iList(n, h, be32(task + 0x30) & 0xFFFFFF);
 	} else if (f == FAMILY_F5ROGUE) {
 		h->f5Colors = h->f5Viewport = h->f5Persp = 0, h->f5TexScale[0] = h->f5TexScale[1] = 0;
 		f5List(n, h, be32(task + 0x30) & 0xFFFFFF);
