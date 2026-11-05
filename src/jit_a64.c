@@ -1570,6 +1570,13 @@ static void linkTo(struct Jit* j, uint64_t target) {
 	movConst(e, 1, target);
 	aDp(e, A_SUBS | W64, ZR, 0, 1, S_LSL, 0);
 	uint8_t* other = aBcond(e, C_NE, NULL);
+	// Code the TLB maps isn't jumped to directly (it may move): its entries here, kept as chain keeps
+	// them, find it without going back to C.
+	if (((uint32_t) target & 0xC0000000u) != 0x80000000u) {
+		chain(j);
+		patchHere(e, other);
+		return;
+	}
 	uint8_t* site = aB(e, NULL);
 	patchHere(e, site);
 	aMovX(e, 0, N);
