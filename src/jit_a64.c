@@ -365,13 +365,90 @@ static void storeSingle(struct Jit* j, int fd) {
 	aStr(e, 0, CPU, fprOff(j, fd));
 }
 
+// A 64-bit FPU register, as get64 and set64 find it.
+static unsigned fprOff64(const struct Jit* j, int r) {
+	return CPU_OFF(fpr) + 8 * (unsigned) (j->fr ? r : r & ~1);
+}
+
+// A double-precision result in x0 as setD stores it: flushed to zero when subnormal with FCR31.FS
+// set, and the host's default NaN made the VR4300's.
+static void storeDouble(struct Jit* j, int fd) {
+	struct Emitter* e = &j->e;
+	aLdr(e, 17, CPU, CPU_OFF(fcr31));
+	uint8_t* keep = aTbz(e, 17, 24, NULL);
+	emit32(e, 0xD374F801); // ubfx x1, x0, #52, #11: the exponent
+	uint8_t* normal = aCbnzX(e, 1, NULL);
+	emit32(e, 0x92410000); // and x0, x0, #0x8000000000000000
+	patchHere(e, keep);
+	patchHere(e, normal);
+	emit32(e, 0x9240F801); // and x1, x0, #0x7FFFFFFFFFFFFFFF
+	emit32(e, 0xD2EFFF02); // movz x2, #0x7FF8, lsl #48
+	emit32(e, 0xEB02003F); // cmp x1, x2
+	emit32(e, 0x92F00102); // movn x2, #0x8008, lsl #48: 0x7FF7FFFFFFFFFFFF
+	emit32(e, 0x9A800040); // csel x0, x2, x0, eq
+	aStrX(e, 0, CPU, fprOff64(j, fd));
+}
+
+// Double-precision arithmetic, moves, compares and the conversions between S and D, as
+// fpuExecuteFast does them.
+static void emitFpuDouble(struct Jit* j, uint32_t op) {
+	struct Emitter* e = &j->e;
+	int fmt = (op >> 21) & 31, func = op & 0x3F, ft = (op >> 16) & 31, fs = (op >> 11) & 31, fd = (op >> 6) & 31;
+	j->extraCycles = (int) fpuCycles(fmt, func);
+	if (fmt == 16) {
+		// cvt.d.s
+		aFldr(e, 0, CPU, fprOff(j, fs));
+		emit32(e, 0x1E22C000); // fcvt d0, s0
+		emit32(e, 0x9E660000); // fmov x0, d0
+		storeDouble(j, fd);
+		return;
+	}
+	emit32(e, 0xFD400000 | (fprOff64(j, fs) / 8) << 10 | (unsigned) CPU << 5 | 0); // ldr d0
+	if (func >= 0x30) {
+		emit32(e, 0xFD400000 | (fprOff64(j, ft) / 8) << 10 | (unsigned) CPU << 5 | 1); // ldr d1
+		emit32(e, 0x1E602000 | 1 << 16 | 0 << 5); // fcmp d0, d1
+		aMovImm(e, 0, 0);
+		static const int conds[3] = { C_VS, C_EQ, C_MI };
+		for (int k = 0; k < 3; ++k) {
+			if (func & (1 << k)) {
+				aCset(e, 1, conds[k]);
+				aDp(e, A_ORR, 0, 0, 1, S_LSL, 0);
+			}
+		}
+		aLdr(e, 1, CPU, CPU_OFF(fcr31));
+		aBfi(e, 1, 0, 23, 1);
+		aStr(e, 1, CPU, CPU_OFF(fcr31));
+		return;
+	}
+	if (func == 0x20) {
+		// cvt.s.d
+		emit32(e, 0x1E624000); // fcvt s0, d0
+		emit32(e, 0x1E260000); // fmov w0, s0
+		storeSingle(j, fd);
+		return;
+	}
+	if (func == 6) {
+		emit32(e, 0xFD000000 | (fprOff64(j, fd) / 8) << 10 | (unsigned) CPU << 5 | 0); // str d0
+		return;
+	}
+	if (func == 5 || func == 7) {
+		aFop(e, (func == 5 ? F_ABS : F_NEG) | 0x00400000, 0, 0, 0);
+	} else {
+		emit32(e, 0xFD400000 | (fprOff64(j, ft) / 8) << 10 | (unsigned) CPU << 5 | 1); // ldr d1
+		aFop(e, (const uint32_t[]) { F_ADD, F_SUB, F_MUL, F_DIV }[func] | 0x00400000, 0, 0, 1);
+	}
+	emit32(e, 0x9E660000); // fmov x0, d0
+	storeDouble(j, fd);
+}
+
 // With HLE accuracy, the FPU instructions most code runs, inline for the Status.FR the block was
 // compiled with: the host's arithmetic, as fpuExecuteFast.
 static bool emitFpuFast(struct Jit* j, uint32_t op) {
 	struct Emitter* e = &j->e;
 	int fmt = (op >> 21) & 31, func = op & 0x3F, ft = (op >> 16) & 31, fs = (op >> 11) & 31, fd = (op >> 6) & 31;
 	bool single = fmt == 16 && (func <= 3 || (func >= 5 && func <= 7) || func == 13 || func >= 0x30);
-	if (!(fmt == 0 || fmt == 2 || fmt == 4 || single || (fmt == 20 && func == 32))) {
+	bool dbl = (fmt == 17 && (func <= 3 || (func >= 5 && func <= 7) || func == 0x20 || func >= 0x30)) || (fmt == 16 && func == 0x21);
+	if (!(fmt == 0 || fmt == 2 || fmt == 4 || single || dbl || (fmt == 20 && func == 32))) {
 		return false;
 	}
 	needCop1(j);
@@ -403,6 +480,10 @@ static bool emitFpuFast(struct Jit* j, uint32_t op) {
 		emit32(e, 0x1E220000 | 0 << 5 | 0);
 		aFstr(e, 0, CPU, fprOff(j, fd));
 		j->extraCycles = (int) fpuCycles(fmt, func);
+		return true;
+	}
+	if (dbl) {
+		emitFpuDouble(j, op);
 		return true;
 	}
 	j->extraCycles = (int) fpuCycles(fmt, func);
