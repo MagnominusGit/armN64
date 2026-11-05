@@ -15,7 +15,7 @@
 // S2DEX and S2DEX2 are the 2D microcodes (F3DEX's and F3DEX2's command numbers for what they share):
 // backgrounds so far, other commands leave the task to the RSP.
 // ZSort draws objects the game sorted from vertices it transformed here first (its DMEM in between).
-enum { FAMILY_NONE, FAMILY_F3D, FAMILY_F3DEX, FAMILY_F3DEX2, FAMILY_F3DPD, FAMILY_S2DEX, FAMILY_S2DEX2, FAMILY_ZSORT };
+enum { FAMILY_NONE, FAMILY_F3D, FAMILY_F3DEX, FAMILY_F3DEX2, FAMILY_F3DPD, FAMILY_S2DEX, FAMILY_S2DEX2, FAMILY_ZSORT, FAMILY_TURBO3D };
 
 // Geometry mode bits, kept in the F3DEX2 layout.
 enum {
@@ -1477,6 +1477,99 @@ static void zsortMoveMem(struct N64* n, struct Hle* h, uint32_t w0, uint32_t w1)
 	}
 }
 
+// ---- Turbo3D (Dark Rift's; libultra's gt.h, as GLideN64's Turbo3D.cpp runs it)
+
+// An RDP list as it is (a texture rectangle's second word next), up to two zero words.
+static void turbo3dRdp(struct N64* n, struct Hle* h, uint32_t a) {
+	if (!a) {
+		return;
+	}
+	a = address(h, a);
+	for (int steps = 0; steps < 1 << 16; ++steps) {
+		uint32_t const w0 = rd32(n, a), w1 = rd32(n, a + 4);
+		if (!w0 && !w1) {
+			return;
+		}
+		int const op = w0 >> 24;
+		if (op == 0xE4 || op == 0xE5) {
+			emit(n, h, (uint64_t) w0 << 32 | w1);
+			emit(n, h, (uint64_t) rd32(n, a + 8) << 32 | rd32(n, a + 12));
+			a += 16;
+		} else {
+			a = rdpCommand(n, h, a, w0, w1);
+		}
+	}
+}
+
+// An object (gtStateL at state): its other modes and matrix, vertices, RDP list, then triangles.
+static void turbo3dObject(struct N64* n, struct Hle* h, uint32_t state, uint32_t vtx, uint32_t tri) {
+	uint32_t const a = address(h, state);
+	uint32_t const render = rd32(n, a), texture = rd32(n, a + 4);
+	int const count = rd8(n, a + 8) & 0xFF, first = rd8(n, a + 9) & 0xFF, tris = rd8(n, a + 10) & 0xFF, flag = rd8(n, a + 11) & 0xFF;
+	h->texTile = texture & 7, h->texLevel = 0, h->texOn = (render & 2) != 0;
+	h->texScaleS = h->texScaleT = 1;
+	h->modeH = rd32(n, a + 16) & 0xFFFFFF, h->modeL = rd32(n, a + 20);
+	emit(n, h, (uint64_t) (0xEF000000u | h->modeH) << 32 | h->modeL);
+	// GT_FLAG_NOMTX keeps the last matrix; otherwise the combined one follows the state.
+	if (flag != 1) {
+		readMatrix(n, a + 24, h->mvp);
+	}
+	setGeometry(h, GEOM_LIGHTING | GEOM_FOG, render | 0x2205, false);
+	// GT_FLAG_NO_XFM: the vertices are on the screen already (gtVtxOut).
+	if (flag == 2 && vtx && tri) {
+		uint32_t const v = address(h, vtx), t = address(h, tri);
+		turbo3dRdp(n, h, rd32(n, a + 12));
+		for (int i = 0; i < tris; ++i) {
+			int const k[3] = { rd8(n, t + 4 * (uint32_t) i) & 0xFF, rd8(n, t + 4 * (uint32_t) i + 1) & 0xFF, rd8(n, t + 4 * (uint32_t) i + 2) & 0xFF };
+			if (k[0] >= count || k[1] >= count || k[2] >= count) {
+				continue;
+			}
+			struct ScreenVertex c[3];
+			for (int j = 0; j < 3; ++j) {
+				uint32_t const e = v + 16 * (uint32_t) k[j];
+				float const z = (int32_t) rd32(n, e + 4) / 65536.0f * 32 / 0x7FFF;
+				c[j] = (struct ScreenVertex) { rd16(n, e) / 4.0f, rd16(n, e + 2) / 4.0f, z < 0 ? 0 : z > 1 ? 1 : z, 1,
+				                               (rd8(n, e + 12) & 0xFF) / 255.0f, (rd8(n, e + 13) & 0xFF) / 255.0f, (rd8(n, e + 14) & 0xFF) / 255.0f,
+				                               (rd8(n, e + 15) & 0xFF) / 255.0f, rd16(n, e + 8) / 32.0f, rd16(n, e + 10) / 32.0f };
+			}
+			triangle(n, h, &c[0], &c[1], &c[2], NULL);
+		}
+		return;
+	}
+	if (vtx) {
+		loadVertices(n, h, vtx, first, count);
+	}
+	turbo3dRdp(n, h, rd32(n, a + 12));
+	if (tri) {
+		uint32_t const t = address(h, tri);
+		for (int i = 0; i < tris; ++i) {
+			drawTriangle(n, h, rd8(n, t + 4 * (uint32_t) i) & 0xFF, rd8(n, t + 4 * (uint32_t) i + 1) & 0xFF, rd8(n, t + 4 * (uint32_t) i + 2) & 0xFF);
+		}
+	}
+}
+
+// The task's list: gtGfx entries (global state, object state, vertices, triangles) up to an object
+// state of zero. A global state brings other modes, segments, the viewport and an RDP list.
+static void turbo3dList(struct N64* n, struct Hle* h, uint32_t pc) {
+	for (int steps = 0; steps < 1 << 16; ++steps, pc += 16) {
+		uint32_t const global = rd32(n, pc), state = rd32(n, pc + 4), vtx = rd32(n, pc + 8), tri = rd32(n, pc + 12);
+		if (!state) {
+			return;
+		}
+		if (global) {
+			uint32_t const g = address(h, global);
+			h->modeH = rd32(n, g + 8) & 0xFFFFFF, h->modeL = rd32(n, g + 12);
+			emit(n, h, (uint64_t) (0xEF000000u | h->modeH) << 32 | h->modeL);
+			for (int i = 0; i < 16; ++i) {
+				h->segments[i] = rd32(n, g + 16 + 4 * (uint32_t) i) & 0xFFFFFF;
+			}
+			viewport(n, h, address(h, global + 80));
+			turbo3dRdp(n, h, rd32(n, g + 96));
+		}
+		turbo3dObject(n, h, state, vtx, tri);
+	}
+}
+
 static void zsortList(struct N64* n, struct Hle* h, uint32_t pc) {
 	int sp = 0;
 	for (int steps = 0; pc && steps < 1 << 20; ++steps) {
@@ -2278,6 +2371,10 @@ bool hleGraphics(struct N64* n, bool dry) {
 	if (f == FAMILY_F3D && ucode == 0x7754FFF8u) {
 		f = FAMILY_F3DEX;
 	}
+	// Dark Rift's Turbo3D has no name either.
+	if (f == FAMILY_NONE && ucode == 0xA9DAF288u) {
+		f = FAMILY_TURBO3D;
+	}
 	bool const wrus = f == FAMILY_F3D && (ucode == 0xAC1B2CFEu || ucode == 0x106A093Eu);
 	bool const dkr = f == FAMILY_NONE && (ucode == 0x5277D6E7u || ucode == 0x26EDE132u);
 	if (dkr) {
@@ -2337,6 +2434,8 @@ bool hleGraphics(struct N64* n, bool dry) {
 		h->zRdp[0] = h->zRdp[1] = h->zRdp[2] = 0;
 		h->zScale[0] = h->zScale[1] = h->zTrans[0] = h->zTrans[1] = 0;
 		zsortList(n, h, address(h, be32(task + 0x30)));
+	} else if (f == FAMILY_TURBO3D) {
+		turbo3dList(n, h, be32(task + 0x30) & 0xFFFFFF);
 	} else {
 		runList(n, h, address(h, be32(task + 0x30)));
 	}
