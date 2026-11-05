@@ -365,6 +365,12 @@ static void dkrMatrix(struct N64* n, struct Hle* h, uint32_t w0, uint32_t w1) {
 
 // Rare's G_DMA_VTX: x, y, z and a colour, 10 bytes each, after the ones loaded since the last
 // triangles (a billboard's after its first vertex, and moved by it).
+// A vertex's fog, in its alpha, from its depth on screen.
+static float fogAlpha(const struct Hle* h, const struct Vertex* v) {
+	float f = (v->w != 0 ? v->z / v->w : 0) * h->fogMul + h->fogOffset;
+	return (f < 0 ? 0 : f > 255 ? 255 : f) / 255.0f;
+}
+
 static void dkrVertices(struct N64* n, struct Hle* h, uint32_t w0, uint32_t w1) {
 	if (w0 & 0x10000) {
 		h->dkrVertex = h->dkrBillboard ? 1 : h->dkrVertex;
@@ -388,8 +394,7 @@ static void dkrVertices(struct N64* n, struct Hle* h, uint32_t w0, uint32_t w1) 
 		v->b = n->rdram[(a + 8) & (RDRAM_SIZE - 1)] / 255.0f, v->a = n->rdram[(a + 9) & (RDRAM_SIZE - 1)] / 255.0f;
 		v->s = v->t = 0;
 		if (h->geometry & GEOM_FOG) {
-			float f = (v->w != 0 ? v->z / v->w : 0) * h->fogMul + h->fogOffset;
-			v->a = (f < 0 ? 0 : f > 255 ? 255 : f) / 255.0f;
+			v->a = fogAlpha(h, v);
 		}
 	}
 	h->dkrVertex += count;
@@ -566,8 +571,7 @@ static void loadVertices(struct N64* n, struct Hle* h, uint32_t a, int first, in
 		v->s = s * h->texScaleS * unit;
 		v->t = t * h->texScaleT * unit;
 		if (h->geometry & GEOM_FOG) {
-			float f = (v->w != 0 ? v->z / v->w : 0) * h->fogMul + h->fogOffset;
-			v->a = (f < 0 ? 0 : f > 255 ? 255 : f) / 255.0f;
+			v->a = fogAlpha(h, v);
 		}
 	}
 }
@@ -822,6 +826,10 @@ static void drawTriangle(struct N64* n, struct Hle* h, int i0, int i1, int i2) {
 			}
 			if ((da >= 0) != (db >= 0) && out < 9) {
 				poly[cur ^ 1][out++] = lerp(a, b, da / (da - db));
+				// A new corner's fog comes from its own depth, as the microcodes work it out.
+				if (h->geometry & GEOM_FOG) {
+					poly[cur ^ 1][out - 1].a = fogAlpha(h, &poly[cur ^ 1][out - 1]);
+				}
 			}
 		}
 		count = out;
