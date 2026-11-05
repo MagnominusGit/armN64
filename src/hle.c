@@ -143,6 +143,8 @@ struct Hle {
 	int texTile, texLevel;
 	bool texOn;
 	float fogMul, fogOffset;
+	// G_MW_CLIP's ratio: x and y clip at that many times w.
+	float clipRatio;
 	uint32_t modeH, modeL;
 	uint32_t half1;
 	// Fast3D's Sprite2D: the sprite its base command named; the scale-flip and draw commands
@@ -792,8 +794,9 @@ static void drawTriangle(struct N64* n, struct Hle* h, int i0, int i1, int i2) {
 	int count = 3;
 	poly[0][0] = h->v[i0], poly[0][1] = h->v[i1], poly[0][2] = h->v[i2];
 	int cur = 0;
-	// Planes as (x, y, z, w) weights: near, then x and y within four screens.
-	static const float planes[5][4] = { { 0, 0, 1, 1 }, { 1, 0, 0, 4 }, { -1, 0, 0, 4 }, { 0, 1, 0, 4 }, { 0, -1, 0, 4 } };
+	// Planes as (x, y, z, w) weights: near, then x and y within the clip ratio's screens.
+	float const r = h->clipRatio;
+	float const planes[5][4] = { { 0, 0, 1, 1 }, { 1, 0, 0, r }, { -1, 0, 0, r }, { 0, 1, 0, r }, { 0, -1, 0, r } };
 	// NoN skips the near plane only for a triangle wholly in front of the eye (one reaching behind it is
 	// clipped there as usual: Conker's floors).
 	bool const noNear = h->noNear && poly[0][0].w > 0 && poly[0][1].w > 0 && poly[0][2].w > 0;
@@ -801,7 +804,7 @@ static void drawTriangle(struct N64* n, struct Hle* h, int i0, int i1, int i2) {
 	bool inside = true;
 	for (int k = 0; k < 3 && inside; ++k) {
 		const struct Vertex* v = &poly[0][k];
-		inside = isfinite(v->z) && (noNear || v->z + v->w + 1e-4f * fabsf(v->w) >= 0) && fabsf(v->x) <= 4 * v->w && fabsf(v->y) <= 4 * v->w;
+		inside = isfinite(v->z) && (noNear || v->z + v->w + 1e-4f * fabsf(v->w) >= 0) && fabsf(v->x) <= r * v->w && fabsf(v->y) <= r * v->w;
 	}
 	for (int p = inside ? 5 : 0; p < 5 && count >= 3; ++p) {
 		const float* pl = planes[p];
@@ -4224,6 +4227,8 @@ static void runList(struct N64* n, struct Hle* h, uint32_t pc) {
 					setLightColor(h, offset / 24, w1);
 				} else if (index == 0x10 && h->cbfd) {
 					cbfdCoordMod(h, w0, w1);
+				} else if (index == 4 && offset == 0x14) {
+					h->clipRatio = (float) ((int16_t) w1 > 0 ? (int16_t) w1 : 1);
 				} else if (index == 6) {
 					h->segments[(offset / 4) & 15] = w1 & 0xFFFFFF;
 				} else if (index == 8 && h->am && (offset & 0xFF) == 0x0C) {
@@ -4488,6 +4493,8 @@ static void runList(struct N64* n, struct Hle* h, uint32_t pc) {
 				} else if (index == 2) {
 					int l = (int) (((w1 - 0x80000000u) >> 5) - 1);
 					h->lights = l < 0 ? 0 : l > LIGHTS ? LIGHTS : l;
+				} else if (index == 4 && offset == 0x14) {
+					h->clipRatio = (float) ((int16_t) w1 > 0 ? (int16_t) w1 : 1);
 				} else if (index == 6) {
 					h->segments[(offset / 4) & 15] = w1 & 0xFFFFFF;
 				} else if (index == 8) {
@@ -5094,6 +5101,7 @@ bool hleGraphics(struct N64* n, bool dry) {
 	h->dry = dry;
 	memset(h->segments, 0, sizeof(h->segments));
 	memset(h->objStatus, 0, sizeof(h->objStatus));
+	h->clipRatio = 2;
 	static const float identity[16] = { 1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1 };
 	h->depth = 0;
 	memcpy(h->modelview[0], identity, sizeof(identity));
