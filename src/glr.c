@@ -1871,8 +1871,8 @@ bool glrDrew(struct N64* n, uint32_t addr, uint32_t len) {
 }
 
 // The framebuffer of the color image the VI shows from origin (rows rows, stride pixels a row, size
-// 2 or 3), when the GPU drew all of those rows since its pixels last went back to RDRAM: x and y of
-// the picture's first pixel in it. 0 otherwise: RDRAM has the picture.
+// 2 or 3), when the GPU drew some of those rows since its pixels last went back to RDRAM: x and y
+// of the picture's first pixel in it. 0 otherwise: RDRAM has the picture.
 unsigned glrPicture(struct N64* n, uint32_t origin, uint32_t stride, int size, int rows, int* x, int* y) {
 	struct Glr* g = n->glr;
 	uint32_t const bytes = size == 3 ? 4 : 2;
@@ -1887,6 +1887,29 @@ unsigned glrPicture(struct N64* n, uint32_t origin, uint32_t stride, int size, i
 		}
 		glesUse(g->gles);
 		flushBatch(n, g);
+		*x = (int) (offset % (stride * bytes) / bytes);
+		*y = (int) row;
+		return t->framebuffer;
+	}
+	// A target the GPU drew part of: the rows it didn't draw come from RDRAM (borders a game clears
+	// once, rows given back).
+	for (int i = 0; i < TARGETS; ++i) {
+		struct Target* t = &g->target[i];
+		if (!t->texture || t->size != size || t->width != stride || t->dirtyTo <= t->dirtyFrom || origin < t->addr) {
+			continue;
+		}
+		uint32_t const offset = origin - t->addr, row = offset / (stride * bytes);
+		if ((int) row + rows > TARGET_ROWS || (int) row >= t->dirtyTo || (int) row + rows <= t->dirtyFrom) {
+			continue;
+		}
+		glesUse(g->gles);
+		flushBatch(n, g);
+		if ((int) row < t->dirtyFrom) {
+			loadPixels(n, g, t, (int) row, t->dirtyFrom);
+		}
+		if ((int) row + rows > t->dirtyTo) {
+			loadPixels(n, g, t, t->dirtyTo, (int) row + rows);
+		}
 		*x = (int) (offset % (stride * bytes) / bytes);
 		*y = (int) row;
 		return t->framebuffer;
