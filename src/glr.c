@@ -145,14 +145,14 @@ struct ProgramKey {
 
 // A program's uniforms as last set.
 struct Uniforms {
-	float size[2], prim[4], env[4], fog[4], blend[4], primLod, primDepth, k[2];
+	float size[2], prim[4], env[4], fog[4], blend[4], primLod, primDepth, k[2], lastCombined[4];
 	int persp, tile[LEVELS][12], image[LEVELS][4];
 };
 
 struct Program {
 	struct ProgramKey key;
 	GLuint program;
-	GLint size, persp, prim, env, fog, blend, primLod, primDepth, k, tile[LEVELS], image[LEVELS], texture[LEVELS], memory;
+	GLint size, persp, prim, env, fog, blend, primLod, primDepth, k, lastCombined, tile[LEVELS], image[LEVELS], texture[LEVELS], memory;
 	struct Uniforms set;
 	bool uniformsSet;
 };
@@ -180,7 +180,7 @@ struct DrawState {
 	struct Program* program;
 	struct Texture* texture[LEVELS];
 	int tile[LEVELS][12];
-	float prim[4], env[4], fog[4], blend[4], primLod, primDepth, k[2];
+	float prim[4], env[4], fog[4], blend[4], primLod, primDepth, k[2], lastCombined[4];
 	int scissor[4];
 	bool depthTest, depthWrite, decal, depthLess, blendOn, persp;
 	// Into the GPU's depth only (depthTriangle).
@@ -205,6 +205,9 @@ struct Glr {
 	GLuint depthFramebuffer;
 	// Drawing a triangle into the depth image (depthTriangle).
 	bool depthImage;
+	// A program read COMBINED where it is the previous pixel's: from then on each primitive's last
+	// pixel is combined in software for the next (rdpLastCombined).
+	bool chained;
 	// Targets drawn at scale times the RDP's resolution (N64_GL_SCALE); their pixels go to and from
 	// RDRAM through a texture at its resolution.
 	int scale;
@@ -363,7 +366,7 @@ static const char fragmentHead[] =
 	"in vec4 vShade;\n"
 	"in vec3 vTex;\n"
 	"flat in uint vSeq;\n"
-	"uniform vec4 uPrim, uEnv, uFog, uBlend;\n"
+	"uniform vec4 uPrim, uEnv, uFog, uBlend, uLastCombined;\n"
 	"uniform float uPrimLod, uPrimDepth;\n"
 	"uniform vec2 uK;\n"
 	"uniform int uPersp;\n"
@@ -572,6 +575,19 @@ static void fetchBlend(char* out, size_t size, int sel, bool last) {
 	         fetchColorInput(sel >> 4), rejects ? "a8 >= 255.0 ? combined.rgb : o" : "o");
 }
 
+// Whether the cycle the RDP runs first (the second-cycle equation in one-cycle mode) reads COMBINED,
+// which there is the previous pixel's output.
+static bool readsCombined(uint64_t c, int cycleType) {
+	if (cycleType >= 2) {
+		return false;
+	}
+	int cycle = cycleType == 1 ? 0 : 1;
+	int a = cycle ? (c >> 37) & 15 : (c >> 52) & 15, m = cycle ? (c >> 32) & 31 : (c >> 47) & 31;
+	int b = cycle ? (c >> 24) & 15 : (c >> 28) & 15, d = cycle ? (c >> 6) & 7 : (c >> 15) & 7;
+	int aa = cycle ? (c >> 21) & 7 : (c >> 44) & 7, ab = cycle ? (c >> 3) & 7 : (c >> 12) & 7, ad = cycle ? c & 7 : (c >> 9) & 7;
+	return !a || !b || !m || m == 7 || !d || !aa || !ab || !ad;
+}
+
 static GLuint compile(struct Glr* g, GLenum type, const char* source) {
 	struct Gl* gl = &g->gl;
 	GLuint s = gl->CreateShader(type);
@@ -643,7 +659,7 @@ static struct Program* program(struct Glr* g, struct ProgramKey key) {
 		}
 		strcat(source, "}\n");
 	}
-	strcat(source, "void main() {\n	vec4 combined = vec4(0.0);\n");
+	strcat(source, readsCombined(key.combine, cycleType) ? "void main() {\n	vec4 combined = uLastCombined;\n" : "void main() {\n	vec4 combined = vec4(0.0);\n");
 	if (g->barrier) {
 		strcat(source, "	oColor = texelFetch(uMemory, ivec2(gl_FragCoord.xy), 0);\n");
 	}
@@ -886,6 +902,7 @@ compileFragment:;
 	pr->primLod = gl->GetUniformLocation(p, "uPrimLod");
 	pr->primDepth = gl->GetUniformLocation(p, "uPrimDepth");
 	pr->k = gl->GetUniformLocation(p, "uK");
+	pr->lastCombined = gl->GetUniformLocation(p, "uLastCombined");
 	gl->UseProgram(p);
 	g->applied.program = p;
 	for (int k = 0; k < LEVELS; ++k) {
@@ -1244,6 +1261,7 @@ static void flushBatch(struct N64* n, struct Glr* g) {
 	uniform(g, p->primLod, 1, &s->primLod, &u->primLod);
 	uniform(g, p->primDepth, 1, &s->primDepth, &u->primDepth);
 	uniform(g, p->k, 2, s->k, u->k);
+	uniform(g, p->lastCombined, 4, s->lastCombined, u->lastCombined);
 	for (int k = 0; k < LEVELS; ++k) {
 		if (s->texture[k]) {
 			useTexture(g, k, s->texture[k]->texture);
@@ -1454,6 +1472,15 @@ static bool drawState(struct N64* n, struct Glr* g, struct RDP* r, bool textured
 	}
 	colorOf(&r->prim, s.prim), colorOf(&r->env, s.env), colorOf(&r->fog, s.fog), colorOf(&r->blend, s.blend);
 	s.primLod = r->primLod / 255.0f;
+	if (readsCombined(r->combine, cycleType)) {
+		const int c[4] = { r->lastCombined.r, r->lastCombined.g, r->lastCombined.b, r->lastCombined.a };
+		for (int i = 0; i < 4; ++i) {
+			// rdp.c's clamp9, as the shader keeps a cycle's output.
+			int v = c[i] & 0x1FF;
+			s.lastCombined[i] = (v >= 0x180 ? 0 : v >= 0x100 ? 255 : v) / 255.0f;
+		}
+		g->chained = true;
+	}
 	s.k[0] = r->k4 / 255.0f, s.k[1] = r->k5 / 255.0f;
 	s.primDepth = (float) r->primZ / 0x3FFFF;
 	s.depthTest = depth && r->zCompare;
@@ -1694,7 +1721,7 @@ static void depthTriangle(struct N64* n, struct Glr* g, struct RDP* r, const uin
 	g->depthImage = false, g->fastValid = false;
 }
 
-void glrDraw(struct N64* n, struct RDP* r, const uint64_t* w, int op) {
+static void draw(struct N64* n, struct RDP* r, const uint64_t* w, int op) {
 	struct Glr* g = n->glr;
 	glesUse(g->gles);
 	g->seq = r->seq;
@@ -1817,6 +1844,17 @@ void glrDraw(struct N64* n, struct RDP* r, const uint64_t* w, int op) {
 		return;
 	}
 	rectangle(g, (float) x0, (float) y0, (float) (x1 + 1), (float) (y1 + 1), (float) (r->primZ >> 3) / 0x7FFF, ss, ts, flip);
+}
+
+void glrDraw(struct N64* n, struct RDP* r, const uint64_t* w, int op) {
+	draw(n, r, w, op);
+	// What the GPU drew leaves the next pixel's COMBINED as the RDP would (the RDP's own drawing
+	// keeps it already).
+	bool triangle = op >= 0x08 && op <= 0x0F;
+	if (n->glr->chained && (triangle || op == 0x24 || op == 0x25) && r->cycleType < 2 && r->colorSize != 1 &&
+	    !(triangle && r->zAddr && r->colorAddr == r->zAddr && r->colorSize == 2)) {
+		rdpLastCombined(n, r, w, op);
+	}
 }
 
 bool glrDrew(struct N64* n, uint32_t addr, uint32_t len) {

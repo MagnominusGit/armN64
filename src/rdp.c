@@ -843,15 +843,12 @@ static struct Color blendInput(struct RDP* r, struct Color pixel, struct Color m
 
 // The depth test (with the stored depth slope: coplanar and decal tests, and whether an
 // antialiased edge blends), then the blender, and the coverage and depth written.
-static void shadePixel(struct N64* n, struct RDP* r, int x, int y, struct Pixel* p) {
-	p->x = x, p->y = y;
-	int cycleType = r->cycleType;
-	int z = r->zPrim ? r->primZ : p->z;
-	z = z < 0 ? 0 : z > 0x3FFFF ? 0x3FFFF : z;
+// The combiner's output for a pixel, which the next pixel's first cycle reads as COMBINED.
+static struct Color combinePixel(struct RDP* r, struct Pixel* p) {
 	// One-cycle mode runs the combiner's second-cycle equation.
 	p->combined = r->lastCombined;
-	struct Color c = combineCycle(r, p, cycleType == 1 ? 0 : 1);
-	if (cycleType == 1) {
+	struct Color c = combineCycle(r, p, r->cycleType == 1 ? 0 : 1);
+	if (r->cycleType == 1) {
 		// The second cycle sees the pipelined texels: texel 1 as texel 0 (and texel 0 as texel 1, as
 		// paraLLEl-RDP has it for the next pixel's).
 		struct Color t = p->tex0;
@@ -860,6 +857,15 @@ static void shadePixel(struct N64* n, struct RDP* r, int x, int y, struct Pixel*
 		c = combineCycle(r, p, 1);
 	}
 	r->lastCombined = c;
+	return c;
+}
+
+static void shadePixel(struct N64* n, struct RDP* r, int x, int y, struct Pixel* p) {
+	p->x = x, p->y = y;
+	int cycleType = r->cycleType;
+	int z = r->zPrim ? r->primZ : p->z;
+	z = z < 0 ? 0 : z > 0x3FFFF ? 0x3FFFF : z;
+	struct Color c = combinePixel(r, p);
 	r->lastPos = r->seq << 24 | (uint64_t) y << 12 | (uint32_t) x;
 	c = (struct Color) { clamp9(c.r), clamp9(c.g), clamp9(c.b), clamp9(c.a) };
 	int rgbDither, alphaDither;
@@ -1154,7 +1160,7 @@ void rdpRectBounds(struct RDP* r, uint64_t w0, int* cx0, int* cy0, int* x0, int*
 	rectBounds(r, w0, cx0, cy0, x0, y0, x1, y1);
 }
 
-static void textureRect(struct N64* n, struct RDP* r, uint64_t w0, uint64_t w1, bool flip) {
+static void textureRect(struct N64* n, struct RDP* r, uint64_t w0, uint64_t w1, bool flip, bool lastOnly) {
 	int tile = (w0 >> 24) & 7;
 	int s0 = (int16_t) (w1 >> 48), t0 = (int16_t) (w1 >> 32);
 	int dsdx = (int16_t) (w1 >> 16), dtdy = (int16_t) w1;
@@ -1166,11 +1172,11 @@ static void textureRect(struct N64* n, struct RDP* r, uint64_t w0, uint64_t w1, 
 	rectBounds(r, w0, &cx0, &cy0, &x0, &y0, &x1, &y1);
 	r->maxLevel = 0;
 	bool doLod = cycleType < 2 && (((r->otherModes >> 48) & 1) || lodFracUsed(r));
-	for (int y = y0; y <= y1; ++y) {
-		if (!ownsRow(r, y)) {
+	for (int y = lastOnly ? y1 : y0; y <= y1; ++y) {
+		if (!lastOnly && !ownsRow(r, y)) {
 			continue;
 		}
-		for (int x = x0; x <= x1; ++x) {
+		for (int x = lastOnly ? x1 : x0; x <= x1; ++x) {
 			int dx = x - cx0, dy = y - cy0;
 			int s = ((s0 << 5) + (flip ? dy * dsdx : dx * dsdx)) >> 5;
 			int t = ((t0 << 5) + (flip ? dx * dtdy : dy * dtdy)) >> 5;
@@ -1203,6 +1209,11 @@ static void textureRect(struct N64* n, struct RDP* r, uint64_t w0, uint64_t w1, 
 			p->z = r->primZ;
 			p->cvg = 8;
 			p->cvbit = true;
+			if (lastOnly) {
+				p->x = x, p->y = y;
+				combinePixel(r, p);
+				return;
+			}
 			shadePixel(n, r, x, y, p);
 		}
 	}
@@ -1430,7 +1441,8 @@ static void rowAttributes(const struct Edges* t, const struct Attributes* a, int
 	}
 }
 
-static void triangle(struct N64* n, struct RDP* r, const uint64_t* w, int op) {
+// lastOnly: only the last pixel drawn, combined (rdpLastCombined).
+static void triangle(struct N64* n, struct RDP* r, const uint64_t* w, int op, bool lastOnly) {
 	bool shade = op & 4, tex = op & 2, zbuf = op & 1;
 	int tile = (w[0] >> 48) & 7;
 	struct Edges e = edges(w);
@@ -1442,9 +1454,10 @@ static void triangle(struct N64* n, struct RDP* r, const uint64_t* w, int op) {
 	int32_t dir = e.flip ? 1 : -1;
 	int first, end;
 	triangleRows(r, &e, &first, &end);
-	for (int y = first; y < end; ++y) {
+	for (int row = first; row < end; ++row) {
+		int y = lastOnly ? first + end - 1 - row : row;
 		struct Span sp;
-		if (!ownsRow(r, y) || !span(r, &e, y, &sp)) {
+		if ((!lastOnly && !ownsRow(r, y)) || !span(r, &e, y, &sp)) {
 			continue;
 		}
 		// In fill mode a row takes the fill colour, as a fill rectangle's does (Lemon's FillTriangle).
@@ -1461,7 +1474,8 @@ static void triangle(struct N64* n, struct RDP* r, const uint64_t* w, int op) {
 			inLeft = sp.left[k] > inLeft ? sp.left[k] : inLeft;
 			inRight = sp.right[k] < inRight ? sp.right[k] : inRight;
 		}
-		for (int x = sp.x0; x <= sp.x1; ++x) {
+		for (int column = sp.x0; column <= sp.x1; ++column) {
+			int x = lastOnly ? sp.x0 + sp.x1 - column : column;
 			int mask = x * 8 >= inLeft && x * 8 + 6 < inRight ? 0xFF : coverageMask(&sp, x);
 			// A pixel is drawn when any sample is covered with antialiasing, else when the first is.
 			if (!mask || (!r->antialias && !(mask & 1))) {
@@ -1508,6 +1522,11 @@ static void triangle(struct N64* n, struct RDP* r, const uint64_t* w, int op) {
 					p->lodFrac = levelOfDetail(r, tile, s, t, sx, tx, sy, ty, &t1, &t2);
 				}
 				textures(r, p, t1, t2, s, t);
+			}
+			if (lastOnly) {
+				p->x = x, p->y = y;
+				combinePixel(r, p);
+				return;
 			}
 			shadePixel(n, r, x, y, p);
 		}
@@ -1756,11 +1775,11 @@ static void execute(struct N64* n, struct RDP* r, const uint64_t* w, int op) {
 	case 0x0D:
 	case 0x0E:
 	case 0x0F:
-		triangle(n, r, w, op);
+		triangle(n, r, w, op, false);
 		break;
 	case 0x24:
 	case 0x25:
-		textureRect(n, r, w[0], w[1], op == 0x25);
+		textureRect(n, r, w[0], w[1], op == 0x25, false);
 		break;
 	case 0x2C:
 		r->k4 = (c >> 9) & 0x1FF;
@@ -3338,6 +3357,17 @@ void rdpDrawSoftware(struct N64* n, struct RDP* r, const uint64_t* w, int op) {
 	// The primitive is numbered already (execute numbers it again).
 	--r->seq;
 	execute(n, r, w, op);
+}
+
+void rdpLastCombined(struct N64* n, struct RDP* r, const uint64_t* w, int op) {
+	if (r->cycleType >= 2) {
+		return;
+	}
+	if (op >= 0x08 && op <= 0x0F) {
+		triangle(n, r, w, op, true);
+	} else if (op == 0x24 || op == 0x25) {
+		textureRect(n, r, w[0], w[1], op == 0x25, true);
+	}
 }
 
 float rdpDepthAt(struct N64* n, struct RDP* r, int x, int y) {
