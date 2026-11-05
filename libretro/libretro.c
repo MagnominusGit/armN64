@@ -165,6 +165,9 @@ static struct retro_core_option_v2_definition optionDefinitions[] = {
 	{ "armn64_gfx_rsp", "Graphics Microcode", NULL,
 	  "With Fast. Game's Own runs the real microcode on the RSP: slower, for a game drawn wrong. Applies on Restart.",
 	  NULL, "advanced", { { "library", "Built In (Fast)" }, { "rsp", "Game's Own" }, { NULL, NULL } }, "library" },
+	{ "armn64_hle_timing", "Graphics Task Timing", NULL,
+	  "With Fast. Console: the built-in graphics take as long as the game's own microcode, so games keep the console's frame rate. Short: they finish sooner, and some games then draw more frames than on the console. Applies on Restart.",
+	  NULL, "advanced", { { "console", "Console" }, { "short", "Short" }, { NULL, NULL } }, "console" },
 	{ "armn64_rsp_thread", "Threaded RSP", NULL,
 	  "With Fast. A core of its own for the RSP: faster for games like Rogue Squadron. Applies on Restart.",
 	  NULL, "advanced", { { "disabled", "Off" }, { "enabled", "On" }, { NULL, NULL } }, "disabled" },
@@ -214,6 +217,7 @@ static bool showOptions(void) {
 		{ "armn64_resolution", gl },
 		{ "armn64_vi_filters", !gl },
 		{ "armn64_gfx_rsp", hle },
+		{ "armn64_hle_timing", hle },
 		{ "armn64_rsp_thread", hle },
 		{ "armn64_rdp_threads", !strcmp(renderer(), "cpu") },
 		{ "armn64_pak1_card", optionIs(environment, "armn64_pak1", "memory") || !optionValue(environment, "armn64_pak1") },
@@ -316,6 +320,9 @@ static const char* settings(const char* name) {
 	}
 	if (!strcmp(name, "N64_GFX_RSP")) {
 		return optionIs(environment, "armn64_gfx_rsp", "rsp") ? "1" : "0";
+	}
+	if (!strcmp(name, "N64_HLE_TIMING")) {
+		return optionIs(environment, "armn64_hle_timing", "short") ? "short" : "console";
 	}
 	if (!strcmp(name, "N64_RSP_THREAD")) {
 		return optionIs(environment, "armn64_rsp_thread", "enabled") ? "1" : "0";

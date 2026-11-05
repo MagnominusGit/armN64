@@ -135,6 +135,8 @@ static void start(struct N64* n) {
 	n->hleCheck = setting(n, "N64HLECHECK") != NULL;
 	const char* gfxRsp = setting(n, "N64_GFX_RSP");
 	n->gfxRsp = gfxRsp && gfxRsp[0] == '1';
+	const char* hleTiming = setting(n, "N64_HLE_TIMING");
+	n->hleShortTasks = hleTiming && !strcmp(hleTiming, "short");
 	if (setting(n, "N64ISVIEWER") && !n->isViewer) {
 		n->isViewer = calloc(1, 0x10000);
 	}

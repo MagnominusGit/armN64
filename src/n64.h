@@ -299,6 +299,9 @@ struct N64 {
 	// N64HLECHECK=1: each graphics task also runs at high level without drawing, and the RDP commands
 	// it would send are counted against those the microcode sends ([0] microcode, [1] high level).
 	bool hleCheck;
+	// N64_HLE_TIMING=short: high-level graphics tasks take the time of the RDP words they send, less
+	// than the microcode's own (some games then draw more frames than on the console).
+	bool hleShortTasks;
 	uint32_t checkCounts[2][64];
 	// The first commands' first words, for finding where the two part.
 	uint64_t checkSeq[2][4096];

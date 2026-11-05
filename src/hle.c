@@ -176,8 +176,8 @@ struct Hle {
 	bool stalled;
 	uint64_t list[LIST_MAX];
 	size_t count;
-	// The list's length as the RDP's commands fill it (the task's time), and the words left of the
-	// command the list ends in.
+	// The task's time: the RSP's work in CPU cycles where the microcode's costs are known, otherwise the
+	// list's length as the RDP's commands fill it; and the words left of the command the list ends in.
 	size_t timeCount, left;
 };
 
@@ -262,6 +262,21 @@ static void flush(struct N64* n, struct Hle* h, bool canStall) {
 	h->count = total - sent;
 }
 
+// The RSP's cycles for each vertex, triangle and display list command, measured against the
+// microcodes' own runs (CPU cycles; Perfect Dark's from its game alone).
+static bool costed(struct N64* n, struct Hle* h) {
+	return !n->hleShortTasks && (h->family == FAMILY_F3D || h->family == FAMILY_F3DEX || h->family == FAMILY_F3DEX2 || h->family == FAMILY_F3DPD);
+}
+
+static void charge(struct N64* n, struct Hle* h, int vertices, int triangles, int commands) {
+	static const int costs[][3] = {
+		[FAMILY_F3D] = { 320, 63, 165 }, [FAMILY_F3DEX] = { 160, 199, 216 }, [FAMILY_F3DEX2] = { 160, 175, 64 }, [FAMILY_F3DPD] = { 480, 0, 70 },
+	};
+	if (costed(n, h)) {
+		h->timeCount += (size_t) (vertices * costs[h->family][0] + triangles * costs[h->family][1] + commands * costs[h->family][2]);
+	}
+}
+
 static void emit(struct N64* n, struct Hle* h, uint64_t w) {
 	if (h->count == LIST_MAX) {
 		flush(n, h, false);
@@ -270,7 +285,9 @@ static void emit(struct N64* n, struct Hle* h, uint64_t w) {
 	if (!h->left) {
 		// A full list keeps the words of the command it ends in.
 		h->left = commandWords(w);
-		h->timeCount = h->timeCount + h->left > LIST_MAX ? h->left : h->timeCount + h->left;
+		if (!costed(n, h)) {
+			h->timeCount = h->timeCount + h->left > LIST_MAX ? h->left : h->timeCount + h->left;
+		}
 	}
 	--h->left;
 }
@@ -378,6 +395,7 @@ static void dkrVertices(struct N64* n, struct Hle* h, uint32_t w0, uint32_t w1) 
 		h->dkrVertex = 0;
 	}
 	int const count = (int) ((w0 >> 19) & 31) + (h->jfg ? 0 : 1), first = h->dkrVertex + (int) ((w0 >> 9) & 31);
+	charge(n, h, count, 0, 0);
 	uint32_t a = address(h, w1) + h->dkrVtxOffset;
 	const float* m = h->mvp;
 	for (int i = 0; i < count && first + i < VERTICES; ++i, a += 10) {
@@ -475,6 +493,7 @@ static void cbfdLight(struct Hle* h, struct Vertex* v, const float* e, float dir
 }
 
 static void loadVertices(struct N64* n, struct Hle* h, uint32_t a, int first, int count) {
+	charge(n, h, count, 0, 0);
 	a = address(h, a);
 	// Vertices before the buffer (a start the list can't mean) go nowhere.
 	if (first < 0) {
@@ -782,6 +801,7 @@ static struct Vertex lerp(const struct Vertex* a, const struct Vertex* b, float 
 // Clips against the near plane and a wide guard band, culls by facing on screen, and draws the
 // rest as a fan.
 static void drawTriangle(struct N64* n, struct Hle* h, int i0, int i1, int i2) {
+	charge(n, h, 0, 1, 0);
 	if (i0 >= VERTICES || i1 >= VERTICES || i2 >= VERTICES) {
 		return;
 	}
@@ -4059,6 +4079,7 @@ static void runList(struct N64* n, struct Hle* h, uint32_t pc) {
 		int op = w0 >> 24;
 		uint32_t next = pc + 8;
 		bool end = false;
+		charge(n, h, 0, 0, 1);
 		bool const s2dex = h->family == FAMILY_S2DEX || h->family == FAMILY_S2DEX2, two = h->family == FAMILY_S2DEX2;
 		// S2DEX's G_RDPHALF_0, half of a G_SELECT_DL (0xE4, otherwise a texture rectangle).
 		if (s2dex && op == 0xE4 && rd32(n, next) >> 24 == (two ? 0x04u : 0xB0u)) {
@@ -4955,10 +4976,12 @@ static void finishTask(struct N64* n, struct Hle* h) {
 	} else if (!h->dry && h->waiting) {
 		n->sp.hleDoneAt = n->cycles + 2048;
 	} else if (!h->dry) {
-		n->sp.hleDoneAt = n->cycles + 4096 + 64 * (uint64_t) h->timeCount;
+		n->sp.hleDoneAt = n->cycles + 4096 + (costed(n, h) ? 1 : 64) * (uint64_t) h->timeCount;
 	}
+	bool const waiting = h->waiting;
 	flush(n, h, !h->dry);
-	h->timeCount = h->count;
+	// A task that waits or stalls keeps its time for when it ends.
+	h->timeCount = !costed(n, h) ? h->count : waiting || h->stalled ? h->timeCount : 0;
 	if (h->stalled) {
 		n->sp.hleDoneAt = n->cycles + 2048;
 	} else if (!h->dry && !h->waiting) {
