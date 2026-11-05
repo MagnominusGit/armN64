@@ -113,10 +113,37 @@ static ucode_func_t try_audio_task_detection(struct hle_t* hle)
     return NULL;
 }
 
-/* The audio task in DMEM (type 2) run on dram when its microcode is known; false leaves it alone. */
+/* armN64: the video microcodes of re2.c (graphics tasks), from hle.c's try_normal_task_detection. */
+static ucode_func_t try_re2_task_detection(struct hle_t* hle)
+{
+    uint32_t ucode = *dmem_u32(hle, TASK_UCODE);
+    unsigned int sum = 0;
+
+    for (uint32_t i = 0; i < 256; ++i)
+        sum += dram_r8(hle, ucode + i);
+
+    /* Resident Evil 2 */
+    switch (sum) {
+
+    case 0x450f:
+        return &resize_bilinear_task;
+
+    case 0x3b44:
+        return &decode_video_frame_task;
+
+    case 0x3d84:
+        return &fill_video_double_buffer_task;
+    }
+
+    return NULL;
+}
+
+/* The audio task in DMEM (type 2), or a graphics task of re2.c's, run on dram when its microcode is
+ * known; false leaves it alone. */
 static bool audioHleRun(struct N64* n, uint8_t* dram)
 {
-    if (be32(&n->sp.mem[0xFC0]) != 2) {
+    uint32_t type = be32(&n->sp.mem[0xFC0]);
+    if (type != 1 && type != 2) {
         return false;
     }
     if (!n->hleAudio && !(n->hleAudio = calloc(1, sizeof(struct hle_t)))) {
@@ -131,7 +158,7 @@ static bool audioHleRun(struct N64* n, uint8_t* dram)
     for (unsigned i = 0; i < 0x1000; ++i) {
         hle->dmem[i ^ S8] = n->sp.mem[i];
     }
-    ucode_func_t run = try_audio_task_detection(hle);
+    ucode_func_t run = type == 2 ? try_audio_task_detection(hle) : try_re2_task_detection(hle);
     if (!run) {
         return false;
     }
@@ -150,13 +177,14 @@ void hle_written(struct hle_t* hle)
     hle->written_start = hle->written_end = 0;
 }
 
-/* The audio task in DMEM run here, done a little later; false leaves it to the RSP. */
+/* The audio (or video) task in DMEM run here, done a little later; false leaves it to the RSP. */
 bool audioHle(struct N64* n)
 {
-    if (!audioHleRun(n, n->rdram)) {
+    bool graphics = be32(&n->sp.mem[0xFC0]) == 1;
+    if ((graphics && n->gfxRsp) || !audioHleRun(n, n->rdram)) {
         return false;
     }
-    ++n->stats.audioHleTasks;
+    n->stats.audioHleTasks += !graphics;
     n->sp.hleDoneAt = n->cycles + 4096;
     return true;
 }
@@ -168,7 +196,8 @@ static uint64_t checkTask;
 
 void audioCheckStart(struct N64* n)
 {
-    if (!getenv("N64AUDIOCHECK") || checkBefore || be32(&n->sp.mem[0xFC0]) != 2) {
+    uint32_t type = be32(&n->sp.mem[0xFC0]);
+    if (!getenv("N64AUDIOCHECK") || checkBefore || (type != 1 && type != 2)) {
         return;
     }
     checkBefore = malloc(RDRAM_SIZE);
@@ -176,7 +205,8 @@ void audioCheckStart(struct N64* n)
     memcpy(checkBefore, n->rdram, RDRAM_SIZE);
     memcpy(checkHle, n->rdram, RDRAM_SIZE);
     if (!audioHleRun(n, checkHle)) {
-        printf("AUDIOCHECK task %llu: microcode not known\n", (unsigned long long) ++checkTask);
+        if (type == 2)
+            printf("AUDIOCHECK task %llu: microcode not known\n", (unsigned long long) ++checkTask);
         free(checkBefore);
         free(checkHle);
         checkBefore = checkHle = NULL;

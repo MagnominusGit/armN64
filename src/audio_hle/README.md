@@ -6,6 +6,8 @@ Changed for armN64: RDRAM is big-endian bytes, so DRAM goes through the accessor
 (dram_r*/dram_w*, and dram_load_swapped16 where mupen64plus copied raw word-swapped memory); the
 task's DMEM is copied into hle_t as host-order words; hle_internal.h keeps only what audio uses;
 audio_hle.c holds the task detection from hle.c and the glue. Graphics, JPEG and other tasks are
-not here (hle.c in src/ does graphics).
+not here (hle.c in src/ does graphics), except the video frame microcodes in re2.c (graphics tasks
+with no display list; from mupen64plus-rsp-hle at 8a7a472a7172eb2c8725b305eae26818ed7b51a2).
 
-N64AUDIOCHECK=1 with mle or lle accuracy compares each audio task run here with the microcode's.
+N64AUDIOCHECK=1 with mle or lle accuracy compares each audio or video task run here with the
+microcode's.
