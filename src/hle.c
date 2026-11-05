@@ -5025,7 +5025,7 @@ bool hleGraphics(struct N64* n, bool dry) {
 		f = FAMILY_F3DEX;
 	}
 	// Power League 64's is F3DEX under Fast3D's name (as GLideN64 has it).
-	if (f == FAMILY_F3D && (ucode == 0x7754FFF8u || ucode == 0x2A089EC4u)) {
+	if (f == FAMILY_F3D && ucode == 0x7754FFF8u) {
 		f = FAMILY_F3DEX;
 	}
 	// Dark Rift's Turbo3D has no name either.
