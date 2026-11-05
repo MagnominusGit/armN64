@@ -8,7 +8,8 @@ task's DMEM is copied into hle_t as host-order words; hle_internal.h keeps only 
 audio_hle.c holds the task detection from hle.c and the glue. Graphics, JPEG and other tasks are
 not here (hle.c in src/ does graphics), except the video microcodes in re2.c and hvqm.c (graphics
 tasks with no display list; from mupen64plus-rsp-hle at 8a7a472a7172eb2c8725b305eae26818ed7b51a2;
-hvqm.c's check of the SP status, which hle_t doesn't keep, left out).
+hvqm.c's check of the SP status, which hle_t doesn't keep, left out). musyx.c keeps its sample copies
+and reads inside its buffers, as DMEM would keep them: stray voice data overran the stack.
 
 N64AUDIOCHECK=1 with mle or lle accuracy compares each audio or video task run here with the
 microcode's.

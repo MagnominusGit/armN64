@@ -144,8 +144,8 @@ static void init_subframes_v2(musyx_t *musyx);
 static uint32_t voice_stage(struct hle_t* hle, musyx_t *musyx,
                             uint32_t voice_ptr, uint32_t last_sample_ptr);
 
-static void dma_cat8(struct hle_t* hle, uint8_t *dst, uint32_t catsrc_ptr);
-static void dma_cat16(struct hle_t* hle, uint16_t *dst, uint32_t catsrc_ptr);
+static void dma_cat8(struct hle_t* hle, uint8_t *dst, uint32_t catsrc_ptr, size_t max);
+static void dma_cat16(struct hle_t* hle, uint16_t *dst, uint32_t catsrc_ptr, size_t max);
 
 static void load_samples_PCM16(struct hle_t* hle, uint32_t voice_ptr, int16_t *samples,
                                unsigned *segbase, unsigned *offset);
@@ -499,15 +499,15 @@ static uint32_t voice_stage(struct hle_t* hle, musyx_t *musyx,
     return output_ptr;
 }
 
-static void dma_cat8(struct hle_t* hle, uint8_t *dst, uint32_t catsrc_ptr)
+static void dma_cat8(struct hle_t* hle, uint8_t *dst, uint32_t catsrc_ptr, size_t max)
 {
     uint32_t ptr1  = dram_r32(hle, catsrc_ptr + CATSRC_PTR1);
     uint32_t ptr2  = dram_r32(hle, catsrc_ptr + CATSRC_PTR2);
     uint16_t size1 = dram_r16(hle, catsrc_ptr + CATSRC_SIZE1);
     uint16_t size2 = dram_r16(hle, catsrc_ptr + CATSRC_SIZE2);
 
-    size_t count1 = size1;
-    size_t count2 = size2;
+    size_t count1 = size1 < max ? size1 : max;
+    size_t count2 = size2 < max - count1 ? size2 : max - count1;
 
     HleVerboseMessage(hle->user_defined,
                       "dma_cat: %08x %08x %04x %04x",
@@ -524,15 +524,15 @@ static void dma_cat8(struct hle_t* hle, uint8_t *dst, uint32_t catsrc_ptr)
     dram_load_u8(hle, dst + count1, ptr2, count2);
 }
 
-static void dma_cat16(struct hle_t* hle, uint16_t *dst, uint32_t catsrc_ptr)
+static void dma_cat16(struct hle_t* hle, uint16_t *dst, uint32_t catsrc_ptr, size_t max)
 {
     uint32_t ptr1  = dram_r32(hle, catsrc_ptr + CATSRC_PTR1);
     uint32_t ptr2  = dram_r32(hle, catsrc_ptr + CATSRC_PTR2);
     uint16_t size1 = dram_r16(hle, catsrc_ptr + CATSRC_SIZE1);
     uint16_t size2 = dram_r16(hle, catsrc_ptr + CATSRC_SIZE2);
 
-    size_t count1 = size1 >> 1;
-    size_t count2 = size2 >> 1;
+    size_t count1 = (size_t)(size1 >> 1) < max ? (size_t)(size1 >> 1) : max;
+    size_t count2 = (size_t)(size2 >> 1) < max - count1 ? (size_t)(size2 >> 1) : max - count1;
 
     HleVerboseMessage(hle->user_defined,
                       "dma_cat: %08x %08x %04x %04x",
@@ -561,13 +561,17 @@ static void load_samples_PCM16(struct hle_t* hle, uint32_t voice_ptr, int16_t *s
 
     HleVerboseMessage(hle->user_defined, "Format: PCM16");
 
+    /* armN64: the copies kept to the buffer (stray voice data must not overrun the stack) */
+    if (count > SAMPLE_BUFFER_SIZE)
+        count = SAMPLE_BUFFER_SIZE;
+
     *segbase = SAMPLE_BUFFER_SIZE - count;
     *offset  = u8_3e;
 
-    dma_cat16(hle, (uint16_t *)samples + *segbase, voice_ptr + VOICE_CATSRC_0);
+    dma_cat16(hle, (uint16_t *)samples + *segbase, voice_ptr + VOICE_CATSRC_0, count);
 
     if (u16_42 != 0)
-        dma_cat16(hle, (uint16_t *)samples, voice_ptr + VOICE_CATSRC_1);
+        dma_cat16(hle, (uint16_t *)samples, voice_ptr + VOICE_CATSRC_1, *segbase);
 }
 
 static void load_samples_ADPCM(struct hle_t* hle, uint32_t voice_ptr, int16_t *samples,
@@ -590,16 +594,23 @@ static void load_samples_ADPCM(struct hle_t* hle, uint32_t voice_ptr, int16_t *s
     HleVerboseMessage(hle->user_defined, "Loading ADPCM table: %08x", adpcm_table_ptr);
     dram_load_u16(hle, (uint16_t *)adpcm_table, adpcm_table_ptr, 128);
 
+    /* armN64: the frames kept to the buffers (stray voice data must not overrun the stack) */
+    if (u8_3c > SAMPLE_BUFFER_SIZE / 32)
+        u8_3c = SAMPLE_BUFFER_SIZE / 32;
+
     count = u8_3c << 5;
 
     *segbase = SAMPLE_BUFFER_SIZE - count;
     *offset  = u8_3e & 0x1f;
 
-    dma_cat8(hle, buffer, voice_ptr + VOICE_CATSRC_0);
+    if (u8_3d > *segbase / 32)
+        u8_3d = *segbase / 32;
+
+    dma_cat8(hle, buffer, voice_ptr + VOICE_CATSRC_0, sizeof(buffer));
     adpcm_decode_frames(hle, samples + *segbase, buffer, adpcm_table, u8_3c, u8_3e);
 
     if (u8_3d != 0) {
-        dma_cat8(hle, buffer, voice_ptr + VOICE_CATSRC_1);
+        dma_cat8(hle, buffer, voice_ptr + VOICE_CATSRC_1, sizeof(buffer));
         adpcm_decode_frames(hle, samples, buffer, adpcm_table, u8_3d, u8_3f);
     }
 }
@@ -734,8 +745,9 @@ static void mix_voice_samples(struct hle_t* hle, musyx_t *musyx,
         if (dist >= 0)
             sample = sample_restart + dist;
 
-        /* apply resample filter */
-        v = clamp_s16(dot4(sample, lut));
+        /* apply resample filter (armN64: silence for a position outside the buffer, from stray
+         * voice data) */
+        v = sample - samples >= 0 && sample - samples <= SAMPLE_BUFFER_SIZE - 4 ? clamp_s16(dot4(sample, lut)) : 0;
 
         for (k = 0; k < 4; ++k) {
             /* envmix */
