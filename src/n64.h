@@ -359,12 +359,15 @@ struct N64 {
 	uint8_t dirtyPages[(RDRAM_SIZE >> 12) + 1];
 	// One bit per RDRAM word that a block holds: writes elsewhere in a page with code keep its blocks.
 	uint8_t codeWords[RDRAM_SIZE >> 5];
-	uint32_t blockGen;
+	// blockGen: all compiled code's addresses (the TLB, a new arena); codeGen: any block thrown away.
+	uint32_t blockGen, codeGen;
 	bool useBlocks;
 	// Compiled blocks (jit_x64.c): the code arena, how far compiled code may run, and the code
 	// for recent addresses. blockGen also changes with the TLB.
 	bool useJit;
 	uint8_t* jitArena;
+	// Where a thrown-away block's code now goes: the jitTable for the pc, else back to C.
+	void* jitRedispatch;
 	size_t jitUsed;
 	uint64_t jitLimit, jitFire;
 	void (*jitEnter)(struct N64*, void* code);
@@ -585,6 +588,7 @@ uint32_t blockPollPass(const uint32_t* ops, uint32_t count, uint32_t vaddr, int*
 void* jitCompile(struct N64*, const uint32_t* ops, uint32_t count, uint32_t vaddr, uint32_t paddr);
 void jitReset(struct N64*);
 void jitUnlink(struct N64*);
+void jitKill(struct N64*, void* code);
 void jitFree(struct N64*);
 // rdp.c: waits for RDP commands still being drawn by other threads.
 void rdpWait(struct N64*);

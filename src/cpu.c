@@ -1788,7 +1788,7 @@ static bool uncachedWord(struct N64* n, uint32_t op) {
 bool cpuJitStep(struct N64* n, uint32_t op) {
 	struct CPU* c = &n->cpu;
 	uint64_t pc = c->pc;
-	uint32_t gen = n->blockGen;
+	uint32_t gen = n->blockGen, code = n->codeGen;
 	if (!uncachedWord(n, op)) {
 		execute(n, op);
 	}
@@ -1798,7 +1798,7 @@ bool cpuJitStep(struct N64* n, uint32_t op) {
 	n->jitLimit = n->eventAt < n->jitFire ? n->eventAt : n->jitFire;
 	bool timer = op >> 26 == 0x10 && (RS == 0x04 || RS == 0x05) && (RD == CP0_COUNT || RD == CP0_COMPARE);
 	bool icache = op >> 26 == 0x2F && ((op >> 16) & 3) == 0;
-	return c->pc != pc || n->blockGen != gen || interruptPending(n) || timer || icache || !cpuPlainMode(n);
+	return c->pc != pc || n->blockGen != gen || n->codeGen != code || interruptPending(n) || timer || icache || !cpuPlainMode(n);
 }
 
 void cpuStep(struct N64* n) {

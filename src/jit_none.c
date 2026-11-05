@@ -14,6 +14,9 @@ void jitUnlink(struct N64* n) {
 	n->linkGen = n->blockGen;
 }
 
+void jitKill(struct N64* n, void* code) {
+}
+
 void jitFree(struct N64* n) {
 }
 

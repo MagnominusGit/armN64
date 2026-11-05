@@ -116,18 +116,30 @@ uint32_t blockPollPass(const uint32_t* ops, uint32_t count, uint32_t vaddr, int*
 	return count;
 }
 
+// A block thrown away alone: whatever still jumps to its code finds the pc's block again.
+static void dropBlock(struct N64* n, struct Block* b) {
+	if (b && b->code) {
+		struct JitEntry* je = &n->jitTable[(b->vaddr >> 2) & (JIT_TABLE_SIZE - 1)];
+		if (je->code == b->code) {
+			je->vaddr = 1;
+		}
+		jitKill(n, b->code);
+	}
+	free(b);
+}
+
 void blocksInvalidatePage(struct N64* n, uint32_t page) {
 	struct Block** t = n->blockPage[page];
 	if (t) {
 		for (int i = 0; i < PAGE_WORDS; ++i) {
-			free(t[i]);
+			dropBlock(n, t[i]);
 		}
 		free(t);
 		n->blockPage[page] = NULL;
 	}
 	n->pageFlags[page] &= ~PAGE_CODE;
 	memset(&n->codeWords[page << 7], 0, 128);
-	++n->blockGen;
+	++n->codeGen;
 }
 
 void blocksFree(struct N64* n) {
@@ -417,7 +429,7 @@ void blocksRun(struct N64* n) {
 		}
 		struct Block* b = t[(paddr >> 2) & (PAGE_WORDS - 1)];
 		if (b && b->vaddr != v) {
-			free(b);
+			dropBlock(n, b);
 			b = t[(paddr >> 2) & (PAGE_WORDS - 1)] = NULL;
 		}
 		if (!b) {
@@ -440,7 +452,7 @@ void blocksRun(struct N64* n) {
 			continue;
 		}
 		uint64_t pc = c->pc;
-		uint32_t gen = n->blockGen;
+		uint32_t gen = n->blockGen, code = n->codeGen;
 		for (uint32_t i = 0; i < b->count; ++i) {
 			cpuStepOp(n, b->ops[i], paddr + i * 4);
 			n->cycles += 1 + c->stall;
@@ -448,7 +460,7 @@ void blocksRun(struct N64* n) {
 			pc += 4;
 			// Stop at the next event, where the program didn't go on to the next instruction,
 			// or when a write threw this block away.
-			if (n->cycles >= n->eventAt || c->pc != pc || n->blockGen != gen) {
+			if (n->cycles >= n->eventAt || c->pc != pc || n->blockGen != gen || n->codeGen != code) {
 				break;
 			}
 		}

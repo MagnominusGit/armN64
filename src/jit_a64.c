@@ -1643,6 +1643,25 @@ static void chain(struct Jit* j) {
 	}
 }
 
+// To the block at the pc through the jitTable, else back to C.
+static void lookup(struct Emitter* e, uint8_t* leave) {
+	aLdrX(e, 0, CPU, CPU_OFF(pc));
+	aSxtw(e, 1, 0);
+	aDp(e, A_SUBS | W64, ZR, 1, 0, S_LSL, 0);
+	aBcond(e, C_NE, leave);
+	loadN(e, 4, N64_OFF(blockGen), 4);
+	aUbfx(e, 1, 0, 2, 14);
+	aAddImmX(e, 7, N, N64_OFF(jitTable));
+	aDp(e, A_ADD | W64, 7, 7, 1, S_LSL, 4);
+	aLdpW(e, 3, 6, 7, (unsigned) offsetof(struct JitEntry, vaddr));
+	aDp(e, A_SUBS, ZR, 3, 0, S_LSL, 0);
+	aBcond(e, C_NE, leave);
+	aDp(e, A_SUBS, ZR, 6, 4, S_LSL, 0);
+	aBcond(e, C_NE, leave);
+	aLdrX(e, 5, 7, (unsigned) offsetof(struct JitEntry, code));
+	aBr(e, 5);
+}
+
 // The arena starts with the way in, jitEnter(n, code), and the way out back to C.
 static uint8_t* arenaGet(struct N64* n) {
 	if (n->jitArena) {
@@ -1681,6 +1700,8 @@ static uint8_t* arenaGet(struct N64* n) {
 	aLdp(&e, 27, 28, 80);
 	aPop(&e, 29, 30, 96);
 	aRet(&e);
+	n->jitRedispatch = e.p;
+	lookup(&e, n->jitLeave);
 	__builtin___clear_cache((char*) p, (char*) e.p);
 	n->jitEnter = (void (*)(struct N64*, void*)) p;
 	return p;
@@ -1690,6 +1711,13 @@ void jitReset(struct N64* n) {
 	n->jitUsed = SHARED_SIZE;
 	n->linkCount = 0;
 	++n->blockGen;
+}
+
+// A thrown-away block's code starts again at jitRedispatch (any jump to it comes with the pc set).
+void jitKill(struct N64* n, void* code) {
+	uint32_t* p = code;
+	*p = 0x14000000 | ((uint32_t) (((uint8_t*) n->jitRedispatch - (uint8_t*) p) >> 2) & 0x03FFFFFF);
+	__builtin___clear_cache((char*) p, (char*) (p + 1));
 }
 
 void jitUnlink(struct N64* n) {

@@ -2,6 +2,7 @@
 #include "x64/emit.h"
 
 #include <stddef.h>
+#include <string.h>
 #include <sys/mman.h>
 
 // x86-64 code for a block of cached RDRAM instructions. The ALU and branches run inline; the rest
@@ -938,23 +939,27 @@ static void pollSkip(struct Jit* j, const uint32_t* ops, uint32_t count, uint32_
 	}
 }
 
-static void chain(struct Jit* j) {
-	struct Emitter* e = &j->e;
+// To the block at the pc through the jitTable, else to leave.
+static void lookup(struct Emitter* e, uint8_t* leave) {
 	xLoad(e, 8, RAX, CPU_AT(pc));
 	xMovsxd(e, RCX, R(RAX));
 	xAluRR(e, X_CMP, 8, R(RCX), RAX);
-	xJcc(e, CC_NE, j->leave);
+	xJcc(e, CC_NE, leave);
 	xMovRR(e, 4, RCX, RAX);
 	xShiftI(e, X_SHR, 4, R(RCX), 2);
 	xAluI(e, X_AND, 4, R(RCX), JIT_TABLE_SIZE - 1);
 	xShiftI(e, X_SHL, 4, R(RCX), 4);
 	xLea(e, 8, RDX, MI(RBX, RCX, 1, (int32_t) offsetof(struct N64, jitTable)));
 	xAluRM(e, X_CMP, 4, RAX, M(RDX, (int32_t) offsetof(struct JitEntry, vaddr)));
-	xJcc(e, CC_NE, j->leave);
+	xJcc(e, CC_NE, leave);
 	xLoad(e, 4, RAX, N64_AT(blockGen));
 	xAluRM(e, X_CMP, 4, RAX, M(RDX, (int32_t) offsetof(struct JitEntry, gen)));
-	xJcc(e, CC_NE, j->leave);
+	xJcc(e, CC_NE, leave);
 	xJmpM(e, M(RDX, (int32_t) offsetof(struct JitEntry, code)));
+}
+
+static void chain(struct Jit* j) {
+	lookup(&j->e, j->leave);
 }
 
 // The arena starts with the way in, jitEnter(n, code), and the way out back to C.
@@ -985,6 +990,8 @@ static uint8_t* arenaGet(struct N64* n) {
 		xPop(&e, R12);
 		xPop(&e, RBX);
 		xRet(&e);
+		n->jitRedispatch = e.p;
+		lookup(&e, n->jitLeave);
 		n->jitEnter = (void (*)(struct N64*, void*)) p;
 	}
 	return n->jitArena;
@@ -997,6 +1004,14 @@ void jitReset(struct N64* n) {
 
 void jitUnlink(struct N64* n) {
 	n->linkGen = n->blockGen;
+}
+
+// A thrown-away block's code starts again at jitRedispatch (any jump to it comes with the pc set).
+void jitKill(struct N64* n, void* code) {
+	uint8_t* p = code;
+	int32_t d = (int32_t) ((uint8_t*) n->jitRedispatch - (p + 5));
+	p[0] = 0xE9;
+	memcpy(p + 1, &d, 4);
 }
 
 void jitFree(struct N64* n) {
