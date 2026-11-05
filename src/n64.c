@@ -149,7 +149,8 @@ static void start(struct N64* n) {
 		n->pak[i] = paks[i] == 'm' ? PAK_MEMORY : paks[i] == 'r' ? PAK_RUMBLE : paks[i] == 't' ? PAK_TRANSFER : PAK_NONE;
 	}
 	n->flashMode = n->flashStatus = 0;
-	if (n->compat) {
+	// RDRAM zeroed, as the emulators hacks are made on start it (some hacks rely on that).
+	if (n->emulatorLike) {
 		memset(n->rdram, 0, RDRAM_SIZE);
 	}
 	blocksFree(n);
