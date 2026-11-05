@@ -74,6 +74,8 @@ struct Hle {
 	// S2DEX: the 2D matrix (A to D, the offset in pixels, the base scales), the object render mode,
 	// the state words texture loads and G_SELECT_DL test, and G_RDPHALF_0's half of a selection.
 	float objA, objB, objC, objD, objX, objY, objBaseX, objBaseY;
+	// Triangles S2DEX draws for an object: 1/w whole (0x7FFF), the texture coordinates as they are.
+	bool objTriangles;
 	uint32_t objMode, objStatus[4], half0w0, half0w1;
 	// F3DFLX (F-Zero X's F3DEX2): light k in slot k + 1, slot 1 its alpha light, a direction whose
 	// angle to the normal picks each vertex's alpha from a table at the G_DMA_IO address (in place of
@@ -627,10 +629,11 @@ static void edgeSetup(const struct Hle* h, const struct ScreenVertex* a, const s
 // One RDP triangle (after libdragon's rdpq_triangle_cpu): edges, then shade, texture and depth
 // coefficients as the command asks for them.
 static void triangle(struct N64* n, struct Hle* h, const struct ScreenVertex* a, const struct ScreenVertex* b, const struct ScreenVertex* c, const struct ScreenVertex* flat) {
-	// The microcodes scale 1/w so the corners' largest is a half, and send S and T times it: the
-	// RDP divides that out with perspective correction and takes S and T as they are without.
+	// The microcodes scale 1/w so the corners' largest is a half (S2DEX's objects: whole), and send S
+	// and T times it: the RDP divides that out with perspective correction and takes S and T as they
+	// are without.
 	float maxW = a->invW > b->invW ? (a->invW > c->invW ? a->invW : c->invW) : (b->invW > c->invW ? b->invW : c->invW);
-	float k = maxW > 0 ? 0.5f / maxW : 0.5f;
+	float k = maxW > 0 ? (h->objTriangles ? 1.0f : 0.5f) / maxW : 0.5f;
 	struct EdgeSetup edge;
 	edgeSetup(h, a, b, c, &edge);
 	if (n->rdpGl && !h->image8 && !h->dry) {
@@ -1179,21 +1182,23 @@ static bool objRotated(struct N64* n, struct Hle* h, float objX, float objY, int
 	emit(n, h, (uint64_t) 0x35 << 56 | (uint64_t) format << 53 | (uint64_t) size << 51 | (uint64_t) stride << 41 | (uint64_t) tmem << 32 |
 	           (uint64_t) pal << 20 | (uint64_t) clamp << 19 | (uint64_t) clamp << 9);
 	emit(n, h, (uint64_t) 0x32 << 56 | (uint64_t) ((width - 1) << 2) << 12 | (uint64_t) ((height - 1) << 2));
-	float const lx[2] = { objX, objX + width / dsdx }, ly[2] = { objY, objY + height / dtdy };
+	// The far corner a pixel in, its texel where the scale puts it there.
+	float const lx[2] = { objX, objX + width / dsdx - 1 }, ly[2] = { objY, objY + height / dtdy - 1 };
+	float const ls[2] = { 0, width - dsdx }, lt[2] = { 0, height - dtdy };
 	struct ScreenVertex v[4];
 	for (int i = 0; i < 4; ++i) {
 		float const px = lx[i & 1], py = ly[i >> 1];
 		v[i] = (struct ScreenVertex) { h->objA * px + h->objB * py + h->objX, h->objC * px + h->objD * py + h->objY, 0, 1, 1, 1, 1, 1,
-		                               (float) ((i & 1) != flipS ? width : 0), (float) ((i >> 1) != flipT ? height : 0) };
+		                               flipS ? ls[!(i & 1)] : ls[i & 1], flipT ? lt[!(i >> 1)] : lt[i >> 1] };
 	}
 	uint32_t const geometry = h->geometry;
 	bool const texOn = h->texOn;
 	int const texTile = h->texTile, texLevel = h->texLevel;
 	h->geometry &= ~(uint32_t) (GEOM_SHADE | GEOM_ZBUFFER);
-	h->texOn = true, h->texTile = 0, h->texLevel = 0;
+	h->texOn = true, h->texTile = 0, h->texLevel = 0, h->objTriangles = true;
 	triangle(n, h, &v[0], &v[1], &v[2], NULL);
 	triangle(n, h, &v[1], &v[3], &v[2], NULL);
-	h->geometry = geometry, h->texOn = texOn, h->texTile = texTile, h->texLevel = texLevel;
+	h->geometry = geometry, h->texOn = texOn, h->texTile = texTile, h->texLevel = texLevel, h->objTriangles = false;
 	return true;
 }
 
