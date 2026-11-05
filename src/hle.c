@@ -1284,9 +1284,9 @@ static void reject(struct Hle* h) {
 	h->rejectedNow = true;
 }
 
-static int family(struct N64* n, uint32_t data, uint32_t size);
-static bool isFlx(struct N64* n, uint32_t data, uint32_t size);
-static void ucodeFlags(struct N64* n, struct Hle* h, uint32_t data, uint32_t size);
+static int family(struct N64* n, uint32_t code, uint32_t data, uint32_t size);
+static bool isFlx(struct N64* n, uint32_t code, uint32_t data, uint32_t size);
+static void ucodeFlags(struct N64* n, struct Hle* h, uint32_t code, uint32_t data, uint32_t size);
 static void ucodeName(struct N64* n, uint32_t code, uint32_t data, uint32_t dataSize, char* out, size_t size);
 
 // G_LOAD_UCODE: the list goes on in another microcode (its data named by G_RDPHALF_1); F3DEX's takes
@@ -1299,9 +1299,9 @@ static bool loadMicrocode(struct N64* n, struct Hle* h, uint32_t code, uint32_t 
 		h->cbfdAdvanced = true;
 		return true;
 	}
-	int f = family(n, address(h, h->half1), dataSize);
-	h->flx = isFlx(n, address(h, h->half1), dataSize);
-	ucodeFlags(n, h, address(h, h->half1), dataSize);
+	int f = family(n, address(h, code), address(h, h->half1), dataSize);
+	h->flx = isFlx(n, address(h, code), address(h, h->half1), dataSize);
+	ucodeFlags(n, h, address(h, code), address(h, h->half1), dataSize);
 	if (f == FAMILY_NONE) {
 		char name[40];
 		ucodeName(n, address(h, code), address(h, h->half1), dataSize, name, sizeof(name));
@@ -4543,6 +4543,16 @@ static const char* gfxName(const char* text) {
 	return name ? name + 1 : NULL;
 }
 
+// The name a microcode's data gives, where a patch blanked it (a fan translation), known by the hash
+// of its first code.
+static const char* knownName(struct N64* n, uint32_t code) {
+	uint32_t hash = 2166136261u;
+	for (uint32_t i = 0; i < 1024; ++i) {
+		hash = (hash ^ n->rdram[(code + i) & (RDRAM_SIZE - 1)]) * 16777619u;
+	}
+	return hash == 0x732CC90Fu ? "RSP Gfx ucode F3DZEX.NoN  fifo 2.08J Yoshitaka Yasumoto/Kawasedo 1999." : NULL;
+}
+
 // The microcode family from the first ID string in its data (the block may run on into the next
 // microcode's data, and its string).
 // A microcode by the name its data gives (a Fast3D or F3DEX family line), else by the hash of its
@@ -4556,6 +4566,9 @@ static void ucodeName(struct N64* n, uint32_t code, uint32_t data, uint32_t data
 	}
 	text[length] = 0;
 	const char* name = gfxName(text) ? strstr(text, "RSP Gfx") : strstr(text, "RSP SW Version");
+	if (!name) {
+		name = knownName(n, code);
+	}
 	if (name) {
 		snprintf(out, size, "%.*s", (int) (size - 1), name);
 		return;
@@ -4578,9 +4591,9 @@ void hleUcodeName(struct N64* n, char* out, size_t size) {
 }
 
 // The line microcodes, F3DTEX/A and F3DAM, by name.
-static void ucodeFlags(struct N64* n, struct Hle* h, uint32_t data, uint32_t size) {
+static void ucodeFlags(struct N64* n, struct Hle* h, uint32_t code, uint32_t data, uint32_t size) {
 	char text[48];
-	ucodeName(n, 0, data, size, text, sizeof(text));
+	ucodeName(n, code, data, size, text, sizeof(text));
 	const char* name = gfxName(text);
 	h->lines = name && !strncmp(name, "L3DEX", 5);
 	h->texa = name && !strncmp(name, "F3DTEX/A", 8);
@@ -4589,14 +4602,14 @@ static void ucodeFlags(struct N64* n, struct Hle* h, uint32_t data, uint32_t siz
 	h->cbfd = name && !strncmp(name, "F3DEXBG", 7);
 }
 
-static bool isFlx(struct N64* n, uint32_t data, uint32_t size) {
+static bool isFlx(struct N64* n, uint32_t code, uint32_t data, uint32_t size) {
 	char text[48];
-	ucodeName(n, 0, data, size, text, sizeof(text));
+	ucodeName(n, code, data, size, text, sizeof(text));
 	const char* name = gfxName(text);
 	return name && !strncmp(name, "F3DFLX", 6);
 }
 
-static int family(struct N64* n, uint32_t data, uint32_t size) {
+static int family(struct N64* n, uint32_t code, uint32_t data, uint32_t size) {
 	if (size > 0x1000) {
 		size = 0x1000;
 	}
@@ -4606,6 +4619,9 @@ static int family(struct N64* n, uint32_t data, uint32_t size) {
 		text[i] = c >= 32 && c < 127 ? (char) c : ' ';
 	}
 	text[size] = 0;
+	if (!strstr(text, "RSP Gfx") && !strstr(text, "RSP SW Version") && knownName(n, code)) {
+		snprintf(text, sizeof(text), "%s", knownName(n, code));
+	}
 	const char* name = gfxName(text);
 	const char* sw = strstr(text, "RSP SW Version");
 	if (sw && (!name || sw < name)) {
@@ -4981,7 +4997,7 @@ bool hleGraphics(struct N64* n, bool dry) {
 		return false;
 	}
 	uint32_t data = be32(task + 0x18) & 0xFFFFFF, dataSize = be32(task + 0x1C);
-	int f = family(n, data, dataSize);
+	int f = family(n, code, data, dataSize);
 	// Perfect Dark's microcode has no name: it is known by its code.
 	if (f == FAMILY_NONE && ucode == 0xB0811E2Fu) {
 		f = FAMILY_F3DPD;
@@ -4996,7 +5012,7 @@ bool hleGraphics(struct N64* n, bool dry) {
 		f = FAMILY_F3DEX;
 	}
 	// Power League 64's is F3DEX under Fast3D's name (as GLideN64 has it).
-	if (f == FAMILY_F3D && ucode == 0x7754FFF8u) {
+	if (f == FAMILY_F3D && (ucode == 0x7754FFF8u || ucode == 0x2A089EC4u)) {
 		f = FAMILY_F3DEX;
 	}
 	// Dark Rift's Turbo3D has no name either.
@@ -5050,9 +5066,9 @@ bool hleGraphics(struct N64* n, bool dry) {
 		gbStart(n, h);
 		return true;
 	}
-	h->flx = isFlx(n, data, dataSize);
+	h->flx = isFlx(n, code, data, dataSize);
 	h->wrus = wrus;
-	ucodeFlags(n, h, data, dataSize);
+	ucodeFlags(n, h, code, data, dataSize);
 	h->cbfdAdvanced = false;
 	h->dkr = dkr, h->jfg = ucode == 0x26EDE132u;
 	h->dkrBillboard = false, h->dkrVertex = 0, h->dkrMtxOffset = h->dkrVtxOffset = h->dkrTexTable = 0;
