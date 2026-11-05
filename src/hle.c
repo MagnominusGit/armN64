@@ -15,7 +15,7 @@
 // S2DEX and S2DEX2 are the 2D microcodes (F3DEX's and F3DEX2's command numbers for what they share):
 // backgrounds so far, other commands leave the task to the RSP.
 // ZSort draws objects the game sorted from vertices it transformed here first (its DMEM in between).
-enum { FAMILY_NONE, FAMILY_F3D, FAMILY_F3DEX, FAMILY_F3DEX2, FAMILY_F3DPD, FAMILY_S2DEX, FAMILY_S2DEX2, FAMILY_ZSORT, FAMILY_TURBO3D, FAMILY_T3DUX, FAMILY_ZSORTBOSS };
+enum { FAMILY_NONE, FAMILY_F3D, FAMILY_F3DEX, FAMILY_F3DEX2, FAMILY_F3DPD, FAMILY_S2DEX, FAMILY_S2DEX2, FAMILY_ZSORT, FAMILY_TURBO3D, FAMILY_T3DUX, FAMILY_ZSORTBOSS, FAMILY_F5ROGUE };
 
 // Geometry mode bits, kept in the F3DEX2 layout.
 enum {
@@ -92,6 +92,9 @@ struct Hle {
 	float bossInvw;
 	uint8_t bossFog[256];
 	int16_t bossTable[8][8];
+	// Factor 5's: each list level's jump target (its first word), the vertex colour table, the texture
+	// coordinate scales, and where the viewport and the projection matrix were.
+	uint32_t f5Jump[DL_DEPTH + 1], f5Colors, f5TexScale[2], f5Viewport, f5Persp;
 	uint32_t objMode, objStatus[4], half0w0, half0w1;
 	// F3DFLX (F-Zero X's F3DEX2): light k in slot k + 1, slot 1 its alpha light, a direction whose
 	// angle to the normal picks each vertex's alpha from a table at the G_DMA_IO address (in place of
@@ -2077,6 +2080,495 @@ static void bossRun(struct N64* n, struct Hle* h) {
 	h->bossDone = true;
 }
 
+// ---- Factor 5's (Rogue Squadron's; GLideN64's F5Rogue.cpp, after Lemmy's LemNemu and olivieryuyu's
+// decoding). GLideN64 keeps the generated terrain's arrays index-swapped (^1); so does this, the same
+// raw indices reaching them.
+
+struct F5Triangle {
+	int v[3], z;
+};
+
+// A vertex (x, y, z) through the combined matrix, y the other way up (as Factor 5's matrices have it).
+static void f5Vertex(struct Hle* h, int i, float x, float y, float z) {
+	const float* m = h->mvp;
+	struct Vertex* v = &h->v[i];
+	v->x = x * m[0] + y * m[4] + z * m[8] + m[12];
+	v->y = -(x * m[1] + y * m[5] + z * m[9] + m[13]);
+	v->z = x * m[2] + y * m[6] + z * m[10] + m[14];
+	v->w = x * m[3] + y * m[7] + z * m[11] + m[15];
+}
+
+// The colours (RGBA words) and, textured, the texture coordinates (S and T words through the two
+// scales, as the RSP's multiplies keep them: 10.5 with perspective, else 11.4) of the vertices; fog in
+// the alpha when it is on.
+static void f5Prepare(struct Hle* h, const int* index, const uint32_t* colors, const uint32_t* texCoords, bool persp, int count) {
+	uint32_t const sscale = h->f5TexScale[0] >> 16, tscale = h->f5TexScale[0] & 0xFFFF, sscale1 = h->f5TexScale[1] >> 16, tscale1 = h->f5TexScale[1] & 0xFFFF;
+	for (int i = 0; i < count; ++i) {
+		struct Vertex* v = &h->v[index[i]];
+		uint32_t const c = colors[i];
+		v->r = (c >> 24) / 255.0f, v->g = ((c >> 16) & 0xFF) / 255.0f, v->b = ((c >> 8) & 0xFF) / 255.0f, v->a = (c & 0xFF) / 255.0f;
+		if (h->geometry & GEOM_FOG) {
+			float const f = (v->w != 0 ? v->z / v->w : 0) * h->fogMul + h->fogOffset;
+			v->a = (f < 0 ? 0 : f > 255 ? 255 : f) / 255.0f;
+		}
+		if (texCoords) {
+			uint32_t const st = texCoords[i], s0 = (uint32_t) (int32_t) (int16_t) (st >> 16), t0 = (uint32_t) (int32_t) (int16_t) st;
+			int16_t const s = (int16_t) ((int16_t) ((s0 * sscale) >> 16) + (int16_t) (s0 * sscale1));
+			int16_t const t = (int16_t) ((int16_t) ((t0 * tscale) >> 16) + (int16_t) (t0 * tscale1));
+			v->s = s / (persp ? 32.0f : 16.0f), v->t = t / (persp ? 32.0f : 16.0f);
+		}
+	}
+}
+
+static int f5Z(const struct Hle* h, int i) {
+	const struct Vertex* v = &h->v[i];
+	return (int) (((v->w != 0 ? v->z / v->w : 0) * h->vscale[2] + h->vtrans[2]) * 32768.0f);
+}
+
+// The generated triangles back to front (by their corners' average depth), then drawn.
+static void f5DrawSorted(struct N64* n, struct Hle* h, struct F5Triangle* t, int count) {
+	for (int i = 0; i < count; ++i) {
+		t[i].z = (f5Z(h, t[i].v[0]) + f5Z(h, t[i].v[1]) + f5Z(h, t[i].v[2])) / 3;
+	}
+	for (int i = 1; i < count; ++i) {
+		struct F5Triangle const x = t[i];
+		int j = i;
+		while (j > 0 && t[j - 1].z < x.z) {
+			t[j] = t[j - 1];
+			--j;
+		}
+		t[j] = x;
+	}
+	for (int i = 0; i < count; ++i) {
+		drawTriangle(n, h, t[i].v[0], t[i].v[1], t[i].v[2]);
+	}
+}
+
+static void f5HeightAverage(uint16_t* d, int a, int b, int to) {
+	d[to] = (uint16_t) (int16_t) (((int16_t) d[a] + (int16_t) d[b]) / 2);
+}
+
+static void f5ColorAverage(uint32_t* c, int a, int b, int to) {
+	uint32_t r = 0;
+	for (int k = 0; k < 32; k += 8) {
+		r |= ((((c[a] >> k) & 0xFF) + ((c[b] >> k) & 0xFF)) >> 1) << k;
+	}
+	c[to] = r;
+}
+
+static void f5HeightWeight(uint16_t* d, int a, int b, int to, uint16_t w) {
+	int32_t const v = (int16_t) d[to] * (0x10000 - w) + ((((int16_t) d[a] + (int16_t) d[b]) * w) >> 1);
+	d[to] = (uint16_t) (v >> 16);
+}
+
+static void f5ColorWeight(uint32_t* c, int a, int b, int to, uint16_t w) {
+	uint32_t r = 0;
+	for (int k = 0; k < 32; k += 8) {
+		uint32_t const v = ((c[to] >> k) & 0xFF) * (0x10000u - w) + (((((c[a] >> k) & 0xFF) + ((c[b] >> k) & 0xFF)) * w) >> 1);
+		r |= ((v >> 16) & 0xFF) << k;
+	}
+	c[to] = r;
+}
+
+// A terrain patch's corner fix: when the option byte matches, two edge heights and colours averaged
+// and two triangles more.
+static void f5Option(uint32_t param, uint32_t mask, uint32_t want, uint16_t* d, uint32_t* c, const int (*h)[3], const int (*col)[3], int pairs,
+                     const int (*tris)[3], int trisCount, struct F5Triangle* t, int* count) {
+	if ((param & mask) != want) {
+		return;
+	}
+	for (int i = 0; i < pairs; ++i) {
+		f5HeightAverage(d, h[i][0], h[i][1], h[i][2]);
+		f5ColorAverage(c, col[i][0], col[i][1], col[i][2]);
+	}
+	for (int i = 0; i < trisCount; ++i) {
+		t[(*count)++] = (struct F5Triangle) { { tris[i][0], tris[i][1], tris[i][2] }, 0 };
+	}
+}
+
+static void f5Weight(uint16_t w, uint16_t* d, uint32_t* c, const int (*h)[3], const int (*col)[3], int pairs) {
+	if (!w) {
+		return;
+	}
+	for (int i = 0; i < pairs; ++i) {
+		f5HeightWeight(d, h[i][0], h[i][1], h[i][2], w);
+		f5ColorWeight(c, col[i][0], col[i][1], col[i][2], w);
+	}
+}
+
+// The grid's vertices (step x step): x from params[8] by params[9]'s step a column, z from params[9]
+// by the same a row, y each height plus params[8]'s low half times 16 (16-bit lanes as the RSP adds
+// them).
+static int f5Grid(struct Hle* h, const uint32_t* params, int step, const uint16_t* heights) {
+	uint16_t const s = (uint16_t) params[9], y0 = (uint16_t) ((params[8] & 0xFFFF) << 4), x0 = (uint16_t) (params[8] >> 16), z0 = (uint16_t) (params[9] >> 16);
+	int count = 0;
+	uint16_t x = 0;
+	for (int column = 0; column < step; ++column, x = (uint16_t) (x + s)) {
+		uint16_t z = 0;
+		for (int row = 0; row < step * (step - 1) + 1; row += step, z = (uint16_t) (z + s)) {
+			f5Vertex(h, count++, (int16_t) (uint16_t) (x + x0), (int16_t) (uint16_t) (heights[(column + row) ^ 1] + y0), (int16_t) (uint16_t) (z + z0));
+		}
+	}
+	return count;
+}
+
+// The colours and texture coordinates of a step x step grid, then its triangles sorted and drawn.
+static void f5GridDraw(struct N64* n, struct Hle* h, const uint32_t* params, int step, const uint32_t* colorData, struct F5Triangle* t, int count,
+                       const struct F5Triangle* order, int orderCount) {
+	int const vertices = step * step;
+	int index[25];
+	uint32_t colors[25], texCoords[25];
+	uint16_t const tex = (uint16_t) params[7];
+	int k = 0;
+	for (int i = 0, start = 0; i < vertices; i += step, ++start) {
+		for (int j = 0; j < step; ++j, ++k) {
+			index[k] = k, colors[k] = colorData[start + j * step];
+		}
+	}
+	k = 0;
+	for (int i = 0; i < step; ++i) {
+		uint32_t st = (uint32_t) (uint16_t) (tex * i) << 16 | (uint16_t) (tex * (step - 1));
+		for (int j = 0; j < step; ++j, st -= tex) {
+			texCoords[k++] = st;
+		}
+	}
+	f5Prepare(h, index, colors, texCoords, false, vertices);
+	for (int i = 0; i < orderCount; ++i) {
+		t[count++] = order[i];
+	}
+	f5DrawSorted(n, h, t, count);
+}
+
+// G_TRIGEN 00 00: a 5 x 5 terrain patch from 25 heights (bytes) and 25 colours.
+static void f5Patch5(struct N64* n, struct Hle* h, const uint32_t* params) {
+	static const struct F5Triangle order[32] = {
+		{ { 0, 6, 1 }, 0 }, { { 0, 5, 6 }, 0 }, { { 1, 7, 2 }, 0 }, { { 1, 6, 7 }, 0 }, { { 2, 8, 3 }, 0 }, { { 5, 11, 6 }, 0 }, { { 2, 7, 8 }, 0 },
+		{ { 5, 10, 11 }, 0 }, { { 3, 9, 4 }, 0 }, { { 3, 8, 9 }, 0 }, { { 6, 12, 7 }, 0 }, { { 6, 11, 12 }, 0 }, { { 10, 16, 11 }, 0 }, { { 7, 13, 8 }, 0 },
+		{ { 10, 15, 16 }, 0 }, { { 7, 12, 13 }, 0 }, { { 8, 14, 9 }, 0 }, { { 11, 17, 12 }, 0 }, { { 8, 13, 14 }, 0 }, { { 11, 16, 17 }, 0 }, { { 15, 21, 16 }, 0 },
+		{ { 12, 18, 13 }, 0 }, { { 15, 20, 21 }, 0 }, { { 12, 17, 18 }, 0 }, { { 13, 19, 14 }, 0 }, { { 16, 22, 17 }, 0 }, { { 16, 21, 22 }, 0 }, { { 13, 18, 19 }, 0 },
+		{ { 17, 23, 18 }, 0 }, { { 17, 22, 23 }, 0 }, { { 18, 24, 19 }, 0 }, { { 18, 23, 24 }, 0 } };
+	uint32_t colorData[25];
+	uint16_t d[26] = { 0 };
+	uint32_t const colorAt = params[3] & 0xFFFFFF, heightAt = params[2] & 0xFFFFF8;
+	for (int i = 0; i < 25; ++i) {
+		colorData[i] = rd32(n, colorAt + 4 * (uint32_t) i);
+		int8_t const v = rd8(n, heightAt + (params[2] & 7) + (uint32_t) i);
+		d[i ^ 1] = (uint16_t) ((v & 0xFF) << 4 | (v < 0 ? 0xF000 : 0));
+	}
+	struct F5Triangle t[64];
+	int count = 0;
+	static const int o1h[2][3] = { { 1, 3, 0 }, { 3, 5, 2 } }, o1c[2][3] = { { 0, 2, 1 }, { 2, 4, 3 } }, o1t[2][3] = { { 0, 10, 5 }, { 10, 20, 15 } };
+	static const int o2h[2][3] = { { 21, 23, 20 }, { 23, 25, 22 } }, o2c[2][3] = { { 20, 22, 21 }, { 22, 24, 23 } }, o2t[2][3] = { { 4, 9, 14 }, { 14, 19, 24 } };
+	static const int o3h[2][3] = { { 1, 11, 4 }, { 11, 21, 14 } }, o3c[2][3] = { { 0, 10, 5 }, { 10, 20, 15 } }, o3t[2][3] = { { 0, 1, 2 }, { 2, 3, 4 } };
+	static const int o4h[2][3] = { { 5, 15, 8 }, { 15, 25, 18 } }, o4c[2][3] = { { 4, 14, 9 }, { 14, 24, 19 } }, o4t[2][3] = { { 22, 24, 23 }, { 20, 22, 21 } };
+	static const int w5h[8][3] = { { 1, 13, 7 }, { 3, 13, 6 }, { 3, 15, 9 }, { 11, 13, 10 }, { 13, 15, 12 }, { 11, 23, 17 }, { 13, 23, 16 }, { 13, 25, 19 } };
+	static const int w5c[8][3] = { { 0, 12, 6 }, { 2, 12, 7 }, { 2, 14, 8 }, { 10, 12, 11 }, { 12, 14, 13 }, { 10, 22, 16 }, { 12, 22, 17 }, { 12, 24, 18 } };
+	f5Option(params[1], 0xFF00, 0x0100, d, colorData, o1h, o1c, 2, o1t, 2, t, &count);
+	f5Weight((uint16_t) params[6], d, colorData, o1h, o1c, 2);
+	f5Option(params[1], 0xFF, 0x01, d, colorData, o2h, o2c, 2, o2t, 2, t, &count);
+	f5Weight((uint16_t) (params[7] >> 16), d, colorData, o2h, o2c, 2);
+	f5Option(params[1], 0xFF000000u, 0x01000000u, d, colorData, o3h, o3c, 2, o3t, 2, t, &count);
+	f5Weight((uint16_t) params[5], d, colorData, o3h, o3c, 2);
+	f5Option(params[1], 0xFF0000, 0x010000, d, colorData, o4h, o4c, 2, o4t, 2, t, &count);
+	f5Weight((uint16_t) (params[6] >> 16), d, colorData, o4h, o4c, 2);
+	f5Weight((uint16_t) (params[5] >> 16), d, colorData, w5h, w5c, 8);
+	f5Grid(h, params, 5, d);
+	f5GridDraw(n, h, params, 5, colorData, t, count, order, 32);
+}
+
+// G_TRIGEN 00 01: a 3 x 3 patch, its heights and colours spread out in memory.
+static void f5Patch3(struct N64* n, struct Hle* h, const uint32_t* params) {
+	static const struct F5Triangle order[8] = { { { 0, 3, 4 }, 0 }, { { 0, 4, 1 }, 0 }, { { 1, 4, 5 }, 0 }, { { 1, 5, 2 }, 0 },
+	                                            { { 3, 6, 7 }, 0 }, { { 3, 7, 4 }, 0 }, { { 4, 7, 8 }, 0 }, { { 4, 8, 5 }, 0 } };
+	uint32_t colorData[32] = { 0 };
+	uint16_t d[64] = { 0 };
+	uint32_t const end = ((params[4] & 0xFFFF) + 0x13) & 0xFF0, offset = params[3] & 7;
+	if (end < offset) {
+		return;
+	}
+	uint32_t const size = (end - offset) / 4, colorAt = (params[3] & 0xFFFFF8) + offset;
+	int colorCount = 0;
+	for (uint32_t i = 0; colorCount + 3 <= 32;) {
+		colorData[colorCount++] = rd32(n, colorAt + 4 * i), i += 2;
+		colorData[colorCount++] = rd32(n, colorAt + 4 * i), i += 2;
+		colorData[colorCount++] = rd32(n, colorAt + 4 * i), i += 6;
+		if (size <= i) {
+			break;
+		}
+	}
+	uint32_t const heightSize = ((params[4] >> 16) + 0x16) & 0xFF0, heightAt = params[2] & 0xFFFFF8;
+	uint32_t at = params[2] & 7;
+	for (int i = 0; i < 64;) {
+		for (int k = 0; k < 3 && i < 64; ++k, ++i, at += 2) {
+			int8_t const v = rd8(n, heightAt + at);
+			d[i ^ 1] = (uint16_t) ((v & 0xFF) << 4 | (v < 0 ? 0xF000 : 0));
+		}
+		at += 4;
+		if (heightSize <= at) {
+			break;
+		}
+	}
+	struct F5Triangle t[32];
+	int count = 0;
+	static const int o1h[1][3] = { { 1, 3, 0 } }, o1c[1][3] = { { 0, 2, 1 } }, o1t[1][3] = { { 0, 6, 3 } };
+	static const int o2h[1][3] = { { 7, 9, 8 } }, o2c[1][3] = { { 6, 8, 7 } }, o2t[1][3] = { { 2, 5, 8 } };
+	static const int w2h[1][3] = { { 7, 9, 6 } };
+	static const int o3h[1][3] = { { 1, 7, 2 } }, o3c[1][3] = { { 0, 6, 3 } }, o3t[1][3] = { { 0, 1, 2 } };
+	static const int o4h[1][3] = { { 3, 9, 4 } }, o4c[1][3] = { { 2, 8, 5 } }, o4t[1][3] = { { 6, 8, 7 } };
+	static const int w5h[1][3] = { { 1, 9, 5 } }, w5c[1][3] = { { 0, 8, 4 } };
+	f5Option(params[1], 0xFF00, 0x0200, d, colorData, o1h, o1c, 1, o1t, 1, t, &count);
+	f5Weight((uint16_t) params[6], d, colorData, o1h, o1c, 1);
+	f5Option(params[1], 0xFF, 0x02, d, colorData, o2h, o2c, 1, o2t, 1, t, &count);
+	f5Weight((uint16_t) (params[7] >> 16), d, colorData, w2h, o2c, 1);
+	f5Option(params[1], 0xFF000000u, 0x02000000u, d, colorData, o3h, o3c, 1, o3t, 1, t, &count);
+	f5Weight((uint16_t) params[5], d, colorData, o3h, o3c, 1);
+	f5Option(params[1], 0x00FF0000, 0x00020000, d, colorData, o4h, o4c, 1, o4t, 1, t, &count);
+	f5Weight((uint16_t) (params[6] >> 16), d, colorData, o4h, o4c, 1);
+	f5Weight((uint16_t) (params[5] >> 16), d, colorData, w5h, w5c, 1);
+	f5Grid(h, params, 3, d);
+	f5GridDraw(n, h, params, 3, colorData, t, count, order, 8);
+}
+
+// G_TRIGEN 02: a quad, its four corners from params[1] and [2] on the grid params[8] and [9] give.
+static void f5Quad(struct N64* n, struct Hle* h, const uint32_t* params) {
+	uint16_t const s = (uint16_t) params[9], y0 = (uint16_t) ((params[8] & 0xFFFF) << 4), x0 = (uint16_t) (params[8] >> 16), z0 = (uint16_t) (params[9] >> 16);
+	uint16_t const heights[4] = { (uint16_t) (params[1] >> 16), (uint16_t) params[1], (uint16_t) (params[2] >> 16), (uint16_t) params[2] };
+	uint16_t const dx[4] = { 0, s, 0, s }, dz[4] = { 0, 0, s, s };
+	for (int i = 0; i < 4; ++i) {
+		f5Vertex(h, i, (int16_t) (uint16_t) (x0 + dx[i]), (int16_t) (uint16_t) (y0 + heights[i]), (int16_t) (uint16_t) (z0 + dz[i]));
+	}
+	uint32_t const tex = (uint16_t) params[7];
+	int const index[4] = { 0, 1, 2, 3 };
+	uint32_t const colors[4] = { params[3], params[4], params[5], params[6] }, texCoords[4] = { tex, tex | tex << 16, 0, tex << 16 };
+	f5Prepare(h, index, colors, texCoords, false, 4);
+	const struct Vertex* b = &h->v[1], * c = &h->v[2];
+	if ((c->w != 0 ? c->z / c->w : 0) > (b->w != 0 ? b->z / b->w : 0)) {
+		drawTriangle(n, h, 0, 1, 3), drawTriangle(n, h, 0, 3, 2);
+	} else {
+		drawTriangle(n, h, 0, 3, 2), drawTriangle(n, h, 0, 1, 3);
+	}
+}
+
+// G_TRI1 and G_TRI2: vertices (DMEM offsets / 40), their colours from the table by the next word's
+// indices, texture coordinates after it when textured; flat shading takes the colour of the corner the
+// word's top bits name.
+static uint32_t f5Triangles(struct N64* n, struct Hle* h, uint32_t pc, uint32_t w0, uint32_t w1, bool two) {
+	int const v[4] = { (int) (((w1 >> 13) & 0x7F8) / 40), (int) (((w1 >> 5) & 0x7F8) / 40), (int) (((w1 << 3) & 0x7F8) / 40), (int) (((w1 >> 21) & 0x7F8) / 40) };
+	uint32_t const param = rd32(n, pc + 8);
+	uint32_t const index[4] = { (param >> 16) & 0xFF, (param >> 8) & 0xFF, param & 0xFF, param >> 24 };
+	bool const textured = w0 & 2;
+	uint32_t colors[4], texCoords[4];
+	for (int i = 0; i < 4; ++i) {
+		colors[i] = rd32(n, h->f5Colors + index[i]);
+		texCoords[i] = textured ? rd32(n, pc + 16 + 4 * (uint32_t) i) : 0;
+	}
+	for (int i = 0; i < 4; ++i) {
+		if (v[i] >= VERTICES) {
+			return pc + (textured ? 32 : 16);
+		}
+	}
+	f5Prepare(h, v, colors, textured ? texCoords : NULL, h->modeH & 0x80000, two ? 4 : 3);
+	uint32_t const geometry = h->geometry;
+	if ((h->geometry & (GEOM_CULL_FRONT | GEOM_CULL_BACK)) == (GEOM_CULL_FRONT | GEOM_CULL_BACK)) {
+		h->geometry &= ~(uint32_t) GEOM_CULL_FRONT;
+	}
+	int const first = (int) ((w1 >> 24) & 3) % 3;
+	int const tris[2][3] = { { v[0], v[1], v[2] }, { v[0], v[2], v[3] } };
+	for (int k = 0; k < (two ? 2 : 1); ++k) {
+		drawTriangle(n, h, tris[k][first], tris[k][(first + 1) % 3], tris[k][(first + 2) % 3]);
+	}
+	h->geometry = geometry;
+	return pc + (textured ? 32 : 16);
+}
+
+// G_TEXRECT_GEN: a sprite at a vertex, its size through the viewport and the projection's scale over w,
+// its texture steps from the command over the size (the combined matrix's fractions below them).
+static void f5Sprite(struct N64* n, struct Hle* h, uint32_t pc, uint32_t w0) {
+	int const index = (int) (((w0 >> 5) & 0x7F8) / 40);
+	if (index >= VERTICES) {
+		return;
+	}
+	const struct Vertex* v = &h->v[index];
+	if (v->x > v->w || v->x < -v->w || v->y > v->w || v->y < -v->w || v->w < 0.01f) {
+		return;
+	}
+	uint32_t const p1 = rd32(n, pc + 4), p3 = rd32(n, pc + 12), p4 = rd32(n, pc + 16);
+	float const screenX = v->x / v->w * h->vscale[0] + h->vtrans[0], screenY = -v->y / v->w * h->vscale[1] + h->vtrans[1];
+	bool const flip = w0 & 1;
+	uint64_t const w = v->w > 1 ? (uint64_t) v->w : 1;
+	uint32_t const vp = rd32(n, h->f5Viewport), viewX = (vp >> 17) & 0x7FFF, viewY = (vp >> 1) & 0x7FFF;
+	uint32_t const pm = h->f5Persp;
+	uint32_t const perspX = (rd32(n, pm) & 0xFFFF0000u) | rd32(n, pm + 32) >> 16, perspY = rd32(n, pm + 8) << 16 | (rd32(n, pm + 40) & 0xFFFF);
+	uint64_t p3x = p3 >> 16, p3y = p3 & 0xFFFF;
+	if (flip) {
+		uint64_t const t = p3x;
+		p3x = p3y, p3y = t;
+	}
+	uint32_t ox = (uint32_t) (((p3x * viewX * perspX) / w) >> 16), oy = (uint32_t) (((p3y * viewY * perspY) / w) >> 16);
+	float const ulx = screenX - ox / 4.0f, lrx = screenX + ox / 4.0f, uly = screenY - oy / 4.0f, lry = screenY + oy / 4.0f;
+	if (lrx - ulx <= 0 || lry - uly <= 0 || !ox || !oy) {
+		return;
+	}
+	float whole;
+	uint32_t const p4x = (p4 & 0xFFFF0000u) | (uint32_t) (fabsf(modff(h->mvp[0], &whole)) * 65536.0f);
+	uint32_t const p4y = p4 << 16 | (uint32_t) (fabsf(modff(h->mvp[1], &whole)) * 65536.0f);
+	if (flip) {
+		uint32_t const t = ox;
+		ox = oy, oy = t;
+	}
+	uint16_t dsdx = (uint16_t) ((p4x / ox) >> 10), dtdy = (uint16_t) ((p4y / oy) >> 10), e = 0, f = 0;
+	if (w0 & 2) {
+		dsdx = (uint16_t) -dsdx, e = (uint16_t) (p4 >> 16);
+	}
+	if (w0 & 4) {
+		dtdy = (uint16_t) -dtdy, f = (uint16_t) p4;
+	}
+	uint16_t const rectDsdx = dsdx, rectDtdy = dtdy;
+	if (flip) {
+		uint16_t const t = dsdx;
+		dsdx = dtdy, dtdy = t;
+	}
+	uint16_t const s = ulx > 0 ? (uint16_t) (e + 0xFFF0) : (uint16_t) (((0 - (dsdx << 6) * (int) (ulx * 4)) << 3) + e + 0xFFF0);
+	uint16_t const t = uly > 0 ? (uint16_t) (f + 0xFFF0) : (uint16_t) (((0 - (dtdy << 6) * (int) (uly * 4)) << 3) + f + 0xFFF0);
+	float const z = v->z / v->w * h->vscale[2] + h->vtrans[2];
+	emit(n, h, (uint64_t) 0x2E << 56 | (uint64_t) (uint16_t) (int) (z * 32) << 16);
+	emit(n, h, (uint64_t) 0x3A << 56 | p1);
+	if (h->geometry & GEOM_FOG) {
+		emit(n, h, (uint64_t) 0x38 << 56 | (p1 & 0xFFFFFF00u) | (uint32_t) (v->a * 255.0f));
+	}
+	int const xh = ulx > 0 ? (int) (ulx * 4) : 0, yh = uly > 0 ? (int) (uly * 4) : 0, xl = (int) (lrx * 4), yl = (int) (lry * 4);
+	emit(n, h, (uint64_t) (flip ? 0x25 : 0x24) << 56 | (uint64_t) (xl & 0xFFF) << 44 | (uint64_t) (yl & 0xFFF) << 32 | (uint64_t) (h->texTile & 7) << 24 |
+	           (uint64_t) (xh & 0xFFF) << 12 | (uint64_t) (yh & 0xFFF));
+	emit(n, h, (uint64_t) s << 48 | (uint64_t) t << 32 | (uint64_t) rectDsdx << 16 | rectDtdy);
+}
+
+// The list (and those it calls): each starts with a word the jump command goes to, which a call or
+// branch skips.
+static void f5List(struct N64* n, struct Hle* h, uint32_t pc) {
+	uint32_t stack[DL_DEPTH];
+	int sp = 0;
+	h->f5Jump[0] = rd32(n, pc) & 0xFFFFFF;
+	pc += 8;
+	for (int steps = 0; steps < 1 << 22; ++steps) {
+		uint32_t const w0 = rd32(n, pc), w1 = rd32(n, pc + 4);
+		int const op = w0 >> 24;
+		uint32_t next = pc + 8;
+		switch (op) {
+		case 0x00:
+			break;
+		case 0x01: {
+			int const p = (w0 >> 16) & 0xFF;
+			if (p & 1) {
+				h->f5Persp = w1 & 0xFFFFFF;
+			}
+			matrix(n, h, w1, p & 1, p & 2, p & 4);
+			break;
+		}
+		case 0x02:
+			h->f5Colors = address(h, w1);
+			break;
+		case 0x03:
+			if (((w0 >> 16) & 0xFF) == 0x80) {
+				h->f5Viewport = pc + 8;
+				viewport(n, h, pc + 8);
+			} else if (((w0 >> 16) & 0xFF) == 0x82) {
+				h->f5TexScale[0] = rd32(n, pc + 16), h->f5TexScale[1] = rd32(n, pc + 12);
+			}
+			next = pc + 24;
+			break;
+		case 0x04: {
+			uint32_t const a = address(h, w1);
+			int const count = (int) ((w0 >> 10) & 0x3F);
+			for (int i = 0; i < count && i < VERTICES; ++i) {
+				f5Vertex(h, i, rd16(n, a + 8 * (uint32_t) i), rd16(n, a + 8 * (uint32_t) i + 2), rd16(n, a + 8 * (uint32_t) i + 4));
+			}
+			break;
+		}
+		case 0x05: {
+			uint32_t params[10];
+			for (int i = 0; i < 10; ++i) {
+				params[i] = rd32(n, pc + 4 * (uint32_t) i);
+			}
+			int const mode = (w0 >> 8) & 0xFF;
+			if (mode == 0 && (w0 & 0xFF) == 0) {
+				f5Patch5(n, h, params);
+			} else if (mode == 0 && (w0 & 0xFF) == 1) {
+				f5Patch3(n, h, params);
+			} else if (mode == 2) {
+				f5Quad(n, h, params);
+			}
+			next = pc + 40;
+			break;
+		}
+		case 0x06:
+		case 0x07:
+			if (op == 0x06) {
+				if (sp >= DL_DEPTH) {
+					break;
+				}
+				stack[sp++] = next;
+			}
+			next = address(h, w1);
+			h->f5Jump[sp] = rd32(n, next) & 0xFFFFFF;
+			next += 8;
+			break;
+		case 0xB5:
+			next = h->f5Jump[sp];
+			h->f5Jump[sp] = rd32(n, next) & 0xFFFFFF;
+			next += 8;
+			break;
+		case 0xB8:
+			if (!sp) {
+				return;
+			}
+			next = stack[--sp];
+			break;
+		case 0xB3:
+		case 0xBE:
+			otherModeMask(n, h, op == 0xBE, ~rd32(n, pc + 8), w1);
+			next = pc + 16;
+			break;
+		case 0xB4:
+		case 0xBF:
+			next = f5Triangles(n, h, pc, w0, w1, op == 0xB4);
+			break;
+		case 0xB6:
+			setGeometry(h, w1, 0, false);
+			break;
+		case 0xB7:
+			setGeometry(h, 0, w1, false);
+			break;
+		case 0xB9:
+		case 0xBA:
+			otherMode(n, h, op == 0xBA, (w0 >> 8) & 0xFF, w0 & 0xFF, w1);
+			break;
+		case 0xBB:
+			h->texScaleS = (w1 >> 16) / 65536.0f, h->texScaleT = (w1 & 0xFFFF) / 65536.0f;
+			h->texLevel = (w0 >> 11) & 7, h->texTile = (w0 >> 8) & 7, h->texOn = w0 & 0xFF;
+			break;
+		case 0xBC:
+			if ((w0 & 0xFF) == 0x06) {
+				h->segments[(((w0 >> 8) & 0xFFFF) >> 2) & 15] = w1 & 0xFFFFFF;
+			} else if ((w0 & 0xFF) == 0x08) {
+				h->fogMul = (int32_t) w1 / 256.0f;
+			} else if ((w0 & 0xFF) == 0x0A) {
+				h->fogOffset = (int32_t) w1 / 256.0f;
+			}
+			break;
+		case 0xBD:
+			f5Sprite(n, h, pc, w0);
+			next = pc + 24;
+			break;
+		default:
+			if (op >= 0xC0) {
+				next = rdpCommand(n, h, pc, w0, w1);
+			}
+			break;
+		}
+		pc = next;
+	}
+}
+
 static void zsortList(struct N64* n, struct Hle* h, uint32_t pc) {
 	int sp = 0;
 	for (int steps = 0; pc && steps < 1 << 20; ++steps) {
@@ -2904,6 +3396,10 @@ bool hleGraphics(struct N64* n, bool dry) {
 	if (f == FAMILY_NONE && ucode == 0x57C8BE85u) {
 		f = FAMILY_ZSORTBOSS;
 	}
+	// Rogue Squadron's (and its Japanese release's).
+	if (f == FAMILY_NONE && ucode == 0xDB79F253u) {
+		f = FAMILY_F5ROGUE;
+	}
 	bool const wrus = f == FAMILY_F3D && (ucode == 0xAC1B2CFEu || ucode == 0x106A093Eu);
 	bool const dkr = f == FAMILY_NONE && (ucode == 0x5277D6E7u || ucode == 0x26EDE132u);
 	if (dkr) {
@@ -2985,6 +3481,9 @@ bool hleGraphics(struct N64* n, bool dry) {
 			n->sp.status = (n->sp.status & ~(uint32_t) (SIG1 | SIG2)) | SIG4;
 		}
 		bossRun(n, h);
+	} else if (f == FAMILY_F5ROGUE) {
+		h->f5Colors = h->f5Viewport = h->f5Persp = 0, h->f5TexScale[0] = h->f5TexScale[1] = 0;
+		f5List(n, h, be32(task + 0x30) & 0xFFFFFF);
 	} else if (f == FAMILY_TURBO3D || f == FAMILY_T3DUX) {
 		turbo3dList(n, h, be32(task + 0x30) & 0xFFFFFF);
 	} else {
