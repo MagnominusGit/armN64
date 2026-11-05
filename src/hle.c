@@ -15,7 +15,7 @@
 // S2DEX and S2DEX2 are the 2D microcodes (F3DEX's and F3DEX2's command numbers for what they share):
 // backgrounds so far, other commands leave the task to the RSP.
 // ZSort draws objects the game sorted from vertices it transformed here first (its DMEM in between).
-enum { FAMILY_NONE, FAMILY_F3D, FAMILY_F3DEX, FAMILY_F3DEX2, FAMILY_F3DPD, FAMILY_S2DEX, FAMILY_S2DEX2, FAMILY_ZSORT, FAMILY_TURBO3D };
+enum { FAMILY_NONE, FAMILY_F3D, FAMILY_F3DEX, FAMILY_F3DEX2, FAMILY_F3DPD, FAMILY_S2DEX, FAMILY_S2DEX2, FAMILY_ZSORT, FAMILY_TURBO3D, FAMILY_T3DUX };
 
 // Geometry mode bits, kept in the F3DEX2 layout.
 enum {
@@ -76,6 +76,9 @@ struct Hle {
 	float objA, objB, objC, objD, objX, objY, objBaseX, objBaseY;
 	// Triangles S2DEX draws for an object: 1/w whole (0x7FFF), the texture coordinates as they are.
 	bool objTriangles;
+	// T3DUX: an object's vertices (up to 255), and the last SETTILE its RDP lists gave.
+	struct Vertex t3dux[256];
+	uint32_t t3duxTile[2];
 	uint32_t objMode, objStatus[4], half0w0, half0w1;
 	// F3DFLX (F-Zero X's F3DEX2): light k in slot k + 1, slot 1 its alpha light, a direction whose
 	// angle to the normal picks each vertex's alpha from a table at the G_DMA_IO address (in place of
@@ -1496,6 +1499,9 @@ static void turbo3dRdp(struct N64* n, struct Hle* h, uint32_t a) {
 			emit(n, h, (uint64_t) rd32(n, a + 8) << 32 | rd32(n, a + 12));
 			a += 16;
 		} else {
+			if (op == 0xF5) {
+				h->t3duxTile[0] = w0, h->t3duxTile[1] = w1;
+			}
 			a = rdpCommand(n, h, a, w0, w1);
 		}
 	}
@@ -1548,10 +1554,78 @@ static void turbo3dObject(struct N64* n, struct Hle* h, uint32_t state, uint32_t
 	}
 }
 
-// The task's list: gtGfx entries (global state, object state, vertices, triangles) up to an object
-// state of zero. A global state brings other modes, segments, the viewport and an RDP list.
+// T3DUX's object (Toukon Road's; GLideN64's T3DUX.cpp): 8-byte vertices (x, y, z, flag) with their
+// colours in the table at col, and 8-byte triangles (vertices, flat colour index, the table's texture
+// coordinates for each corner, a palette).
+static void t3duxObject(struct N64* n, struct Hle* h, uint32_t state, uint32_t vtx, uint32_t tri, uint32_t col) {
+	uint32_t const a = address(h, state), colors = address(h, col);
+	uint32_t const render = rd32(n, a);
+	int const geomMode = rd8(n, a + 4) & 0xFF, texMode = rd8(n, a + 5) & 0xFF, count = rd8(n, a + 6) & 0xFF;
+	int const tris = rd8(n, a + 8) & 0xFF, matrixFlag = rd8(n, a + 9) & 0xFF;
+	bool const texturing = texMode != 1, flat = !(geomMode & 15);
+	h->texTile = 0, h->texLevel = 0, h->texOn = texturing;
+	h->texScaleS = h->texScaleT = 1;
+	h->modeH = rd32(n, a + 16) & 0xFFFFFF, h->modeL = rd32(n, a + 20);
+	emit(n, h, (uint64_t) (0xEF000000u | h->modeH) << 32 | h->modeL);
+	if (!(matrixFlag & 1)) {
+		readMatrix(n, a + 24, h->mvp);
+	}
+	setGeometry(h, GEOM_LIGHTING | GEOM_FOG, render | 0x2205, false);
+	if (vtx) {
+		uint32_t const v = address(h, vtx);
+		const float* m = h->mvp;
+		for (int i = 0; i < count; ++i) {
+			float const x = rd16(n, v + 8 * (uint32_t) i), y = rd16(n, v + 8 * (uint32_t) i + 2), z = rd16(n, v + 8 * (uint32_t) i + 4);
+			uint32_t const c = colors + 4 * (uint32_t) i;
+			h->t3dux[i] = (struct Vertex) { x * m[0] + y * m[4] + z * m[8] + m[12], x * m[1] + y * m[5] + z * m[9] + m[13],
+			                                x * m[2] + y * m[6] + z * m[10] + m[14], x * m[3] + y * m[7] + z * m[11] + m[15],
+			                                (rd8(n, c) & 0xFF) / 255.0f, (rd8(n, c + 1) & 0xFF) / 255.0f, (rd8(n, c + 2) & 0xFF) / 255.0f,
+			                                (rd8(n, c + 3) & 0xFF) / 255.0f, 0, 0 };
+		}
+	}
+	turbo3dRdp(n, h, rd32(n, a + 12));
+	if (!tri) {
+		return;
+	}
+	// A triangle's palette byte, when it has one, goes in at the tile's palette (bit 20) of the SETTILE
+	// the RDP list gave.
+	uint32_t tileW1 = h->t3duxTile[1];
+	h->t3duxTile[1] &= 0xFF0FFFFF;
+	uint32_t const t = address(h, tri);
+	for (int i = 0; i < tris; ++i) {
+		uint32_t const e = t + 8 * (uint32_t) i;
+		int const k[3] = { rd8(n, e) & 0xFF, rd8(n, e + 1) & 0xFF, rd8(n, e + 2) & 0xFF }, flag = rd8(n, e + 3) & 0xFF;
+		int const tex[3] = { rd8(n, e + 4) & 0xFF, rd8(n, e + 5) & 0xFF, rd8(n, e + 6) & 0xFF }, triPal = rd8(n, e + 7) & 0xFF;
+		if (texturing && triPal && (h->t3duxTile[1] | (uint32_t) triPal << 20) != tileW1) {
+			tileW1 = h->t3duxTile[1] | (uint32_t) triPal << 20;
+			emit(n, h, (uint64_t) h->t3duxTile[0] << 32 | tileW1);
+		}
+		if (k[0] >= count || k[1] >= count || k[2] >= count) {
+			continue;
+		}
+		uint32_t const flatColor = colors + (((uint32_t) flag << 2) & 0x3FC);
+		for (int j = 0; j < 3; ++j) {
+			struct Vertex* v = &h->v[j];
+			*v = h->t3dux[k[j]];
+			if (texturing) {
+				uint32_t const st = rd32(n, colors + ((uint32_t) tex[j] << 2));
+				v->s = (int16_t) (st >> 16) / 32.0f, v->t = (int16_t) st / 32.0f;
+			}
+			if (flat) {
+				v->r = (rd8(n, flatColor) & 0xFF) / 255.0f, v->g = (rd8(n, flatColor + 1) & 0xFF) / 255.0f;
+				v->b = (rd8(n, flatColor + 2) & 0xFF) / 255.0f, v->a = (rd8(n, flatColor + 3) & 0xFF) / 255.0f;
+			}
+		}
+		drawTriangle(n, h, 0, 1, 2);
+	}
+}
+
+// The task's list: gtGfx entries (global state, object state, vertices, triangles; T3DUX's also a
+// colour table and a store, 24 bytes) up to an object state of zero. A global state brings other
+// modes, segments, the viewport and an RDP list.
 static void turbo3dList(struct N64* n, struct Hle* h, uint32_t pc) {
-	for (int steps = 0; steps < 1 << 16; ++steps, pc += 16) {
+	bool const ux = h->family == FAMILY_T3DUX;
+	for (int steps = 0; steps < 1 << 16; ++steps, pc += ux ? 24 : 16) {
 		uint32_t const global = rd32(n, pc), state = rd32(n, pc + 4), vtx = rd32(n, pc + 8), tri = rd32(n, pc + 12);
 		if (!state) {
 			return;
@@ -1566,7 +1640,11 @@ static void turbo3dList(struct N64* n, struct Hle* h, uint32_t pc) {
 			viewport(n, h, address(h, global + 80));
 			turbo3dRdp(n, h, rd32(n, g + 96));
 		}
-		turbo3dObject(n, h, state, vtx, tri);
+		if (ux) {
+			t3duxObject(n, h, state, vtx, tri, rd32(n, pc + 16));
+		} else {
+			turbo3dObject(n, h, state, vtx, tri);
+		}
 	}
 }
 
@@ -2375,6 +2453,10 @@ bool hleGraphics(struct N64* n, bool dry) {
 	if (f == FAMILY_NONE && ucode == 0xA9DAF288u) {
 		f = FAMILY_TURBO3D;
 	}
+	// The Toukon Road games' T3DUX (0.83 and 0.85 start alike).
+	if (f == FAMILY_NONE && ucode == 0xEE50B3B1u) {
+		f = FAMILY_T3DUX;
+	}
 	bool const wrus = f == FAMILY_F3D && (ucode == 0xAC1B2CFEu || ucode == 0x106A093Eu);
 	bool const dkr = f == FAMILY_NONE && (ucode == 0x5277D6E7u || ucode == 0x26EDE132u);
 	if (dkr) {
@@ -2434,7 +2516,7 @@ bool hleGraphics(struct N64* n, bool dry) {
 		h->zRdp[0] = h->zRdp[1] = h->zRdp[2] = 0;
 		h->zScale[0] = h->zScale[1] = h->zTrans[0] = h->zTrans[1] = 0;
 		zsortList(n, h, address(h, be32(task + 0x30)));
-	} else if (f == FAMILY_TURBO3D) {
+	} else if (f == FAMILY_TURBO3D || f == FAMILY_T3DUX) {
 		turbo3dList(n, h, be32(task + 0x30) & 0xFFFFFF);
 	} else {
 		runList(n, h, address(h, be32(task + 0x30)));
