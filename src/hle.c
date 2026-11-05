@@ -885,6 +885,16 @@ static void readLight(struct N64* n, struct Hle* h, uint32_t a, int index) {
 
 static void readLookat(struct N64* n, struct Hle* h, uint32_t a, int index);
 
+// G_MW_LIGHTCOL: a light's colour (the ambient one after the last light) replaced.
+static void setLightColor(struct Hle* h, int index, uint32_t rgb) {
+	if (index > LIGHTS) {
+		return;
+	}
+	for (int i = 0; i < 3; ++i) {
+		h->lightColor[index][i] = ((rgb >> (24 - 8 * i)) & 0xFF) / 255.0f;
+	}
+}
+
 // The lookats and lights each task starts with: Fast3D's and F3DEX's data (DMEM from 0) as the
 // microcode loads it, found by its G_MOVEMEM table's lookat Y, X and light places, ten 0x20 apart
 // (Mario Kart 64's logo is lit and mapped by these alone).
@@ -1734,6 +1744,8 @@ static void runList(struct N64* n, struct Hle* h, uint32_t pc) {
 				} else if (index == 2) {
 					int const l = (int) (w1 / (h->cbfd ? 48 : 24));
 					h->lights = l > LIGHTS ? LIGHTS : l;
+				} else if (index == 0x0A && !h->cbfd && !h->flx && offset % 24 == 0) {
+					setLightColor(h, offset / 24, w1);
 				} else if (index == 0x10 && h->cbfd) {
 					cbfdCoordMod(h, w0, w1);
 				} else if (index == 6) {
@@ -2004,6 +2016,8 @@ static void runList(struct N64* n, struct Hle* h, uint32_t pc) {
 					h->segments[(offset / 4) & 15] = w1 & 0xFFFFFF;
 				} else if (index == 8) {
 					h->fogMul = (int16_t) (w1 >> 16), h->fogOffset = (int16_t) w1;
+				} else if (index == 0x0A && offset % 32 == 0) {
+					setLightColor(h, offset / 32, w1);
 				} else if (index == 0x0C) {
 					modifyVertex(h, offset / 40, offset % 40, w1);
 				}
