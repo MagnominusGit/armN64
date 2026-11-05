@@ -4445,14 +4445,19 @@ static void runList(struct N64* n, struct Hle* h, uint32_t pc) {
 				}
 				break;
 			case 0xB3:
+				// Fast3D's G_RDPHALF_2 and G_RDPHALF_CONT send both halves to the RDP.
 				if (h->wrus) {
 					h->half1 = w1;
+				} else if (!f3dex && !f3dex2) {
+					emit(n, h, (uint64_t) h->half1 << 32 | w1);
 				}
 				break;
 			case 0xB2:
-				// F3DEX's G_MODIFYVTX (Fast3D's 0xB2 is the third texture rectangle word).
+				// F3DEX's G_MODIFYVTX.
 				if (f3dex) {
 					modifyVertex(h, (int) (w0 & 0xFFFF) / 2, (w0 >> 16) & 0xFF, w1);
+				} else if (!f3dex2 && !h->wrus) {
+					emit(n, h, (uint64_t) h->half1 << 32 | w1);
 				}
 				break;
 			case 0xAF:
