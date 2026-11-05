@@ -1941,8 +1941,10 @@ void glrSyncRange(struct N64* n, uint32_t addr, uint32_t len) {
 		}
 		glesUse(g->gles);
 		flushBatch(n, g);
-		writePixels(n, t, first, t->dirtyTo);
+		// Given back before they're written, so the write isn't taken for this target's drawing.
+		int const last = t->dirtyTo;
 		t->dirtyTo = first;
+		writePixels(n, t, first, last);
 	}
 }
 
