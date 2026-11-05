@@ -4543,14 +4543,27 @@ static const char* gfxName(const char* text) {
 	return name ? name + 1 : NULL;
 }
 
-// The name a microcode's data gives, where a patch blanked it (a fan translation), known by the hash
-// of its first code.
+// The name a microcode's data gives, where a patch blanked it (a fan translation, a ROM hack), known
+// by the hash of its first code.
 static const char* knownName(struct N64* n, uint32_t code) {
 	uint32_t hash = 2166136261u;
 	for (uint32_t i = 0; i < 1024; ++i) {
 		hash = (hash ^ n->rdram[(code + i) & (RDRAM_SIZE - 1)]) * 16777619u;
 	}
-	return hash == 0x732CC90Fu ? "RSP Gfx ucode F3DZEX.NoN  fifo 2.08J Yoshitaka Yasumoto/Kawasedo 1999." : NULL;
+	static const struct {
+		uint32_t hash;
+		const char* name;
+	} known[] = {
+		{ 0x732CC90Fu, "RSP Gfx ucode F3DZEX.NoN  fifo 2.08J Yoshitaka Yasumoto/Kawasedo 1999." },
+		{ 0xCDD276A8u, "RSP SW Version: 2.0G, 09-30-96" },
+		{ 0xF5216367u, "RSP Gfx ucode F3DEX       fifo 2.08  Yoshitaka Yasumoto 1999 Nintendo." },
+	};
+	for (size_t i = 0; i < sizeof(known) / sizeof(known[0]); ++i) {
+		if (known[i].hash == hash) {
+			return known[i].name;
+		}
+	}
+	return NULL;
 }
 
 // The microcode family from the first ID string in its data (the block may run on into the next
