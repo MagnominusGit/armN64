@@ -15,7 +15,7 @@
 // S2DEX and S2DEX2 are the 2D microcodes (F3DEX's and F3DEX2's command numbers for what they share):
 // backgrounds so far, other commands leave the task to the RSP.
 // ZSort draws objects the game sorted from vertices it transformed here first (its DMEM in between).
-enum { FAMILY_NONE, FAMILY_F3D, FAMILY_F3DEX, FAMILY_F3DEX2, FAMILY_F3DPD, FAMILY_S2DEX, FAMILY_S2DEX2, FAMILY_ZSORT, FAMILY_TURBO3D, FAMILY_T3DUX, FAMILY_ZSORTBOSS, FAMILY_F5ROGUE, FAMILY_F5INDI };
+enum { FAMILY_NONE, FAMILY_F3D, FAMILY_F3DEX, FAMILY_F3DEX2, FAMILY_F3DPD, FAMILY_S2DEX, FAMILY_S2DEX2, FAMILY_ZSORT, FAMILY_TURBO3D, FAMILY_T3DUX, FAMILY_ZSORTBOSS, FAMILY_F5ROGUE, FAMILY_F5INDI, FAMILY_GBPPU };
 
 // Geometry mode bits, kept in the F3DEX2 layout.
 enum {
@@ -102,6 +102,16 @@ struct Hle {
 	int32_t f5iStMtx[16];
 	uint16_t nabooAA;
 	int16_t nabooBB, nabooEE, nabooHH;
+	// gb64's Game Boy picture processor, one line at a time as the CPU signals: its task (the task
+	// data's address, and the data), the sprites of the next line, the tile cache and each tile's
+	// offset, the attribute cache, the tilemap and window rows, the line (with room either side),
+	// the lines begun, the window's line, and where the caches stand.
+	uint32_t gbData;
+	uint8_t gbTask[24], gbSprites[160], gbTiles[32][16], gbAttrs[24], gbMap[64], gbWindow[64], gbLine[8 + 160 + 16];
+	uint16_t gbTileIds[32];
+	uint32_t gbLines, gbWindowY;
+	int gbTile, gbAttr, gbState;
+	uint64_t gbReadyAt;
 	uint8_t nabooDD, nabooCC, nabooTT;
 	uint32_t objMode, objStatus[4], half0w0, half0w1;
 	// F3DFLX (F-Zero X's F3DEX2): light k in slot k + 1, slot 1 its alpha light, a direction whose
@@ -4655,6 +4665,234 @@ static int family(struct N64* n, uint32_t data, uint32_t size) {
 // A task's list run (or run until it waits): the RSP's time for it, roughly. The RDP draws while
 // the RSP makes its commands, so it can't be done before the RSP is; waiting, it looks again a
 // little later.
+// gb64's Game Boy picture processor (its rsp/ppu.s, MIT): the CPU signals each line's mode 2 (SIG1:
+// the sprites) and mode 3 (SIG0: the line), or SIG2 to stop; each line goes to the output as 160
+// palette indices (the background's 0-31, the sprites' 32-63).
+enum { GB_COLOR = 1, GB_BG = 0x01, GB_OBJ = 0x02, GB_OBJ16 = 0x04, GB_BG_MAP = 0x08, GB_TILE_DATA = 0x10, GB_WINDOW = 0x20, GB_WINDOW_MAP = 0x40 };
+
+static uint8_t gbLcdc(struct Hle* h) {
+	return h->gbTask[14];
+}
+
+static bool gbColor(struct Hle* h) {
+	return h->gbTask[13] & GB_COLOR;
+}
+
+static void gbRead(struct N64* n, uint8_t* to, uint32_t from, uint32_t length) {
+	for (uint32_t i = 0; i < length; ++i) {
+		to[i] = n->rdram[((from & 0xFFFFF8) + i) & (RDRAM_SIZE - 1)];
+	}
+}
+
+// The next tile of the cache holds the tile at this offset (read again only when it held another).
+static void gbRequestTile(struct N64* n, struct Hle* h, uint32_t tile) {
+	int slot = h->gbTile++ & 31;
+	if (h->gbTileIds[slot] != (uint16_t) tile) {
+		h->gbTileIds[slot] = (uint16_t) tile;
+		gbRead(n, h->gbTiles[slot], be32(&h->gbTask[8]) + tile, 16);
+	}
+}
+
+// A tilemap row (and its attributes on the Game Boy Color).
+static void gbPrecacheLine(struct N64* n, struct Hle* h, uint8_t* row, uint32_t y, uint8_t map) {
+	uint32_t a = be32(&h->gbTask[8]) + 0x1800 + ((gbLcdc(h) & map) ? 0x400 : 0) + (y >> 3) * 32;
+	gbRead(n, row, a, 32);
+	if (gbColor(h)) {
+		gbRead(n, row + 32, a + 0x2000, 32);
+	}
+}
+
+static void gbPrecacheTiles(struct N64* n, struct Hle* h, const uint8_t* row, uint32_t x, uint32_t count) {
+	for (; count; --count, x = (x + 1) & 31) {
+		uint32_t at = (gbLcdc(h) & GB_TILE_DATA) ? 0 : 0x80;
+		uint32_t tile = (((row[x] + at) & 0xFF) + at) << 4;
+		uint8_t attr = row[32 + x];
+		h->gbAttrs[h->gbAttr++ % 24] = attr;
+		gbRequestTile(n, h, tile + ((attr & 8) << 10));
+	}
+}
+
+// Bit x of a tile row's two planes (the first byte's the colour's low bit), flipped or not.
+static int gbPixel(const uint8_t* row, int x, bool flip) {
+	int b = flip ? x : 7 - x;
+	return (row[0] >> b & 1) | (row[1] >> b & 1) << 1;
+}
+
+// The cached tiles drawn from pixel x on (the first one shifted left by shift), over the sprites.
+static void gbTileLine(struct Hle* h, int x, int count, int y, int shift) {
+	count += shift;
+	int at = 8 + x - shift;
+	uint8_t saved[8];
+	memcpy(saved, &h->gbLine[at + count], 8);
+	bool spritesFirst = gbColor(h) && !(gbLcdc(h) & GB_BG);
+	for (; count > 0; count -= 8, at += 8) {
+		uint8_t attr = h->gbAttrs[h->gbAttr++ % 24];
+		const uint8_t* row = h->gbTiles[h->gbTile++ & 31] + ((attr & 0x40) ? 14 - 2 * y : 2 * y);
+		for (int i = 0; i < 8; ++i) {
+			int color = gbPixel(row, i, attr & 0x20);
+			uint8_t bg = (uint8_t) (color | (attr & 7) << 2), was = h->gbLine[at + i], obj = was & 0x7F;
+			uint8_t top = obj ? obj : bg;
+			h->gbLine[at + i] = spritesFirst || !color || !((was & 0x80) | (attr & 0x80)) ? top : bg;
+		}
+	}
+	memcpy(&h->gbLine[at + count], saved, 8);
+}
+
+static void gbSprites(struct Hle* h) {
+	uint8_t ly = h->gbTask[15];
+	for (const uint8_t* s = h->gbSprites; s < h->gbSprites + 160 && s[0]; s += 4) {
+		int y = (ly - (s[0] - 16)) & 7;
+		y = (s[3] & 0x40) ? 7 - y : y;
+		uint8_t add = (uint8_t) ((gbColor(h) ? (s[3] & 7) << 2 : (s[3] & 0x10) >> 2) | (s[3] & 0x80) | 0x20);
+		const uint8_t* row = h->gbTiles[h->gbTile++ & 31] + 2 * y;
+		uint8_t* to = &h->gbLine[s[1]];
+		for (int i = 0; i < 8; ++i) {
+			int color = gbPixel(row, i, s[3] & 0x20);
+			if (color && !to[i]) {
+				to[i] = (uint8_t) (color | add);
+			}
+		}
+	}
+}
+
+// Mode 2: the sprites read and the next line's (at most 10) kept, in x order but on the Game Boy Color.
+static void gbMode2(struct N64* n, struct Hle* h) {
+	gbRead(n, h->gbSprites, be32(&h->gbTask[4]) + 0xD0, 160);
+	int height = (gbLcdc(h) & GB_OBJ16) ? 16 : 8, kept = 0;
+	uint8_t* s = h->gbSprites;
+	for (int i = 0; i < 40 && kept < 10; ++i) {
+		int d = (int) h->gbLines - (s[4 * i] - 16);
+		if (s[4 * i + 1] >= 168 || d < 0 || d >= height) {
+			continue;
+		}
+		uint8_t sprite[4];
+		memcpy(sprite, &s[4 * i], 4);
+		int at = kept;
+		if (!gbColor(h)) {
+			for (at = 0; at < kept && sprite[1] >= s[4 * at + 1]; ++at) {
+			}
+			memmove(&s[4 * at + 4], &s[4 * at], (size_t) (4 * (kept - at)));
+		}
+		memcpy(&s[4 * at], sprite, 4);
+		++kept;
+	}
+	memset(&s[4 * kept], 0, 4);
+	++h->gbLines;
+}
+
+// Mode 3, after the task's data was read at its start: the line drawn and written out; true when
+// it was the last.
+static bool gbMode3(struct N64* n, struct Hle* h) {
+	uint8_t lcdc = gbLcdc(h), ly = h->gbTask[15], scy = h->gbTask[16], scx = h->gbTask[17], wy = h->gbTask[18], wx = h->gbTask[19];
+	gbPrecacheLine(n, h, h->gbMap, (uint8_t) (ly + scy), GB_BG_MAP);
+	h->gbTile = h->gbAttr = 0;
+	if (!(lcdc & GB_OBJ)) {
+		memset(h->gbSprites, 0, 4);
+	}
+	for (const uint8_t* s = h->gbSprites; be32(s); s += 4) {
+		uint32_t tile = s[2];
+		if (lcdc & GB_OBJ16) {
+			tile = (tile & 0xFE) ^ (((ly - (s[0] - 16)) & 8) >> 3) ^ ((s[3] & 0x40) >> 6);
+		}
+		gbRequestTile(n, h, (tile << 4) + (gbColor(h) && (s[3] & 8) ? 0x2000 : 0));
+	}
+	int window = 160;
+	uint32_t windowY = h->gbWindowY;
+	if ((lcdc & GB_WINDOW) && wy <= ly && wx - 7 < 160) {
+		window = wx - 7;
+		++h->gbWindowY;
+		gbPrecacheLine(n, h, h->gbWindow, windowY, GB_WINDOW_MAP);
+	}
+	if (window > 0) {
+		uint32_t count = ((scx + (uint32_t) window - 1) >> 3) - (scx >> 3) + 1;
+		if ((lcdc & GB_BG) || gbColor(h)) {
+			gbPrecacheTiles(n, h, h->gbMap, scx >> 3, count);
+		} else {
+			for (; count; --count) {
+				int slot = h->gbTile++ & 31;
+				memset(h->gbTiles[slot], 0, 16);
+				h->gbTileIds[slot] = 0xFFFF;
+			}
+		}
+	}
+	if (window < 160) {
+		gbPrecacheTiles(n, h, h->gbWindow, 0, ((159 - (uint32_t) window) >> 3) + 1);
+	}
+	n->sp.status &= ~(uint32_t) (SIG0 | SIG1);
+	h->gbTile = h->gbAttr = 0;
+	gbSprites(h);
+	if (window > 0) {
+		gbTileLine(h, 0, window, (ly + scy) & 7, scx & 7);
+	}
+	if (window < 160) {
+		gbTileLine(h, window, 160 - window, windowY & 7, 0);
+	}
+	uint32_t to = (be32(h->gbTask) + ly * 160u) & 0xFFFFF8;
+	n64RdramWrite(n, to, 160);
+	for (int i = 0; i < 160; ++i) {
+		n->rdram[(to + (uint32_t) i) & (RDRAM_SIZE - 1)] = h->gbLine[8 + i];
+	}
+	return ly == 143;
+}
+
+// The RSP's time for mode 2, and for mode 3 up to its clearing the signals (measured, CPU cycles):
+// the CPU's handshake counts on it (its next mode 3 signal often comes while the RSP is busy).
+enum { GB_MODE2_TIME = 1400, GB_MODE3_TIME = 1450 };
+enum { GB_WAIT_MODE2, GB_MODE2, GB_WAIT_MODE3, GB_MODE3 };
+
+// What the signals ask for, done as the RSP would by now; the task ends at the last line or SIG2
+// (its wait counts written to the task's performance words, here each wait counted once).
+static void gbRun(struct N64* n, struct Hle* h) {
+	while (n->cycles >= h->gbReadyAt) {
+		if ((h->gbState == GB_WAIT_MODE2 || h->gbState == GB_WAIT_MODE3) && (n->sp.status & SIG2)) {
+			break;
+		}
+		if (h->gbState == GB_WAIT_MODE2 && (n->sp.status & SIG1)) {
+			gbMode2(n, h);
+			h->gbState = GB_MODE2, h->gbReadyAt = n->cycles + GB_MODE2_TIME;
+		} else if (h->gbState == GB_MODE2) {
+			h->gbState = GB_WAIT_MODE3;
+		} else if (h->gbState == GB_WAIT_MODE3 && (n->sp.status & SIG0)) {
+			gbRead(n, h->gbTask, h->gbData, 24);
+			h->gbState = GB_MODE3, h->gbReadyAt = n->cycles + GB_MODE3_TIME;
+		} else if (h->gbState == GB_MODE3) {
+			if (gbMode3(n, h)) {
+				break;
+			}
+			memset(&h->gbLine[8], 0, 160);
+			h->gbState = GB_WAIT_MODE2;
+		} else {
+			n->sp.hleDoneAt = n->cycles + (1 << 20);
+			return;
+		}
+	}
+	if (n->cycles < h->gbReadyAt) {
+		n->sp.hleDoneAt = h->gbReadyAt;
+		return;
+	}
+	uint32_t perf = be32(&h->gbTask[20]) & 0xFFFFF8;
+	n64RdramWrite(n, perf, 8);
+	for (int i = 0; i < 8; ++i) {
+		n->rdram[(perf + (uint32_t) i) & (RDRAM_SIZE - 1)] = (uint8_t) (h->gbLines >> (8 * (3 - (i & 3))));
+	}
+	h->waiting = false;
+	n->sp.hleDoneAt = n->cycles + 2048;
+}
+
+static void gbStart(struct N64* n, struct Hle* h) {
+	h->gbData = be32(&n->sp.mem[0xFF0]) & 0xFFFFFF;
+	gbRead(n, h->gbTask, h->gbData, 24);
+	memset(h->gbTileIds, 0xFF, sizeof(h->gbTileIds));
+	memset(h->gbAttrs, 0, sizeof(h->gbAttrs));
+	memset(h->gbMap, 0, sizeof(h->gbMap));
+	memset(h->gbWindow, 0, sizeof(h->gbWindow));
+	memset(h->gbLine, 0, sizeof(h->gbLine));
+	h->gbLines = h->gbWindowY = 0;
+	h->gbState = GB_WAIT_MODE2, h->gbReadyAt = 0;
+	h->waiting = true;
+	gbRun(n, h);
+}
+
 static void finishTask(struct N64* n, struct Hle* h) {
 	if (!h->dry && h->waiting && h->family == FAMILY_ZSORTBOSS) {
 		// Waiting on a signal: the CPU's write of it brings the task back (hleSignalled).
@@ -4674,6 +4912,12 @@ static void finishTask(struct N64* n, struct Hle* h) {
 }
 
 void hleSignalled(struct N64* n) {
+	// The picture processor, when not busy, answers at once.
+	if (n->hle && n->hle->family == FAMILY_GBPPU && n->hle->waiting && n->sp.hleDoneAt && n->cycles >= n->hle->gbReadyAt) {
+		gbRun(n, n->hle);
+		n64Event(n, n->sp.hleDoneAt);
+		return;
+	}
 	if (n->hle && n->hle->family == FAMILY_ZSORTBOSS && n->hle->waiting && n->sp.hleDoneAt > n->cycles) {
 		n->sp.hleDoneAt = n->cycles;
 		n64Event(n, n->cycles);
@@ -4689,6 +4933,10 @@ void hleResume(struct N64* n) {
 	struct Hle* h = n->hle;
 	if (h->stalled) {
 		finishTask(n, h);
+		return;
+	}
+	if (h->family == FAMILY_GBPPU) {
+		gbRun(n, h);
 		return;
 	}
 	if (h->family == FAMILY_ZSORTBOSS) {
@@ -4770,6 +5018,14 @@ bool hleGraphics(struct N64* n, bool dry) {
 	if (f == FAMILY_NONE && (ucode == 0x5804274Fu || ucode == 0x3CCF37FFu)) {
 		f = FAMILY_F5INDI;
 	}
+	// gb64's Game Boy picture processor, all in its boot code.
+	if (f == FAMILY_NONE && !code) {
+		uint32_t boot = be32(task + 8) & 0xFFFFFF, bootHash = 2166136261u;
+		for (uint32_t i = 0; i < be32(task + 12) && i < 0x1000; ++i) {
+			bootHash = (bootHash ^ n->rdram[(boot + i) & (RDRAM_SIZE - 1)]) * 16777619u;
+		}
+		f = bootHash == 0x8856B8EFu ? FAMILY_GBPPU : f;
+	}
 	bool const wrus = f == FAMILY_F3D && (ucode == 0xAC1B2CFEu || ucode == 0x106A093Eu);
 	bool const dkr = f == FAMILY_NONE && (ucode == 0x5277D6E7u || ucode == 0x26EDE132u);
 	if (dkr) {
@@ -4787,6 +5043,13 @@ bool hleGraphics(struct N64* n, bool dry) {
 	struct Hle* h = n->hle;
 	h->ucode = ucode;
 	h->family = f;
+	if (f == FAMILY_GBPPU) {
+		if (dry) {
+			return false;
+		}
+		gbStart(n, h);
+		return true;
+	}
 	h->flx = isFlx(n, data, dataSize);
 	h->wrus = wrus;
 	ucodeFlags(n, h, data, dataSize);
