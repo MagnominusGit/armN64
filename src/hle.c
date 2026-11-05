@@ -5087,6 +5087,7 @@ bool hleGraphics(struct N64* n, bool dry) {
 	h->dkrBillboard = false, h->dkrVertex = 0, h->dkrMtxOffset = h->dkrVtxOffset = h->dkrTexTable = 0;
 	h->dry = dry;
 	memset(h->segments, 0, sizeof(h->segments));
+	memset(h->objStatus, 0, sizeof(h->objStatus));
 	static const float identity[16] = { 1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1 };
 	h->depth = 0;
 	memcpy(h->modelview[0], identity, sizeof(identity));
