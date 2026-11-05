@@ -709,6 +709,8 @@ void glrForget(struct N64*);
 // whether it can go on.
 bool hleWaiting(struct N64*);
 void hleResume(struct N64*);
+// The CPU changed an SP signal: a task waiting on one goes on.
+void hleSignalled(struct N64*);
 void rdpDestroy(struct N64*);
 void rdpStateLoad(struct N64*, const struct RDP* saved, bool keepGl);
 void rdpStateGet(struct N64*, struct RDP* out);

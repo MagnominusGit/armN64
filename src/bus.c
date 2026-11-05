@@ -164,6 +164,9 @@ static void spWriteStatus(struct N64* n, uint32_t v) {
 			*s |= 0x80u << sig;
 		}
 	}
+	if (v & 0x01FFFE00u) {
+		hleSignalled(n);
+	}
 }
 
 // The VI clock the AI counts: a PAL console's is 49.65653 MHz, an MPAL one's 48.628316 MHz, an NTSC

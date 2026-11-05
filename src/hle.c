@@ -15,7 +15,7 @@
 // S2DEX and S2DEX2 are the 2D microcodes (F3DEX's and F3DEX2's command numbers for what they share):
 // backgrounds so far, other commands leave the task to the RSP.
 // ZSort draws objects the game sorted from vertices it transformed here first (its DMEM in between).
-enum { FAMILY_NONE, FAMILY_F3D, FAMILY_F3DEX, FAMILY_F3DEX2, FAMILY_F3DPD, FAMILY_S2DEX, FAMILY_S2DEX2, FAMILY_ZSORT, FAMILY_TURBO3D, FAMILY_T3DUX };
+enum { FAMILY_NONE, FAMILY_F3D, FAMILY_F3DEX, FAMILY_F3DEX2, FAMILY_F3DPD, FAMILY_S2DEX, FAMILY_S2DEX2, FAMILY_ZSORT, FAMILY_TURBO3D, FAMILY_T3DUX, FAMILY_ZSORTBOSS };
 
 // Geometry mode bits, kept in the F3DEX2 layout.
 enum {
@@ -55,6 +55,9 @@ struct Hle {
 	// ZSort: its DMEM (the data first), the viewport in quarter pixels, and the RDP lists last run for
 	// an object's three.
 	uint8_t zDmem[0x1000];
+	// What ZSort's and ZSortBOSS's DMEM commands work on: zDmem, or (ZSortBOSS, not dry) the SP's own DMEM,
+	// which the CPU reads.
+	uint8_t* zMem;
 	float zScale[2], zTrans[2];
 	uint32_t zRdp[3];
 	float lightColor[LIGHTS + 1][3], lightDir[LIGHTS + 1][3], lookat[2][3];
@@ -79,6 +82,16 @@ struct Hle {
 	// T3DUX: an object's vertices (up to 255), and the last SETTILE its RDP lists gave.
 	struct Vertex t3dux[256];
 	uint32_t t3duxTile[2];
+	// ZSortBOSS: where its main and sub lists are and which runs, whether each has ended, a signal
+	// waited on, the other-mode bits G_RDPSETOTHERMODE takes, the 1/w scale, the fog table and the
+	// audio's ADPCM table (the last four kept from task to task, as GLideN64 has them).
+	uint32_t bossPc[2];
+	int bossList;
+	bool bossEnded[2], bossSignal, bossDone, bossInit;
+	uint32_t bossMask[2];
+	float bossInvw;
+	uint8_t bossFog[256];
+	int16_t bossTable[8][8];
 	uint32_t objMode, objStatus[4], half0w0, half0w1;
 	// F3DFLX (F-Zero X's F3DEX2): light k in slot k + 1, slot 1 its alpha light, a direction whose
 	// angle to the normal picks each vertex's alpha from a table at the G_DMA_IO address (in place of
@@ -1290,11 +1303,11 @@ static uint32_t zField(uint32_t field) {
 }
 
 static uint32_t zRd16(const struct Hle* h, uint32_t a) {
-	return (uint32_t) h->zDmem[a & 0xFFF] << 8 | h->zDmem[(a + 1) & 0xFFF];
+	return (uint32_t) h->zMem[a & 0xFFF] << 8 | h->zMem[(a + 1) & 0xFFF];
 }
 
 static void zWr16(struct Hle* h, uint32_t a, uint32_t v) {
-	h->zDmem[a & 0xFFF] = (uint8_t) (v >> 8), h->zDmem[(a + 1) & 0xFFF] = (uint8_t) v;
+	h->zMem[a & 0xFFF] = (uint8_t) (v >> 8), h->zMem[(a + 1) & 0xFFF] = (uint8_t) v;
 }
 
 // An RDP command list in RDRAM, to the end command (0xDF).
@@ -1384,7 +1397,7 @@ static void zsortTransform(struct Hle* h, uint32_t w1) {
 		zWr16(h, dst, (uint32_t) sx), zWr16(h, dst + 2, (uint32_t) sy);
 		zWr16(h, dst + 4, invw >> 16), zWr16(h, dst + 6, invw);
 		zWr16(h, dst + 8, (uint32_t) (int) X), zWr16(h, dst + 10, (uint32_t) (int) Y);
-		h->zDmem[(dst + 12) & 0xFFF] = (uint8_t) cc, h->zDmem[(dst + 13) & 0xFFF] = (uint8_t) fog;
+		h->zMem[(dst + 12) & 0xFFF] = (uint8_t) cc, h->zMem[(dst + 13) & 0xFFF] = (uint8_t) fog;
 		zWr16(h, dst + 14, (uint32_t) (int) W);
 	}
 }
@@ -1400,13 +1413,13 @@ static void zsortLights(struct Hle* h, uint32_t w1) {
 	uint32_t a = zField(w1 & 0xFFF);
 	h->lights = count > LIGHTS ? LIGHTS : count;
 	for (int k = 0; k < 3; ++k) {
-		h->lightColor[h->lights][k] = h->zDmem[(a + (uint32_t) k) & 0xFFF] / 255.0f;
+		h->lightColor[h->lights][k] = h->zMem[(a + (uint32_t) k) & 0xFFF] / 255.0f;
 	}
 	a += 8;
 	for (int l = 0; l < count; ++l, a += 24) {
 		for (int k = 0; l < LIGHTS && k < 3; ++k) {
-			h->lightColor[l][k] = h->zDmem[(a + (uint32_t) k) & 0xFFF] / 255.0f;
-			h->lightDir[l][k] = (int8_t) h->zDmem[(a + 8 + (uint32_t) k) & 0xFFF];
+			h->lightColor[l][k] = h->zMem[(a + (uint32_t) k) & 0xFFF] / 255.0f;
+			h->lightDir[l][k] = (int8_t) h->zMem[(a + 8 + (uint32_t) k) & 0xFFF];
 		}
 		if (l < LIGHTS) {
 			normalize(h->lightDir[l]);
@@ -1414,7 +1427,7 @@ static void zsortLights(struct Hle* h, uint32_t w1) {
 	}
 	for (int l = 0; l < 2; ++l, a += 24) {
 		for (int k = 0; k < 3; ++k) {
-			h->lookat[l][k] = (int8_t) h->zDmem[(a + 8 + (uint32_t) k) & 0xFFF];
+			h->lookat[l][k] = (int8_t) h->zMem[(a + 8 + (uint32_t) k) & 0xFFF];
 		}
 		normalize(h->lookat[l]);
 	}
@@ -1428,7 +1441,7 @@ static void zsortLighting(struct Hle* h, uint32_t w0, uint32_t w1) {
 	const float* mv = h->modelview[h->depth];
 	const float* pr = h->projection;
 	for (int i = 0; i < count; ++i, nsrs += 3, csrs += 4, cdest += 4, tdest += 4) {
-		float const nx = (int8_t) h->zDmem[nsrs & 0xFFF], ny = (int8_t) h->zDmem[(nsrs + 1) & 0xFFF], nz = (int8_t) h->zDmem[(nsrs + 2) & 0xFFF];
+		float const nx = (int8_t) h->zMem[nsrs & 0xFFF], ny = (int8_t) h->zMem[(nsrs + 1) & 0xFFF], nz = (int8_t) h->zMem[(nsrs + 2) & 0xFFF];
 		float e[3] = { nx * mv[0] + ny * mv[4] + nz * mv[8], nx * mv[1] + ny * mv[5] + nz * mv[9], nx * mv[2] + ny * mv[6] + nz * mv[10] };
 		normalize(e);
 		float rgb[3] = { h->lightColor[h->lights][0], h->lightColor[h->lights][1], h->lightColor[h->lights][2] };
@@ -1443,10 +1456,10 @@ static void zsortLighting(struct Hle* h, uint32_t w0, uint32_t w1) {
 		float const x = p[0] * h->lookat[0][0] + p[1] * h->lookat[0][1] + p[2] * h->lookat[0][2];
 		float const y = p[0] * h->lookat[1][0] + p[1] * h->lookat[1][1] + p[2] * h->lookat[1][2];
 		for (int k = 0; k < 3; ++k) {
-			float const c = (rgb[k] > 1 ? 1 : rgb[k]) * h->zDmem[(csrs + (uint32_t) k) & 0xFFF] / 255.0f;
-			h->zDmem[(cdest + (uint32_t) k) & 0xFFF] = (uint8_t) (c * 255.0f);
+			float const c = (rgb[k] > 1 ? 1 : rgb[k]) * h->zMem[(csrs + (uint32_t) k) & 0xFFF] / 255.0f;
+			h->zMem[(cdest + (uint32_t) k) & 0xFFF] = (uint8_t) (c * 255.0f);
 		}
-		h->zDmem[(cdest + 3) & 0xFFF] = h->zDmem[(csrs + 3) & 0xFFF];
+		h->zMem[(cdest + 3) & 0xFFF] = h->zMem[(csrs + 3) & 0xFFF];
 		zWr16(h, tdest, (uint32_t) (int) ((x + 1) * 512 * 32)), zWr16(h, tdest + 2, (uint32_t) (int) ((y + 1) * 512 * 32));
 	}
 }
@@ -1459,12 +1472,12 @@ static void zsortMoveMem(struct N64* n, struct Hle* h, uint32_t w0, uint32_t w1)
 	if (index == 0) {
 		if (!(w0 & 1)) {
 			for (uint32_t i = 0; i < length; ++i) {
-				h->zDmem[(offset + i) & 0xFFF] = n->rdram[(a + i) & (RDRAM_SIZE - 1)];
+				h->zMem[(offset + i) & 0xFFF] = n->rdram[(a + i) & (RDRAM_SIZE - 1)];
 			}
 		} else if (!h->dry) {
 			n64RdramWrite(n, a, length);
 			for (uint32_t i = 0; i < length; ++i) {
-				n->rdram[(a + i) & (RDRAM_SIZE - 1)] = h->zDmem[(offset + i) & 0xFFF];
+				n->rdram[(a + i) & (RDRAM_SIZE - 1)] = h->zMem[(offset + i) & 0xFFF];
 			}
 		}
 	} else if (zsortMatrix(h, index)) {
@@ -1646,6 +1659,422 @@ static void turbo3dList(struct N64* n, struct Hle* h, uint32_t pc) {
 			turbo3dObject(n, h, state, vtx, tri);
 		}
 	}
+}
+
+// ---- ZSortBOSS (World Driver Championship's and Stunt Racer 64's; GLideN64's ZSortBOSS.cpp)
+
+// SP_STATUS's signals the CPU and this microcode pass each other.
+enum { SIG0 = 0x80, SIG1 = 0x100, SIG2 = 0x200, SIG3 = 0x400, SIG4 = 0x800 };
+
+static uint32_t zRd32(const struct Hle* h, uint32_t a) {
+	return zRd16(h, a) << 16 | zRd16(h, a + 2);
+}
+
+static void zWr32(struct Hle* h, uint32_t a, uint32_t v) {
+	zWr16(h, a, v >> 16), zWr16(h, a + 2, v);
+}
+
+static float* bossMatrix(struct Hle* h, uint32_t which) {
+	return which == 0x830 ? h->modelview[h->depth] : which == 0x870 ? h->projection : which == 0x8B0 ? h->mvp : NULL;
+}
+
+static int32_t bossInvw(int32_t w) {
+	return w ? 0x7FFFFFFF / w : 0x7FFFFFFF;
+}
+
+// Its RDP-side commands: other modes (F3DEX2's shifts; G_RDPSETOTHERMODE through the update mask), the
+// update mask, the triangles' tile and level, or an RDP command as it is. The next command's address.
+static uint32_t bossRdpCommand(struct N64* n, struct Hle* h, uint32_t pc, uint32_t w0, uint32_t w1) {
+	switch (w0 >> 24) {
+	case 0xE2:
+	case 0xE3:
+		otherModeMask(n, h, (w0 >> 24) == 0xE3, (uint32_t) ((int32_t) 0x80000000 >> (w0 & 31)) >> ((w0 >> 8) & 31), w1);
+		return pc + 8;
+	case 0xEF:
+		h->modeH = ((w0 & h->bossMask[0]) | (h->modeH & ~h->bossMask[0])) & 0xFFFFFF;
+		h->modeL = (w1 & h->bossMask[1]) | (h->modeL & ~h->bossMask[1]);
+		emit(n, h, (uint64_t) (0xEF000000u | h->modeH) << 32 | h->modeL);
+		return pc + 8;
+	case 0xDD:
+		h->bossMask[0] = w0 | 0xFF000000u, h->bossMask[1] = w1;
+		return pc + 8;
+	case 0xDE:
+		h->texScaleS = h->texScaleT = 1, h->texLevel = (w1 >> 3) & 7, h->texOn = true, h->texTile = w1 & 7;
+		h->geometry |= GEOM_SHADE | GEOM_SHADING_SMOOTH;
+		return pc + 8;
+	case 0xDF:
+	case 0xE1:
+	case 0xF1:
+		return pc + 8;
+	}
+	return rdpCommand(n, h, pc, w0, w1);
+}
+
+// An RDP list, to its 0xDF.
+static void bossRdp(struct N64* n, struct Hle* h, uint32_t a) {
+	for (int k = 0; a && k < 0x10000; ++k) {
+		uint32_t const w0 = rd32(n, a), w1 = rd32(n, a + 4);
+		if (w0 >> 24 == 0xDF) {
+			break;
+		}
+		a = bossRdpCommand(n, h, a, w0, w1);
+	}
+}
+
+// An object's triangle or quad on the screen: x and y (10.2), colour, S and T (10.5 with perspective,
+// else 10.6) and 1/w (scaled by the list's factor; equal to the colour word or negative: none).
+static void bossDraw(struct N64* n, struct Hle* h, uint32_t a, int count) {
+	bool const persp = h->modeH & 0x80000;
+	struct ScreenVertex v[4];
+	for (int i = 0; i < count; ++i, a += 16) {
+		int32_t const invw = (int32_t) rd32(n, a + 12), rgba = (int32_t) rd32(n, a + 4);
+		float const w = invw == rgba || invw < 0 ? 1 : bossInvw(invw) / h->bossInvw;
+		v[i] = (struct ScreenVertex) { rd16(n, a) / 4.0f, rd16(n, a + 2) / 4.0f, 0, w != 0 ? 1 / w : 1,
+		                               (rd8(n, a + 4) & 0xFF) / 255.0f, (rd8(n, a + 5) & 0xFF) / 255.0f, (rd8(n, a + 6) & 0xFF) / 255.0f,
+		                               (rd8(n, a + 7) & 0xFF) / 255.0f, rd16(n, a + 8) / (persp ? 32.0f : 64.0f), rd16(n, a + 10) / (persp ? 32.0f : 64.0f) };
+	}
+	bool const texOn = h->texOn;
+	h->texOn = true;
+	triangle(n, h, &v[0], &v[1], &v[2], NULL);
+	if (count == 4) {
+		triangle(n, h, &v[2], &v[1], &v[3], NULL);
+	}
+	h->texOn = texOn;
+}
+
+// G_ZOBJ: two lists of objects, each with three RDP lists (run when they changed) and a textured
+// triangle or quad.
+static void bossObjects(struct N64* n, struct Hle* h, uint32_t header) {
+	for (int k = 0; header && k < 0x10000; ++k) {
+		uint32_t const a = header & ~7u;
+		int const type = (int) (header & 7) << 1;
+		if (type == 0 || type == 4 || type == 8) {
+			for (int i = 0; i < 3; ++i) {
+				uint32_t const w1 = rd32(n, a + 4 + 4 * (uint32_t) i);
+				if (w1 != h->zRdp[i]) {
+					h->zRdp[i] = w1;
+					bossRdp(n, h, w1 ? address(h, w1) : 0);
+				}
+			}
+			if (type) {
+				bossDraw(n, h, a + 16, type == 4 ? 3 : 4);
+			}
+		}
+		header = address(h, rd32(n, a));
+	}
+}
+
+// G_ZMULT_MPMTX: vertices (three s16 each) through the combined matrix into screen records: x and y
+// (10.2), 1/w, x and y as integers, clip codes, fog (through the fog table) and w.
+static void bossTransform(struct Hle* h, uint32_t w1) {
+	int const count = 1 + (int) (w1 >> 24);
+	uint32_t src = (w1 >> 12) & 0xFFF, dst = w1 & 0xFFF;
+	const float* m = h->mvp;
+	float const f = h->bossInvw;
+	for (int i = 0; i < count; ++i, src += 6, dst += 16) {
+		float const x = (int16_t) zRd16(h, src), y = (int16_t) zRd16(h, src + 2), z = (int16_t) zRd16(h, src + 4);
+		float const X = x * m[0] + y * m[4] + z * m[8] + m[12], Y = x * m[1] + y * m[5] + z * m[9] + m[13];
+		float const Z = x * m[2] + y * m[6] + z * m[10] + m[14], W = x * m[3] + y * m[7] + z * m[11] + m[15];
+		float const iw = W <= 0 ? f : 1 / W;
+		float const xw = X * iw < -f ? -f : X * iw > f ? f : X * iw, yw = Y * iw < -f ? -f : Y * iw > f ? f : Y * iw;
+		int fog = (int) (W * (h->fogMul / 65536.0f) + h->fogOffset);
+		fog = fog > 127 ? 127 : fog < -128 ? -128 : fog;
+		int const cc = (X >= W ? 0x10 : 0) | (Y >= W ? 0x20 : 0) | (Z >= W ? 0x40 : 0) | (X <= -W ? 0x01 : 0) | (Y <= -W ? 0x02 : 0) | (Z <= -W ? 0x04 : 0);
+		zWr16(h, dst, (uint32_t) (int16_t) (int32_t) (h->zTrans[0] + xw * h->zScale[0]));
+		zWr16(h, dst + 2, (uint32_t) (int16_t) (int32_t) (h->zTrans[1] + yw * h->zScale[1]));
+		zWr32(h, dst + 4, (uint32_t) bossInvw((int32_t) (W * f)));
+		zWr16(h, dst + 8, (uint32_t) (int16_t) (int32_t) X), zWr16(h, dst + 10, (uint32_t) (int16_t) (int32_t) Y);
+		h->zMem[(dst + 12) & 0xFFF] = (uint8_t) cc, h->zMem[(dst + 13) & 0xFFF] = h->bossFog[fog + 128];
+		zWr16(h, dst + 14, (uint32_t) (int16_t) (int32_t) W);
+	}
+}
+
+// G_ZMOVEMEM: a matrix loaded (the combined one also saved), the viewport, or bytes between RDRAM and
+// DMEM (the fog table kept as it goes in).
+static void bossMoveMem(struct N64* n, struct Hle* h, uint32_t w0, uint32_t w1) {
+	bool const save = (w0 >> 23) & 1;
+	uint32_t const length = 1 + ((w0 >> 12) & 0x7FF), offset = w0 & 0xFFF, a = address(h, w1);
+	float* m = bossMatrix(h, offset);
+	if (m && !save) {
+		readMatrix(n, a, m);
+		return;
+	}
+	if (m) {
+		if (!h->dry) {
+			n64RdramWrite(n, a, 64);
+			for (int i = 0; i < 16; ++i) {
+				int32_t const v = (int32_t) lrintf(m[i] * 65536.0f);
+				uint32_t const at = (a + 2 * (uint32_t) i) & (RDRAM_SIZE - 1);
+				n->rdram[at] = (uint8_t) (v >> 24), n->rdram[(at + 1) & (RDRAM_SIZE - 1)] = (uint8_t) (v >> 16);
+				n->rdram[(at + 32) & (RDRAM_SIZE - 1)] = (uint8_t) (v >> 8), n->rdram[(at + 33) & (RDRAM_SIZE - 1)] = (uint8_t) v;
+			}
+		}
+		return;
+	}
+	if (offset == 0) {
+		viewport(n, h, a);
+		h->fogMul = rd16(n, a + 6), h->fogOffset = rd16(n, a + 14);
+		for (int k = 0; k < 2; ++k) {
+			h->zScale[k] = h->vscale[k] * 4, h->zTrans[k] = h->vtrans[k] * 4;
+		}
+		return;
+	}
+	if (offset + length > 0x1000) {
+		return;
+	}
+	if (offset == 0x730) {
+		for (uint32_t i = 0; i < 256 && i < length; ++i) {
+			h->bossFog[i] = n->rdram[(a + i) & (RDRAM_SIZE - 1)];
+		}
+	}
+	if (!save) {
+		for (uint32_t i = 0; i < length; ++i) {
+			h->zMem[offset + i] = n->rdram[(a + i) & (RDRAM_SIZE - 1)];
+		}
+	} else if (!h->dry) {
+		n64RdramWrite(n, a, length);
+		for (uint32_t i = 0; i < length; ++i) {
+			n->rdram[(a + i) & (RDRAM_SIZE - 1)] = h->zMem[offset + i];
+		}
+	}
+}
+
+// G_ZLIGHTING: S and T for each normal (s8 in DMEM) against the lookat directions, into DMEM.
+static void bossLighting(struct Hle* h, uint32_t w0, uint32_t w1) {
+	int const count = 1 + (int) (w1 >> 24);
+	uint32_t normals = w0 & 0xFFF, st = w1 & 0xFFF;
+	for (int i = 0; i < count; ++i, normals += 3, st += 4) {
+		float const e[3] = { (int8_t) h->zMem[normals & 0xFFF] / 256.0f, (int8_t) h->zMem[(normals + 1) & 0xFFF] / 256.0f,
+		                     (int8_t) h->zMem[(normals + 2) & 0xFFF] / 256.0f };
+		float const x = e[0] * h->lookat[0][0] + e[1] * h->lookat[0][1] + e[2] * h->lookat[0][2];
+		float const y = e[0] * h->lookat[1][0] + e[1] * h->lookat[1][1] + e[2] * h->lookat[1][2];
+		zWr16(h, st, (uint32_t) (int16_t) (int32_t) ((x + 0.5f) * 1024)), zWr16(h, st + 2, (uint32_t) (int16_t) (int32_t) ((y + 0.5f) * 1024));
+	}
+}
+
+// G_ZTRANSFORMLIGHTS: the two lookat directions (s8 in DMEM) through the model matrix, normalized (the
+// microcode's lights, which no game here has, are left out as GLideN64 leaves them).
+static void bossLookat(struct Hle* h, uint32_t w1) {
+	uint32_t a = w1 & 0xFFF;
+	int const lights = 1 - (int) (w1 >> 12);
+	a += 24 * (uint32_t) (lights > 0 && lights < 12 ? lights : 0);
+	const float* m = h->modelview[h->depth];
+	for (int l = 0; l < 2; ++l, a += 24) {
+		float const d[3] = { (int8_t) h->zMem[(a + 16) & 0xFFF] / 256.0f, (int8_t) h->zMem[(a + 17) & 0xFFF] / 256.0f,
+		                     (int8_t) h->zMem[(a + 18) & 0xFFF] / 256.0f };
+		float r[3] = { m[0] * d[0] + m[4] * d[1] + m[8] * d[2], m[1] * d[0] + m[5] * d[1] + m[9] * d[2], m[2] * d[0] + m[6] * d[1] + m[10] * d[2] };
+		float const len = r[0] * r[0] + r[1] * r[1] + r[2] * r[2];
+		float recip = len != 0 ? 1 / sqrtf(len) : 256;
+		recip = recip > 256 ? 256 : recip;
+		for (int k = 0; k < 3; ++k) {
+			h->lookat[l][k] = r[k] * recip;
+		}
+	}
+}
+
+// The audio commands, in DMEM as GLideN64 has them. G_ZAUDIO1: a word of DMEM to RDRAM (with the next).
+static void bossAudio1(struct N64* n, struct Hle* h, uint32_t w0, uint32_t w1) {
+	uint32_t const a = address(h, w1);
+	zWr32(h, 0, zRd32(h, w0 & 0xFFC));
+	if (!h->dry) {
+		n64RdramWrite(n, a, 8);
+		for (uint32_t i = 0; i < 8; ++i) {
+			n->rdram[(a + i) & (RDRAM_SIZE - 1)] = h->zMem[i];
+		}
+	}
+}
+
+// G_ZAUDIO2: samples resampled (a step and a start, 8.16) between the two at 0x30 and mixed into the
+// buffer the word at DMEM 0x10 points at, by the two volumes at 0x904.
+static void bossAudio2(struct Hle* h, uint32_t w0, uint32_t w1) {
+	int const length = (int) (w1 >> 24);
+	uint32_t dst = zRd32(h, 0x10);
+	float const step = (float) ((w0 >> 16) & 0xFF) + (float) (w0 & 0xFFFF) / 65536.0f, start = (float) ((w1 >> 16) & 0xFF) + (float) (w1 & 0xFFFF) / 65536.0f;
+	uint16_t const volume[2] = { (uint16_t) zRd16(h, 0x904), (uint16_t) zRd16(h, 0x906) };
+	for (int i = 0; i < length; i += 4) {
+		for (int j = 0; j < 4; ++j) {
+			float whole;
+			float const frac = fabsf(modff(i * step + j * step + start, &whole));
+			int const index = (int) whole << 1;
+			int16_t const v9 = (int16_t) zRd16(h, 0x30 + (uint32_t) index), v10 = (int16_t) zRd16(h, 0x32 + (uint32_t) index);
+			int16_t const v12 = (int16_t) (v10 - v9), v13 = (int16_t) zRd16(h, dst);
+			for (int k = 0; k < 2; ++k, dst += 2) {
+				int16_t const sample = (int16_t) (((int32_t) ((uint32_t) v9 << 16) + v12 * (int32_t) (uint16_t) (frac * 65536.0f)) >> 16);
+				zWr16(h, dst, (uint32_t) (int16_t) (((int32_t) ((uint32_t) v13 << 16) + volume[k] * sample) >> 16));
+			}
+		}
+	}
+}
+
+// G_ZAUDIO3: the ADPCM table (8 x 8) from RDRAM, and 8 bytes from another address into DMEM 0, that
+// address after them.
+static void bossAudio3(struct N64* n, struct Hle* h, uint32_t w0, uint32_t w1) {
+	uint32_t a = address(h, w0);
+	for (int i = 0; i < 8; ++i) {
+		for (int j = 0; j < 8; ++j) {
+			h->bossTable[i][j] = rd16(n, a + (uint32_t) (i << 4) + (uint32_t) (j << 1));
+		}
+	}
+	a = address(h, w1);
+	for (uint32_t i = 0; i < 8; ++i) {
+		h->zMem[i] = n->rdram[(a + i) & (RDRAM_SIZE - 1)];
+	}
+	zWr32(h, 8, a);
+}
+
+// G_ZAUDIO4: ADPCM frames (9 bytes: scale and predictor, 16 samples) decoded into DMEM 0x30, from the
+// two samples at DMEM 0.
+static void bossAudio4(struct N64* n, struct Hle* h, uint32_t w0, uint32_t w1) {
+	uint32_t src = address(h, w1) + ((w0 & 0xF000) >> 12), dst = 0x30;
+	int16_t v1 = (int16_t) zRd16(h, 0), v2 = (int16_t) zRd16(h, 2);
+	for (int left = (int) (w0 & 0xFFF); left > 0; left -= 9) {
+		uint32_t const head = n->rdram[src++ & (RDRAM_SIZE - 1)];
+		int const index = (int) (head & 15) << 1;
+		if (index > 6) {
+			break;
+		}
+		int16_t const scale = (int16_t) (1 << ((head >> 4) & 31));
+		for (int half = 0; half < 2; ++half, dst += 16) {
+			int16_t coeff[8];
+			for (int b = 0; b < 4; ++b) {
+				int32_t const v = (int8_t) n->rdram[src++ & (RDRAM_SIZE - 1)];
+				coeff[2 * b] = (int16_t) (v >> 4), coeff[2 * b + 1] = (int16_t) ((int32_t) ((uint32_t) v << 28) >> 28);
+			}
+			int16_t out[8];
+			for (int i = 0; i < 8; ++i) {
+				int32_t sum = 0;
+				for (int j = 0, k = i; j < i; ++j, --k) {
+					sum += h->bossTable[index + 1][k - 1] * coeff[j];
+				}
+				sum += coeff[i] * 0x0800;
+				sum *= scale;
+				int32_t const prediction = v1 * h->bossTable[index][i] + v2 * h->bossTable[index + 1][i];
+				out[i] = (int16_t) ((sum * 0x20 + prediction * 0x20) >> 16);
+				zWr16(h, dst + 2 * (uint32_t) i, (uint32_t) out[i]);
+			}
+			v1 = out[6], v2 = out[7];
+		}
+	}
+}
+
+// The task's two lists, from where they were: the main list ends waiting for the CPU's SIG0, then the
+// sub list runs; G_ZWAITSIGNAL raises SIG3 (and an SP interrupt) and waits for the CPU to clear it. A wait leaves the task
+// waiting (hleResume comes back here).
+static void bossRun(struct N64* n, struct Hle* h) {
+	h->waiting = false;
+	h->zMem = h->dry ? h->zDmem : n->sp.mem;
+	for (int steps = 0; steps < 1 << 22; ++steps) {
+		uint32_t const pc = h->bossPc[h->bossList], w0 = rd32(n, pc), w1 = rd32(n, pc + 4);
+		uint32_t next = pc + 8;
+		switch (w0 >> 24) {
+		case 0x02:
+			if (h->bossEnded[1]) {
+				h->bossDone = true;
+				return;
+			}
+			h->bossEnded[0] = true;
+			if (!(n->sp.status & SIG0)) {
+				h->waiting = !h->dry;
+				return;
+			}
+			if (!h->dry) {
+				n->sp.status &= ~(uint32_t) SIG0;
+			}
+			h->bossPc[0] = next, h->bossList = 1;
+			continue;
+		case 0x1A:
+			if (h->bossEnded[0]) {
+				h->bossDone = true;
+				return;
+			}
+			h->bossEnded[1] = true;
+			h->bossPc[1] = next, h->bossList = 0;
+			continue;
+		case 0x12:
+			// The CPU clears SIG3 in its SP interrupt, which the microcode raises with it.
+			if (!h->bossSignal && !h->dry) {
+				n->sp.status = (n->sp.status & ~(uint32_t) (SIG1 | SIG2)) | SIG3;
+				n64Interrupt(n, MI_SP, true);
+			}
+			if (h->dry || (n->sp.status & SIG3)) {
+				h->bossSignal = true;
+				h->waiting = !h->dry;
+				return;
+			}
+			h->bossSignal = false;
+			break;
+		case 0x04:
+			bossMoveMem(n, h, w0, w1);
+			break;
+		case 0x06:
+			if ((w0 & 0xFFF) == 0x10 && rd32(n, next) >> 24 == 0x04) {
+				h->bossInvw = (float) w1;
+			}
+			zWr32(h, w0 & 0xFFC, w1);
+			break;
+		case 0x08: {
+			float* m = bossMatrix(h, w1 & 0xFFF);
+			if (m) {
+				float t[16];
+				memcpy(t, m, sizeof(t));
+				for (int i = 0; i < 3; ++i) {
+					for (int j = 0; j < 3; ++j) {
+						m[j * 4 + i] = t[i * 4 + j];
+					}
+				}
+			}
+			break;
+		}
+		case 0x0A: {
+			// G_ZMTXCAT: D = T x S (S in the second word's top half, T in the first word).
+			float* a = bossMatrix(h, (w1 >> 16) & 0xFFF), * b = bossMatrix(h, w0 & 0xFFF), * d = bossMatrix(h, w1 & 0xFFF);
+			if (a && b && d) {
+				float m[16];
+				multiply(m, b, a);
+				memcpy(d, m, sizeof(m));
+			}
+			break;
+		}
+		case 0x0C:
+			bossTransform(h, w1);
+			break;
+		case 0x0E:
+			bossRdp(n, h, w1 ? address(h, w1) : 0);
+			break;
+		case 0x10:
+			bossObjects(n, h, address(h, w0));
+			bossObjects(n, h, address(h, w1));
+			break;
+		case 0x14:
+			bossLighting(h, w0, w1);
+			break;
+		case 0x18:
+			bossLookat(h, w1);
+			break;
+		case 0x1C:
+			bossAudio2(h, w0, w1);
+			break;
+		case 0x1E:
+			memset(&h->zMem[0xC20], 0, 512);
+			break;
+		case 0x22:
+			bossAudio3(n, h, w0, w1);
+			break;
+		case 0x24:
+			bossAudio4(n, h, w0, w1);
+			break;
+		case 0x26:
+			bossAudio1(n, h, w0, w1);
+			break;
+		default:
+			if (w0 >> 24 >= 0xDD) {
+				next = bossRdpCommand(n, h, pc, w0, w1);
+			}
+			break;
+		}
+		h->bossPc[h->bossList] = next;
+	}
+	h->bossDone = true;
 }
 
 static void zsortList(struct N64* n, struct Hle* h, uint32_t pc) {
@@ -2369,7 +2798,10 @@ static int family(struct N64* n, uint32_t data, uint32_t size) {
 // the RSP makes its commands, so it can't be done before the RSP is; waiting, it looks again a
 // little later.
 static void finishTask(struct N64* n, struct Hle* h) {
-	if (!h->dry && h->waiting) {
+	if (!h->dry && h->waiting && h->family == FAMILY_ZSORTBOSS) {
+		// Waiting on a signal: the CPU's write of it brings the task back (hleSignalled).
+		n->sp.hleDoneAt = n->cycles + (1 << 20);
+	} else if (!h->dry && h->waiting) {
 		n->sp.hleDoneAt = n->cycles + 2048;
 	} else if (!h->dry) {
 		n->sp.hleDoneAt = n->cycles + 4096 + 64 * (uint64_t) h->timeCount;
@@ -2383,6 +2815,13 @@ static void finishTask(struct N64* n, struct Hle* h) {
 	}
 }
 
+void hleSignalled(struct N64* n) {
+	if (n->hle && n->hle->family == FAMILY_ZSORTBOSS && n->hle->waiting && n->sp.hleDoneAt > n->cycles) {
+		n->sp.hleDoneAt = n->cycles;
+		n64Event(n, n->cycles);
+	}
+}
+
 bool hleWaiting(struct N64* n) {
 	return n->hle && (n->hle->waiting || n->hle->stalled);
 }
@@ -2391,6 +2830,11 @@ bool hleWaiting(struct N64* n) {
 void hleResume(struct N64* n) {
 	struct Hle* h = n->hle;
 	if (h->stalled) {
+		finishTask(n, h);
+		return;
+	}
+	if (h->family == FAMILY_ZSORTBOSS) {
+		bossRun(n, h);
 		finishTask(n, h);
 		return;
 	}
@@ -2457,6 +2901,9 @@ bool hleGraphics(struct N64* n, bool dry) {
 	if (f == FAMILY_NONE && ucode == 0xEE50B3B1u) {
 		f = FAMILY_T3DUX;
 	}
+	if (f == FAMILY_NONE && ucode == 0x57C8BE85u) {
+		f = FAMILY_ZSORTBOSS;
+	}
 	bool const wrus = f == FAMILY_F3D && (ucode == 0xAC1B2CFEu || ucode == 0x106A093Eu);
 	bool const dkr = f == FAMILY_NONE && (ucode == 0x5277D6E7u || ucode == 0x26EDE132u);
 	if (dkr) {
@@ -2513,9 +2960,31 @@ bool hleGraphics(struct N64* n, bool dry) {
 		for (uint32_t i = 0; i < sizeof(h->zDmem); ++i) {
 			h->zDmem[i] = i < dataSize ? n->rdram[(data + i) & (RDRAM_SIZE - 1)] : 0;
 		}
+		h->zMem = h->zDmem;
 		h->zRdp[0] = h->zRdp[1] = h->zRdp[2] = 0;
 		h->zScale[0] = h->zScale[1] = h->zTrans[0] = h->zTrans[1] = 0;
 		zsortList(n, h, address(h, be32(task + 0x30)));
+	} else if (f == FAMILY_ZSORTBOSS) {
+		// The microcode's data in DMEM (the SP's own unless dry: the CPU reads the transformed vertices
+		// there), below the task.
+		h->zMem = dry ? h->zDmem : n->sp.mem;
+		for (uint32_t i = 0; i < (dry ? sizeof(h->zDmem) : 0xFC0); ++i) {
+			if (i < dataSize || dry) {
+				h->zMem[i] = i < dataSize ? n->rdram[(data + i) & (RDRAM_SIZE - 1)] : 0;
+			}
+		}
+		h->zRdp[0] = h->zRdp[1] = h->zRdp[2] = 0;
+		if (!h->bossInit) {
+			h->bossInit = true, h->bossInvw = 10, h->bossMask[0] = h->bossMask[1] = 0;
+			memset(h->bossFog, 0, sizeof(h->bossFog)), memset(h->bossTable, 0, sizeof(h->bossTable));
+		}
+		// The sub list starts at the task's yield data.
+		h->bossPc[0] = be32(task + 0x30) & 0xFFFFFF, h->bossPc[1] = be32(task + 0x38) & 0xFFFFFF;
+		h->bossList = 0, h->bossEnded[0] = h->bossEnded[1] = h->bossSignal = h->bossDone = false;
+		if (!dry) {
+			n->sp.status = (n->sp.status & ~(uint32_t) (SIG1 | SIG2)) | SIG4;
+		}
+		bossRun(n, h);
 	} else if (f == FAMILY_TURBO3D || f == FAMILY_T3DUX) {
 		turbo3dList(n, h, be32(task + 0x30) & 0xFFFFFF);
 	} else {
