@@ -2559,6 +2559,13 @@ static void f5List(struct N64* n, struct Hle* h, uint32_t pc) {
 			f5Sprite(n, h, pc, w0);
 			next = pc + 24;
 			break;
+		case 0xE4:
+		case 0xE5:
+			// A texture rectangle's other words follow it as they are.
+			emit(n, h, (uint64_t) w0 << 32 | w1);
+			emit(n, h, (uint64_t) rd32(n, pc + 8) << 32 | rd32(n, pc + 12));
+			next = pc + 16;
+			break;
 		default:
 			if (op >= 0xC0) {
 				next = rdpCommand(n, h, pc, w0, w1);
