@@ -161,6 +161,8 @@ struct Hle {
 	uint32_t ucode, rejected[8];
 	int rejectedCount;
 	bool rejectedNow;
+	// Fast3D triangles this task with vertex numbers that aren't multiples of 10.
+	int oddTriangles;
 	// Why the list was left to the RSP (for the frontend).
 	char why[48];
 	// Counting the commands instead of drawing them (N64HLECHECK).
@@ -4515,8 +4517,12 @@ static void runList(struct N64* n, struct Hle* h, uint32_t pc) {
 				}
 				break;
 			case 0xBF:
-				// Fast3D's indices are vertex numbers times 10: other ones are another microcode's.
+				// Fast3D's indices are vertex numbers times 10: other ones are another microcode's. A few
+				// (a hack's slip, read from the middle of a vertex) are left out.
 				if (!f3dex && (((w1 >> 16) & 0xFF) % scale || ((w1 >> 8) & 0xFF) % scale || (w1 & 0xFF) % scale)) {
+					if (++h->oddTriangles <= 4) {
+						break;
+					}
 					snprintf(h->why, sizeof(h->why), "Fast3D-like %08x", h->ucode);
 					reject(h);
 					return;
@@ -5113,6 +5119,7 @@ bool hleGraphics(struct N64* n, bool dry) {
 	h->fifoEnd = fifo ? fifoEnd & ~7u : 0;
 	h->sp = 0;
 	h->rejectedNow = false;
+	h->oddTriangles = 0;
 	h->why[0] = 0;
 	h->objBaseX = h->objBaseY = 1024, h->objA = h->objD = 1, h->objB = h->objC = 0, h->objX = h->objY = 0;
 	if (f == FAMILY_ZSORT) {
