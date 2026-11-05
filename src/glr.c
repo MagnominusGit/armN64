@@ -687,7 +687,7 @@ static struct Program* program(struct Glr* g, struct ProgramKey key) {
 			         "	for (int v = (l >> 5) & 0xFF; !magnify && v > 1; v >>= 1) ++level;\n"
 			         "	bool distant = (l & 0x4000) != 0 || %d == 0 || (!magnify && ((l & 0x6000) != 0 || level >= %d));\n"
 			         "	int frac = (l & 0x4000) != 0 ? 0xFF : magnify ? %s : %s;\n"
-			         "	lodFrac = float(frac) / 255.0;\n",
+			         "	lodFrac = float((frac & 0x100) != 0 ? (frac & 0x1FF) - 0x200 : frac) / 255.0;\n",
 			         maxLevel, maxLevel, !sharpen && !detail ? "(distant ? 0xFF : 0)" : sharpen ? "(max(l, %d) << 3) | 0x100" : "max(l, %d) << 3",
 			         !sharpen && !detail ? "(distant ? 0xFF : ((l << 3) >> level) & 0xFF)" : "((l << 3) >> level) & 0xFF");
 			if (sharpen || detail) {
