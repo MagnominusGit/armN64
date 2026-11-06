@@ -1745,6 +1745,15 @@ static uint64_t primitiveClocks(struct RDP* r, const uint64_t* w, int op) {
 	} else if (op == 0x36) {
 		int cx0, cy0;
 		rectBounds(r, w[0], &cx0, &cy0, &x0, &y0, &x1, &y1);
+	} else if (op == 0x30 || op == 0x33 || op == 0x34) {
+		// A texture load moves a 64-bit TMEM word a clock: a tile's texels, a block's, a palette's
+		// entries.
+		uint64_t c = w[0];
+		int sl = (c >> 44) & 0xFFF, tl = (c >> 32) & 0xFFF, sh = (c >> 12) & 0xFFF, th = c & 0xFFF;
+		uint64_t texels = op == 0x34 ? (uint64_t) ((sh >> 2) - (sl >> 2) + 1) * (uint64_t) ((th >> 2) - (tl >> 2) + 1)
+		                  : op == 0x33 ? (uint64_t) (sh - sl + 1) : (uint64_t) ((sh >> 2) - (sl >> 2) + 1);
+		uint64_t bytes = op == 0x30 ? texels * 2 : r->texSize ? texels << (r->texSize - 1) : texels / 2;
+		return (sh < sl || (op == 0x34 && th < tl)) ? 10 : bytes / 8 + 10;
 	} else {
 		return 0;
 	}
