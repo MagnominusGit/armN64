@@ -447,6 +447,9 @@ struct N64 {
 	// was hardware cycles ocHwAt at cycle ocAt.
 	uint32_t ocNum, ocDen, countCycles, ocWantNum, ocWantDen;
 	uint64_t ocAt, ocHwAt;
+	// Cycles an instruction takes before its stalls: 1, or 4 in mle, as mupen64plus and Project64
+	// count two Count ticks an instruction.
+	uint32_t opCycles;
 	uint64_t fields;
 	// Where the settings (N64_ACCURACY and the others) come from when the machine starts: the
 	// environment unless a frontend gives its own lookup.

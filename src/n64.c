@@ -31,6 +31,7 @@ struct N64* n64Create(void) {
 	n->plugged[0] = PLUG_CONTROLLER;
 	n->ocNum = n->ocDen = 1;
 	n->countCycles = 2;
+	n->opCycles = 1;
 	for (int i = 0; i < 4; ++i) {
 		pakFormat(n->paks[i]);
 	}
@@ -127,6 +128,7 @@ static void start(struct N64* n) {
 	// HLE draws at high level with the hardware's own timing; only mle behaves like the
 	// emulators hacks were made on.
 	n->compat = n->accuracy == ACCURACY_MLE;
+	n->opCycles = 1;
 	n->emulatorLike = n->accuracy != ACCURACY_LLE;
 	n->rspPlainTiming = n->accuracy != ACCURACY_LLE;
 	n->fast = n->accuracy == ACCURACY_HLE;
@@ -384,7 +386,7 @@ void n64RunField(struct N64* n) {
 			blocksRun(n);
 		} else do {
 			cpuStep(n);
-			n->cycles += 1 + n->cpu.stall;
+			n->cycles += n->opCycles + n->cpu.stall;
 			n->cpu.stall = 0;
 		} while (n->slice && n->cycles < n->eventAt);
 		if (n->rspThread) {

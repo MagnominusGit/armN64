@@ -229,7 +229,7 @@ static void jitRun(struct N64* n, void* code) {
 		n->jitEnter(n, code);
 	} else {
 		cpuStep(n);
-		n->cycles += 1 + n->cpu.stall;
+		n->cycles += n->opCycles + n->cpu.stall;
 		n->cpu.stall = 0;
 	}
 }
@@ -265,7 +265,7 @@ static bool idleStepTo(struct N64* n, uint32_t pc, int limit) {
 	struct CPU* c = &n->cpu;
 	for (int k = 0; k < limit && n->cycles < n->eventAt; ++k) {
 		cpuStep(n);
-		n->cycles += 1 + c->stall;
+		n->cycles += n->opCycles + c->stall;
 		c->stall = 0;
 		if (n->idle.fatal) {
 			return false;
@@ -296,7 +296,7 @@ static bool idleStepBack(struct N64* n, uint32_t pc, const struct IdleRegs* regs
 	struct IdleRegs now;
 	for (int k = 0; k < limit && n->cycles < n->eventAt; ++k) {
 		cpuStep(n);
-		n->cycles += 1 + c->stall;
+		n->cycles += n->opCycles + c->stall;
 		c->stall = 0;
 		if (n->idle.fatal) {
 			return false;
@@ -415,7 +415,7 @@ void blocksRun(struct N64* n) {
 		if ((v & 0xE0000000) == 0xA0000000 || (v & 3) || c->pc != (uint64_t) (int64_t) (int32_t) v ||
 		    c->nextInDelay || (mapped && !cpuPeekAddress(n, v, &paddr)) || paddr >= RDRAM_SIZE) {
 			cpuStep(n);
-			n->cycles += 1 + c->stall;
+			n->cycles += n->opCycles + c->stall;
 			c->stall = 0;
 			continue;
 		}
@@ -423,7 +423,7 @@ void blocksRun(struct N64* n) {
 		struct Block** t = n->blockPage[page];
 		if (!t && !(t = n->blockPage[page] = calloc(PAGE_WORDS, sizeof(*t)))) {
 			cpuStep(n);
-			n->cycles += 1 + c->stall;
+			n->cycles += n->opCycles + c->stall;
 			c->stall = 0;
 			continue;
 		}
@@ -436,7 +436,7 @@ void blocksRun(struct N64* n) {
 			// A full code arena throws every block away, this page's table with them.
 			if (!(b = compile(n, v, paddr))) {
 				cpuStep(n);
-				n->cycles += 1 + c->stall;
+				n->cycles += n->opCycles + c->stall;
 				c->stall = 0;
 				continue;
 			}
@@ -455,7 +455,7 @@ void blocksRun(struct N64* n) {
 		uint32_t gen = n->blockGen, code = n->codeGen;
 		for (uint32_t i = 0; i < b->count; ++i) {
 			cpuStepOp(n, b->ops[i], paddr + i * 4);
-			n->cycles += 1 + c->stall;
+			n->cycles += n->opCycles + c->stall;
 			c->stall = 0;
 			pc += 4;
 			// Stop at the next event, where the program didn't go on to the next instruction,

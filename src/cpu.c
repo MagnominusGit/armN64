@@ -1793,7 +1793,7 @@ bool cpuJitStep(struct N64* n, uint32_t op) {
 		execute(n, op);
 	}
 	c->gpr[0] = 0;
-	n->cycles += 1 + c->stall;
+	n->cycles += n->opCycles + c->stall;
 	c->stall = 0;
 	n->jitLimit = n->eventAt < n->jitFire ? n->eventAt : n->jitFire;
 	bool timer = op >> 26 == 0x10 && (RS == 0x04 || RS == 0x05) && (RD == CP0_COUNT || RD == CP0_COMPARE);

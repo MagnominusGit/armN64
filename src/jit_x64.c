@@ -131,6 +131,7 @@ struct Jit {
 	// Outside mle the D-cache holds the data cached accesses use; with HLE accuracy (fast)
 	// there are no caches.
 	bool cacheData, fast, plainCount;
+	int opCycles;
 };
 
 static void exitAt(struct Jit* j, uint8_t* site, uint64_t pc, enum Kind kind, bool delay, bool skip) {
@@ -563,9 +564,9 @@ static void icacheCheck(struct Emitter* e, uint32_t vaddr, uint32_t paddr, bool 
 	patchHere(e, hit);
 }
 
-// The idle loop at vaddr, when its I-cache lines are in: whole passes of two cycles up to one or two
-// cycles short of the limit, leaving the last instructions to run as usual.
-static void skipIdle(struct Emitter* e, uint32_t vaddr, uint32_t paddr, bool fast) {
+// The idle loop at vaddr, when its I-cache lines are in: whole passes of its two instructions up to a
+// pass or less short of the limit, leaving the last instructions to run as usual.
+static void skipIdle(struct Emitter* e, uint32_t vaddr, uint32_t paddr, bool fast, int opCycles) {
 	uint8_t* skip[3];
 	int sites = 0;
 	int lines = fast ? 0 : (paddr + 4) & 31 ? 1 : 2;
@@ -580,8 +581,8 @@ static void skipIdle(struct Emitter* e, uint32_t vaddr, uint32_t paddr, bool fas
 	xAluI(e, X_CMP, 8, R(RAX), 1);
 	skip[sites++] = xJcc(e, CC_LE, NULL);
 	xAluI(e, X_SUB, 8, R(RAX), 1);
-	xShiftI(e, X_SHR, 8, R(RAX), 1);
-	xLea(e, 8, R13, MI(R13, RAX, 2, 0));
+	xShiftI(e, X_SHR, 8, R(RAX), opCycles == 4 ? 3 : 1);
+	xLea(e, 8, R13, MI(R13, RAX, opCycles == 4 ? 8 : 2, 0));
 	for (int i = 0; i < sites; ++i) {
 		patchHere(e, skip[i]);
 	}
@@ -1040,11 +1041,12 @@ void* jitCompile(struct N64* n, const uint32_t* ops, uint32_t count, uint32_t va
 	j->rdpGl = n->rdpGl;
 	j->fast = n->fast;
 	j->plainCount = n->countCycles == 2;
+	j->opCycles = (int) n->opCycles;
 	j->cacheData = !n->compat && !n->fast;
 	struct Emitter* e = &j->e;
 
 	if (blockIsIdleLoop(ops, count, vaddr)) {
-		skipIdle(e, vaddr, paddr, j->fast);
+		skipIdle(e, vaddr, paddr, j->fast, j->opCycles);
 	}
 	int reload;
 	uint32_t pollPass = blockPollPass(ops, count, vaddr, &reload);
@@ -1083,7 +1085,7 @@ void* jitCompile(struct N64* n, const uint32_t* ops, uint32_t count, uint32_t va
 			} else {
 				loadStallCheck(e, op);
 			}
-			xAluI(e, X_ADD, 8, R(R13), 1 + j->extraCycles);
+			xAluI(e, X_ADD, 8, R(R13), j->opCycles + j->extraCycles);
 			if (j->interruptCheck) {
 				// An interrupt now due is taken before the next instruction.
 				xTest(e, 4, R(RCX), RCX);
@@ -1223,7 +1225,7 @@ void* jitCompile(struct N64* n, const uint32_t* ops, uint32_t count, uint32_t va
 			continue;
 		}
 		if (x->skip) {
-			xAluI(e, X_ADD, 8, R(R13), 2);
+			xAluI(e, X_ADD, 8, R(R13), 2 * j->opCycles);
 			storeConst(e, CPU_AT(pc), x->pc + 8);
 			storeConst(e, CPU_AT(nextPc), x->pc + 12);
 		} else if (x->delay) {
@@ -1238,7 +1240,7 @@ void* jitCompile(struct N64* n, const uint32_t* ops, uint32_t count, uint32_t va
 			xAluRR(e, X_CMP, 8, R(R13), R14);
 			xJcc(e, CC_AE, j->leave);
 			if (pollPass) {
-				pollSkip(j, ops, count, vaddr, paddr, pollPass, reload);
+				pollSkip(j, ops, count, vaddr, paddr, pollPass * (uint32_t) j->opCycles, reload);
 			}
 			chain(j);
 		} else {
