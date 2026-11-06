@@ -147,7 +147,8 @@ struct VI {
 
 // N64_FRAMESKIP (a speed setting, not exact): every other frame drawn into a framebuffer the VI
 // shows is left undrawn (its triangles and rectangles; modes, loads and other images still run),
-// and the picture before it shown again.
+// and the picture before it shown again. Automatic (N64_FRAMESKIP=2): only a frame started while
+// the frontend is behind, never two in a row.
 struct FrameSkip {
 	bool on;
 	// The VI's last few framebuffers, the one being drawn, frames counted, and each buffer's last
@@ -155,6 +156,10 @@ struct FrameSkip {
 	uint32_t shown[4];
 	uint32_t drawing;
 	bool intoShown;
+	bool automatic, behind;
+	// With HLE graphics, HLE decides at each color image (frameSkipImage) and leaves a skipped frame's
+	// triangles and rectangles out (dropping the one it is emitting); the RDP then doesn't.
+	bool hleDecides, hleSkipping, dropping;
 	uint64_t frames;
 	bool skipping;
 	uint32_t buffer[4];
@@ -539,6 +544,8 @@ bool n64PictureStart(struct N64*, int* width, int* height);
 // context); 0 when it is elsewhere.
 unsigned n64PictureBuffer(struct N64*);
 bool n64GlPicture(struct N64*, unsigned* framebuffer, int* x, int* y, int* width, int* height);
+// Frame Skip: whether the VI shows a frame left undrawn (the picture before it stays).
+bool n64PictureSkipped(struct N64*);
 // The GL renderer's Shader Precompile, a few programs a frame (glrPrecompile).
 bool n64GlPrecompile(struct N64*, double ms, int* done, int* total);
 
@@ -619,6 +626,8 @@ void rdpWaitRead(struct N64*, uint32_t addr, uint32_t len);
 struct Gles* rdpGpuShare(struct N64*, uint32_t addr, uint32_t len);
 void rdpWaitDrawn(struct N64*, uint32_t addr, uint32_t len);
 bool frameSkipped(struct N64*, uint32_t origin);
+// A color image at addr: whether a skipped frame is drawn into it.
+bool frameSkipImage(struct N64*, uint32_t addr);
 
 // Whether any word of RDRAM [addr, addr + len) inside page p is part of a block.
 static inline bool n64HoldsCode(struct N64* n, uint32_t p, uint32_t addr, uint32_t len) {

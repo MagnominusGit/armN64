@@ -3329,30 +3329,39 @@ static int shownBuffer(const struct N64* n, uint32_t addr) {
 	return -1;
 }
 
+bool frameSkipImage(struct N64* n, uint32_t addr) {
+	struct FrameSkip* s = &n->skip;
+	s->intoShown = shownBuffer(n, addr) >= 0;
+	if (!s->intoShown) {
+		return false;
+	}
+	// Images drawn in between (textures) don't start a frame; another shown buffer does.
+	if (addr != s->drawing) {
+		s->drawing = addr;
+		++s->frames;
+		s->skipping = s->automatic ? s->behind && !s->skipping : s->frames & 1;
+		int slot = 0;
+		for (int i = 0; i < 4; ++i) {
+			if (s->buffer[i] == addr || !s->buffer[i]) {
+				slot = i;
+				break;
+			}
+		}
+		s->buffer[slot] = addr;
+		s->skipped[slot] = s->skipping;
+	}
+	return s->skipping;
+}
+
 // Follows the color images to count frames into shown buffers; true for a primitive to leave
-// undrawn (the RDP's time for it still counts).
+// undrawn (the RDP's time for it still counts). Not where HLE decides.
 static bool skipCommand(struct N64* n, const uint64_t* w, int op) {
 	struct FrameSkip* s = &n->skip;
+	if (s->hleDecides) {
+		return false;
+	}
 	if (op == 0x3F) {
-		uint32_t addr = w[0] & 0xFFFFFF;
-		s->intoShown = shownBuffer(n, addr) >= 0;
-		if (!s->intoShown) {
-			return false;
-		}
-		// Images drawn in between (textures) don't start a frame; another shown buffer does.
-		if (addr != s->drawing) {
-			s->drawing = addr;
-			s->skipping = ++s->frames & 1;
-			int slot = 0;
-			for (int i = 0; i < 4; ++i) {
-				if (s->buffer[i] == addr || !s->buffer[i]) {
-					slot = i;
-					break;
-				}
-			}
-			s->buffer[slot] = addr;
-			s->skipped[slot] = s->skipping;
-		}
+		frameSkipImage(n, w[0] & 0xFFFFFF);
 		return false;
 	}
 	bool draws = (op >= 0x08 && op <= 0x0F) || op == 0x24 || op == 0x25 || op == 0x36;

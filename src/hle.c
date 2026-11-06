@@ -283,6 +283,18 @@ static void charge(struct N64* n, struct Hle* h, int vertices, int triangles, in
 }
 
 static void emit(struct N64* n, struct Hle* h, uint64_t w) {
+	// A skipped frame's rectangles (and any triangle passed on as it is) left out whole.
+	if (!h->left) {
+		int op = (w >> 56) & 0x3F;
+		n->skip.dropping = n->skip.hleSkipping && ((op >= 0x08 && op <= 0x0F) || op == 0x24 || op == 0x25 || op == 0x36);
+	}
+	if (n->skip.dropping) {
+		if (!h->left) {
+			h->left = commandWords(w);
+		}
+		--h->left;
+		return;
+	}
 	if (h->count == LIST_MAX) {
 		flush(n, h, false);
 	}
@@ -816,6 +828,9 @@ static struct Vertex lerp(const struct Vertex* a, const struct Vertex* b, float 
 // rest as a fan.
 static void drawTriangle(struct N64* n, struct Hle* h, int i0, int i1, int i2) {
 	charge(n, h, 0, 1, 0);
+	if (n->skip.hleSkipping) {
+		return;
+	}
 	if (i0 >= VERTICES || i1 >= VERTICES || i2 >= VERTICES) {
 		return;
 	}
@@ -1049,6 +1064,11 @@ static uint32_t rdpCommand(struct N64* n, struct Hle* h, uint32_t pc, uint32_t w
 	}
 	if (op == 0xFD || op == 0xFE || op == 0xFF) {
 		w1 = address(h, w1);
+	}
+	// Frame Skip: HLE leaves a skipped frame's drawing out itself.
+	if (op == 0xFF && n->skip.on) {
+		n->skip.hleDecides = true;
+		n->skip.hleSkipping = frameSkipImage(n, w1 & 0xFFFFFF);
 	}
 	// Rare's texture shifts: each RGBA image moved by the table's next entry, unless its load block
 	// doesn't come out whole lines (then the image as it was, and no more shifts).

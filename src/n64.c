@@ -198,7 +198,8 @@ static void start(struct N64* n) {
 		n->rdpThreads = 1;
 	}
 	const char* skip = setting(n, "N64_FRAMESKIP");
-	n->skip.on = skip && skip[0] == '1';
+	n->skip.on = skip && (skip[0] == '1' || skip[0] == '2');
+	n->skip.automatic = skip && skip[0] == '2';
 	const char* rdpGl = setting(n, "N64_RDP_GL");
 	n->rdpGl = rdpGl && rdpGl[0] == '1';
 	if (n->rdpGl) {
@@ -670,6 +671,10 @@ bool n64GlPicture(struct N64* n, unsigned* framebuffer, int* x, int* y, int* wid
 	*width = s.w;
 	*height = s.h;
 	return *framebuffer != 0;
+}
+
+bool n64PictureSkipped(struct N64* n) {
+	return n->skip.on && frameSkipped(n, n->vi.reg[1] & 0xFFFFFF);
 }
 
 bool n64GlPrecompile(struct N64* n, double ms, int* done, int* total) {

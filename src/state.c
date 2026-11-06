@@ -127,6 +127,7 @@ bool n64StateLoad(struct N64* n, const void* data, size_t size, bool quick) {
 	n->viSharedProgram = was->viSharedProgram < 0 ? -1 : 0;
 	n->pictureGles = was->pictureBinding == 4 ? NULL : was->pictureGles, n->pictureBinding = was->pictureBinding, n->pictureRgba = was->pictureRgba;
 	n->skip.on = was->skip.on;
+	n->skip.automatic = was->skip.automatic;
 	n->lastPicture = was->lastPicture, n->viKept = was->viKept, n->viPool = was->viPool;
 	n->lastWidth = was->lastWidth, n->lastHeight = was->lastHeight, n->settings = was->settings;
 	n->audio = was->audio, n->audioCapacity = was->audioCapacity, n->audioCount = 0;
