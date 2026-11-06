@@ -121,6 +121,8 @@ bool glrRead(struct N64*, unsigned framebuffer, int x, int y, int w, int h, uint
 void rdpRectBounds(struct RDP*, uint64_t w0, int* cx0, int* cy0, int* x0, int* y0, int* x1, int* y1);
 // Whether the GPU has drawn RDRAM [addr, addr + len) and not given it back.
 bool glrDrew(struct N64*, uint32_t addr, uint32_t len);
+// Framebuffer Effects Fast (texture loads don't wait for the GPU's pixels).
+bool glrFastEffects(struct N64*);
 bool glrShows(struct N64*, uint32_t origin);
 void glrSyncRange(struct N64*, uint32_t addr, uint32_t len);
 unsigned glrPicture(struct N64*, uint32_t origin, uint32_t stride, int size, int rows, int* x, int* y);

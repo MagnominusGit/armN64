@@ -3446,8 +3446,8 @@ static void command(struct N64* n, struct RDP* r, const uint64_t* w, int op, int
 		n64Event(n, n->dp.syncAt);
 		return;
 	}
-	// A texture load from a color image the GPU drew waits for its pixels.
-	if (n->glr && n->rdpPending && (op == 0x30 || op == 0x33 || op == 0x34)) {
+	// A texture load from a color image the GPU drew waits for its pixels (unless set not to).
+	if (n->glr && n->rdpPending && (op == 0x30 || op == 0x33 || op == 0x34) && !glrFastEffects(n)) {
 		uint32_t addr, len;
 		loadSource(r, w, op, &addr, &len);
 		if (glrDrew(n, addr, len)) {

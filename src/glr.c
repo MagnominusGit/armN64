@@ -223,6 +223,8 @@ struct Glr {
 	GLuint native, nativeFramebuffer;
 	struct Program programs[PROGRAMS];
 	int programCount;
+	// Framebuffer Effects Fast: texture loads from images the GPU drew don't wait for its pixels.
+	bool fastEffects;
 	struct Texture textures[TEXTURES];
 	int textureBucket[TEXTURE_BUCKETS];
 	uint64_t clock;
@@ -1953,6 +1955,10 @@ void glrDraw(struct N64* n, struct RDP* r, const uint64_t* w, int op) {
 	}
 }
 
+bool glrFastEffects(struct N64* n) {
+	return n->glr && n->glr->fastEffects;
+}
+
 bool glrDrew(struct N64* n, uint32_t addr, uint32_t len) {
 	struct Glr* g = n->glr;
 	for (int i = 0; i < TARGETS; ++i) {
@@ -2235,6 +2241,8 @@ struct Glr* glrCreate(struct N64* n) {
 			g->samples = 0;
 		}
 	}
+	const char* effects = n->settings ? n->settings("N64_GL_FB_EFFECTS") : getenv("N64_GL_FB_EFFECTS");
+	g->fastEffects = effects && !strcmp(effects, "fast");
 	return g;
 }
 
