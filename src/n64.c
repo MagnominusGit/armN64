@@ -343,6 +343,10 @@ void n64RunField(struct N64* n) {
 		} else if (n->sp.gfxSince && n->cycles - n->sp.gfxSince > 60 * n->fieldCycles) {
 			hleTakeOver(n);
 		}
+		// A graphics task on the RSP's thread: done there by now, its end where its time says.
+		if (n->sp.hleDoneAt && n->cycles >= n->sp.hleDoneAt && rspThreadHleBusy(n)) {
+			rspThreadHleJoin(n);
+		}
 		if (n->sp.hleDoneAt && n->cycles >= n->sp.hleDoneAt && hleWaiting(n)) {
 			hleResume(n);
 		} else if (n->sp.hleDoneAt && n->cycles >= n->sp.hleDoneAt) {

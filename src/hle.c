@@ -205,6 +205,92 @@ static size_t commandWords(uint64_t w) {
 	       op == 0x24 || op == 0x25 ? 2 : 1;
 }
 
+// A FIFO microcode's commands go through its output buffer in RDRAM, the RDP's registers pointing
+// at them, where programs can see them (DPC_CURRENT, the buffer); a list longer than the buffer goes
+// round it, the RDP taking each fill. A frozen RDP takes none, so the microcode waits before writing
+// over a fill (Banjo-Kazooie's intro): the commands sent before that.
+static size_t fifoSend(struct N64* n, struct Hle* h, const uint64_t* list, size_t count, bool canStall) {
+	size_t const capacity = (h->fifoEnd - h->fifoStart) / 8;
+	for (size_t done = 0; done < count;) {
+		if (canStall && (n->dp.status & 2) && n->dp.current < n->dp.end) {
+			h->stalled = true;
+			return done;
+		}
+		size_t end = done;
+		while (end < count && end - done + commandWords(list[end]) <= capacity) {
+			end += commandWords(list[end]);
+		}
+		if (end == done) {
+			break;
+		}
+		end = end > count ? count : end;
+		n64RdramWrite(n, h->fifoStart, (uint32_t) (end - done) * 8);
+		for (size_t i = done; i < end; ++i) {
+			uint8_t* p = &n->rdram[h->fifoStart + (i - done) * 8];
+			for (int b = 0; b < 8; ++b) {
+				p[b] = (uint8_t) (list[i] >> (56 - 8 * b));
+			}
+		}
+		n->dp.status &= ~1u;
+		n->dp.start = n->dp.current = h->fifoStart;
+		n->dp.end = h->fifoStart + (uint32_t) (end - done) * 8;
+		rdpRun(n);
+		done = end;
+	}
+	return count;
+}
+
+// A FIFO microcode's buffer and the RDP's registers as a flush of count words leaves them, its
+// commands taken (hleThreadFeed runs them).
+static void fifoFill(struct N64* n, struct Hle* h, const uint64_t* list, size_t count) {
+	size_t const capacity = (h->fifoEnd - h->fifoStart) / 8;
+	for (size_t done = 0; done < count;) {
+		size_t end = done;
+		while (end < count && end - done + commandWords(list[end]) <= capacity) {
+			end += commandWords(list[end]);
+		}
+		if (end == done) {
+			break;
+		}
+		end = end > count ? count : end;
+		n64RdramWrite(n, h->fifoStart, (uint32_t) (end - done) * 8);
+		for (size_t i = done; i < end; ++i) {
+			uint8_t* p = &n->rdram[h->fifoStart + (i - done) * 8];
+			for (int b = 0; b < 8; ++b) {
+				p[b] = (uint8_t) (list[i] >> (56 - 8 * b));
+			}
+		}
+		n->dp.status &= ~1u;
+		n->dp.start = h->fifoStart;
+		n->dp.current = n->dp.end = h->fifoStart + (uint32_t) (end - done) * 8;
+		done = end;
+	}
+}
+
+// The commands of the flushes made on the RSP's thread, from flush *flush and word *fed to about
+// upTo (whole commands), on the main thread as the task goes on; the last flush's are drawn knowing
+// the task's end.
+void hleThreadFeed(struct N64* n, const uint64_t* words, const size_t* flushes, size_t flushCount, size_t* flush, size_t* fed, size_t upTo, uint64_t end) {
+	struct Hle* h = n->hle;
+	while (*flush < flushCount && *fed < upTo) {
+		size_t const from = *flush ? flushes[*flush - 1] : 0, to = flushes[*flush];
+		if (*fed == from && h->fifoEnd > h->fifoStart && to > from) {
+			fifoFill(n, h, words + from, to - from);
+		}
+		size_t stop = *fed;
+		while (stop < to && stop < upTo) {
+			stop += commandWords(words[stop]);
+		}
+		stop = stop > to ? to : stop;
+		n->sp.hleDoneAt = *flush + 1 == flushCount ? end : 0;
+		rdpCommands(n, words + *fed, stop - *fed);
+		*fed = stop;
+		if (stop == to) {
+			++*flush;
+		}
+	}
+}
+
 static void flush(struct N64* n, struct Hle* h, bool canStall) {
 	// A FIFO microcode waiting on a frozen RDP keeps waiting, its list as it is.
 	if (!h->dry && canStall && h->fifoEnd > h->fifoStart && h->count && (n->dp.status & 2) && n->dp.current < n->dp.end) {
@@ -218,39 +304,10 @@ static void flush(struct N64* n, struct Hle* h, bool canStall) {
 	}
 	h->count = sent = whole;
 	h->stalled = false;
-	size_t capacity = (h->fifoEnd - h->fifoStart) / 8;
-	if (!h->dry && capacity && h->count) {
-		// A FIFO microcode's commands go through its output buffer in RDRAM, the RDP's registers
-		// pointing at them, where programs can see them (DPC_CURRENT, the buffer); a list longer
-		// than the buffer goes round it, the RDP taking each fill. A frozen RDP takes none, so the
-		// microcode waits before writing over a fill (Banjo-Kazooie's intro).
-		for (size_t done = 0; done < h->count;) {
-			if (canStall && (n->dp.status & 2) && n->dp.current < n->dp.end) {
-				h->stalled = true;
-				sent = done;
-				break;
-			}
-			size_t end = done;
-			while (end < h->count && end - done + commandWords(h->list[end]) <= capacity) {
-				end += commandWords(h->list[end]);
-			}
-			if (end == done) {
-				break;
-			}
-			end = end > h->count ? h->count : end;
-			n64RdramWrite(n, h->fifoStart, (uint32_t) (end - done) * 8);
-			for (size_t i = done; i < end; ++i) {
-				uint8_t* p = &n->rdram[h->fifoStart + (i - done) * 8];
-				for (int b = 0; b < 8; ++b) {
-					p[b] = (uint8_t) (h->list[i] >> (56 - 8 * b));
-				}
-			}
-			n->dp.status &= ~1u;
-			n->dp.start = n->dp.current = h->fifoStart;
-			n->dp.end = h->fifoStart + (uint32_t) (end - done) * 8;
-			rdpRun(n);
-			done = end;
-		}
+	if (!h->dry && rspThreadQueue(n, h->list, h->count)) {
+		// On the RSP's thread: sent at the task's end (hleThreadWords).
+	} else if (!h->dry && h->fifoEnd > h->fifoStart && h->count) {
+		sent = fifoSend(n, h, h->list, h->count, canStall);
 	} else if (!h->dry) {
 		rdpCommands(n, h->list, h->count);
 	} else {
@@ -5010,7 +5067,12 @@ static void finishTask(struct N64* n, struct Hle* h) {
 	} else if (!h->dry && h->waiting) {
 		n->sp.hleDoneAt = n->cycles + 2048;
 	} else if (!h->dry) {
-		n->sp.hleDoneAt = n->cycles + 4096 + (costed(n, h) ? 1 : 64) * (uint64_t) h->timeCount;
+		uint64_t const span = 4096 + (costed(n, h) ? 1 : 64) * (uint64_t) h->timeCount;
+		if (rspThreadOn()) {
+			rspThreadHleSpan(n, span);
+		} else {
+			n->sp.hleDoneAt = n->cycles + span;
+		}
 	}
 	bool const waiting = h->waiting;
 	flush(n, h, !h->dry);
@@ -5018,7 +5080,7 @@ static void finishTask(struct N64* n, struct Hle* h) {
 	h->timeCount = !costed(n, h) ? h->count : waiting || h->stalled ? h->timeCount : 0;
 	if (h->stalled) {
 		n->sp.hleDoneAt = n->cycles + 2048;
-	} else if (!h->dry && !h->waiting) {
+	} else if (!h->dry && !h->waiting && !rspThreadOn()) {
 		n->dp.busyUntil = n->dp.busyUntil > n->sp.hleDoneAt ? n->dp.busyUntil : n->sp.hleDoneAt;
 	}
 }
@@ -5284,6 +5346,11 @@ bool hleGraphics(struct N64* n, bool dry) {
 	}
 	finishTask(n, h);
 	h->doneList = dry ? h->doneList : list;
+	// Through without a FIFO or waits: the next tasks of this microcode may run on the RSP's thread.
+	bool const plain = f == FAMILY_F3D || f == FAMILY_F3DEX || f == FAMILY_F3DEX2 || f == FAMILY_F3DPD || f == FAMILY_S2DEX || f == FAMILY_S2DEX2;
+	if (!dry && n->rspThread && !rspThreadOn() && plain && !h->waiting && !h->stalled) {
+		rspThreadHleGood(n, ucode);
+	}
 	return true;
 }
 

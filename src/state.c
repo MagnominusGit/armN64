@@ -41,6 +41,7 @@ bool n64StateSave(struct N64* n, void* data, size_t size, bool quick) {
 		return false;
 	}
 	if (n->rspThread) {
+		rspThreadHleJoin(n);
 		rspThreadJoin(n);
 	}
 	// What the renderers and the GPU drew goes to RDRAM first.

@@ -700,6 +700,15 @@ void rspThreadJoin(struct N64*);
 void spInterrupt(struct N64*, bool on);
 void rdpKick(struct N64*);
 void spDmaPages(struct N64*, uint32_t addr, uint32_t len, bool write);
+// High level graphics tasks on the thread.
+bool rspThreadOn(void);
+void rspThreadHleGood(struct N64*, uint32_t ucode);
+bool rspThreadHleStart(struct N64*, uint32_t ucode);
+bool rspThreadHleBusy(struct N64*);
+void rspThreadHleSpan(struct N64*, uint64_t span);
+void rspThreadHleJoin(struct N64*);
+bool rspThreadQueue(struct N64*, const uint64_t* words, size_t count);
+void hleThreadFeed(struct N64*, const uint64_t* words, const size_t* flushes, size_t flushCount, size_t* flush, size_t* fed, size_t upTo, uint64_t end);
 static inline void n64Event(struct N64* n, uint64_t at) {
 	if (at < n->eventAt) {
 		n->eventAt = at;

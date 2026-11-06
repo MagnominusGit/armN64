@@ -109,7 +109,8 @@ static void spWriteStatus(struct N64* n, uint32_t v) {
 		for (int i = 0; graphics && n->accuracy == ACCURACY_MLE && i < n->sp.gfxHighCount; ++i) {
 			high |= n->sp.gfxHigh[i] == hleUcodeHash(n);
 		}
-		if ((n->accuracy == ACCURACY_HLE && ((!n->gfxRsp && hleGraphics(n, false)) || audioHle(n))) || ((high || (graphics && n->accuracy != ACCURACY_HLE && !n->gfxRsp)) && hleGraphics(n, false))) {
+		bool const threaded = graphics && n->accuracy == ACCURACY_HLE && !n->gfxRsp && n->rspThread && rspThreadHleStart(n, hleUcodeHash(n));
+		if (threaded || (n->accuracy == ACCURACY_HLE && ((!n->gfxRsp && hleGraphics(n, false)) || audioHle(n))) || ((high || (graphics && n->accuracy != ACCURACY_HLE && !n->gfxRsp)) && hleGraphics(n, false))) {
 			n64Event(n, n->sp.hleDoneAt);
 			n->stats.gfxHle += graphics;
 		} else {
@@ -172,7 +173,7 @@ static void spWriteStatus(struct N64* n, uint32_t v) {
 			*s |= 0x80u << sig;
 		}
 	}
-	if (v & 0x01FFFE00u) {
+	if ((v & 0x01FFFE00u) && !rspThreadHleBusy(n)) {
 		hleSignalled(n);
 	}
 }

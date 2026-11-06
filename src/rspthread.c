@@ -1,7 +1,9 @@
 #include "n64.h"
+#include "rdp.h"
 
 #include <pthread.h>
 #include <stdatomic.h>
+#include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 
@@ -11,6 +13,11 @@
 // the rest of the machine (its interrupt, the RDP's commands) happens then, at those points in the
 // emulated time, so a run doesn't depend on how the threads are scheduled. What only the main thread
 // can do (waiting for the RDP, throwing away compiled CPU code) the RSP asks for and waits.
+//
+// A graphics task at high level runs on the thread too, from its start until its end in emulated
+// time, as the RSP would beside the CPU (a game leaves the task's memory alone until it ends): its
+// RDP commands wait for the main thread there, and the task ends at its start plus its own time.
+// Only microcodes that went through at high level before, without a FIFO or waits, run there.
 
 enum { IDLE, RUN, ASK, QUIT };
 enum { SPIN = 4000 };
@@ -30,7 +37,19 @@ struct RspThread {
 	int interruptCount;
 	uint64_t* words;
 	size_t wordCount, wordSpace;
+	// The high level graphics task on the thread: its start, its time, the microcodes it may run.
+	atomic_bool hleJob;
+	bool hleResult;
+	uint64_t hleStart, hleSpan, lastSpan;
+	uint32_t hleUcodes[16];
+	int hleUcodeCount;
+	// Where each of its flushes ends in words, and the words given to the RDP so far.
+	size_t* flushes;
+	size_t flushCount, flushSpace, hleFlush, hleFed;
+	bool hleReady;
 };
+
+static void hleSlice(struct N64*, struct RspThread*);
 
 static _Thread_local bool onThread;
 
@@ -76,9 +95,13 @@ static void* run(void* arg) {
 	struct RspThread* t = n->rspThread;
 	onThread = true;
 	while (await(t, IDLE, &t->sleeping) == RUN) {
-		n->catchingUp = true;
-		rspRunTo(n, t->until);
-		n->catchingUp = false;
+		if (atomic_load(&t->hleJob)) {
+			t->hleResult = hleGraphics(n, false);
+		} else {
+			n->catchingUp = true;
+			rspRunTo(n, t->until);
+			n->catchingUp = false;
+		}
 		set(t, IDLE, &t->waiting);
 	}
 	return NULL;
@@ -104,6 +127,7 @@ void rspThreadStop(struct N64* n) {
 	if (!t) {
 		return;
 	}
+	rspThreadHleJoin(n);
 	rspThreadJoin(n);
 	set(t, QUIT, &t->sleeping);
 	pthread_join(t->thread, NULL);
@@ -111,6 +135,7 @@ void rspThreadStop(struct N64* n) {
 	pthread_cond_destroy(&t->wake);
 	pthread_cond_destroy(&t->done);
 	free(t->words);
+	free(t->flushes);
 	free(t);
 	n->rspThread = NULL;
 }
@@ -128,6 +153,13 @@ static void answer(struct N64* n, struct RspThread* t) {
 void rspThreadJoin(struct N64* n) {
 	struct RspThread* t = n->rspThread;
 	if (onThread) {
+		return;
+	}
+	// A graphics task there is waited for at its end only.
+	if (atomic_load(&t->hleJob)) {
+		if (atomic_load_explicit(&t->state, memory_order_acquire) == ASK) {
+			answer(n, t);
+		}
 		return;
 	}
 	while (await(t, RUN, &t->waiting) == ASK) {
@@ -148,6 +180,7 @@ void rspThreadSlice(struct N64* n) {
 	if (atomic_load_explicit(&t->state, memory_order_acquire) == ASK) {
 		answer(n, t);
 	}
+	hleSlice(n, t);
 	if (n->cycles < n->rspWindowAt) {
 		return;
 	}
@@ -227,4 +260,146 @@ void rdpKick(struct N64* n) {
 		const uint8_t* p = d->status & 1 ? &n->sp.mem[d->current & 0xFF8] : &n->rdram[d->current & (RDRAM_SIZE - 8)];
 		t->words[t->wordCount++] = (uint64_t) be32(p) << 32 | be32(p + 4);
 	}
+}
+
+bool rspThreadOn(void) {
+	return onThread;
+}
+
+// A microcode that went through at high level on the main thread, without a FIFO or waits.
+void rspThreadHleGood(struct N64* n, uint32_t ucode) {
+	struct RspThread* t = n->rspThread;
+	for (int i = 0; i < t->hleUcodeCount; ++i) {
+		if (t->hleUcodes[i] == ucode) {
+			return;
+		}
+	}
+	if (t->hleUcodeCount < 16) {
+		t->hleUcodes[t->hleUcodeCount++] = ucode;
+	}
+}
+
+// The graphics task just started, on the thread when its microcode may run there: true then, and
+// the main thread looks at it again at hleDoneAt (an estimate from the last one's time).
+bool rspThreadHleStart(struct N64* n, uint32_t ucode) {
+	struct RspThread* t = n->rspThread;
+	bool good = false;
+	for (int i = 0; i < t->hleUcodeCount && !good; ++i) {
+		good = t->hleUcodes[i] == ucode;
+	}
+	if (!good || atomic_load(&t->hleJob) || (n->dp.status & 2)) {
+		return false;
+	}
+	rspThreadJoin(n);
+	t->hleStart = n->cycles;
+	t->hleSpan = 0;
+	t->hleReady = false;
+	t->hleFlush = t->hleFed = 0;
+	atomic_store(&t->hleJob, true);
+	set(t, RUN, &t->sleeping);
+	n->sp.hleDoneAt = n->cycles + (t->lastSpan > 8192 ? t->lastSpan * 3 / 4 : 4096);
+	return true;
+}
+
+bool rspThreadHleBusy(struct N64* n) {
+	return n->rspThread && atomic_load(&((struct RspThread*) n->rspThread)->hleJob);
+}
+
+// The task's time, from the thread.
+void rspThreadHleSpan(struct N64* n, uint64_t span) {
+	n->rspThread->hleSpan = span;
+}
+
+// The task's list made on the thread: its end is known (or, given up, the RSP runs it from here).
+static bool hleReady(struct N64* n, struct RspThread* t) {
+	if (t->hleReady) {
+		return true;
+	}
+	while (await(t, RUN, &t->waiting) == ASK) {
+		answer(n, t);
+	}
+	if (!t->hleResult) {
+		atomic_store(&t->hleJob, false);
+		t->wordCount = t->flushCount = 0;
+		glrQueueClear(n);
+		n->sp.hleDoneAt = 0;
+		n->sp.status &= ~1u;
+		return false;
+	}
+	t->hleReady = true;
+	n->sp.hleDoneAt = t->hleStart + t->hleSpan;
+	n64Event(n, n->sp.hleDoneAt);
+	return true;
+}
+
+// The RDP takes the commands as it would have at the task's start, a part at a time as the task
+// goes on, as the RSP would hand them over.
+static void hleFeed(struct N64* n, struct RspThread* t, size_t upTo) {
+	uint64_t const now = n->cycles, end = t->hleStart + t->hleSpan;
+	n->cycles = t->hleStart;
+	hleThreadFeed(n, t->words, t->flushes, t->flushCount, &t->hleFlush, &t->hleFed, upTo, end);
+	n->cycles = now;
+	n->sp.hleDoneAt = end;
+}
+
+// The graphics task on the thread at its end: the rest of its commands.
+void rspThreadHleJoin(struct N64* n) {
+	struct RspThread* t = n->rspThread;
+	if (!t || onThread || !atomic_load(&t->hleJob) || !hleReady(n, t)) {
+		return;
+	}
+	hleFeed(n, t, t->wordCount + 1);
+	atomic_store(&t->hleJob, false);
+	t->wordCount = t->flushCount = 0;
+	t->lastSpan = t->hleSpan;
+	n->sp.hleDoneAt = t->hleStart + t->hleSpan;
+	n->dp.busyUntil = n->dp.busyUntil > n->sp.hleDoneAt ? n->dp.busyUntil : n->sp.hleDoneAt;
+	if (n->sp.hleDoneAt > n->cycles) {
+		n64Event(n, n->sp.hleDoneAt);
+	}
+}
+
+// Each slice, the commands of the task's time so far.
+static void hleSlice(struct N64* n, struct RspThread* t) {
+	if (!atomic_load(&t->hleJob) || !hleReady(n, t) || !t->hleSpan) {
+		return;
+	}
+	uint64_t const passed = n->cycles - t->hleStart;
+	size_t const upTo = passed >= t->hleSpan ? t->wordCount : (size_t) ((unsigned __int128) t->wordCount * passed / t->hleSpan);
+	if (upTo > t->hleFed) {
+		hleFeed(n, t, upTo);
+	}
+}
+
+// High level RDP commands on the thread: kept for the join.
+bool rspThreadQueue(struct N64* n, const uint64_t* words, size_t count) {
+	struct RspThread* t = n->rspThread;
+	if (!onThread || !t) {
+		return false;
+	}
+	if (count && t->wordCount + count > t->wordSpace) {
+		size_t space = t->wordSpace ? t->wordSpace : 4096;
+		while (space < t->wordCount + count) {
+			space *= 2;
+		}
+		uint64_t* more = realloc(t->words, space * sizeof(*more));
+		if (!more) {
+			return true;
+		}
+		t->words = more, t->wordSpace = space;
+	}
+	if (count) {
+		memcpy(t->words + t->wordCount, words, count * sizeof(*words));
+	}
+	t->wordCount += count;
+	if (t->flushCount == t->flushSpace) {
+		size_t space = t->flushSpace ? t->flushSpace * 2 : 64;
+		size_t* more = realloc(t->flushes, space * sizeof(*more));
+		if (!more) {
+			return true;
+		}
+		t->flushes = more, t->flushSpace = space;
+	}
+	t->flushes[t->flushCount++] = t->wordCount;
+	return true;
 }
