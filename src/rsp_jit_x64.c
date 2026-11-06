@@ -4,9 +4,8 @@
 #include <stddef.h>
 #include <sys/mman.h>
 
-// x86-64 code for blocks of RSP instructions. Each block's first instruction takes its timing from
-// rspTimingStep (the instruction before it isn't known) unless the timing is plain; the rest have the
-// timing compiled in. Scalar instructions, DMEM loads and stores and most of the vector unit run
+// x86-64 code for blocks of RSP instructions, each instruction's timing compiled in (the first one's
+// pairing checked against lastDesc). Scalar instructions, DMEM loads and stores and most of the vector unit run
 // inline, the rest of the vector unit and COP0 through C but its SP status, DMA and semaphore reads. A
 // block that waits for a DMA (rspDmaWait) first skips the passes it would make. In lle, code stops after any instruction that takes the clock to the limit, as
 // rspCatchUp does; in mle and hle at the block's end.
@@ -104,14 +103,13 @@ static void loadTiming(struct Emitter* e) {
 // rspPlainTiming, for the block being compiled.
 static bool plainTiming;
 
-static void emitTiming(struct Emitter* e, uint32_t op, uint32_t prev, uint32_t pc) {
+static void emitTimingAs(struct Emitter* e, uint32_t op, bool pairable) {
 	if (plainTiming) {
 		xLea(e, 8, R13, M(R13, 1 + rspIsBranch(op)));
 		return;
 	}
 	int scalar[8], vector[16], nv, written[16], latency[16], nw;
 	int ns = rspTimingRegs(op, scalar, vector, &nv, written, latency, &nw);
-	bool pairable = rspPairable(prev, (pc - 4) & 0xFFC, op);
 	if (pairable) {
 		xAluRR(e, X_XOR, 4, R(RAX), RAX);
 	} else {
@@ -153,6 +151,61 @@ static void emitTiming(struct Emitter* e, uint32_t op, uint32_t prev, uint32_t p
 		xLea(e, 8, RAX, M(R15, latency[i]));
 		xStore(e, 8, written[i] < 32 ? scalarReady(written[i]) : vectorReady(written[i] - 32), RAX);
 	}
+}
+
+static void emitTiming(struct Emitter* e, uint32_t op, uint32_t prev, uint32_t pc) {
+	emitTimingAs(e, op, rspPairable(prev, (pc - 4) & 0xFFC, op));
+}
+
+// The first instruction's timing: whether it may pair with the instruction before, which another
+// block or the interpreter left in lastAlone, lastPc, inDelay and lastDesc (as rspTimingStep's
+// pairs() decides it), then as emitTiming.
+static void emitEntryTiming(struct Emitter* e, uint32_t op) {
+	loadTiming(e);
+	uint16_t self = rspTimingDesc(op);
+	if (self & 4) {
+		emitTimingAs(e, op, false);
+		return;
+	}
+	int rt = (op >> 16) & 31, rd = (op >> 11) & 31, sa = (op >> 6) & 31, code = op >> 26;
+	int forbidden[3], count = 0;
+	if (self & 2) {
+		forbidden[count++] = rt, forbidden[count++] = rd, forbidden[count++] = sa;
+	} else {
+		if (code == 0x3A || code == 0x32) {
+			forbidden[count++] = rt;
+		}
+		if (code == 0x12) {
+			forbidden[count++] = rd;
+		}
+	}
+	uint8_t* alone[8];
+	int sites = 0;
+	xTest(e, 4, R(RBP), RBP);
+	alone[sites++] = xJcc(e, CC_E, NULL);
+	xTestI(e, 4, RSP_AT(lastPc), 4);
+	alone[sites++] = xJcc(e, CC_NE, NULL);
+	xAluI(e, X_CMP, 1, RSP_AT(inDelay), 0);
+	alone[sites++] = xJcc(e, CC_NE, NULL);
+	// Not a branch, not CFC2 or CTC2, and the other unit (vector or scalar) than op's.
+	xMovzx(e, RAX, 2, RSP_AT(lastDesc));
+	xMovRR(e, 4, RCX, RAX);
+	xAluI(e, X_AND, 4, R(RCX), 7);
+	xAluI(e, X_CMP, 4, R(RCX), self & 2 ? 0 : 2);
+	alone[sites++] = xJcc(e, CC_NE, NULL);
+	// Nor reading a vector register it writes.
+	xShiftI(e, X_SHR, 4, R(RAX), 8);
+	for (int i = 0; i < count; ++i) {
+		xAluI(e, X_CMP, 4, R(RAX), forbidden[i] + 1);
+		alone[sites++] = xJcc(e, CC_E, NULL);
+	}
+	emitTimingAs(e, op, true);
+	uint8_t* done = xJmp(e, NULL);
+	for (int i = 0; i < sites; ++i) {
+		patchHere(e, alone[i]);
+	}
+	emitTimingAs(e, op, false);
+	patchHere(e, done);
 }
 
 // The DMEM address of rs + offset in ecx, and whether the access of size bytes wraps past the end.
@@ -1252,11 +1305,7 @@ void* rspCompile(struct N64* n, const uint8_t* ops, uint32_t count, uint32_t sta
 			loadTiming(e);
 			emitTiming(e, op, 0, pc);
 		} else if (k == 0) {
-			xMovRR(e, 8, RDI, RBX);
-			xMovI(e, RSI, op);
-			xMovI(e, RDX, pc);
-			callC(e, rspTimingStep);
-			loadTiming(e);
+			emitEntryTiming(e, op);
 		} else {
 			emitTiming(e, op, prev, pc);
 		}
@@ -1312,6 +1361,7 @@ void* rspCompile(struct N64* n, const uint8_t* ops, uint32_t count, uint32_t sta
 			}
 		}
 		xStoreI(e, 4, RSP_AT(lastOp), x->op);
+		xStoreI(e, 2, RSP_AT(lastDesc), rspTimingDesc(x->op));
 		xStoreI(e, 4, RSP_AT(lastPc), x->pc);
 		xStoreI(e, 1, RSP_AT(inDelay), x->kind == BRANCH);
 		storeTiming(e);
