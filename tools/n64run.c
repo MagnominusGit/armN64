@@ -12,6 +12,25 @@
 #include <unistd.h>
 #include <sys/syscall.h>
 
+// Whether field is one of a comma-separated list.
+static bool shotField(const char* fields, int field) {
+	while (*fields) {
+		char* end;
+		long const at = strtol(fields, &end, 10);
+		if (end == fields) {
+			return false;
+		}
+		if (at == field) {
+			return true;
+		}
+		if (*end != ',') {
+			return false;
+		}
+		fields = end + 1;
+	}
+	return false;
+}
+
 // N64SAMPLE=file: the main thread's program counter every half millisecond of its CPU time, as
 // 64-bit words, for a profile where perf isn't there (N64_PERFMAP=1 names the compiled blocks).
 enum { SAMPLES = 1 << 22 };
@@ -390,8 +409,11 @@ int main(int argc, char** argv) {
 			clock_gettime(CLOCK_MONOTONIC, &b);
 			picSecs += (b.tv_sec - a.tv_sec) + (b.tv_nsec - a.tv_nsec) / 1e9;
 		}
-		// N64SHOTS=prefix N64SHOTEVERY=fields: a picture every so many fields, as prefix-<field>.ppm.
-		if (getenv("N64SHOTS") && (f + 1) % atoi(getenv("N64SHOTEVERY") ? getenv("N64SHOTEVERY") : "300") == 0) {
+		// N64SHOTS=prefix with N64SHOTFIELDS=comma-separated fields or N64SHOTEVERY=interval.
+		const char* shotFields = getenv("N64SHOTFIELDS");
+		int shotEvery = atoi(getenv("N64SHOTEVERY") ? getenv("N64SHOTEVERY") : "300");
+		bool takeShot = shotFields ? shotField(shotFields, f + 1) : shotEvery > 0 && (f + 1) % shotEvery == 0;
+		if (getenv("N64SHOTS") && takeShot) {
 			char path[1024];
 			snprintf(path, sizeof(path), "%s-%05d.ppm", getenv("N64SHOTS"), f + 1);
 			writePicture(n, path);
