@@ -5065,6 +5065,36 @@ void hleResume(struct N64* n) {
 }
 
 // false leaves it to the RSP. Dry, it only counts the RDP commands it would send.
+// The hash microcodes are known by: the task's first 1 KB of code.
+uint32_t hleUcodeHash(struct N64* n) {
+	uint32_t code = be32(&n->sp.mem[0xFD0]) & 0xFFFFFF, ucode = 2166136261u;
+	for (uint32_t i = 0; i < 1024; ++i) {
+		ucode = (ucode ^ n->rdram[(code + i) & (RDRAM_SIZE - 1)]) * 16777619u;
+	}
+	return ucode;
+}
+
+// MLE: the graphics task the RSP hasn't finished in a second (a list its microcode can't run, made
+// for emulators' high-level graphics) runs at high level from its start, and so does its microcode
+// from then on.
+void hleTakeOver(struct N64* n) {
+	n->sp.gfxSince = 0;
+	// Not one high level doesn't run, nor one meant to run on (a Game Boy PPU's).
+	uint8_t running[64];
+	memcpy(running, &n->sp.mem[0xFC0], sizeof(running));
+	memcpy(&n->sp.mem[0xFC0], n->sp.gfxTask, sizeof(n->sp.gfxTask));
+	if (!hleGraphics(n, true) || n->hle->family == FAMILY_GBPPU) {
+		memcpy(&n->sp.mem[0xFC0], running, sizeof(running));
+		return;
+	}
+	if (n->sp.gfxHighCount < 4) {
+		n->sp.gfxHigh[n->sp.gfxHighCount++] = hleUcodeHash(n);
+	}
+	if (hleGraphics(n, false)) {
+		n64Event(n, n->sp.hleDoneAt);
+	}
+}
+
 bool hleGraphics(struct N64* n, bool dry) {
 	const uint8_t* task = &n->sp.mem[0xFC0];
 	if (be32(task) != 1) {

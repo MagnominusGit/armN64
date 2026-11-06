@@ -105,10 +105,18 @@ static void spWriteStatus(struct N64* n, uint32_t v) {
 		}
 		// A graphics or audio task run at high level: the RSP shows it running until hleDoneAt.
 		bool graphics = be32(&n->sp.mem[0xFC0]) == 1;
-		if (n->accuracy == ACCURACY_HLE && ((!n->gfxRsp && hleGraphics(n, false)) || audioHle(n))) {
+		bool high = false;
+		for (int i = 0; graphics && n->accuracy == ACCURACY_MLE && i < n->sp.gfxHighCount; ++i) {
+			high |= n->sp.gfxHigh[i] == hleUcodeHash(n);
+		}
+		if ((n->accuracy == ACCURACY_HLE && ((!n->gfxRsp && hleGraphics(n, false)) || audioHle(n))) || ((high || (graphics && n->accuracy != ACCURACY_HLE && !n->gfxRsp)) && hleGraphics(n, false))) {
 			n64Event(n, n->sp.hleDoneAt);
 			n->stats.gfxHle += graphics;
 		} else {
+			if (n->accuracy == ACCURACY_MLE && graphics) {
+				n->sp.gfxSince = n->cycles;
+				memcpy(n->sp.gfxTask, &n->sp.mem[0xFC0], sizeof(n->sp.gfxTask));
+			}
 			if (n->accuracy == ACCURACY_HLE && graphics) {
 				++n->stats.gfxRsp;
 				hleUcodeName(n, n->stats.gfxRspUcode, sizeof(n->stats.gfxRspUcode));

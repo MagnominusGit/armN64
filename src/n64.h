@@ -93,6 +93,12 @@ struct SP {
 	uint64_t dmaUntil, dmaFullUntil;
 	// A task hleGraphics ran: the RSP shows it running (doing nothing) until then.
 	uint64_t hleDoneAt;
+	// MLE: when the graphics task on the RSP started (0 when none) and its header; microcodes that
+	// never finished one, which run at high level from then on.
+	uint64_t gfxSince;
+	uint8_t gfxTask[64];
+	uint32_t gfxHigh[4];
+	int gfxHighCount;
 };
 
 struct RSP {
@@ -733,6 +739,8 @@ void rdpFeed(struct N64*, const uint64_t* words, size_t count);
 
 // hle.c
 bool hleGraphics(struct N64*, bool dry);
+uint32_t hleUcodeHash(struct N64*);
+void hleTakeOver(struct N64*);
 void hleUcodeName(struct N64*, char* out, size_t size);
 // audio_hle/audio_hle.c
 bool audioHle(struct N64*);

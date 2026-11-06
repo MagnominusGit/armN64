@@ -136,8 +136,10 @@ static void start(struct N64* n) {
 	const char* idleSkip = setting(n, "N64_IDLESKIP");
 	n->idle.enabled = n->accuracy == ACCURACY_HLE && !(idleSkip && idleSkip[0] == '0');
 	n->hleCheck = setting(n, "N64HLECHECK") != NULL;
+	// The game's own graphics microcode on the RSP, or the built-in one (any accuracy); unset, the
+	// built-in one with HLE only.
 	const char* gfxRsp = setting(n, "N64_GFX_RSP");
-	n->gfxRsp = gfxRsp && gfxRsp[0] == '1';
+	n->gfxRsp = gfxRsp ? gfxRsp[0] == '1' : n->accuracy != ACCURACY_HLE;
 	const char* hleTiming = setting(n, "N64_HLE_TIMING");
 	n->hleShortTasks = hleTiming && !strcmp(hleTiming, "short");
 	if (setting(n, "N64ISVIEWER") && !n->isViewer) {
@@ -335,6 +337,11 @@ void n64RunField(struct N64* n) {
 				n->dp.syncAt = n->dp.syncQueue[0];
 				memmove(n->dp.syncQueue, n->dp.syncQueue + 1, sizeof(n->dp.syncQueue[0]) * (size_t) --n->dp.syncQueued);
 			}
+		}
+		if (n->sp.gfxSince && (n->sp.status & 1)) {
+			n->sp.gfxSince = 0;
+		} else if (n->sp.gfxSince && n->cycles - n->sp.gfxSince > 60 * n->fieldCycles) {
+			hleTakeOver(n);
 		}
 		if (n->sp.hleDoneAt && n->cycles >= n->sp.hleDoneAt && hleWaiting(n)) {
 			hleResume(n);
