@@ -393,6 +393,26 @@ static bool interruptPending(struct N64* n) {
 	return (st & ST_IE) && !(st & (ST_EXL | ST_ERL)) && (cop0[CP0_CAUSE] & st & 0xFF00);
 }
 
+static uint32_t vpageUnknown(uint32_t page);
+
+// Compiled code finds cached mapped pages through vpages (data, and code's jitTable tags), by 32-bit
+// kernel addresses only.
+static void fillVpage(struct N64* n, uint32_t v, uint32_t paddr, uint64_t lo) {
+	if ((paddr & ~0xFFFu) >= RDRAM_SIZE || ((lo >> 3) & 7) == 2 || !cpuPlainMode(n)) {
+		return;
+	}
+	uint32_t delta = (paddr & ~0xFFFu) - (v & ~0xFFFu);
+	uint32_t page = v >> 12, writes = lo & 4 ? delta : vpageUnknown(page);
+	if (n->vpages[page] != delta || n->vpages[VPAGES + page] != writes) {
+		if (n->vpageFillCount < VPAGE_FILLED) {
+			n->vpageFilled[n->vpageFillCount] = page;
+		}
+		++n->vpageFillCount;
+		n->vpages[page] = delta;
+		n->vpages[VPAGES + page] = writes;
+	}
+}
+
 // Virtual to physical. Returns false after raising the exception.
 // A virtual page's entry in vpages when it isn't known: the page past RDRAM.
 static uint32_t vpageUnknown(uint32_t page) {
@@ -415,6 +435,22 @@ void cpuTlbChanged(struct N64* n) {
 		}
 	}
 	n->vpageFillCount = 0;
+}
+
+// The 4 KB pages a TLB entry covers (both halves) look up again, and compiled code there goes: false
+// when it covers too many.
+static bool tlbPagesChanged(struct N64* n, const struct TLBEntry* e) {
+	uint32_t const size = e->pageMask + 0x2000, first = ((uint32_t) e->entryHi & ~(size - 1)) >> 12;
+	if (size > 0x10000) {
+		return false;
+	}
+	for (uint32_t page = first; page < first + (size >> 12) && page < VPAGES; ++page) {
+		// kseg0 and kseg1 aren't mapped (an entry put there is one taken out of use).
+		if (page < 0x80000 || page >= 0xC0000) {
+			n->vpages[page] = n->vpages[VPAGES + page] = vpageUnknown(page);
+		}
+	}
+	return true;
 }
 
 // The privilege the CPU runs at: kernel (KSU 0, or EXL or ERL set), supervisor (KSU 1) or user;
@@ -550,20 +586,28 @@ static bool translate(struct N64* n, uint64_t vaddr, bool store, uint32_t* paddr
 	}
 	*paddr = ((uint32_t) (lo >> 6) << 12 & ~offsetMask) | (v & offsetMask);
 	c->cachedAccess = ((lo >> 3) & 7) != 2;
-	// Compiled code finds the cached pages through vpages, by 32-bit kernel addresses only.
-	if ((*paddr & ~0xFFFu) < RDRAM_SIZE && c->cachedAccess && cpuPlainMode(n) && (uint64_t) (int64_t) (int32_t) v == vaddr) {
-		uint32_t delta = (*paddr & ~0xFFFu) - (v & ~0xFFFu);
-		uint32_t page = v >> 12, writes = lo & 4 ? delta : vpageUnknown(page);
-		if (n->vpages[page] != delta || n->vpages[VPAGES + page] != writes) {
-			if (n->vpageFillCount < VPAGE_FILLED) {
-				n->vpageFilled[n->vpageFillCount] = page;
-			}
-			++n->vpageFillCount;
-			n->vpages[page] = delta;
-			n->vpages[VPAGES + page] = writes;
-		}
+	if ((uint64_t) (int64_t) (int32_t) v == vaddr) {
+		fillVpage(n, v, *paddr, lo);
 	}
 	return true;
+}
+
+void cpuCodePage(struct N64* n, uint32_t vaddr) {
+	struct CPU* c = &n->cpu;
+	uint32_t paddr;
+	if (segmentOf(c, (uint64_t) (int64_t) (int32_t) vaddr, &paddr) != SEG_MAPPED) {
+		return;
+	}
+	int const i = tlbFind(c, (uint64_t) (int64_t) (int32_t) vaddr);
+	if (i < 0) {
+		return;
+	}
+	const struct TLBEntry* e = &c->tlb[i];
+	uint32_t const offsetMask = (e->pageMask | 0x1FFF) >> 1;
+	uint64_t const lo = e->entryLo[(vaddr & (offsetMask + 1)) ? 1 : 0];
+	if (lo & 2) {
+		fillVpage(n, vaddr, ((uint32_t) (lo >> 6) << 12 & ~offsetMask) | (vaddr & offsetMask), lo);
+	}
 }
 
 // For tools: the physical address of a virtual one, without raising exceptions or changing state.
@@ -581,6 +625,28 @@ bool cpuPeekAddress(struct N64* n, uint64_t vaddr, uint32_t* paddr) {
 	uint32_t offsetMask = (e->pageMask | 0x1FFF) >> 1;
 	uint64_t lo = e->entryLo[((uint32_t) vaddr & (offsetMask + 1)) ? 1 : 0];
 	*paddr = ((uint32_t) (lo >> 6) << 12 & ~offsetMask) | ((uint32_t) vaddr & offsetMask);
+	return lo & 2;
+}
+
+// As cpuPeekAddress, for code about to run from blocks: a mapped page also goes into vpages, which
+// is otherwise filled by loads and stores only.
+bool cpuCodeAddress(struct N64* n, uint64_t vaddr, uint32_t* paddr) {
+	struct CPU* c = &n->cpu;
+	int const seg = segmentOf(c, vaddr, paddr);
+	if (seg != SEG_MAPPED) {
+		return seg != SEG_UNUSED;
+	}
+	int const i = tlbFind(c, vaddr);
+	if (i < 0) {
+		return false;
+	}
+	const struct TLBEntry* e = &c->tlb[i];
+	uint32_t offsetMask = (e->pageMask | 0x1FFF) >> 1;
+	uint64_t lo = e->entryLo[((uint32_t) vaddr & (offsetMask + 1)) ? 1 : 0];
+	*paddr = ((uint32_t) (lo >> 6) << 12 & ~offsetMask) | ((uint32_t) vaddr & offsetMask);
+	if (lo & 2) {
+		fillVpage(n, (uint32_t) vaddr, *paddr, lo);
+	}
 	return lo & 2;
 }
 
@@ -628,8 +694,12 @@ static void tlbWrite(struct N64* n, int i) {
 	// 32 bits of physical address: PFN bits 6-25.
 	e->entryLo[0] = (c->cop0[CP0_ENTRYLO0] & 0x03FFFFFE) | g;
 	e->entryLo[1] = (c->cop0[CP0_ENTRYLO1] & 0x03FFFFFE) | g;
-	// Writing an entry as it was maps nothing differently.
+	// Writing an entry as it was maps nothing differently; otherwise the pages it mapped and maps
+	// now (or, past a few, everything) look up again and their compiled code goes.
 	if (old.pageMask != e->pageMask || old.entryHi != e->entryHi || old.entryLo[0] != e->entryLo[0] || old.entryLo[1] != e->entryLo[1]) {
+		if (tlbPagesChanged(n, &old) && tlbPagesChanged(n, e)) {
+			return;
+		}
 		++n->blockGen;
 		cpuTlbChanged(n);
 	}

@@ -217,8 +217,8 @@ enum { VPAGES = 1 << 20, VPAGE_FILLED = 1024 };
 #define DCACHE_NONE 0xFFFFFFFFu
 #define DCACHE_FILLING 0x80000000u
 
-// Compiled code for a virtual address, good while blockGen is unchanged.
-enum { JIT_TABLE_SIZE = 1 << 14 };
+// Compiled code for a virtual address, good while its jitTag is unchanged.
+enum { JIT_TABLE_BITS = 14, JIT_TABLE_SIZE = 1 << JIT_TABLE_BITS };
 struct JitEntry {
 	uint32_t vaddr, gen;
 	void* code;
@@ -366,7 +366,7 @@ struct N64 {
 	uint32_t blockGen, codeGen;
 	bool useBlocks;
 	// Compiled blocks (jit_x64.c): the code arena, how far compiled code may run, and the code
-	// for recent addresses. blockGen also changes with the TLB.
+	// for recent addresses (good while their jitTag is as it was).
 	bool useJit;
 	uint8_t* jitArena;
 	// Where a thrown-away block's code now goes: the jitTable for the pc, else back to C.
@@ -500,6 +500,13 @@ struct N64 {
 };
 
 // n64.c
+// What a jitTable entry for vaddr holds as its tag: the physical address vpages gives it now (one past
+// RDRAM when the page isn't known), so code the TLB maps stays good while its page maps the same.
+void cpuCodePage(struct N64*, uint32_t vaddr);
+static inline uint32_t jitTag(const struct N64* n, uint32_t vaddr) {
+	return vaddr + n->vpages[vaddr >> 12];
+}
+
 struct N64* n64Create(void);
 void n64Destroy(struct N64*);
 bool n64LoadRom(struct N64*, const uint8_t* data, size_t size);
@@ -541,6 +548,7 @@ void cpuException(struct N64*, int code, int coprocessor);
 void cpuCheckInterrupts(struct N64*);
 uint32_t cpuCount(struct N64*);
 bool cpuPeekAddress(struct N64*, uint64_t vaddr, uint32_t* paddr);
+bool cpuCodeAddress(struct N64*, uint64_t vaddr, uint32_t* paddr);
 // Kernel mode, the only mode compiled code runs in.
 bool cpuPlainMode(const struct N64*);
 uint32_t cpuDcacheMiss(struct N64*, uint32_t vaddr, uint32_t paddr, uint64_t now, bool store);

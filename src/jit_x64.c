@@ -953,7 +953,11 @@ static void lookup(struct Emitter* e, uint8_t* leave) {
 	xLea(e, 8, RDX, MI(RBX, RCX, 1, (int32_t) offsetof(struct N64, jitTable)));
 	xAluRM(e, X_CMP, 4, RAX, M(RDX, (int32_t) offsetof(struct JitEntry, vaddr)));
 	xJcc(e, CC_NE, leave);
-	xLoad(e, 4, RAX, N64_AT(blockGen));
+	// Good while its page maps where it was compiled (jitTag): the address through vpages.
+	xLoad(e, 8, R8, N64_AT(vpages));
+	xMovRR(e, 4, RCX, RAX);
+	xShiftI(e, X_SHR, 4, R(RCX), 12);
+	xAluRM(e, X_ADD, 4, RAX, MI(R8, RCX, 4, 0));
 	xAluRM(e, X_CMP, 4, RAX, M(RDX, (int32_t) offsetof(struct JitEntry, gen)));
 	xJcc(e, CC_NE, leave);
 	xJmpM(e, M(RDX, (int32_t) offsetof(struct JitEntry, code)));

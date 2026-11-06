@@ -149,6 +149,9 @@ void blocksFree(struct N64* n) {
 		}
 	}
 	jitReset(n);
+	for (uint32_t i = 0; i < JIT_TABLE_SIZE; ++i) {
+		n->jitTable[i].vaddr = 1;
+	}
 }
 
 // From paddr to a branch's delay slot, the end of the page or BLOCK_MAX instructions.
@@ -404,7 +407,7 @@ void blocksRun(struct N64* n) {
 	do {
 		uint32_t v = (uint32_t) c->pc;
 		struct JitEntry* je = &n->jitTable[(v >> 2) & (JIT_TABLE_SIZE - 1)];
-		if (je->vaddr == v && je->gen == n->blockGen && c->pc == (uint64_t) (int64_t) (int32_t) v && !c->nextInDelay) {
+		if (je->vaddr == v && je->gen == jitTag(n, v) && c->pc == (uint64_t) (int64_t) (int32_t) v && !c->nextInDelay) {
 			jitRun(n, je->code);
 			continue;
 		}
@@ -413,7 +416,7 @@ void blocksRun(struct N64* n) {
 		// delay slot reached by leaving a block early, takes the plain step.
 		bool mapped = (v & 0xC0000000) != 0x80000000;
 		if ((v & 0xE0000000) == 0xA0000000 || (v & 3) || c->pc != (uint64_t) (int64_t) (int32_t) v ||
-		    c->nextInDelay || (mapped && !cpuPeekAddress(n, v, &paddr)) || paddr >= RDRAM_SIZE) {
+		    c->nextInDelay || (mapped && !cpuCodeAddress(n, c->pc, &paddr)) || paddr >= RDRAM_SIZE) {
 			cpuStep(n);
 			n->cycles += n->opCycles + c->stall;
 			c->stall = 0;
@@ -447,7 +450,11 @@ void blocksRun(struct N64* n) {
 			}
 		}
 		if (b->code) {
-			*je = (struct JitEntry) { v, n->blockGen, b->code };
+			// Kept only with the page known: an unknown one's tag is the same for every page.
+			cpuCodePage(n, v);
+			if (jitTag(n, v) < RDRAM_SIZE) {
+				*je = (struct JitEntry) { v, jitTag(n, v), b->code };
+			}
 			jitRun(n, b->code);
 			continue;
 		}
