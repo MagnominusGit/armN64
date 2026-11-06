@@ -1921,6 +1921,36 @@ static void depthTriangle(struct N64* n, struct Glr* g, struct RDP* r, const uin
 	g->depthImage = false, g->fastValid = false;
 }
 
+// A fill the RDP draws in RDRAM over rows of one target only: those rows go back first and load again
+// after, the rest staying on the GPU. False when another target holds any of them.
+static bool fillRows(struct N64* n, struct Glr* g, struct RDP* r, const uint64_t* w, int op, int from, int to) {
+	uint32_t const bytes = r->colorSize == 3 ? 4 : r->colorSize == 1 ? 1 : 2, lo = r->colorAddr + (uint32_t) from * r->colorWidth * bytes,
+	               hi = r->colorAddr + (uint32_t) to * r->colorWidth * bytes;
+	struct Target* t = NULL;
+	for (int i = 0; i < TARGETS; ++i) {
+		struct Target* o = &g->target[i];
+		uint32_t const oRow = o->width * (o->size == 3 ? 4 : o->size == 1 ? 1 : 2);
+		int const rows = o->loadedRows > o->dirtyTo ? o->loadedRows : o->dirtyTo;
+		if (!o->texture || !rows) {
+			continue;
+		}
+		if (o->addr == r->colorAddr && o->width == r->colorWidth && o->size == r->colorSize) {
+			t = o;
+		} else if (o->addr < hi && lo < o->addr + (uint32_t) rows * oRow) {
+			return false;
+		}
+	}
+	flushBatch(n, g);
+	if (t && t->dirtyTo > from && t->dirtyFrom < to) {
+		writePixels(n, t, from > t->dirtyFrom ? from : t->dirtyFrom, to < t->dirtyTo ? to : t->dirtyTo);
+	}
+	rdpDrawSoftware(n, r, w, op);
+	if (t && from < t->loadedRows) {
+		loadPixels(n, g, t, from, to < t->loadedRows ? to : t->loadedRows);
+	}
+	return true;
+}
+
 static void draw(struct N64* n, struct RDP* r, const uint64_t* w, int op) {
 	struct Glr* g = n->glr;
 	glesUse(g->gles);
@@ -1980,9 +2010,13 @@ static void draw(struct N64* n, struct RDP* r, const uint64_t* w, int op) {
 		// A fill taller than a target (several images at once), or one whose pixels aren't all the same
 		// (an 8-bit image takes the fill's bytes in turn, a 16-bit one its two halves): in RDRAM.
 		bool uniform = r->colorSize == 3 || (r->colorSize == 2 && (r->fillColor >> 16) == (r->fillColor & 0xFFFF));
-		if (r->cycleType == 3 && ((y1 >> 2) >= TARGET_ROWS || !uniform)) {
-			glrSync(n);
-			rdpDrawSoftware(n, r, w, op);
+		// The rows it reaches, the scissor's taken off.
+		int end = (y1 >> 2) + 1 < (r->scissorY1 + 3) >> 2 ? (y1 >> 2) + 1 : (r->scissorY1 + 3) >> 2;
+		if (r->cycleType == 3 && (end > TARGET_ROWS || !uniform)) {
+			if (end > TARGET_ROWS || !fillRows(n, g, r, w, op, y0 >> 2, end)) {
+				glrSync(n);
+				rdpDrawSoftware(n, r, w, op);
+			}
 			return;
 		}
 		if (r->cycleType == 3) {
