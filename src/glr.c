@@ -630,7 +630,7 @@ static struct Program* program(struct Glr* g, struct ProgramKey key) {
 		return NULL;
 	}
 	struct Gl* gl = &g->gl;
-	static char source[8192];
+	static char source[65536];
 	char line[1024];
 	int cycleType = key.modes & MODE_CYCLE;
 	if (g->fetch && !g->barrier) {
