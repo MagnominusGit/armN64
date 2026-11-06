@@ -330,6 +330,12 @@ int main(int argc, char** argv) {
 			memset(n->dirtyPages, 0xFF, sizeof(n->dirtyPages));
 		}
 		rdpDumping = rdpDump && f >= rdpDumpFrom;
+		// N64CHEAT=code: a GameShark code (codes joined by "+") applied before each field.
+		static struct Cheats cheats;
+		if (f == 0 && getenv("N64CHEAT")) {
+			cheatsSet(&cheats, 0, true, getenv("N64CHEAT"));
+		}
+		cheatsApply(n, &cheats);
 		n64RunField(n);
 		if (rdpDumping) {
 			rdpDumpWords((uint32_t[]) { 4 }, 1);

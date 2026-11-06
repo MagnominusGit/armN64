@@ -43,6 +43,8 @@ static retro_log_printf_t logPrintf;
 static retro_set_rumble_state_t setRumble;
 
 static struct N64* machine;
+// GameShark codes from the frontend (retro_cheat_set).
+static struct Cheats cheats;
 // The game as it was loaded (and the 64DD's IPL for a disk), to start again on a reset.
 static uint8_t* game;
 static size_t gameSize;
@@ -1043,6 +1045,7 @@ void retro_run(void) {
 	readPorts();
 	machine->viFilters = optionIs(environment, "armn64_vi_filters", "on") ||
 	                     (!optionIs(environment, "armn64_vi_filters", "off") && machine->accuracy != ACCURACY_HLE && !machine->rdpGl);
+	cheatsApply(machine, &cheats);
 	n64RunField(machine);
 	int width = 0, height = 0;
 	// The GPU RDP's picture goes from its buffer to the frontend's framebuffer without the CPU, and so
@@ -1128,9 +1131,11 @@ bool retro_unserialize(const void* data, size_t size) {
 }
 
 void retro_cheat_reset(void) {
+	cheatsClear(&cheats);
 }
 
 void retro_cheat_set(unsigned index, bool enabled, const char* code) {
+	cheatsSet(&cheats, index, enabled, code);
 }
 
 unsigned retro_get_region(void) {

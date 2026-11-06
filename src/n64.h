@@ -545,6 +545,21 @@ int n64Picture(struct N64*, uint32_t* out, int* width, int* height);
 // shows it from there); false when the VI shows nothing or the GPU isn't used.
 // The shape the VI's window has on a TV (width over height), for the frontend's aspect ratio.
 float n64TvAspect(struct N64*);
+uint32_t n64Peek(struct N64*, uint32_t vaddr, int size);
+void n64Poke(struct N64*, uint32_t vaddr, int size, uint32_t value);
+
+// GameShark codes (cheats.c), applied before each field.
+struct Cheat {
+	uint32_t* words;
+	size_t count;
+};
+struct Cheats {
+	struct Cheat* list;
+	size_t count;
+};
+void cheatsClear(struct Cheats*);
+void cheatsSet(struct Cheats*, unsigned index, bool enabled, const char* code);
+void cheatsApply(struct N64*, const struct Cheats*);
 bool n64PictureStart(struct N64*, int* width, int* height);
 // After n64PictureStart, the GL buffer holding the picture in RGBA bytes (with the GPU RDP, in its
 // context); 0 when it is elsewhere.

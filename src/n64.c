@@ -692,6 +692,31 @@ bool n64GlPrecompile(struct N64* n, double ms, int* done, int* total) {
 	return glrPrecompile(n, ms, done, total);
 }
 
+// A cheat's view of memory at a KSEG0 or KSEG1 address: 1 or 2 bytes as the CPU sees them, from its
+// D-cache when the line is there.
+uint32_t n64Peek(struct N64* n, uint32_t vaddr, int size) {
+	struct CPU* c = &n->cpu;
+	uint32_t const p = vaddr & 0x7FFFFF, i = (vaddr >> 4) & 511;
+	bool const cached = c->dcacheTag[i] != DCACHE_NONE && (c->dcacheTag[i] & ~DCACHE_FILLING) == (p & ~0xFu) && !n->compat;
+	const uint8_t* b = cached ? &c->dcacheData[i][p & 15] : &n->rdram[p];
+	return size == 2 ? (uint32_t) b[0] << 8 | b[1] : b[0];
+}
+
+// A cheat's write: RDRAM there, and the caches' copies of its line, its compiled code thrown away.
+void n64Poke(struct N64* n, uint32_t vaddr, int size, uint32_t value) {
+	struct CPU* c = &n->cpu;
+	uint32_t const p = vaddr & 0x7FFFFF & ~(uint32_t) (size - 1), d = (vaddr >> 4) & 511, k = (vaddr >> 5) & 511;
+	uint8_t const bytes[2] = { (uint8_t) (size == 2 ? value >> 8 : value), (uint8_t) value };
+	n64RdramWrite(n, p, (uint32_t) size);
+	memcpy(&n->rdram[p], bytes, (size_t) size);
+	if (c->dcacheTag[d] != DCACHE_NONE && (c->dcacheTag[d] & ~DCACHE_FILLING) == (p & ~0xFu)) {
+		memcpy(&c->dcacheData[d][p & 15], bytes, (size_t) size);
+	}
+	if (c->icacheTag[k] == (p & ~31u)) {
+		memcpy(&c->icacheData[k][p & 31], bytes, (size_t) size);
+	}
+}
+
 float n64TvAspect(struct N64* n) {
 	struct ViSetup s;
 	return viSetup(n, &s) ? s.tvAspect : 4.0f / 3.0f;
