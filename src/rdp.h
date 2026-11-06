@@ -118,6 +118,7 @@ void glrQueueClear(struct N64*);
 // Brings what the GPU drew back to RDRAM.
 void glrSync(struct N64*);
 void glrStateLoaded(struct Glr*);
+void glrStateReplaced(struct Glr*);
 bool glrRead(struct N64*, unsigned framebuffer, int x, int y, int w, int h, uint32_t* out);
 // Whether the VI's framebuffer (origin) is one the GPU draws: then the picture is the GPU's,
 // without bringing it back (a frontend shows that texture).

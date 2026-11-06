@@ -121,8 +121,11 @@ bool n64StateLoad(struct N64* n, const void* data, size_t size, bool quick) {
 	n->rdpTap = was->rdpTap, n->rdpThreads = was->rdpThreads, n->rdpGpu = was->rdpGpu, n->rdpGl = was->rdpGl;
 	n->glr = was->glr, n->glrScale = was->glrScale;
 	n->rspThread = was->rspThread, n->rspWindow = was->rspWindow;
-	n->viGpu = was->viGpu, n->viFilters = was->viFilters, n->viGles = was->viGles, n->viSharedProgram = was->viSharedProgram;
-	n->pictureGles = was->pictureGles, n->pictureBinding = was->pictureBinding, n->pictureRgba = was->pictureRgba;
+	n->viGpu = was->viGpu, n->viFilters = was->viFilters, n->viGles = was->viGles;
+	// The GPU RDP starts again (rdpStateLoad): the VI's program goes into its new context, and a
+	// picture still in the old one isn't shown.
+	n->viSharedProgram = was->viSharedProgram < 0 ? -1 : 0;
+	n->pictureGles = was->pictureBinding == 4 ? NULL : was->pictureGles, n->pictureBinding = was->pictureBinding, n->pictureRgba = was->pictureRgba;
 	n->skip.on = was->skip.on;
 	n->lastPicture = was->lastPicture, n->viKept = was->viKept, n->viPool = was->viPool;
 	n->lastWidth = was->lastWidth, n->lastHeight = was->lastHeight, n->settings = was->settings;

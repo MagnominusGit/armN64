@@ -3611,10 +3611,15 @@ void rdpStateGet(struct N64* n, struct RDP* out) {
 // start again from it when next drawn; with keepGl the GL renderer stays, forgetting what it knew of
 // the RDP's state.
 void rdpStateLoad(struct N64* n, const struct RDP* saved, bool keepGl) {
-	struct Glr* glr = keepGl ? n->glr : NULL;
+	// The GL renderer stays either way: a quick state keeps its pictures, a full one drops them.
+	struct Glr* glr = n->glr;
 	if (glr) {
 		n->glr = NULL;
-		glrStateLoaded(glr);
+		if (keepGl) {
+			glrStateLoaded(glr);
+		} else {
+			glrStateReplaced(glr);
+		}
 	}
 	rdpDestroy(n);
 	n->glr = glr;

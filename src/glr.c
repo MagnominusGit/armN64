@@ -2386,6 +2386,20 @@ void glrStateLoaded(struct Glr* g) {
 	memset(&g->applied, 0xFF, sizeof(g->applied));
 }
 
+// A full save state loaded: what the renderer drew belongs to the machine before it, so its pictures
+// and draws not yet made are dropped (nothing goes back to RDRAM) and the targets fill from the loaded
+// RDRAM again. The programs stay, so nothing compiles again.
+void glrStateReplaced(struct Glr* g) {
+	glrStateLoaded(g);
+	g->batchCount = 0;
+	g->stateSet = false;
+	for (int i = 0; i < TARGETS; ++i) {
+		g->target[i].dirtyFrom = g->target[i].dirtyTo = 0;
+		g->target[i].loadedRows = 0;
+		g->target[i].marked = 0;
+	}
+}
+
 void glrForget(struct N64* n) {
 	if (n->glr) {
 		memset(&n->glr->applied, 0xFF, sizeof(n->glr->applied));
