@@ -96,7 +96,7 @@ static bool rumbling[4];
 static struct retro_core_option_v2_category optionCategories[] = {
 	{ "system", "System", "How exactly the console is emulated, and how fast it runs." },
 	{ "video", "Video", "How the picture is drawn and shown." },
-	{ "input", "Input", "The stick and rumble." },
+	{ "input", "Input", "The stick, button swaps, two-controller play and rumble." },
 	{ "paks", "Controller Paks", "What is in each controller's slot, and the Controller Pak Manager." },
 	{ "advanced", "Advanced", "Settings for particular games and devices." },
 	{ NULL, NULL, NULL },
@@ -132,6 +132,18 @@ static struct retro_core_option_v2_definition optionDefinitions[] = {
 	  NULL, "input", { { "disabled", "Off" }, { "enabled", "On" }, { NULL, NULL } }, "disabled" },
 	{ "armn64_stick_gate", "Octagonal Stick Gate", NULL,
 	  "Shapes the stick's range like the N64 controller's octagonal gate instead of a circle.",
+	  NULL, "input", { { "disabled", "Off" }, { "enabled", "On" }, { NULL, NULL } }, "disabled" },
+	{ "armn64_stick_sensitivity", "Stick Sensitivity", NULL,
+	  "Scales the stick, for sticks that reach further or less far than the N64's. Above 1x reaches the full tilt sooner.",
+	  NULL, "input", { { "50", "0.5x" }, { "60", "0.6x" }, { "70", "0.7x" }, { "80", "0.8x" }, { "90", "0.9x" }, { "100", "1.0x" }, { "110", "1.1x" }, { "120", "1.2x" }, { "130", "1.3x" }, { "140", "1.4x" }, { "150", "1.5x" }, { "160", "1.6x" }, { "170", "1.7x" }, { "180", "1.8x" }, { "190", "1.9x" }, { "200", "2.0x" }, { NULL, NULL } }, "100" },
+	{ "armn64_control_swap", "Control Swap", NULL,
+	  "D-Pad / Left Stick: the D-pad moves the control stick, the left stick presses the D-pad, and L1 presses Z and L2 presses L. Both Sticks: the two sticks added together move the control stick (no C buttons on the right stick). Left / Right Stick: the right stick moves the control stick and the left stick presses the C buttons. The hotkeys switch them while playing.",
+	  NULL, "input", { { "disabled", "Off" }, { "dpad", "D-Pad / Left Stick" }, { "both", "Both Sticks" }, { "sticks", "Left / Right Stick" }, { NULL, NULL } }, "disabled" },
+	{ "armn64_swap_hotkeys", "Control Swap Hotkeys", NULL,
+	  "On player 1's controller: Start or Select held with any D-pad direction switches D-Pad / Left Stick (the game doesn't see the D-pad meanwhile, and a quick press of Start alone reaches it as you let go); Start or Select with R3 switches Left / Right Stick; L3 and R3 pressed together switch Both Sticks. Each switches its swap on, or off if it's on.",
+	  NULL, "input", { { "start", "Start + D-Pad / R3, L3 + R3" }, { "select", "Select + D-Pad / R3, L3 + R3" }, { "disabled", "Off" }, { NULL, NULL } }, "start" },
+	{ "armn64_dual_controller", "Dual Controllers", NULL,
+	  "Player 1's controller is two N64 controllers, one in each hand, for games with a two-controller mode: controller 1 has the left stick, D-pad, L1, L2, Start and B/Y as A/B; controller 2 has the right stick (its stick), R2 (its Z), R1 and A/X as A/B. Players 2 and 3 become controllers 3 and 4.",
 	  NULL, "input", { { "disabled", "Off" }, { "enabled", "On" }, { NULL, NULL } }, "disabled" },
 	{ "armn64_pak1", "Player 1 Pak", NULL,
 	  "What is in controller 1's slot. Transfer Pak (on Restart): the Game Boy ROM in system/armN64/TransferPak1.",
@@ -848,16 +860,20 @@ void retro_reset(void) {
 	}
 }
 
-// The stick as the controller reports it: about 80 each way; or with the octagonal gate, the input's
-// circle stretched to the gate's octagon (85 across, corners at 69, 69) and kept inside it.
-static void stick(unsigned port, bool gate, int* x, int* y) {
-	int const ix = inputState(port, RETRO_DEVICE_ANALOG, RETRO_DEVICE_INDEX_ANALOG_LEFT, RETRO_DEVICE_ID_ANALOG_X);
-	int const iy = inputState(port, RETRO_DEVICE_ANALOG, RETRO_DEVICE_INDEX_ANALOG_LEFT, RETRO_DEVICE_ID_ANALOG_Y);
+// The stick as the controller reports it from ix, iy (-32768 to 32767) times the sensitivity: about 80
+// each way; or with the octagonal gate, the input's circle stretched to the gate's octagon (85
+// across, corners at 69, 69) and kept inside it.
+static void stick(int ix, int iy, bool gate, int* x, int* y) {
+	const char* sensitivity = optionValue(environment, "armn64_stick_sensitivity");
+	double const k = sensitivity ? atoi(sensitivity) / 100.0 : 1;
+	double dx = ix / 32768.0 * (k > 0 ? k : 1), dy = iy / 32768.0 * (k > 0 ? k : 1);
 	if (!gate) {
-		*x = ix * 80 / 32768, *y = iy * 80 / 32768;
+		dx = dx < -1 ? -1 : dx > 1 ? 1 : dx;
+		dy = dy < -1 ? -1 : dy > 1 ? 1 : dy;
+		*x = (int) (dx * 80), *y = (int) (dy * 80);
 		return;
 	}
-	double dx = ix / 32768.0, dy = iy / 32768.0, r = sqrt(dx * dx + dy * dy);
+	double r = sqrt(dx * dx + dy * dy);
 	if (r < 1e-6) {
 		*x = *y = 0;
 		return;
@@ -871,27 +887,134 @@ static void stick(unsigned port, bool gate, int* x, int* y) {
 	*x = (int) lround(dx * r * edge), *y = (int) lround(dy * r * edge);
 }
 
-// A controller as the PIF reads it: the buttons in the top half, then the stick's X and Y.
-static uint32_t readController(unsigned port) {
-	static const struct {
-		unsigned id;
-		uint32_t bit;
-	} buttons[] = {
-		{ RETRO_DEVICE_ID_JOYPAD_B, 1u << 31 }, { RETRO_DEVICE_ID_JOYPAD_Y, 1u << 30 }, { RETRO_DEVICE_ID_JOYPAD_L2, 1u << 29 },
-		{ RETRO_DEVICE_ID_JOYPAD_START, 1u << 28 }, { RETRO_DEVICE_ID_JOYPAD_UP, 1u << 27 }, { RETRO_DEVICE_ID_JOYPAD_DOWN, 1u << 26 },
-		{ RETRO_DEVICE_ID_JOYPAD_LEFT, 1u << 25 }, { RETRO_DEVICE_ID_JOYPAD_RIGHT, 1u << 24 }, { RETRO_DEVICE_ID_JOYPAD_L, 1u << 21 },
-		{ RETRO_DEVICE_ID_JOYPAD_R, 1u << 20 },
-	};
-	uint32_t state = 0;
-	for (size_t i = 0; i < sizeof(buttons) / sizeof(*buttons); ++i) {
-		state |= inputState(port, RETRO_DEVICE_JOYPAD, 0, buttons[i].id) ? buttons[i].bit : 0;
+// Control Swap's hotkeys on player 1's controller. With Start or Select + D-pad, the D-pad is held back
+// from the game while that is held, and Start too: a short press alone reaches it as it's let go (for
+// two fields), a long one once it's held that long.
+enum { START_LONG = 20, START_PULSE = 2 };
+static bool startCombo, selectCombo, selectHeld;
+static int startFields, startPulse;
+static bool startUsed;
+
+static void swapHotkeys(void) {
+	startCombo = optionIs(environment, "armn64_swap_hotkeys", "start") || !optionValue(environment, "armn64_swap_hotkeys");
+	selectCombo = optionIs(environment, "armn64_swap_hotkeys", "select");
+	bool const start = startCombo && inputState(0, RETRO_DEVICE_JOYPAD, 0, RETRO_DEVICE_ID_JOYPAD_START);
+	selectHeld = selectCombo && inputState(0, RETRO_DEVICE_JOYPAD, 0, RETRO_DEVICE_ID_JOYPAD_SELECT);
+	startPulse -= startPulse > 0;
+	if (start) {
+		++startFields;
+	} else {
+		if (startFields && startFields <= START_LONG && !startUsed) {
+			startPulse = START_PULSE;
+		}
+		startFields = 0;
+		startUsed = false;
 	}
-	// The C buttons from the right stick, pushed past halfway.
-	int cx = inputState(port, RETRO_DEVICE_ANALOG, RETRO_DEVICE_INDEX_ANALOG_RIGHT, RETRO_DEVICE_ID_ANALOG_X);
-	int cy = inputState(port, RETRO_DEVICE_ANALOG, RETRO_DEVICE_INDEX_ANALOG_RIGHT, RETRO_DEVICE_ID_ANALOG_Y);
-	state |= (cy < -16384 ? 1u << 19 : 0) | (cy > 16384 ? 1u << 18 : 0) | (cx < -16384 ? 1u << 17 : 0) | (cx > 16384 ? 1u << 16 : 0);
+	bool dpad = false;
+	for (unsigned id = RETRO_DEVICE_ID_JOYPAD_UP; id <= RETRO_DEVICE_ID_JOYPAD_RIGHT; ++id) {
+		dpad |= inputState(0, RETRO_DEVICE_JOYPAD, 0, id) != 0;
+	}
+	bool const on = startCombo || selectCombo;
+	static const struct {
+		const char* value, * message;
+	} swaps[3] = {
+		{ "dpad", "Control Swap: D-Pad / Left Stick" },
+		{ "both", "Control Swap: Both Sticks" },
+		{ "sticks", "Control Swap: Left / Right Stick" },
+	};
+	bool const l3 = inputState(0, RETRO_DEVICE_JOYPAD, 0, RETRO_DEVICE_ID_JOYPAD_L3), r3 = inputState(0, RETRO_DEVICE_JOYPAD, 0, RETRO_DEVICE_ID_JOYPAD_R3);
+	bool const down[3] = {
+		(start || selectHeld) && dpad,
+		on && l3 && r3,
+		(start || selectHeld) && r3 && !l3,
+	};
+	static bool held[3];
+	for (int i = 0; i < 3; ++i) {
+		if (down[i] && !held[i]) {
+			bool const now = !optionIs(environment, "armn64_control_swap", swaps[i].value);
+			struct retro_variable set = { "armn64_control_swap", now ? swaps[i].value : "disabled" };
+			environment(RETRO_ENVIRONMENT_SET_VARIABLE, &set);
+			notify(now ? swaps[i].message : "Control Swap: Off");
+		}
+		held[i] = down[i];
+	}
+	startUsed |= (down[0] || down[2]) && start;
+}
+
+// A button as the game sees it: player 1's Start and D-pad held back while Start or Select + D-pad is
+// the hotkey.
+static bool pressed(unsigned port, unsigned id) {
+	if (port == 0 && selectHeld && id >= RETRO_DEVICE_ID_JOYPAD_UP && id <= RETRO_DEVICE_ID_JOYPAD_RIGHT) {
+		return false;
+	}
+	if (port == 0 && startCombo) {
+		bool const start = startFields > 0;
+		if (id == RETRO_DEVICE_ID_JOYPAD_START) {
+			return startPulse > 0 || (start && startFields > START_LONG && !startUsed);
+		}
+		if (start && id >= RETRO_DEVICE_ID_JOYPAD_UP && id <= RETRO_DEVICE_ID_JOYPAD_RIGHT) {
+			return false;
+		}
+	}
+	return inputState(port, RETRO_DEVICE_JOYPAD, 0, id) != 0;
+}
+
+enum { HAND_BOTH, HAND_LEFT, HAND_RIGHT };
+
+// A controller as the PIF reads it from a frontend port: the buttons in the top half, then the
+// stick's X and Y. With Dual Controllers, the left or right hand's half of player 1's.
+static uint32_t readController(unsigned port, int hand) {
+	bool const swapDpad = optionIs(environment, "armn64_control_swap", "dpad"), swapShoulders = swapDpad;
+	// Left / Right Stick (not with Dual Controllers, where each hand has its own): the right stick as
+	// the control stick, the left as the C buttons.
+	bool const swapSticks = hand == HAND_BOTH && optionIs(environment, "armn64_control_swap", "sticks");
+	unsigned const mainStick = swapSticks ? RETRO_DEVICE_INDEX_ANALOG_RIGHT : RETRO_DEVICE_INDEX_ANALOG_LEFT;
+	unsigned const cStick = swapSticks ? RETRO_DEVICE_INDEX_ANALOG_LEFT : RETRO_DEVICE_INDEX_ANALOG_RIGHT;
+	// Both Sticks: the two added together as the control stick, and no C buttons from either.
+	bool const bothSticks = hand == HAND_BOTH && optionIs(environment, "armn64_control_swap", "both");
+	bool const gate = optionIs(environment, "armn64_stick_gate", "enabled");
+	int const z = swapShoulders ? RETRO_DEVICE_ID_JOYPAD_L : RETRO_DEVICE_ID_JOYPAD_L2;
+	int const l = swapShoulders ? RETRO_DEVICE_ID_JOYPAD_L2 : RETRO_DEVICE_ID_JOYPAD_L;
+	#define PRESSED(id) pressed(port, (id))
+	#define AXIS(index, id) inputState(port, RETRO_DEVICE_ANALOG, (index), (id))
+	uint32_t state = 0;
 	int x, y;
-	stick(port, optionIs(environment, "armn64_stick_gate", "enabled"), &x, &y);
+	if (hand == HAND_RIGHT) {
+		// The right hand's controller: the right stick, R2 as Z, R1, and A and X as A and B.
+		state |= (PRESSED(RETRO_DEVICE_ID_JOYPAD_A) ? 1u << 31 : 0) | (PRESSED(RETRO_DEVICE_ID_JOYPAD_X) ? 1u << 30 : 0) |
+		         (PRESSED(RETRO_DEVICE_ID_JOYPAD_R2) ? 1u << 29 : 0) | (PRESSED(RETRO_DEVICE_ID_JOYPAD_R) ? 1u << 20 : 0);
+		stick(AXIS(RETRO_DEVICE_INDEX_ANALOG_RIGHT, RETRO_DEVICE_ID_ANALOG_X), AXIS(RETRO_DEVICE_INDEX_ANALOG_RIGHT, RETRO_DEVICE_ID_ANALOG_Y), gate, &x, &y);
+		return state | (uint32_t) (uint8_t) x << 8 | (uint8_t) -y;
+	}
+	state |= (PRESSED(RETRO_DEVICE_ID_JOYPAD_B) ? 1u << 31 : 0) | (PRESSED(RETRO_DEVICE_ID_JOYPAD_Y) ? 1u << 30 : 0) | (PRESSED(z) ? 1u << 29 : 0) |
+	         (PRESSED(RETRO_DEVICE_ID_JOYPAD_START) ? 1u << 28 : 0) | (PRESSED(l) ? 1u << 21 : 0);
+	if (hand == HAND_BOTH) {
+		state |= PRESSED(RETRO_DEVICE_ID_JOYPAD_R) ? 1u << 20 : 0;
+	}
+	if (hand == HAND_BOTH && !bothSticks) {
+		// The C buttons from the other stick, pushed past halfway.
+		int const cx = AXIS(cStick, RETRO_DEVICE_ID_ANALOG_X), cy = AXIS(cStick, RETRO_DEVICE_ID_ANALOG_Y);
+		state |= (cy < -16384 ? 1u << 19 : 0) | (cy > 16384 ? 1u << 18 : 0) | (cx < -16384 ? 1u << 17 : 0) | (cx > 16384 ? 1u << 16 : 0);
+	}
+	// The D-pad and the stick, one as the other when swapped: the D-pad as the stick pushed all the
+	// way, the stick as the D-pad pushed past halfway.
+	bool const up = PRESSED(RETRO_DEVICE_ID_JOYPAD_UP), down = PRESSED(RETRO_DEVICE_ID_JOYPAD_DOWN);
+	bool const left = PRESSED(RETRO_DEVICE_ID_JOYPAD_LEFT), right = PRESSED(RETRO_DEVICE_ID_JOYPAD_RIGHT);
+	int lx = AXIS(mainStick, RETRO_DEVICE_ID_ANALOG_X), ly = AXIS(mainStick, RETRO_DEVICE_ID_ANALOG_Y);
+	if (bothSticks) {
+		lx += AXIS(RETRO_DEVICE_INDEX_ANALOG_RIGHT, RETRO_DEVICE_ID_ANALOG_X), ly += AXIS(RETRO_DEVICE_INDEX_ANALOG_RIGHT, RETRO_DEVICE_ID_ANALOG_Y);
+		lx = lx < -32768 ? -32768 : lx > 32767 ? 32767 : lx;
+		ly = ly < -32768 ? -32768 : ly > 32767 ? 32767 : ly;
+	}
+	if (swapDpad) {
+		state |= (ly < -16384 ? 1u << 27 : 0) | (ly > 16384 ? 1u << 26 : 0) | (lx < -16384 ? 1u << 25 : 0) | (lx > 16384 ? 1u << 24 : 0);
+		stick((right - left) * 32767, (down - up) * 32767, gate, &x, &y);
+	} else {
+		state |= (up ? 1u << 27 : 0) | (down ? 1u << 26 : 0) | (left ? 1u << 25 : 0) | (right ? 1u << 24 : 0);
+		stick(lx, ly, gate, &x, &y);
+	}
+	#undef PRESSED
+	#undef AXIS
 	return state | (uint32_t) (uint8_t) x << 8 | (uint8_t) -y;
 }
 
@@ -908,18 +1031,26 @@ static uint32_t readMouse(unsigned port) {
 // The ports as the frontend has them, with the paks the options put in, and the Rumble Paks' motors
 // to the frontend.
 static void readPorts(void) {
+	swapHotkeys();
+	// With Dual Controllers, player 1 holds controllers 1 and 2, and the other players move up one.
+	bool const dual = optionIs(environment, "armn64_dual_controller", "enabled");
+	bool shake[4] = { false };
 	for (unsigned port = 0; port < 4; ++port) {
-		unsigned const device = devices[port] & RETRO_DEVICE_MASK;
+		unsigned const from = !dual ? port : port < 2 ? 0 : port - 1;
+		unsigned const device = devices[from] & RETRO_DEVICE_MASK;
 		machine->plugged[port] = device == RETRO_DEVICE_MOUSE ? PLUG_MOUSE : device == RETRO_DEVICE_NONE ? PLUG_NONE : PLUG_CONTROLLER;
 		char key[16];
 		snprintf(key, sizeof(key), "armn64_pak%u", port + 1);
 		machine->pak[port] = optionIs(environment, key, "rumble") ? PAK_RUMBLE : optionIs(environment, key, "transfer") ? PAK_TRANSFER :
 		                     optionIs(environment, key, "none") ? PAK_NONE : PAK_MEMORY;
-		machine->pad[port] = machine->plugged[port] == PLUG_MOUSE ? readMouse(port) : machine->plugged[port] ? readController(port) : 0;
-		bool const on = machine->pak[port] == PAK_RUMBLE && machine->rumble[port] && optionIs(environment, "armn64_rumble", "enabled");
-		if (setRumble && on != rumbling[port]) {
-			setRumble(port, RETRO_RUMBLE_STRONG, on ? 0xFFFF : 0);
-			rumbling[port] = on;
+		int const hand = !dual || port > 1 ? HAND_BOTH : port ? HAND_RIGHT : HAND_LEFT;
+		machine->pad[port] = machine->plugged[port] == PLUG_MOUSE ? readMouse(from) : machine->plugged[port] ? readController(from, hand) : 0;
+		shake[from] |= machine->pak[port] == PAK_RUMBLE && machine->rumble[port] && optionIs(environment, "armn64_rumble", "enabled");
+	}
+	for (unsigned port = 0; port < 4; ++port) {
+		if (setRumble && shake[port] != rumbling[port]) {
+			setRumble(port, RETRO_RUMBLE_STRONG, shake[port] ? 0xFFFF : 0);
+			rumbling[port] = shake[port];
 		}
 	}
 }
