@@ -227,6 +227,9 @@ struct Glr {
 	// RDRAM through a texture at its resolution.
 	int scale;
 	GLuint native, nativeFramebuffer;
+	// Seal Edges (N64_GL_SEAL): how far, in the RDP's pixels, opaque triangles reach past their edges
+	// to cover the cracks between them that show at higher scales.
+	float seal;
 	struct Program programs[PROGRAMS];
 	int programCount;
 	// The game's programs kept by their keys (glesCacheDirectory), made again as the renderer starts:
@@ -1804,8 +1807,54 @@ void glrQueueClear(struct N64* n) {
 	}
 }
 
+// Corners moved out so each edge is d further out, and their values carried on from the triangle's
+// planes. A sharp corner's move is held to four times d.
+static void sealCorners(struct GlrCorners* q, float d) {
+	float (*v)[10] = q->v;
+	float const area = (v[1][0] - v[0][0]) * (v[2][1] - v[0][1]) - (v[2][0] - v[0][0]) * (v[1][1] - v[0][1]);
+	if (fabsf(area) < 1e-3f) {
+		return;
+	}
+	// Each edge's outward normal, the edge from corner i to the next.
+	float nx[3], ny[3];
+	for (int i = 0; i < 3; ++i) {
+		float const ex = v[(i + 1) % 3][0] - v[i][0], ey = v[(i + 1) % 3][1] - v[i][1], len = sqrtf(ex * ex + ey * ey);
+		if (len < 1e-6f) {
+			return;
+		}
+		nx[i] = (area > 0 ? ey : -ey) / len, ny[i] = (area > 0 ? -ex : ex) / len;
+	}
+	float out[3][10];
+	for (int i = 0; i < 3; ++i) {
+		int const p = (i + 2) % 3;
+		float const k = d / fmaxf(1 + nx[p] * nx[i] + ny[p] * ny[i], 0.125f);
+		float const x = v[i][0] + (nx[p] + nx[i]) * k, y = v[i][1] + (ny[p] + ny[i]) * k;
+		float const b1 = ((x - v[0][0]) * (v[2][1] - v[0][1]) - (v[2][0] - v[0][0]) * (y - v[0][1])) / area;
+		float const b2 = ((v[1][0] - v[0][0]) * (y - v[0][1]) - (x - v[0][0]) * (v[1][1] - v[0][1])) / area;
+		out[i][0] = x, out[i][1] = y;
+		for (int a = 2; a < 10; ++a) {
+			out[i][a] = v[0][a] + b1 * (v[1][a] - v[0][a]) + b2 * (v[2][a] - v[0][a]);
+		}
+		out[i][2] = fminf(fmaxf(out[i][2], 0), 1);
+		out[i][3] = fmaxf(out[i][3], 1e-6f);
+		for (int a = 4; a < 8; ++a) {
+			out[i][a] = fminf(fmaxf(out[i][a], 0), 1);
+		}
+	}
+	memcpy(v, out, sizeof(out));
+}
+
 // The HLE's triangle from its corners.
 static void triangle(struct N64* n, struct Glr* g, struct RDP* r, const struct GlrCorners* q) {
+	// Opaque ones sealed: one that blends with the image would show twice where they overlap.
+	struct GlrCorners sealed;
+	const uint8_t* last = r->blendSel[r->cycleType == 1 ? 1 : 0];
+	bool const blends = r->cycleType < 2 && r->forceBlend && ((last[2] == 1) != (last[0] == 1));
+	if (g->seal > 0 && !blends) {
+		sealed = *q;
+		sealCorners(&sealed, g->seal);
+		q = &sealed;
+	}
 	uint32_t c = q->flags;
 	// Depth from the primitive's needs no depth per corner (NFL Quarterback Club 99's shadows).
 	bool z = (c & 1) || (r->zAddr && r->zPrim), tex = c & 2, shade = c & 4, persp = (c >> 16) & 1;
@@ -2300,6 +2349,8 @@ struct Glr* glrCreate(struct N64* n) {
 		--g->scale;
 	}
 	n->glrScale = g->scale;
+	const char* seal = n->settings ? n->settings("N64_GL_SEAL") : getenv("N64_GL_SEAL");
+	g->seal = seal && *seal == '1' ? 0.5f / (float) g->scale : 0;
 	gl->RenderbufferStorage(GL_RENDERBUFFER, GL_DEPTH24_STENCIL8, 1024 * g->scale, TARGET_ROWS * g->scale);
 	gl->GenFramebuffers(1, &g->depthFramebuffer);
 	useFramebuffer(g, g->depthFramebuffer);
