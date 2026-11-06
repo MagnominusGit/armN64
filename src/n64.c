@@ -671,6 +671,10 @@ bool n64GlPicture(struct N64* n, unsigned* framebuffer, int* x, int* y, int* wid
 	return *framebuffer != 0;
 }
 
+bool n64GlPrecompile(struct N64* n, double ms, int* done, int* total) {
+	return glrPrecompile(n, ms, done, total);
+}
+
 float n64TvAspect(struct N64* n) {
 	struct ViSetup s;
 	return viSetup(n, &s) ? s.tvAspect : 4.0f / 3.0f;

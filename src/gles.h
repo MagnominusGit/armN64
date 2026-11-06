@@ -27,6 +27,12 @@ void glesDestroy(struct Gles*);
 const char* glesRenderer(struct Gles*);
 // Where compiled programs are kept, by their source and the driver (none: "" or NULL).
 void glesCacheDir(const char* dir);
+const char* glesCacheDirectory(void);
+// Another renderer's program (its vertex and fragment shaders' source) kept there: loaded (0 when
+// not kept), marked to be kept before it is linked, kept once linked.
+unsigned glesCachedProgram(struct Gles*, const char* vertex, const char* fragment);
+void glesKeepable(struct Gles*, unsigned program);
+void glesKeepProgram(struct Gles*, unsigned program, const char* vertex, const char* fragment);
 // Whether contexts are the frontend's (glesFrontend).
 bool glesInFrontend(void);
 // Gives a buffer new storage of size bytes (data may be NULL).

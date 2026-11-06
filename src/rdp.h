@@ -104,6 +104,10 @@ struct GlrCorners {
 // The GL renderer (glr.c), for HLE: N64_RDP_GL.
 struct Glr* glrCreate(struct N64*);
 void glrDestroy(struct Glr*);
+// Shader Precompile a few programs a frame (N64_GL_PRECOMPILE=2): the renderer made if need be, then
+// the programs the game used before for up to ms milliseconds. False when none are left to make;
+// else how many of them are made, of total.
+bool glrPrecompile(struct N64*, double ms, int* done, int* total);
 // A primitive: an RDP one, drawn from the HLE's corners when it queued them.
 void glrDraw(struct N64*, struct RDP*, const uint64_t* w, int op);
 // The HLE's corners for a triangle it sends next (the GL renderer made if there is none yet), the

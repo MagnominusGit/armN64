@@ -535,6 +535,8 @@ bool n64PictureStart(struct N64*, int* width, int* height);
 // context); 0 when it is elsewhere.
 unsigned n64PictureBuffer(struct N64*);
 bool n64GlPicture(struct N64*, unsigned* framebuffer, int* x, int* y, int* width, int* height);
+// The GL renderer's Shader Precompile, a few programs a frame (glrPrecompile).
+bool n64GlPrecompile(struct N64*, double ms, int* done, int* total);
 
 // cpu.c
 void cpuReset(struct N64*);

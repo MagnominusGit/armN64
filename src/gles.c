@@ -391,6 +391,41 @@ static void saveProgram(struct Gles* g, GLuint p, const char* path) {
 	free(binary);
 }
 
+const char* glesCacheDirectory(void) {
+	return cacheDir;
+}
+
+static bool pairPath(struct Gles* g, const char* vertex, const char* fragment, char* path, size_t size) {
+	size_t const vl = strlen(vertex), fl = strlen(fragment);
+	char* both = malloc(vl + fl + 1);
+	if (!both) {
+		return false;
+	}
+	memcpy(both, vertex, vl);
+	memcpy(both + vl, fragment, fl + 1);
+	bool const ok = cachePath(g, both, path, size);
+	free(both);
+	return ok;
+}
+
+unsigned glesCachedProgram(struct Gles* g, const char* vertex, const char* fragment) {
+	char path[4200];
+	return pairPath(g, vertex, fragment, path, sizeof(path)) ? cachedProgram(g, path) : 0;
+}
+
+void glesKeepable(struct Gles* g, unsigned program) {
+	if (cacheDir[0] && g->glProgramParameteri) {
+		g->glProgramParameteri(program, GL_PROGRAM_BINARY_RETRIEVABLE_HINT, 1);
+	}
+}
+
+void glesKeepProgram(struct Gles* g, unsigned program, const char* vertex, const char* fragment) {
+	char path[4200];
+	if (pairPath(g, vertex, fragment, path, sizeof(path))) {
+		saveProgram(g, program, path);
+	}
+}
+
 static GLuint compileProgram(struct Gles* g, const char* source, char* error, size_t errorSize) {
 	char path[4200];
 	bool cached = cachePath(g, source, path, sizeof(path));

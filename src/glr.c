@@ -5,6 +5,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <time.h>
 
 // The GL renderer (N64_RDP_GL, with hle): the GPU draws what the HLE makes and the RDP commands
 // around it, into a texture for each color image, with a combiner shader made for each combine
@@ -223,8 +224,16 @@ struct Glr {
 	GLuint native, nativeFramebuffer;
 	struct Program programs[PROGRAMS];
 	int programCount;
+	// The game's programs kept by their keys (glesCacheDirectory), made again as the renderer starts:
+	// pending, with pendingDone of them made (all at once, or a few a frame through glrPrecompile).
+	char keysPath[4400];
+	bool preloading;
+	struct ProgramKey* pending;
+	int pendingCount, pendingDone;
 	// Framebuffer Effects Fast: texture loads from images the GPU drew don't wait for its pixels.
 	bool fastEffects;
+	// A pixel nobody sees, and a texture for every unit, to draw a program once with.
+	GLuint warmFramebuffer, warmTexture;
 	struct Texture textures[TEXTURES];
 	int textureBucket[TEXTURE_BUCKETS];
 	uint64_t clock;
@@ -948,23 +957,35 @@ static struct Program* program(struct Glr* g, struct ProgramKey key) {
 	}
 	strcat(source, "}\n");
 compileFragment:;
-	GLuint fs = compile(g, GL_FRAGMENT_SHADER, source);
-	if (!fs) {
-		return NULL;
+	GLuint p = glesCachedProgram(g->gles, vertexSource, source);
+	if (!p) {
+		GLuint fs = compile(g, GL_FRAGMENT_SHADER, source);
+		if (!fs) {
+			return NULL;
+		}
+		p = gl->CreateProgram();
+		glesKeepable(g->gles, p);
+		gl->AttachShader(p, g->vertexShader);
+		gl->AttachShader(p, fs);
+		gl->LinkProgram(p);
+		gl->DeleteShader(fs);
+		GLint ok = 0;
+		gl->GetProgramiv(p, GL_LINK_STATUS, &ok);
+		if (!ok) {
+			char log[1024];
+			gl->GetProgramInfoLog(p, sizeof(log), NULL, log);
+			fprintf(stderr, "GL renderer: program: %s\n", log);
+			gl->DeleteProgram(p);
+			return NULL;
+		}
+		glesKeepProgram(g->gles, p, vertexSource, source);
 	}
-	GLuint p = gl->CreateProgram();
-	gl->AttachShader(p, g->vertexShader);
-	gl->AttachShader(p, fs);
-	gl->LinkProgram(p);
-	gl->DeleteShader(fs);
-	GLint ok = 0;
-	gl->GetProgramiv(p, GL_LINK_STATUS, &ok);
-	if (!ok) {
-		char log[1024];
-		gl->GetProgramInfoLog(p, sizeof(log), NULL, log);
-		fprintf(stderr, "GL renderer: program: %s\n", log);
-		gl->DeleteProgram(p);
-		return NULL;
+	if (!g->preloading && g->keysPath[0]) {
+		FILE* f = fopen(g->keysPath, "a");
+		if (f) {
+			fprintf(f, "%016llx %08x %08x %08x %d\n", (unsigned long long) key.combine, key.modes, key.lod, key.alphaDither, key.compareNoise);
+			fclose(f);
+		}
 	}
 	struct Program* pr = &g->programs[g->programCount++];
 	pr->key = key;
@@ -994,6 +1015,49 @@ compileFragment:;
 	pr->memory = gl->GetUniformLocation(p, "uMemory");
 	gl->Uniform1i(pr->memory, LEVELS + 1);
 	return pr;
+}
+
+// A program drawn once (a triangle with no area, into a pixel nobody sees): drivers that compile a
+// program for the state it is drawn with (V3D) do so now, not at the game's first draw with it.
+static void warm(struct Glr* g, struct Program* pr) {
+	struct Gl* gl = &g->gl;
+	if (!g->warmFramebuffer) {
+		static const uint8_t black[4] = { 0 };
+		gl->GenTextures(1, &g->warmTexture);
+		gl->ActiveTexture(GL_TEXTURE0);
+		gl->BindTexture(GL_TEXTURE_2D, g->warmTexture);
+		gl->TexImage2D(GL_TEXTURE_2D, 0, GL_RGBA8, 1, 1, 0, GL_RGBA, GL_UNSIGNED_BYTE, black);
+		gl->TexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_NEAREST);
+		gl->TexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_NEAREST);
+		gl->GenFramebuffers(1, &g->warmFramebuffer);
+		gl->BindFramebuffer(GL_FRAMEBUFFER, g->warmFramebuffer);
+		gl->FramebufferTexture2D(GL_FRAMEBUFFER, GL_COLOR_ATTACHMENT0, GL_TEXTURE_2D, g->warmTexture, 0);
+	}
+	gl->BindFramebuffer(GL_FRAMEBUFFER, g->warmFramebuffer);
+	gl->Viewport(0, 0, 1, 1);
+	gl->Disable(GL_SCISSOR_TEST);
+	gl->Disable(GL_DEPTH_TEST);
+	gl->Disable(GL_BLEND);
+	for (int k = 0; k <= LEVELS + 1; ++k) {
+		gl->ActiveTexture(GL_TEXTURE0 + (GLenum) k);
+		gl->BindTexture(GL_TEXTURE_2D, g->warmTexture);
+	}
+	gl->UseProgram(pr->program);
+	gl->BindVertexArray(g->vertexArray);
+	gl->BindBuffer(GL_ARRAY_BUFFER, g->vertexBuffer);
+	size_t const bytes = 3 * VERTEX_FLOATS * 4;
+	if (g->vertexOffset + bytes > VERTEX_BUFFER_BYTES) {
+		gl->BufferData(GL_ARRAY_BUFFER, VERTEX_BUFFER_BYTES, NULL, GL_STREAM_DRAW);
+		g->vertexOffset = 0;
+	}
+	void* to = gl->MapBufferRange(GL_ARRAY_BUFFER, (GLintptr) g->vertexOffset, (GLsizeiptr) bytes, GL_MAP_WRITE_BIT | GL_MAP_UNSYNCHRONIZED_BIT);
+	if (to) {
+		memset(to, 0, bytes);
+		gl->UnmapBuffer(GL_ARRAY_BUFFER);
+		gl->DrawArrays(GL_TRIANGLES, (GLint) (g->vertexOffset / (VERTEX_FLOATS * 4)), 3);
+		g->vertexOffset += bytes;
+	}
+	memset(&g->applied, 0xFF, sizeof(g->applied));
 }
 
 // ---- Color images
@@ -2110,6 +2174,25 @@ void glrSync(struct N64* n) {
 	n->rdpPending = false;
 }
 
+// The pending programs made, for up to ms milliseconds (all of them for a negative ms).
+static void makePending(struct Glr* g, double ms) {
+	struct timespec t0, t;
+	clock_gettime(CLOCK_MONOTONIC, &t0);
+	g->preloading = true;
+	while (g->pendingDone < g->pendingCount) {
+		struct Program* pr = program(g, g->pending[g->pendingDone++]);
+		if (pr) {
+			warm(g, pr);
+		}
+		clock_gettime(CLOCK_MONOTONIC, &t);
+		if (ms >= 0 && (double) (t.tv_sec - t0.tv_sec) * 1e3 + (double) (t.tv_nsec - t0.tv_nsec) / 1e6 >= ms) {
+			break;
+		}
+	}
+	g->preloading = false;
+	memset(&g->applied, 0xFF, sizeof(g->applied));
+}
+
 struct Glr* glrCreate(struct N64* n) {
 	char error[256];
 	struct Glr* g = calloc(1, sizeof(*g));
@@ -2243,7 +2326,55 @@ struct Glr* glrCreate(struct N64* n) {
 	}
 	const char* effects = n->settings ? n->settings("N64_GL_FB_EFFECTS") : getenv("N64_GL_FB_EFFECTS");
 	g->fastEffects = effects && !strcmp(effects, "fast");
+	// The programs the game used before, made now rather than at the draws that first need them.
+	const char* precompile = n->settings ? n->settings("N64_GL_PRECOMPILE") : getenv("N64_GL_PRECOMPILE");
+	bool const preload = !(precompile && *precompile == '0'), stepped = precompile && *precompile == '2';
+	if (glesCacheDirectory()[0] && n->rom && n->romSize >= 0x40) {
+		snprintf(g->keysPath, sizeof(g->keysPath), "%s/%08x%08x.keys", glesCacheDirectory(), be32(n->rom + 0x10), be32(n->rom + 0x14));
+		FILE* f = preload ? fopen(g->keysPath, "r") : NULL;
+		unsigned long long combine;
+		unsigned modes, lod, alphaDither;
+		int compareNoise, room = 0;
+		while (f && fscanf(f, "%llx %x %x %x %d", &combine, &modes, &lod, &alphaDither, &compareNoise) == 5) {
+			if (g->pendingCount == room) {
+				room = room ? 2 * room : 256;
+				struct ProgramKey* more = realloc(g->pending, (size_t) room * sizeof(*more));
+				if (!more) {
+					break;
+				}
+				g->pending = more;
+			}
+			g->pending[g->pendingCount++] = (struct ProgramKey) { combine, modes, lod, alphaDither, compareNoise != 0 };
+		}
+		if (f) {
+			fclose(f);
+		}
+		// A frontend showing the progress makes them a few a frame, before the game runs.
+		if (g->pending && !stepped) {
+			makePending(g, -1);
+			free(g->pending);
+			g->pending = NULL;
+		}
+	}
 	return g;
+}
+
+bool glrPrecompile(struct N64* n, double ms, int* done, int* total) {
+	if (n->rdpGl && !n->glr) {
+		n->glr = glrCreate(n);
+	}
+	struct Glr* g = n->glr;
+	if (!g || !g->pending) {
+		return false;
+	}
+	makePending(g, ms);
+	*done = g->pendingDone;
+	*total = g->pendingCount;
+	if (g->pendingDone == g->pendingCount) {
+		free(g->pending);
+		g->pending = NULL;
+	}
+	return true;
 }
 
 // A save state loaded under the renderer: the RDP's generations start over, so nothing cached by
@@ -2266,6 +2397,7 @@ void glrDestroy(struct Glr* g) {
 		return;
 	}
 	glesDestroy(g->gles);
+	free(g->pending);
 	free(g->batch);
 	free(g->image);
 	free(g->queue);
