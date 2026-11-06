@@ -34,6 +34,15 @@ static bool isBranch(uint32_t op) {
 	return false;
 }
 
+// With HLE accuracy, a block the JIT compiles goes on past a conditional branch that can go either
+// way and doesn't go back to the block's start (a loop keeps its own block), when its delay slot isn't
+// another branch: the branch taken leaves the block.
+static bool throughBranch(const struct N64* n, uint32_t op, uint32_t delayOp, uint32_t vaddr, uint32_t at) {
+	int code = op >> 26, rs = (op >> 21) & 31, rt = (op >> 16) & 31;
+	bool either = (code == 0x04 && rs != rt) || code == 0x05 || (code == 0x06 && rs) || code == 0x07 || (code == 0x01 && (rt == 0 || (rt == 1 && rs)));
+	return jitBranchesInside && n->fast && n->useJit && either && !isBranch(delayOp) && at + 4 + ((uint32_t) (int16_t) op << 2) != vaddr;
+}
+
 // The idle loop "b self; nop" (or "j self; nop"): nothing changes but the cycle count, two cycles a
 // pass once its I-cache lines are in.
 bool blockIsIdleLoop(const uint32_t* ops, uint32_t count, uint32_t vaddr) {
@@ -189,15 +198,28 @@ static struct Block* compile(struct N64* n, uint32_t vaddr, uint32_t paddr) {
 		return NULL;
 	}
 	uint32_t count = 0, a = paddr;
+	// The end of the last branch gone past: a block that stops at BLOCK_MAX after one ends there
+	// instead, where the code past it would start its own block.
+	uint32_t through = 0;
 	bool delay = false;
 	while (count < BLOCK_MAX) {
 		uint32_t op = be32(&n->rdram[a]);
 		b->ops[count++] = op;
 		a += 4;
-		if (delay || !(a & 0xFFF)) {
+		if (!(a & 0xFFF)) {
 			break;
 		}
+		if (delay) {
+			if (!throughBranch(n, b->ops[count - 2], op, vaddr, vaddr + 4 * (count - 2))) {
+				break;
+			}
+			through = count;
+		}
 		delay = isBranch(op);
+		if (count == BLOCK_MAX && through) {
+			count = through;
+			break;
+		}
 	}
 	b->count = count;
 	b->vaddr = vaddr;

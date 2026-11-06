@@ -1027,6 +1027,8 @@ void jitFree(struct N64* n) {
 	n->jitUsed = SHARED_SIZE;
 }
 
+const bool jitBranchesInside = false;
+
 // Code for count instructions at vaddr (cached, at paddr in RDRAM), or NULL when the arena is full.
 void* jitCompile(struct N64* n, const uint32_t* ops, uint32_t count, uint32_t vaddr, uint32_t paddr) {
 	uint8_t* arena = arenaGet(n);

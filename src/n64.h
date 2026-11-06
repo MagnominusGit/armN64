@@ -599,6 +599,8 @@ void idleStore(struct N64*, uint32_t paddr, int size, uint64_t value);
 // on zero (else on non-zero); the passes are the same while it is taken on the register.
 uint32_t blockPollPass(const uint32_t* ops, uint32_t count, uint32_t vaddr, int* reload);
 // jit_x64.c
+// Whether compiled blocks may go on past conditional branches (blocks.c's throughBranch).
+extern const bool jitBranchesInside;
 void* jitCompile(struct N64*, const uint32_t* ops, uint32_t count, uint32_t vaddr, uint32_t paddr);
 void jitReset(struct N64*);
 void jitUnlink(struct N64*);

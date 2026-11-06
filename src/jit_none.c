@@ -2,6 +2,8 @@
 
 // No code generator for this host: everything runs in the interpreters.
 
+const bool jitBranchesInside = false;
+
 void* jitCompile(struct N64* n, const uint32_t* ops, uint32_t count, uint32_t vaddr, uint32_t paddr) {
 	return NULL;
 }
