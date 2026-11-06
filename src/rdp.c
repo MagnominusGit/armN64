@@ -5,6 +5,7 @@
 #include <pthread.h>
 #include <stdio.h>
 #include <stdatomic.h>
+#include <math.h>
 #include <stdlib.h>
 #include <string.h>
 
@@ -1722,11 +1723,17 @@ static int commandWords(int op) {
 }
 
 // The RDP's time for a primitive, from its shape alone: one or two clocks a pixel by cycle type,
-// four pixels a clock to fill or copy, and a fixed setup per triangle and texture rectangle.
-static uint64_t primitiveClocks(struct RDP* r, const uint64_t* w, int op) {
+// four pixels a clock to fill or copy, and a fixed setup per triangle and texture rectangle. Rough
+// (FLE), a triangle's pixels are its area: half its height times its width at the middle corner.
+static uint64_t primitiveClocks(struct RDP* r, const uint64_t* w, int op, bool rough) {
 	int perPixel = r->cycleType == 1 ? 2 : 1;
 	if (op >= 0x08 && op <= 0x0F) {
 		struct Edges e = edges(w);
+		if (rough) {
+			double const height = (e.yl - e.yh) / 4.0;
+			double const width = fabs((e.xh + (double) e.dxh * (e.ym - e.yh) / 4.0 - e.xl) / 65536.0);
+			return height > 0 ? (uint64_t) (height * width / 2) * (uint64_t) perPixel + 20 : 20;
+		}
 		uint64_t pixels = 0;
 		int first, end;
 		triangleRows(r, &e, &first, &end);
@@ -3463,20 +3470,20 @@ static void command(struct N64* n, struct RDP* r, const uint64_t* w, int op, int
 		} else {
 			glrSkip(n, w, op);
 		}
-		uint64_t clocks = primitiveClocks(r, w, op);
+		uint64_t clocks = primitiveClocks(r, w, op, n->fle);
 		r->clocks += clocks;
 		n->dp.bufBusy += (uint32_t) clocks;
 		n->dp.pipeBusy += (uint32_t) clocks;
 		return;
 	}
 	if (n->skip.on && skipCommand(n, w, op)) {
-		uint64_t clocks = primitiveClocks(r, w, op);
+		uint64_t clocks = primitiveClocks(r, w, op, n->fle);
 		r->clocks += clocks;
 		n->dp.bufBusy += (uint32_t) clocks;
 		n->dp.pipeBusy += (uint32_t) clocks;
 		return;
 	}
-	uint64_t clocks = primitiveClocks(r, w, op);
+	uint64_t clocks = primitiveClocks(r, w, op, n->fle);
 	r->clocks += clocks;
 	n->dp.bufBusy += (uint32_t) clocks;
 	n->dp.pipeBusy += (uint32_t) clocks;

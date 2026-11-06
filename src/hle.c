@@ -705,6 +705,12 @@ static void triangle(struct N64* n, struct Hle* h, const struct ScreenVertex* a,
 	float k = maxW > 0 ? (h->objTriangles ? 1.0f : 0.5f) / maxW : 0.5f;
 	struct EdgeSetup edge;
 	edgeSetup(h, a, b, c, &edge);
+	// FLE with the GL renderer: the GL draws from the corners, so the RDP gets the edges only (a
+	// triangle without shade, texture or depth coefficients).
+	bool const lean = n->fle && n->rdpGl && !h->image8 && !h->dry;
+	if (lean) {
+		edge.w[0] &= ~(7ull << 56);
+	}
 	if (n->rdpGl && !h->image8 && !h->dry) {
 		// For the GL renderer: the corners as they are (flat shading takes the one colour), beside
 		// the RDP triangle, which keeps the list and its time the same.
@@ -731,6 +737,9 @@ static void triangle(struct N64* n, struct Hle* h, const struct ScreenVertex* a,
 	float hx = edge.hx, hy = edge.hy, mx = edge.mx, my = edge.my, attr = edge.attr, ish = edge.ish, fy = edge.fy;
 	for (int i = 0; i < 4; ++i) {
 		emit(n, h, edge.w[i]);
+	}
+	if (lean) {
+		return;
 	}
 	// One attribute's start, x and edge (y) slopes in s15.16 from its values at the three corners.
 	#define GRADIENT(v1, v2, v3, start, dx, de, dy) do { \

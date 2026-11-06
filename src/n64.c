@@ -123,8 +123,9 @@ static const char* setting(struct N64* n, const char* name) {
 static void start(struct N64* n) {
 	const char* accuracy = setting(n, "N64_ACCURACY");
 	// The modes' old names, lle-compatible and lle-accurate, still work.
+	n->fle = accuracy && !strcmp(accuracy, "fle");
 	n->accuracy = !accuracy ? ACCURACY_LLE : !strcmp(accuracy, "mle") || !strcmp(accuracy, "lle-compatible") ? ACCURACY_MLE :
-	              !strcmp(accuracy, "hle") ? ACCURACY_HLE : ACCURACY_LLE;
+	              !strcmp(accuracy, "hle") || n->fle ? ACCURACY_HLE : ACCURACY_LLE;
 	// HLE draws at high level with the hardware's own timing; only mle behaves like the
 	// emulators hacks were made on.
 	n->compat = n->accuracy == ACCURACY_MLE;

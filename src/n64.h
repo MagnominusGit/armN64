@@ -302,6 +302,10 @@ struct N64 {
 	// N64_HLE_TIMING=short: high-level graphics tasks take the time of the RDP words they send, less
 	// than the microcode's own (some games then draw more frames than on the console).
 	bool hleShortTasks;
+	// N64_ACCURACY=fle (Fastest): HLE with shortcuts for speed that lose exactness (the recompiler's
+	// cycles per block, no load interlocks, address checks or FPU result fix-ups; triangles' edges only
+	// to the RDP with the GL renderer).
+	bool fle;
 	uint32_t checkCounts[2][64];
 	// The first commands' first words, for finding where the two part.
 	uint64_t checkSeq[2][4096];

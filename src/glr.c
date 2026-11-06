@@ -28,7 +28,7 @@ enum {
 	GL_DEPTH_COMPONENT24 = 0x81A6, GL_FRAMEBUFFER_COMPLETE = 0x8CD5, GL_DEPTH_STENCIL_ATTACHMENT = 0x821A, GL_DEPTH24_STENCIL8 = 0x88F0,
 	GL_STENCIL_TEST = 0x0B90, GL_EXTENSIONS = 0x1F03, GL_MAX_TEXTURE_SIZE = 0x0D33, GL_MAX_RENDERBUFFER_SIZE = 0x84E8, GL_STENCIL_BUFFER_BIT = 0x400, GL_KEEP = 0x1E00, GL_REPLACE = 0x1E01, GL_EQUAL = 0x202, GL_GEQUAL = 0x206,
 	GL_TEXTURE_MIN_FILTER = 0x2801, GL_TEXTURE_MAG_FILTER = 0x2800, GL_NEAREST = 0x2600, GL_TEXTURE_WRAP_S = 0x2802,
-	GL_TEXTURE_WRAP_T = 0x2803, GL_CLAMP_TO_EDGE = 0x812F, GL_TEXTURE0 = 0x84C0,
+	GL_TEXTURE_WRAP_T = 0x2803, GL_CLAMP_TO_EDGE = 0x812F, GL_REPEAT = 0x2901, GL_MIRRORED_REPEAT = 0x8370, GL_LINEAR = 0x2601, GL_TEXTURE0 = 0x84C0,
 	GL_ARRAY_BUFFER = 0x8892, GL_STREAM_DRAW = 0x88E0, GL_TRIANGLES = 4, GL_MAP_WRITE_BIT = 2, GL_MAP_UNSYNCHRONIZED_BIT = 0x20,
 	GL_SCISSOR_TEST = 0x0C11, GL_DEPTH_TEST = 0x0B71, GL_BLEND = 0x0BE2, GL_POLYGON_OFFSET_FILL = 0x8037,
 	GL_DITHER = 0x0BD0, GL_COLOR_BUFFER_BIT = 0x4000, GL_DEPTH_BUFFER_BIT = 0x100,
@@ -179,6 +179,8 @@ struct Texture {
 	int width, height, period, fold;
 	// The decoded texels' columns and rows.
 	int cols, rows;
+	// FLE: how the GPU samples it (wrap S, wrap T, filter), as last set.
+	GLint sampling[3];
 	uint64_t used;
 	// The next texture in its hash bucket (index + 1, 0 for none).
 	int next;
@@ -240,6 +242,11 @@ struct Glr {
 	int pendingCount, pendingDone;
 	// Framebuffer Effects Fast: texture loads from images the GPU drew don't wait for its pixels.
 	bool fastEffects;
+	// Shader Accuracy Fast (N64_GL_SHADERS=fast): the combiner and perspective in the GPU's floats, and
+	// no dither.
+	bool simple;
+	// FLE: the simple shaders, and tiles the GPU's sampler wraps and filters as the RDP does sampled by it.
+	bool fle;
 	// A pixel nobody sees, and a texture for every unit, to draw a program once with.
 	GLuint warmFramebuffer, warmTexture;
 	struct Texture textures[TEXTURES];
@@ -535,6 +542,14 @@ static const char fragmentHead[] =
 	"	}\n"
 	"	return ivec2(clamp(s, -0x10000, 0xFFFF), clamp(tt, -0x10000, 0xFFFF));\n"
 	"}\n"
+	// Shader Accuracy Fast: the divide in floats (the RDP's comes to s * 2^15 / w, w being q * 2^15).
+	"vec2 texCoordFloat() {\n"
+	"	vec3 top = vTex - 0.5 * dFdx(vTex) - 0.5 * dFdy(vTex);\n"
+	"	return top.xy * 32.0 / (uPersp != 0 ? top.z : 1.0);\n"
+	"}\n"
+	"ivec2 texCoordSimple() {\n"
+	"	return ivec2(clamp(floor(texCoordFloat() + 0.01), -65536.0, 65535.0));\n"
+	"}\n"
 	// A texel of the tile: a column past the fold is the row two on per fold, then rows wrap.
 	"vec4 tileTexel(sampler2D t, ivec4 image, int s, int tt) {\n"
 	"	if (image.z < 0) {\n"
@@ -561,6 +576,14 @@ static const char fragmentHead[] =
 	"	if (fs + ft < 32) return c0 + (c1 - c0) * x + (c2 - c0) * y;\n"
 	"	vec4 c3 = tileTexel(t, image, s.y, tt.y);\n"
 	"	return c3 + (c2 - c3) * (1.0 - x) + (c1 - c3) * (1.0 - y);\n"
+	"}\n"
+	// FLE: a tile the GPU's sampler wraps and filters (c.w set) sampled by it at the texel the RDP's
+	// coordinate falls on (half a texel on to filter as the RDP does); else as the RDP does.
+	"vec4 sampleFast(sampler2D t, ivec4 a, ivec4 b, ivec4 c, ivec4 image, vec2 stf, ivec2 st) {\n"
+	"	if (c.w == 0) return sampleTile(t, a, b, c, image, st);\n"
+	"	vec2 scale = vec2(a.x < 11 ? 1.0 / float(1 << a.x) : float(1 << (16 - a.x)), a.y < 11 ? 1.0 / float(1 << a.y) : float(1 << (16 - a.y)));\n"
+	"	vec2 texel = (stf * scale - vec2(a.zw) * 8.0) / 32.0 + (c.z != 0 ? 0.5 : 0.001);\n"
+	"	return texture(t, texel / vec2(image.xy));\n"
 	"}\n";
 
 // modes: cycle type (bits 0-1), alpha compare (2), textured (3), shaded (4), the RDP's dither in
@@ -616,12 +639,17 @@ static const char* input8(char* out, size_t size, const char* input) {
 }
 
 // One combiner cycle as GLSL, in the RDP's integers: ((a - b) * m + d * 256 + 128) / 256 for color and
-// alpha, kept in 9 bits and saturated as the RDP does.
-static void cycleSource(char* out, size_t size, uint64_t c, int cycle) {
+// alpha, kept in 9 bits and saturated as the RDP does; simple, in floats clamped to 0-1.
+static void cycleSource(char* out, size_t size, uint64_t c, int cycle, bool simple) {
 	int a = cycle ? (c >> 37) & 15 : (c >> 52) & 15, m = cycle ? (c >> 32) & 31 : (c >> 47) & 31;
 	int b = cycle ? (c >> 24) & 15 : (c >> 28) & 15, d = cycle ? (c >> 6) & 7 : (c >> 15) & 7;
 	int aa = cycle ? (c >> 21) & 7 : (c >> 44) & 7, ab = cycle ? (c >> 3) & 7 : (c >> 12) & 7;
 	int am = cycle ? (c >> 18) & 7 : (c >> 41) & 7, ad = cycle ? c & 7 : (c >> 9) & 7;
+	if (simple) {
+		snprintf(out, size, "	combined = clamp(vec4((%s - %s) * %s, (%s - %s) * %s) + vec4(%s, %s), 0.0, 1.0);\n", rgbInput(0, a), rgbInput(1, b),
+		         rgbInput(2, m), alphaInput(aa, false), alphaInput(ab, false), alphaInput(am, true), rgbInput(3, d), alphaInput(ad, false));
+		return;
+	}
 	char in[8][64];
 	snprintf(out, size, "	combined = clamp9(floor((vec4((%s - %s) * %s, (%s - %s) * %s) + vec4(%s, %s) * 256.0 + 128.0) / 256.0)) / 255.0;\n",
 	         input8(in[0], 64, rgbInput(0, a)), input8(in[1], 64, rgbInput(1, b)), input8(in[2], 64, rgbInput(2, m)),
@@ -773,12 +801,18 @@ static struct Program* program(struct Glr* g, struct ProgramKey key) {
 	strcat(source, key.modes & MODE_SHADED ? "	vec4 shade = vShade;\n" : "	vec4 shade = vec4(0.0);\n");
 	strcat(source, "	float lodFrac = 0.0;\n");
 	if (key.modes & MODE_TEXTURED) {
-		strcat(source, "	ivec2 st = texCoord();\n");
+		strcat(source, g->fle ? "	vec2 stf = texCoordFloat();\n	ivec2 st = ivec2(clamp(floor(stf + 0.01), -65536.0, 65535.0));\n"
+		               : g->simple ? "	ivec2 st = texCoordSimple();\n" : "	ivec2 st = texCoord();\n");
 		if (levels) {
 			strcat(source, "	vec4 tex0, tex1;\n");
 		} else {
-			strcat(source, "	vec4 tex0 = sampleTile(uTex0, uTile0[0], uTile0[1], uTile0[2], uImage0, st);\n");
-			strcat(source, cycleType == 1 ? "	vec4 tex1 = sampleTile(uTex1, uTile1[0], uTile1[1], uTile1[2], uImage1, st);\n" : "	vec4 tex1 = tex0;\n");
+			if (g->fle) {
+				strcat(source, "	vec4 tex0 = sampleFast(uTex0, uTile0[0], uTile0[1], uTile0[2], uImage0, stf, st);\n");
+				strcat(source, cycleType == 1 ? "	vec4 tex1 = sampleFast(uTex1, uTile1[0], uTile1[1], uTile1[2], uImage1, stf, st);\n" : "	vec4 tex1 = tex0;\n");
+			} else {
+				strcat(source, "	vec4 tex0 = sampleTile(uTex0, uTile0[0], uTile0[1], uTile0[2], uImage0, st);\n");
+				strcat(source, cycleType == 1 ? "	vec4 tex1 = sampleTile(uTex1, uTile1[0], uTile1[1], uTile1[2], uImage1, st);\n" : "	vec4 tex1 = tex0;\n");
+			}
 		}
 		if (key.lod & 1) {
 			// rdp.c levelOfDetail: the texel step to the next pixel and line, its level, the fraction
@@ -822,13 +856,13 @@ static struct Program* program(struct Glr* g, struct ProgramKey key) {
 		strcat(source, "	combined = tex0;\n");
 	} else {
 		if (cycleType == 1) {
-			cycleSource(line, sizeof(line), key.combine, 0);
+			cycleSource(line, sizeof(line), key.combine, 0, g->simple);
 			strcat(source, line);
 			// The second cycle sees the pipelined texels: texel 1 as texel 0, and texel 0 as texel 1
 			// (rdp.c's shadePixel).
 			strcat(source, "	vec4 swapped = tex0;\n	tex0 = tex1;\n	tex1 = swapped;\n");
 		}
-		cycleSource(line, sizeof(line), key.combine, 1);
+		cycleSource(line, sizeof(line), key.combine, 1, g->simple);
 		strcat(source, line);
 	}
 	if (key.modes & MODE_CVG_ALPHA) {
@@ -850,7 +884,7 @@ static struct Program* program(struct Glr* g, struct ProgramKey key) {
 	if (g->fetch && cycleType < 2) {
 		// rdp.c shadePixel with the image's pixel: the first of two cycles blends, the last with force
 		// blend (not at full alpha with the pixel's alpha and 1 - A), then the dither and 5 bits.
-		if (key.alphaDither != 3) {
+		if (key.alphaDither != 3 && !g->simple) {
 			// rdp.c ditherAt's alpha: noise, or the color's matrix value (inverted by mode 1), added to
 			// the pixel's and the shade's alpha.
 			int modeRgb = key.modes & MODE_NOISE ? 2 : key.modes & MODE_DITHER ? (key.modes & MODE_BAYER ? 1 : 0) : 3;
@@ -882,7 +916,7 @@ static struct Program* program(struct Glr* g, struct ProgramKey key) {
 			strcat(source, line);
 		}
 		strcat(source, "	oColor = vec4(combined.rgb, 1.0);\n");
-		if (key.modes & MODE_DITHER) {
+		if ((key.modes & MODE_DITHER) && !g->simple) {
 			char matrix[256];
 			if (key.modes & MODE_NOISE) {
 				snprintf(matrix, sizeof(matrix), "uint h = pixelNoise(4u);\n	ivec3 ditherM = ivec3(uvec3(h, h >> 3, h >> 6) & 7u)");
@@ -913,7 +947,7 @@ static struct Program* program(struct Glr* g, struct ProgramKey key) {
 		blendFormula(line, sizeof(line), first);
 		strcat(source, line);
 	}
-	if (key.modes & MODE_DITHER) {
+	if ((key.modes & MODE_DITHER) && !g->simple) {
 		// The matrix's value for all three channels, or three bits of noise for each.
 		char matrix[256];
 		if (key.modes & MODE_NOISE) {
@@ -951,7 +985,7 @@ static struct Program* program(struct Glr* g, struct ProgramKey key) {
 			// Where the GPU's blend leaves the image none of its own (B zero, or 1 - A with A whole: no
 			// blend), the color is the shader's to dither.
 			int keep = (last >> 6) & 3;
-			if ((key.modes & MODE_DITHER) && (keep == 3 || keep == 0)) {
+			if ((key.modes & MODE_DITHER) && !g->simple && (keep == 3 || keep == 0)) {
 				snprintf(line, sizeof(line), "	dithered = %s;\n", keep == 3 ? "true" : "reject == 1.0");
 				strcat(source, line);
 			}
@@ -963,7 +997,7 @@ static struct Program* program(struct Glr* g, struct ProgramKey key) {
 	} else {
 		strcat(source, "	oColor = combined;\n");
 	}
-	if (key.modes & MODE_DITHER) {
+	if ((key.modes & MODE_DITHER) && !g->simple) {
 		// rdp.c's dither: a channel whose low 3 bits are above the matrix's value rounds up; a 16-bit
 		// image keeps 5 bits, as the RDP's would read back.
 		strcat(source, "	if (dithered) { ivec3 o = ivec3(floor(oColor.rgb * 255.0 + 0.5));\n"
@@ -1413,6 +1447,7 @@ static struct Texture* texture(struct N64* n, struct Glr* g, struct RDP* r, int 
 		gl->TexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_NEAREST);
 		gl->TexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE);
 		gl->TexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE);
+		slot->sampling[0] = slot->sampling[1] = GL_CLAMP_TO_EDGE, slot->sampling[2] = GL_NEAREST;
 	}
 	free(pixels);
 	slot->hash = key, slot->width = w, slot->height = h, slot->period = fold < 0 ? period : rows < need ? rows : 0, slot->fold = fold, slot->cols = cols, slot->rows = rows, slot->used = ++g->clock;
@@ -1422,6 +1457,36 @@ static struct Texture* texture(struct N64* n, struct Glr* g, struct RDP* r, int 
 }
 
 // ---- Drawing
+
+// FLE: whether the GPU's sampler wraps a tile's texture as the RDP does on both axes: the texture all
+// the tile's rows (none repeated by TMEM), and each axis clamped to it (no mask) or wrapping over it
+// unclamped, or clamped exactly where it wraps.
+static bool gpuSamples(const struct Tile* t, const struct Texture* x) {
+	bool const s = !t->maskS || !(t->cmS & 2) || ((t->sh - t->sl) >> 2) + 1 == 1 << t->maskS;
+	bool const tt = !t->maskT || !(t->cmT & 2) || ((t->th - t->tl) >> 2) + 1 == 1 << t->maskT;
+	return !x->period && !x->fold && s && tt;
+}
+
+// FLE: the GPU's wrap on an axis (repeat, mirrored or clamped) and filter for a tile.
+static void sampleAs(struct Glr* g, int unit, struct Texture* x, const int* tile) {
+	GLint const want[3] = {
+		!tile[8] || (tile[6] & 2) ? GL_CLAMP_TO_EDGE : tile[6] & 1 ? GL_MIRRORED_REPEAT : GL_REPEAT,
+		!tile[9] || (tile[7] & 2) ? GL_CLAMP_TO_EDGE : tile[7] & 1 ? GL_MIRRORED_REPEAT : GL_REPEAT,
+		tile[10] ? GL_LINEAR : GL_NEAREST,
+	};
+	if (!memcmp(want, x->sampling, sizeof(want))) {
+		return;
+	}
+	if (g->applied.unit != unit) {
+		g->gl.ActiveTexture(GL_TEXTURE0 + (GLenum) unit);
+		g->applied.unit = unit;
+	}
+	g->gl.TexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, want[0]);
+	g->gl.TexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, want[1]);
+	g->gl.TexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, want[2]);
+	g->gl.TexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, want[2]);
+	memcpy(x->sampling, want, sizeof(want));
+}
 
 static void colorOf(const struct Color* c, float* out) {
 	out[0] = c->r / 255.0f, out[1] = c->g / 255.0f, out[2] = c->b / 255.0f, out[3] = c->a / 255.0f;
@@ -1468,6 +1533,9 @@ static void flushBatch(struct N64* n, struct Glr* g) {
 	for (int k = 0; k < LEVELS; ++k) {
 		if (s->texture[k]) {
 			useTexture(g, k, s->texture[k]->texture);
+			if (s->tile[k][11]) {
+				sampleAs(g, k, s->texture[k], s->tile[k]);
+			}
 			if (memcmp(u->tile[k], s->tile[k], sizeof(u->tile[k]))) {
 				gl->Uniform4iv(p->tile[k], 3, s->tile[k]);
 				memcpy(u->tile[k], s->tile[k], sizeof(u->tile[k]));
@@ -1669,7 +1737,8 @@ static bool drawState(struct N64* n, struct Glr* g, struct RDP* r, bool textured
 			s.texture[k] = texture(n, g, r, index, !filter, &w, &h);
 			const struct Tile* t = &r->tile[index];
 			bool bilinear = filter && ((r->otherModes >> 45) & 1) && cycleType < 2;
-			int params[12] = { t->shiftS, t->shiftT, t->sl, t->tl, t->sh, t->th, t->cmS, t->cmT, t->maskS, t->maskT, bilinear, 0 };
+			int params[12] = { t->shiftS, t->shiftT, t->sl, t->tl, t->sh, t->th, t->cmS, t->cmT, t->maskS, t->maskT, bilinear,
+			                   g->fle && s.texture[k] && gpuSamples(t, s.texture[k]) };
 			memcpy(s.tile[k], params, sizeof(params));
 		}
 	}
@@ -2453,6 +2522,9 @@ struct Glr* glrCreate(struct N64* n) {
 	}
 	const char* effects = n->settings ? n->settings("N64_GL_FB_EFFECTS") : getenv("N64_GL_FB_EFFECTS");
 	g->fastEffects = effects && !strcmp(effects, "fast");
+	const char* shaders = n->settings ? n->settings("N64_GL_SHADERS") : getenv("N64_GL_SHADERS");
+	g->fle = n->fle;
+	g->simple = g->fle || (shaders && !strcmp(shaders, "fast"));
 	// The programs the game used before, made now rather than at the draws that first need them.
 	const char* precompile = n->settings ? n->settings("N64_GL_PRECOMPILE") : getenv("N64_GL_PRECOMPILE");
 	bool const preload = !(precompile && *precompile == '0'), stepped = precompile && *precompile == '2';
