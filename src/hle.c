@@ -179,6 +179,13 @@ struct Hle {
 	// The task's time: the RSP's work in CPU cycles where the microcode's costs are known, otherwise the
 	// list's length as the RDP's commands fill it; and the words left of the command the list ends in.
 	size_t timeCount, left;
+	// Not in save states (hleStateSize), so older ones still load: Widescreen (N64_WIDESCREEN), the
+	// picture shown wider than 4:3, so x on screen times squeeze (3/4 for 16:9) about each viewport's
+	// middle, and small texture rectangles about the color image's (imageWidth); rectHalf: a squeezed
+	// rectangle's second word (its steps) comes next.
+	float squeeze;
+	uint32_t imageWidth;
+	bool rectHalf, rectFlip;
 };
 
 static uint32_t rd32(struct N64* n, uint32_t a) {
@@ -339,6 +346,38 @@ static void charge(struct N64* n, struct Hle* h, int vertices, int triangles, in
 	}
 }
 
+// Widescreen's 2D: a texture rectangle narrower than nine tenths of the image, drawn a cycle at a time
+// (copy mode can't scale), squeezed toward the image's middle with its S or T step (flipped) to
+// match; the color image's width as it's set.
+static uint64_t widen(struct Hle* h, uint64_t w) {
+	if (h->rectHalf && h->left == 1) {
+		h->rectHalf = false;
+		int const shift = h->rectFlip ? 0 : 16;
+		int const step = (int16_t) (w >> shift);
+		long const scaled = lroundf((float) step / h->squeeze);
+		int const clamped = scaled > 32767 ? 32767 : scaled < -32768 ? -32768 : (int) scaled;
+		return (w & ~(0xFFFFull << shift)) | (uint64_t) (uint16_t) clamped << shift;
+	}
+	if (h->left) {
+		return w;
+	}
+	int const op = (w >> 56) & 0x3F;
+	if (op == 0x3F) {
+		h->imageWidth = (uint32_t) ((w >> 32) & 0x3FF) + 1;
+	}
+	if (h->squeeze >= 1 || !h->imageWidth || (op != 0x24 && op != 0x25) || ((h->modeH >> 20) & 3) >= 2) {
+		return w;
+	}
+	float const xl = (float) ((w >> 44) & 0xFFF), xh = (float) ((w >> 12) & 0xFFF), middle = (float) h->imageWidth * 2;
+	if (xl - xh >= (float) h->imageWidth * 4 * 0.9f) {
+		return w;
+	}
+	uint64_t const nxl = (uint64_t) lroundf(middle + (xl - middle) * h->squeeze) & 0xFFF;
+	uint64_t const nxh = (uint64_t) lroundf(middle + (xh - middle) * h->squeeze) & 0xFFF;
+	h->rectHalf = true, h->rectFlip = op == 0x25;
+	return (w & ~(0xFFFull << 44 | 0xFFFull << 12)) | nxl << 44 | nxh << 12;
+}
+
 static void emit(struct N64* n, struct Hle* h, uint64_t w) {
 	// A skipped frame's rectangles (and any triangle passed on as it is) left out whole.
 	if (!h->left) {
@@ -355,6 +394,7 @@ static void emit(struct N64* n, struct Hle* h, uint64_t w) {
 	if (h->count == LIST_MAX) {
 		flush(n, h, false);
 	}
+	w = widen(h, w);
 	h->list[h->count++] = w;
 	if (!h->left) {
 		// A full list keeps the words of the command it ends in.
@@ -702,7 +742,7 @@ static void modifyVertex(struct Hle* h, int index, int where, uint32_t value) {
 		break;
 	case 0x18:
 		if (h->vscale[0] != 0 && h->vscale[1] != 0) {
-			v->x = ((int16_t) (value >> 16) / 4.0f - h->vtrans[0]) / h->vscale[0] * v->w;
+			v->x = ((int16_t) (value >> 16) / 4.0f - h->vtrans[0]) / h->vscale[0] * v->w / h->squeeze;
 			v->y = -((int16_t) value / 4.0f - h->vtrans[1]) / h->vscale[1] * v->w;
 		}
 		break;
@@ -861,7 +901,7 @@ static struct ScreenVertex project(struct Hle* h, const struct Vertex* v) {
 	struct ScreenVertex s;
 	float iw = 1 / v->w;
 	// On screen in quarter pixels, as the microcodes keep it.
-	s.x = floorf((v->x * iw * h->vscale[0] + h->vtrans[0]) * 4) / 4;
+	s.x = floorf((v->x * h->squeeze * iw * h->vscale[0] + h->vtrans[0]) * 4) / 4;
 	s.y = floorf((-v->y * iw * h->vscale[1] + h->vtrans[1]) * 4) / 4;
 	float z = (v->z * iw * h->vscale[2] + h->vtrans[2]) * 32 / 0x7FFF;
 	s.z = z < 0 ? 0 : z > 1 ? 1 : z;
@@ -891,11 +931,13 @@ static void drawTriangle(struct N64* n, struct Hle* h, int i0, int i1, int i2) {
 	if (i0 >= VERTICES || i1 >= VERTICES || i2 >= VERTICES) {
 		return;
 	}
-	// All three outside the same side of the view: rejected, as the microcodes do.
+	// All three outside the same side of the view (Widescreen's wider in x): rejected, as the
+	// microcodes do.
+	float const wide = 1 / h->squeeze;
 	uint32_t outside = 0x3F;
 	for (int k = 0; k < 3; ++k) {
 		const struct Vertex* v = &h->v[k == 0 ? i0 : k == 1 ? i1 : i2];
-		outside &= (v->x < -v->w) | (v->x > v->w) << 1 | (v->y < -v->w) << 2 | (v->y > v->w) << 3 | (v->z < -v->w) << 4 | (v->z > v->w) << 5;
+		outside &= (v->x < -v->w * wide) | (v->x > v->w * wide) << 1 | (v->y < -v->w) << 2 | (v->y > v->w) << 3 | (v->z < -v->w) << 4 | (v->z > v->w) << 5;
 	}
 	if (outside & 0xF) {
 		return;
@@ -905,8 +947,8 @@ static void drawTriangle(struct N64* n, struct Hle* h, int i0, int i1, int i2) {
 	poly[0][0] = h->v[i0], poly[0][1] = h->v[i1], poly[0][2] = h->v[i2];
 	int cur = 0;
 	// Planes as (x, y, z, w) weights: near, then x and y within the clip ratio's screens.
-	float const r = h->clipRatio;
-	float const planes[5][4] = { { 0, 0, 1, 1 }, { 1, 0, 0, r }, { -1, 0, 0, r }, { 0, 1, 0, r }, { 0, -1, 0, r } };
+	float const r = h->clipRatio, rx = r > wide ? r : wide;
+	float const planes[5][4] = { { 0, 0, 1, 1 }, { 1, 0, 0, rx }, { -1, 0, 0, rx }, { 0, 1, 0, r }, { 0, -1, 0, r } };
 	// NoN skips the near plane only for a triangle wholly in front of the eye (one reaching behind it is
 	// clipped there as usual: Conker's floors).
 	bool const noNear = h->noNear && poly[0][0].w > 0 && poly[0][1].w > 0 && poly[0][2].w > 0;
@@ -914,7 +956,7 @@ static void drawTriangle(struct N64* n, struct Hle* h, int i0, int i1, int i2) {
 	bool inside = true;
 	for (int k = 0; k < 3 && inside; ++k) {
 		const struct Vertex* v = &poly[0][k];
-		inside = isfinite(v->z) && (noNear || v->z + v->w + 1e-4f * fabsf(v->w) >= 0) && fabsf(v->x) <= r * v->w && fabsf(v->y) <= r * v->w;
+		inside = isfinite(v->z) && (noNear || v->z + v->w + 1e-4f * fabsf(v->w) >= 0) && fabsf(v->x) <= rx * v->w && fabsf(v->y) <= r * v->w;
 	}
 	for (int p = inside ? 5 : 0; p < 5 && count >= 3; ++p) {
 		const float* pl = planes[p];
@@ -5264,6 +5306,9 @@ bool hleGraphics(struct N64* n, bool dry) {
 	memset(h->segments, 0, sizeof(h->segments));
 	memset(h->objStatus, 0, sizeof(h->objStatus));
 	h->clipRatio = 2;
+	const char* widescreen = n->settings ? n->settings("N64_WIDESCREEN") : getenv("N64_WIDESCREEN");
+	h->squeeze = !widescreen ? 1 : !strcmp(widescreen, "16:9") ? 0.75f : !strcmp(widescreen, "16:10") ? 1 / 1.2f : 1;
+	h->rectHalf = false;
 	static const float identity[16] = { 1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1 };
 	h->depth = 0;
 	memcpy(h->modelview[0], identity, sizeof(identity));
@@ -5355,5 +5400,9 @@ bool hleGraphics(struct N64* n, bool dry) {
 }
 
 size_t hleStateSize(void) {
+	return offsetof(struct Hle, squeeze);
+}
+
+size_t hleSize(void) {
 	return sizeof(struct Hle);
 }

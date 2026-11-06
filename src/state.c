@@ -163,7 +163,7 @@ bool n64StateLoad(struct N64* n, const void* data, size_t size, bool quick) {
 	at += RDRAM_SIZE / 2;
 	rdpStateLoad(n, h.has & HAS_RDP ? (const struct RDP*) at : NULL, quick);
 	at += sizeof(struct RDP);
-	if ((h.has & HAS_HLE) && (n->hle || (n->hle = malloc(hleStateSize())))) {
+	if ((h.has & HAS_HLE) && (n->hle || (n->hle = calloc(1, hleSize())))) {
 		memcpy(n->hle, at, hleStateSize());
 	}
 	at += hleStateSize();

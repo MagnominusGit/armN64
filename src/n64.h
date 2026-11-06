@@ -767,6 +767,7 @@ void rdpDestroy(struct N64*);
 void rdpStateLoad(struct N64*, const struct RDP* saved, bool keepGl);
 void rdpStateGet(struct N64*, struct RDP* out);
 size_t hleStateSize(void);
+size_t hleSize(void);
 size_t audioHleStateSize(void);
 size_t n64StateSize(void);
 bool n64StateSave(struct N64*, void* data, size_t size, bool quick);
