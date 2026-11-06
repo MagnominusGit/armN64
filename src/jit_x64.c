@@ -188,6 +188,237 @@ static bool fpuProbed(uint32_t op) {
 	return fmt == 6 || fmt == 16 || fmt == 17 || fmt == 20 || fmt == 21;
 }
 
+// The FPU's own code, called directly. Its stall counts. With HLE accuracy it raises nothing.
+static void fpuCall(struct Jit* j, uint32_t op) {
+	struct Emitter* e = &j->e;
+	int const rt = (op >> 16) & 31;
+	bool const probe = fpuProbed(op) && !j->fast;
+	xMovRR(e, 8, RDI, RBX);
+	xMovIKeepFlags(e, RSI, op);
+	xMovI64(e, RAX, (uint64_t) (uintptr_t) (j->fast ? (void*) fpuExecuteFast : probe ? (void*) fpuProbe : (void*) fpuExecute));
+	xCallR(e, RAX);
+	if (probe) {
+		xTest(e, 1, R(RAX), RAX);
+		slowIf(j, CC_E);
+	}
+	xLoad(e, 4, RAX, CPU_AT(stall));
+	xAluRR(e, X_ADD, 8, R(R13), RAX);
+	xStoreI(e, 4, CPU_AT(stall), 0);
+	// A move to r0 is undone, as the interpreter zeroes r0 after every instruction.
+	if (((op >> 21) & 31) <= 2 && !rt) {
+		xStoreI(e, 8, gpr(0), 0);
+	}
+}
+
+// An SSE instruction on xmm registers 0-7: prefix (F3 single, F2 double, 66 or none), 0F, op.
+static void xSse(struct Emitter* e, uint8_t prefix, uint8_t op, int xmm, struct Opnd rm, int width) {
+	if (prefix) {
+		e8(e, prefix);
+	}
+	uint8_t const code[2] = { 0x0F, op };
+	emitOp(e, width, code, 2, xmm, rm);
+}
+
+static struct Opnd fprAt(int r) {
+	return CPU_AT(fpr[r]);
+}
+
+// To bad when the value in RAX (single, or double with dbl) is denormal, infinite or NaN; ECX/RCX
+// keeps its exponent bits.
+static void fpuNormal(struct Emitter* e, bool dbl, uint8_t** bad) {
+	if (dbl) {
+		xMovI64(e, RDX, 0x7FF0000000000000ull);
+		xMovRR(e, 8, RCX, RAX);
+		xAluRR(e, X_AND, 8, R(RCX), RDX);
+		xAluRR(e, X_CMP, 8, R(RCX), RDX);
+		bad[0] = xJcc(e, CC_E, NULL);
+		xTest(e, 8, R(RCX), RCX);
+		uint8_t* normal = xJcc(e, CC_NE, NULL);
+		xMovRR(e, 8, RDX, RAX);
+		xShiftI(e, X_SHL, 8, R(RDX), 1);
+		bad[1] = xJcc(e, CC_NE, NULL);
+		patchHere(e, normal);
+	} else {
+		xMovRR(e, 4, RCX, RAX);
+		xAluI(e, X_AND, 4, R(RCX), 0x7F800000);
+		xAluI(e, X_CMP, 4, R(RCX), 0x7F800000);
+		bad[0] = xJcc(e, CC_E, NULL);
+		xTest(e, 4, R(RCX), RCX);
+		uint8_t* normal = xJcc(e, CC_NE, NULL);
+		xTestI(e, 4, R(RAX), 0x7FFFFF);
+		bad[1] = xJcc(e, CC_NE, NULL);
+		patchHere(e, normal);
+	}
+}
+
+// To early when the operand in RAX (exponent bits in RCX) makes the operation take 2 cycles
+// (fpu.c early, trivialS/trivialD): zero, or for MUL a power of two.
+static void fpuTrivial(struct Emitter* e, bool dbl, bool mul, uint8_t** early, int* earlyCount) {
+	xTest(e, dbl ? 8 : 4, R(RCX), RCX);
+	early[(*earlyCount)++] = xJcc(e, CC_E, NULL);
+	if (mul) {
+		if (dbl) {
+			xMovRR(e, 8, RDX, RAX);
+			xShiftI(e, X_SHL, 8, R(RDX), 12);
+		} else {
+			xMovRR(e, 4, RDX, RAX);
+			xAluI(e, X_AND, 4, R(RDX), 0x7FFFFF);
+		}
+		early[(*earlyCount)++] = xJcc(e, CC_E, NULL);
+	}
+}
+
+// MFC1, DMFC1, MTC1, DMTC1, MOV, NEG and ABS, the four operations and C.cond in S and D compiled
+// for operands and results fpu.c takes no exception path on (normal or zero, the host raising no
+// more than inexact, with inexact not enabled), and with the first operand's register the same in
+// both FR modes; anything else goes through fpuCall.
+static void fpuInline(struct Jit* j, uint32_t op) {
+	struct Emitter* e = &j->e;
+	int const fmt = (op >> 21) & 31, ft = (op >> 16) & 31, fs = (op >> 11) & 31, fd = (op >> 6) & 31, func = op & 0x3F;
+	bool const dbl = fmt == 17;
+	if (fs & 1) {
+		fpuCall(j, op);
+		return;
+	}
+	if (fmt == 0 || fmt == 1) {
+		if (ft) {
+			if (fmt == 0) {
+				xLoad(e, 4, RAX, fprAt(fs));
+				xMovsxd(e, RAX, R(RAX));
+			} else {
+				xLoad(e, 8, RAX, fprAt(fs));
+			}
+			xStore(e, 8, gpr(ft), RAX);
+		}
+		return;
+	}
+	if (fmt == 4 || fmt == 5) {
+		xLoad(e, fmt == 4 ? 4 : 8, RAX, gpr(ft));
+		xStore(e, fmt == 4 ? 4 : 8, fprAt(fs), RAX);
+		return;
+	}
+	bool const arith = func <= 3, compare = func >= 0x30, sign = func == 5 || func == 7;
+	if ((fmt != 16 && fmt != 17) || !(arith || compare || sign || func == 6)) {
+		fpuCall(j, op);
+		return;
+	}
+	if (func == 6) {
+		xLoad(e, 8, RAX, fprAt(fs));
+		xStore(e, 8, fprAt(fd), RAX);
+		return;
+	}
+	uint8_t* bad[12];
+	int badCount = 0;
+	uint8_t* early[4];
+	int earlyCount = 0;
+	int const width = dbl ? 8 : 4;
+	if (compare) {
+		// Only NaNs take another path; C.cond leaves no flags.
+		for (int k = 0; k < 2; ++k) {
+			xLoad(e, width, RAX, fprAt(k ? ft : fs));
+			if (dbl) {
+				xShiftI(e, X_SHL, 8, R(RAX), 1);
+				xMovI64(e, RDX, 0xFFE0000000000000ull);
+				xAluRR(e, X_CMP, 8, R(RAX), RDX);
+			} else {
+				xAluI(e, X_AND, 4, R(RAX), 0x7FFFFFFF);
+				xAluI(e, X_CMP, 4, R(RAX), 0x7F800000);
+			}
+			bad[badCount++] = xJcc(e, CC_A, NULL);
+		}
+		xAluRR(e, X_XOR, 4, R(RDX), RDX);
+		xSse(e, dbl ? 0xF2 : 0xF3, 0x10, 0, fprAt(fs), 4);
+		xSse(e, dbl ? 0x66 : 0, 0x2E, 0, fprAt(ft), 4);
+		// Less (CF) and equal (ZF) as asked, into bit 23.
+		if (func & 4) {
+			xSetcc(e, CC_B, R(RDX));
+		}
+		if (func & 2) {
+			xSetcc(e, CC_E, R(RCX));
+			xAluRR(e, X_OR, 1, R(RDX), RCX);
+		}
+		xShiftI(e, X_SHL, 4, R(RDX), 23);
+		xLoad(e, 4, RAX, CPU_AT(fcr31));
+		xAluI(e, X_AND, 4, R(RAX), (int32_t) ~(0x3F000u | 1u << 23));
+		xAluRR(e, X_OR, 4, R(RAX), RDX);
+		xStore(e, 4, CPU_AT(fcr31), RAX);
+	} else if (sign) {
+		xLoad(e, width, RAX, fprAt(fs));
+		fpuNormal(e, dbl, &bad[badCount]);
+		badCount += 2;
+		if (dbl) {
+			xMovI64(e, RDX, 0x8000000000000000ull);
+			if (func == 7) {
+				xAluRR(e, X_XOR, 8, R(RAX), RDX);
+			} else {
+				xNot(e, 8, R(RDX));
+				xAluRR(e, X_AND, 8, R(RAX), RDX);
+			}
+		} else if (func == 7) {
+			xAluI(e, X_XOR, 4, R(RAX), (int32_t) 0x80000000u);
+		} else {
+			xAluI(e, X_AND, 4, R(RAX), 0x7FFFFFFF);
+		}
+		xStore(e, 8, fprAt(fd), RAX);
+		xAluI(e, X_AND, 4, CPU_AT(fcr31), (int32_t) ~0x3F000u);
+	} else {
+		for (int k = 0; k < 2; ++k) {
+			xLoad(e, width, RAX, fprAt(k ? ft : fs));
+			fpuNormal(e, dbl, &bad[badCount]);
+			badCount += 2;
+			fpuTrivial(e, dbl, func == 2, early, &earlyCount);
+		}
+		// Not early: the operation's cycles.
+		uint32_t const cycles = fpuCycles(fmt, func);
+		xMovI(e, RSI, cycles);
+		uint8_t* stalled = xJmp(e, NULL);
+		for (int i = 0; i < earlyCount; ++i) {
+			patchHere(e, early[i]);
+		}
+		xMovI(e, RSI, cycles > 1 ? 1 : cycles);
+		patchHere(e, stalled);
+		// The host's flags cleared, the operation, its flags: anything but inexact goes the other way.
+		struct Opnd const csr = M(RSP, -8), out = M(RSP, -16);
+		xSse(e, 0, 0xAE, 3, csr, 4);
+		xAluI(e, X_AND, 4, csr, ~0x3F);
+		xSse(e, 0, 0xAE, 2, csr, 4);
+		static const uint8_t ops[4] = { 0x58, 0x5C, 0x59, 0x5E };
+		uint8_t const prefix = dbl ? 0xF2 : 0xF3;
+		xSse(e, prefix, 0x10, 0, fprAt(fs), 4);
+		xSse(e, prefix, ops[func], 0, fprAt(ft), 4);
+		xSse(e, 0, 0xAE, 3, csr, 4);
+		xLoad(e, 4, RDI, csr);
+		xTestI(e, 4, R(RDI), 0x1F);
+		bad[badCount++] = xJcc(e, CC_NE, NULL);
+		// A denormal result (exact, so no underflow flag).
+		xSse(e, prefix, 0x11, 0, out, 4);
+		xLoad(e, width, RAX, out);
+		fpuNormal(e, dbl, &bad[badCount]);
+		badCount += 2;
+		// Inexact: its cause, and its flag unless enabled (then the exception, the other way).
+		xLoad(e, 4, RDX, CPU_AT(fcr31));
+		xAluI(e, X_AND, 4, R(RDX), (int32_t) ~0x3F000u);
+		xTestI(e, 4, R(RDI), 0x20);
+		uint8_t* exact = xJcc(e, CC_E, NULL);
+		xTestI(e, 4, R(RDX), 0x80);
+		bad[badCount++] = xJcc(e, CC_NE, NULL);
+		xAluI(e, X_OR, 4, R(RDX), 0x1004);
+		patchHere(e, exact);
+		xStore(e, 4, CPU_AT(fcr31), RDX);
+		if (!dbl) {
+			xMovRR(e, 4, RAX, RAX);
+		}
+		xStore(e, 8, fprAt(fd), RAX);
+		xAluRR(e, X_ADD, 8, R(R13), RSI);
+	}
+	uint8_t* done = xJmp(e, NULL);
+	for (int i = 0; i < badCount; ++i) {
+		patchHere(e, bad[i]);
+	}
+	fpuCall(j, op);
+	patchHere(e, done);
+}
+
 // MFC0 and DMFC0 of anything but Random and the registers that read the latch; MTC0 and DMTC0 of EPC
 // and ErrorEPC.
 static bool emitCop0(struct Jit* j, uint32_t op) {
@@ -468,23 +699,11 @@ static bool emitInline(struct Jit* j, uint32_t op, uint64_t pc, enum Kind* kind)
 		if (!fpuOpValid(op) && !fpuProbed(op)) {
 			return false;
 		}
-		// The FPU's own code, called directly. Its stall counts. With HLE accuracy it raises nothing.
-		bool const probe = fpuProbed(op) && !j->fast;
 		needCop1(j);
-		xMovRR(e, 8, RDI, RBX);
-		xMovIKeepFlags(e, RSI, op);
-		xMovI64(e, RAX, (uint64_t) (uintptr_t) (j->fast ? (void*) fpuExecuteFast : probe ? (void*) fpuProbe : (void*) fpuExecute));
-		xCallR(e, RAX);
-		if (probe) {
-			xTest(e, 1, R(RAX), RAX);
-			slowIf(j, CC_E);
-		}
-		xLoad(e, 4, RAX, CPU_AT(stall));
-		xAluRR(e, X_ADD, 8, R(R13), RAX);
-		xStoreI(e, 4, CPU_AT(stall), 0);
-		// A move to r0 is undone, as the interpreter zeroes r0 after every instruction.
-		if (((op >> 21) & 31) <= 2 && !rt) {
-			xStoreI(e, 8, gpr(0), 0);
+		if (!j->fast) {
+			fpuInline(j, op);
+		} else {
+			fpuCall(j, op);
 		}
 		return true;
 	case 0x20: case 0x21: case 0x23: case 0x24: case 0x25: case 0x27: case 0x37:
