@@ -106,17 +106,20 @@ static struct retro_core_option_v2_category optionCategories[] = {
 // the options that do nothing with the others' values.
 static struct retro_core_option_v2_definition optionDefinitions[] = {
 	{ "armn64_accuracy", "Accuracy", NULL,
-	  "Fast: built-in microcodes, loose timing. Balanced: each game's own microcode. Accurate: cycle for cycle. Applies on Restart.",
-	  NULL, "system", { { "hle", "Fast (HLE)" }, { "mle", "Balanced (MLE)" }, { "lle", "Accurate (LLE)" }, { NULL, NULL } }, "hle" },
+	  "Fastest: Fast with shortcuts for speed (looser CPU timing); some effects may differ. Fast: built-in microcodes, loose timing. Balanced: each game's own microcode. Accurate: cycle for cycle. Applies on Restart.",
+	  NULL, "system", { { "fle", "Fastest (FLE)" }, { "hle", "Fast (HLE)" }, { "mle", "Balanced (MLE)" }, { "lle", "Accurate (LLE)" }, { NULL, NULL } }, "hle" },
 	{ "armn64_overclock", "Overclock", NULL,
 	  "A faster CPU, RSP and RDP for less slowdown and shorter loading; the boot keeps the real speed. Applies on Restart.",
 	  NULL, "system", { { "1", "Off" }, { "1.5", "1.5x" }, { "2", "2x" }, { "2.5", "2.5x" }, { "3", "3x" }, { "4", "4x" }, { NULL, NULL } }, "1" },
 	{ "armn64_renderer", "Renderer", NULL,
-	  "GL is fastest and can draw sharper, but isn't exact; GPU and CPU are. Auto picks by Accuracy. Applies on Restart.",
-	  NULL, "video", { { "auto", "Auto" }, { "gl", "GL (Fast)" }, { "gpu", "GPU (Exact)" }, { "cpu", "CPU (Exact)" }, { NULL, NULL } }, "auto" },
+	  "GL is fastest and can draw sharper, but isn't exact; GPU and CPU are. Applies on Restart.",
+	  NULL, "video", { { "gl", "GL (Fast)" }, { "gpu", "GPU (Exact)" }, { "cpu", "CPU (Exact)" }, { NULL, NULL } }, "gl" },
 	{ "armn64_resolution", "Resolution", NULL,
 	  "The GL renderer's resolution; Auto fits the display. Applies on Restart.",
 	  NULL, "video", { { "auto", "Auto" }, { "1", "Native" }, { "2", "2x" }, { "3", "3x" }, { "4", "4x" }, { "5", "5x" }, { "6", "6x" }, { "7", "7x" }, { "8", "8x" }, { NULL, NULL } }, "auto" },
+	{ "armn64_widescreen", "Widescreen", NULL,
+	  "16:9 and 16:10 draw more of the scene at the sides, with Library graphics; games may leave out things just off the 4:3 edges, and full-screen pictures stay stretched. Picture Only shows the picture that wide and changes nothing else, for a game's own widescreen cheat code (any graphics). Applies on Restart.",
+	  NULL, "video", { { "disabled", "Off" }, { "16:9", "16:9" }, { "16:10", "16:10" }, { "16:9-picture", "16:9 Picture Only" }, { "16:10-picture", "16:10 Picture Only" }, { NULL, NULL } }, "disabled" },
 	{ "armn64_aspect", "Aspect Ratio", NULL,
 	  "Fill 4:3 stretches the picture; TV 4:3 keeps a TV's borders; Square Pixels shows each pixel square.",
 	  NULL, "video", { { "fill", "Fill 4:3" }, { "tv", "TV 4:3" }, { "square", "Square Pixels" }, { NULL, NULL } }, "fill" },
@@ -126,8 +129,24 @@ static struct retro_core_option_v2_definition optionDefinitions[] = {
 	{ "armn64_vi_filters", "TV Filters", NULL,
 	  "The console's antialiasing and dither filters, as a TV showed them. Auto: on with Balanced and Accurate.",
 	  NULL, "video", { { "auto", "Auto" }, { "on", "On" }, { "off", "Off" }, { NULL, NULL } }, "auto" },
-	{ "armn64_frameskip", "Frame Skip", NULL, "Doesn't draw the frames a game makes but never shows. Applies on Restart.",
+	{ "armn64_gl_fb_effects", "Framebuffer Effects", NULL,
+	  "Exact: effects that draw from the picture (blurs, screen copies) wait for the GPU to hand it back. Fast: they use the last one in memory; much faster on some devices, may lag or glitch.",
+	  NULL, "video", { { "exact", "Exact" }, { "fast", "Fast" }, { NULL, NULL } }, "exact" },
+	{ "armn64_gl_msaa", "Anti-Aliasing", NULL,
+	  "Smooths the GL renderer's edges and closes the hairline gaps between triangles that the console's own anti-aliasing hides. Costs GPU time. Applies on Restart.",
+	  NULL, "video", { { "off", "Off" }, { "2", "2x" }, { "4", "4x" }, { "8", "8x" }, { NULL, NULL } }, "off" },
+	{ "armn64_gl_seal", "Seal Edges", NULL,
+	  "Opaque triangles reach half a pixel past their edges, so the background no longer shows through the cracks between them. Applies on Restart.",
 	  NULL, "video", { { "disabled", "Off" }, { "enabled", "On" }, { NULL, NULL } }, "disabled" },
+	{ "armn64_gl_shaders", "Shader Accuracy", NULL,
+	  "Fast: simpler shaders (the GPU's own color and perspective math, no dither), much faster on weak GPUs; colors and textures can differ slightly from the console. Applies on Restart.",
+	  NULL, "video", { { "accurate", "Accurate" }, { "fast", "Fast" }, { NULL, NULL } }, "accurate" },
+	{ "armn64_gl_precompile", "Shader Precompile", NULL,
+	  "Builds the shaders a game used before as it starts, with a progress bar, rather than at the moment each is first needed (fewer stutters).",
+	  NULL, "video", { { "disabled", "Off" }, { "enabled", "On" }, { NULL, NULL } }, "disabled" },
+	{ "armn64_frameskip", "Frame Skip", NULL,
+	  "Leaves frames undrawn and shows the one before again, for full speed on slow devices. Auto: only when the device falls behind (the audio buffer runs low). Every Other Frame: always. Applies on Restart.",
+	  NULL, "video", { { "disabled", "Off" }, { "auto", "Auto" }, { "enabled", "Every Other Frame" }, { NULL, NULL } }, "disabled" },
 	{ "armn64_rumble", "Controller Rumble", NULL, "Shakes your controller when a player's Rumble Pak would.",
 	  NULL, "input", { { "disabled", "Off" }, { "enabled", "On" }, { NULL, NULL } }, "disabled" },
 	{ "armn64_stick_gate", "Octagonal Stick Gate", NULL,
@@ -177,10 +196,10 @@ static struct retro_core_option_v2_definition optionDefinitions[] = {
 	  "Open pauses the game to copy, delete, export, import and format the paks' notes. B closes it.",
 	  NULL, "paks", { { "closed", "Closed" }, { "open", "Open" }, { NULL, NULL } }, "closed" },
 	{ "armn64_gfx_rsp", "Graphics Microcode", NULL,
-	  "With Fast. Game's Own runs the real microcode on the RSP: slower, for a game drawn wrong. Applies on Restart.",
-	  NULL, "advanced", { { "library", "Built In (Fast)" }, { "rsp", "Game's Own" }, { NULL, NULL } }, "library" },
+	  "Library draws with the core's own copy of the graphics microcodes, at any Accuracy. Game's Own runs the game's microcode on the RSP: exact, slower, for a game drawn wrong. Applies on Restart.",
+	  NULL, "advanced", { { "library", "Library" }, { "rsp", "Game's Own" }, { NULL, NULL } }, "library" },
 	{ "armn64_hle_timing", "Graphics Task Timing", NULL,
-	  "With Fast. Console: the built-in graphics take as long as the game's own microcode, so games keep the console's frame rate. Short: they finish sooner, and some games then draw more frames than on the console. Applies on Restart.",
+	  "With Library graphics. Console: they take as long as the game's own microcode, so games keep the console's frame rate. Short: they finish sooner, and some games then draw more frames than on the console. Applies on Restart.",
 	  NULL, "advanced", { { "console", "Console" }, { "short", "Short" }, { NULL, NULL } }, "console" },
 	{ "armn64_rsp_thread", "Threaded RSP", NULL,
 	  "With Fast. A core of its own for the RSP: faster for games like Rogue Squadron. Applies on Restart.",
@@ -201,17 +220,21 @@ static void logMessage(enum retro_log_level level, const char* message) {
 
 static const char* accuracy(void) {
 	const char* value = optionValue(environment, "armn64_accuracy");
-	return value && (!strcmp(value, "mle") || !strcmp(value, "lle")) ? value : "hle";
+	return value && (!strcmp(value, "fle") || !strcmp(value, "mle") || !strcmp(value, "lle")) ? value : "hle";
 }
 
-// The renderer the option picks, with Auto the one for the accuracy.
+// HLE, or FLE built on it.
+static bool highLevel(void) {
+	return !strcmp(accuracy(), "hle") || !strcmp(accuracy(), "fle");
+}
+
+// The renderer the option picks (GL for a value from before Auto went).
 static const char* renderer(void) {
 	const char* value = optionValue(environment, "armn64_renderer");
-	if (value && (!strcmp(value, "gl") || !strcmp(value, "gpu") || !strcmp(value, "cpu"))) {
+	if (value && (!strcmp(value, "gpu") || !strcmp(value, "cpu"))) {
 		return value;
 	}
-	const char* a = accuracy();
-	return !strcmp(a, "hle") ? "gl" : !strcmp(a, "mle") ? "gpu" : "cpu";
+	return "gl";
 }
 
 static const char* overclock(void) {
@@ -223,15 +246,20 @@ static const char* overclock(void) {
 // changes; returns whether that changed which are shown.
 static bool showOptions(void) {
 	static bool shownSet, shown[16];
-	bool const hle = !strcmp(accuracy(), "hle"), gl = !strcmp(renderer(), "gl");
+	bool const hle = highLevel(), gl = !strcmp(renderer(), "gl");
 	struct {
 		const char* key;
 		bool shown;
 	} const options[] = {
 		{ "armn64_resolution", gl },
+		{ "armn64_gl_fb_effects", gl },
+		{ "armn64_gl_precompile", gl },
+		{ "armn64_gl_shaders", gl },
+		{ "armn64_gl_msaa", gl },
+		{ "armn64_gl_seal", gl },
 		{ "armn64_vi_filters", !gl },
-		{ "armn64_gfx_rsp", hle },
-		{ "armn64_hle_timing", hle },
+		{ "armn64_gfx_rsp", true },
+		{ "armn64_hle_timing", !optionIs(environment, "armn64_gfx_rsp", "rsp") },
 		{ "armn64_rsp_thread", hle },
 		{ "armn64_rdp_threads", !strcmp(renderer(), "cpu") },
 		{ "armn64_pak1_card", optionIs(environment, "armn64_pak1", "memory") || !optionValue(environment, "armn64_pak1") },
@@ -319,7 +347,7 @@ static const char* settings(const char* name) {
 		return cache;
 	}
 	if (!strcmp(name, "N64_SLICE")) {
-		return !strcmp(accuracy(), "hle") ? "8192" : "1024";
+		return highLevel() ? "8192" : "1024";
 	}
 	if (!strcmp(name, "N64_JIT") || !strcmp(name, "N64_RSPJIT")) {
 		return "1";
@@ -341,8 +369,28 @@ static const char* settings(const char* name) {
 	if (!strcmp(name, "N64_RSP_THREAD")) {
 		return optionIs(environment, "armn64_rsp_thread", "enabled") ? "1" : "0";
 	}
+	if (!strcmp(name, "N64_GL_FB_EFFECTS")) {
+		return optionIs(environment, "armn64_gl_fb_effects", "fast") ? "fast" : "exact";
+	}
+	if (!strcmp(name, "N64_GL_MSAA")) {
+		const char* v = optionValue(environment, "armn64_gl_msaa");
+		return v && strcmp(v, "off") ? v : "0";
+	}
+	if (!strcmp(name, "N64_WIDESCREEN")) {
+		const char* v = optionValue(environment, "armn64_widescreen");
+		return v && strcmp(v, "disabled") ? v : "0";
+	}
+	if (!strcmp(name, "N64_GL_SEAL")) {
+		return optionIs(environment, "armn64_gl_seal", "enabled") ? "1" : "0";
+	}
+	if (!strcmp(name, "N64_GL_SHADERS")) {
+		return optionIs(environment, "armn64_gl_shaders", "fast") ? "fast" : "accurate";
+	}
+	if (!strcmp(name, "N64_GL_PRECOMPILE")) {
+		return optionIs(environment, "armn64_gl_precompile", "enabled") ? "2" : "0";
+	}
 	if (!strcmp(name, "N64_FRAMESKIP")) {
-		return optionIs(environment, "armn64_frameskip", "enabled") ? "1" : "0";
+		return optionIs(environment, "armn64_frameskip", "auto") ? "2" : optionIs(environment, "armn64_frameskip", "enabled") ? "1" : "0";
 	}
 	if (!strcmp(name, "N64_RDP_THREADS")) {
 		const char* value = optionValue(environment, "armn64_rdp_threads");
@@ -705,6 +753,26 @@ static void notify(const char* text) {
 	logMessage(RETRO_LOG_WARN, text);
 }
 
+// Frame Skip Auto: whether the frontend's audio buffer is running low (a third full or less), and
+// whether a longer buffer has been asked for.
+static bool audioBehind, latencySet;
+
+static void audioBufferStatus(bool active, unsigned occupancy, bool underrunLikely) {
+	audioBehind = active && (underrunLikely || occupancy <= 33);
+}
+
+// Shader Precompile's progress, as a bar where the frontend draws one.
+static void showProgress(int done, int total) {
+	char text[64];
+	int percent = total ? done * 100 / total : 100;
+	snprintf(text, sizeof(text), "Compiling shaders: %d%%", percent);
+	struct retro_message_ext ext = { text, 1000, 2, RETRO_LOG_INFO, RETRO_MESSAGE_TARGET_OSD, RETRO_MESSAGE_TYPE_PROGRESS, (int8_t) percent };
+	if (!environment(RETRO_ENVIRONMENT_SET_MESSAGE_EXT, &ext)) {
+		struct retro_message message = { text, 60 };
+		environment(RETRO_ENVIRONMENT_SET_MESSAGE, &message);
+	}
+}
+
 // What HLE gave up for this game, said once: a graphics microcode it doesn't know (run on the RSP).
 static bool toldRsp;
 
@@ -821,6 +889,9 @@ bool retro_load_game(const struct retro_game_info* info) {
 	audioPhase = 0;
 	memset(audioLast, 0, sizeof(audioLast));
 	describeInput();
+	struct retro_audio_buffer_status_callback bufferStatus = { audioBufferStatus };
+	audioBehind = latencySet = false;
+	environment(RETRO_ENVIRONMENT_SET_AUDIO_BUFFER_STATUS_CALLBACK, machine->skip.automatic ? &bufferStatus : NULL);
 	bool achievements = true;
 	environment(RETRO_ENVIRONMENT_SET_SUPPORT_ACHIEVEMENTS, &achievements);
 	return true;
@@ -1096,6 +1167,14 @@ static void setGeometry(int width, int height) {
 	float aspect = optionIs(environment, "armn64_aspect", "tv")       ? n64TvAspect(machine)
 	               : optionIs(environment, "armn64_aspect", "square") ? (float) width / (float) height
 	                                                                  : 4.0f / 3.0f;
+	// Widescreen: the picture drawn that much wider (with the built-in graphics), or a game's own
+	// code drawing it so (Picture Only).
+	bool const library = machine && !machine->gfxRsp;
+	if (optionIs(environment, "armn64_widescreen", "16:9-picture") || (library && optionIs(environment, "armn64_widescreen", "16:9"))) {
+		aspect *= 4.0f / 3;
+	} else if (optionIs(environment, "armn64_widescreen", "16:10-picture") || (library && optionIs(environment, "armn64_widescreen", "16:10"))) {
+		aspect *= 1.2f;
+	}
 	if (width != pictureWidth || height != pictureHeight || aspect != pictureAspect) {
 		pictureWidth = width, pictureHeight = height, pictureAspect = aspect;
 		struct retro_game_geometry geometry = { (unsigned) width, (unsigned) height, 640 * maxScale, 480 * maxScale, aspect };
@@ -1173,7 +1252,25 @@ void retro_run(void) {
 		}
 		return;
 	}
+	// The game waits while the shaders it used before are made, a few a frame.
+	int done, total;
+	if (shared && hwReady && n64GlPrecompile(machine, 12.0, &done, &total)) {
+		showProgress(done, total);
+		if (done < total) {
+			videoRefresh(NULL, (unsigned) pictureWidth, (unsigned) pictureHeight, 0);
+			return;
+		}
+	}
 	readPorts();
+	if (machine->skip.automatic) {
+		// A longer audio buffer gives the skips time to catch up.
+		if (!latencySet) {
+			unsigned latency = pal ? 120 : 100;
+			environment(RETRO_ENVIRONMENT_SET_MINIMUM_AUDIO_LATENCY, &latency);
+			latencySet = true;
+		}
+		machine->skip.behind = audioBehind;
+	}
 	machine->viFilters = optionIs(environment, "armn64_vi_filters", "on") ||
 	                     (!optionIs(environment, "armn64_vi_filters", "off") && machine->accuracy != ACCURACY_HLE && !machine->rdpGl);
 	cheatsApply(machine, &cheats);
@@ -1183,7 +1280,9 @@ void retro_run(void) {
 	// does the GL renderer's.
 	unsigned buffer = 0, framebuffer = 0;
 	int x = 0, y = 0;
-	if (shared && hwReady && n64GlPicture(machine, &framebuffer, &x, &y, &width, &height) && width && height) {
+	if (machine->glr && n64PictureSkipped(machine)) {
+		videoRefresh(NULL, (unsigned) pictureWidth, (unsigned) pictureHeight, 0);
+	} else if (shared && hwReady && n64GlPicture(machine, &framebuffer, &x, &y, &width, &height) && width && height) {
 		width *= machine->glrScale, height *= machine->glrScale;
 		presentGl(framebuffer, x, y, width, height);
 	} else if (shared && hwReady && n64PictureStart(machine, &width, &height) && width && height && (buffer = n64PictureBuffer(machine))) {
