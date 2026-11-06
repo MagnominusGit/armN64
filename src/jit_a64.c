@@ -10,13 +10,22 @@
 //
 // Registers: x19 = n, x20 = &n->cpu, x21 = cycles left to the limit (the limit less n->cycles),
 // x22 = the limit, x23 = RDRAM,
-// x25 = vpages, x26 = pageFlags, x27 = cpu.dcacheTag, x28 = cpu.dcacheDirty; x24 and x9-x15 hold
-// guest registers within a
-// block (each written through to memory at once, so memory is always up to date); x0-x8, x16 and
-// x17 are scratch. Each block starts with a branch to the way out, for the conditional branches that
+// x25 = vpages, x26 = pageFlags, x27 = cpu.dcacheTag, x28 = cpu.dcacheDirty, w29 = whether a branch
+// inside the block is taken; x24 and x9-x15 hold
+// guest registers within a block, a new value written back to memory when the register is given up,
+// before a call, and on the way out; x0-x8, x16 and x17 are scratch. Each block starts with a branch to the way out, for the conditional branches that
 // can't reach it.
 
-enum { ARENA_SIZE = 128 << 20, BLOCK_CODE_MAX = 32 << 10, SHARED_SIZE = 256 };
+// The arena's first half has the shared code and the blocks' hot code (n->jitUsed), its second half
+// their cold code: slow paths, misses and the exits a pass seldom takes. How much of the second half
+// is used is kept at the end of the shared code's space.
+enum { ARENA_SIZE = 128 << 20, BLOCK_CODE_MAX = 32 << 10, SHARED_SIZE = 512, CHAIN_REST = 384 };
+
+static uint64_t* coldUsed(struct N64* n) {
+	return (uint64_t*) (n->jitArena + SHARED_SIZE - 8);
+}
+
+const bool jitBranchesInside = true;
 
 enum { N = 19, CPU = 20, LEFT = 21, LIMIT = 22, RAM = 23, TLB = 25, PAGES = 26, DTAG = 27, DIRTY = 28, IP = 16, IP1 = 17 };
 
@@ -24,12 +33,40 @@ enum { N = 19, CPU = 20, LEFT = 21, LIMIT = 22, RAM = 23, TLB = 25, PAGES = 26, 
 enum { POOL = 8, POOL_SAVED = 1 };
 static const uint8_t pool[POOL] = { 24, 9, 10, 11, 12, 13, 14, 15 };
 
-// Which guest register each pool register holds, and when it was last used.
+// FLE: sp and v0 live in x27 and x28 (the D-cache's registers, which HLE doesn't use) from the way
+// in to the way out; memory has them only around calls that read or write guest registers.
+enum { PINNED = 2 };
+static const uint8_t pinnedGuest[PINNED] = { 29, 2 }, pinnedHost[PINNED] = { DTAG, DIRTY };
+
+static int pinnedReg(bool fle, int g) {
+	for (int i = 0; fle && i < PINNED; ++i) {
+		if (pinnedGuest[i] == g) {
+			return pinnedHost[i];
+		}
+	}
+	return -1;
+}
+
+static void storePinned(struct Emitter* e) {
+	for (int i = 0; i < PINNED; ++i) {
+		aStrX(e, pinnedHost[i], CPU, (unsigned) offsetof(struct CPU, gpr) + 8u * pinnedGuest[i]);
+	}
+}
+
+static void loadPinned(struct Emitter* e) {
+	for (int i = 0; i < PINNED; ++i) {
+		aLdrX(e, pinnedHost[i], CPU, (unsigned) offsetof(struct CPU, gpr) + 8u * pinnedGuest[i]);
+	}
+}
+
+// Which guest register each pool register holds, when it was last used, and which ones memory
+// doesn't have yet (a bit each).
 struct Cache {
 	int8_t guest[POOL];
 	int8_t host[32];
 	uint32_t used[POOL];
 	uint32_t clock;
+	uint8_t dirty;
 };
 
 #define CPU_OFF(f) ((unsigned) offsetof(struct CPU, f))
@@ -113,10 +150,16 @@ struct Exit {
 	uint8_t mark;
 	// A likely branch not taken: its load cycle (cpuLoadStall), or -1 to check the CPU's mark.
 	int8_t stall;
+	struct Cache cache;
+	// After the delay slot of a branch inside the block, taken: on to its target.
+	bool side;
+	uint64_t to;
 };
 
 struct Slow {
 	uint8_t* site[8];
+	// The registers at each site, whose new values go to memory before the interpreter.
+	struct Cache siteCache[8];
 	int sites;
 	uint8_t* resume;
 	uint32_t op, paddr;
@@ -140,6 +183,7 @@ struct Miss {
 	int size;
 	// A load that, with the GL renderer, waits for the GPU's pages when the line comes in.
 	bool glLoad;
+	bool store;
 	// The guest registers held where the fast path resumes, to load again after a call.
 	struct Cache cache;
 };
@@ -158,6 +202,8 @@ struct Jit {
 	bool interruptCheck;
 	// The instruction set pc and nextPc itself (ERET): the block leaves after it.
 	bool jumped;
+	// The branch being compiled is inside the block (w29 = taken).
+	bool inside;
 	struct Exit exits[3 * 64];
 	int exitCount;
 	struct Slow slows[64];
@@ -170,15 +216,30 @@ struct Jit {
 	// Loads from pages the RDP may still be drawing to, which wait for it.
 	struct Miss rdpWaits[64];
 	int rdpWaitCount;
+	// With HLE accuracy, accesses not to kseg0's RDRAM or not aligned: through vpages in the cold code.
+	struct Miss mapped[64];
+	int mappedCount;
 	uint8_t* leave;
 	bool rdpThreads, rdpGl;
 	// Outside mle the D-cache holds the data cached accesses use; with HLE accuracy (fast)
 	// there are no caches.
 	bool cacheData, fast, plainCount;
+	// FLE (Fastest): cycles counted at the block's exits, and no load interlocks, address checks or
+	// FPU result fix-ups.
+	bool fle;
+	int opCycles;
 	// Status.FR as the block was compiled: with it clear, odd 32-bit FPU registers are the high
 	// halves of even ones.
 	bool fr;
+	// Status already checked on the way here for CU1, and for FR: until a call or a join.
+	bool cu1Seen, frSeen;
+	// While hot exits are emitted: the cold code, where their calls to jitLink go.
+	struct Emitter* cold;
+	uint8_t* arena;
 	struct Cache cache;
+	// The guest registers known to hold a constant here (a bit each), a 32-bit one sign-extended.
+	uint32_t known;
+	int32_t value[32];
 };
 
 static void cacheClear(struct Cache* c) {
@@ -188,13 +249,34 @@ static void cacheClear(struct Cache* c) {
 	for (int g = 0; g < 32; ++g) {
 		c->host[g] = -1;
 	}
+	c->dirty = 0;
 }
 
 static void forget(struct Cache* c, int g) {
 	if (c->host[g] >= 0) {
+		c->dirty &= (uint8_t) ~(1u << c->host[g]);
 		c->guest[c->host[g]] = -1;
 		c->host[g] = -1;
 	}
+}
+
+// The new values a cache holds, to memory.
+static void flushDirty(struct Emitter* e, const struct Cache* c) {
+	for (int k = 0; k < POOL; ++k) {
+		if (c->dirty >> k & 1) {
+			aStrX(e, pool[k], CPU, gprOff(c->guest[k]));
+		}
+	}
+}
+
+static void writeBack(struct Jit* j) {
+	flushDirty(&j->e, &j->cache);
+	j->cache.dirty = 0;
+}
+
+static void slowSite(struct Slow* s, uint8_t* site, const struct Cache* c) {
+	s->siteCache[s->sites] = *c;
+	s->site[s->sites++] = site;
 }
 
 // Calls clobber the pool registers that aren't callee-saved.
@@ -222,8 +304,12 @@ static int claim(struct Jit* j, int g) {
 			}
 		}
 		if (c->guest[i] >= 0) {
+			if (c->dirty >> i & 1) {
+				aStrX(&j->e, pool[i], CPU, gprOff(c->guest[i]));
+			}
 			c->host[c->guest[i]] = -1;
 		}
+		c->dirty &= (uint8_t) ~(1u << i);
 		c->guest[i] = (int8_t) g;
 		c->host[g] = (int8_t) i;
 	}
@@ -236,6 +322,9 @@ static int readReg(struct Jit* j, int g) {
 	if (!g) {
 		return ZR;
 	}
+	if (pinnedReg(j->fle, g) >= 0) {
+		return pinnedReg(j->fle, g);
+	}
 	bool held = j->cache.host[g] >= 0;
 	int host = pool[claim(j, g)];
 	if (!held) {
@@ -245,14 +334,31 @@ static int readReg(struct Jit* j, int g) {
 }
 
 // The host register to compute guest g's new value in (scratch x8 for r0, which keeps 0); commit()
-// then writes it through.
+// then marks it new.
 static int writeReg(struct Jit* j, int g) {
-	return g ? pool[claim(j, g)] : 8;
+	return !g ? 8 : pinnedReg(j->fle, g) >= 0 ? pinnedReg(j->fle, g) : pool[claim(j, g)];
 }
 
 static void commit(struct Jit* j, int g, int host) {
+	(void) host;
 	if (g) {
-		aStrX(&j->e, host, CPU, gprOff(g));
+		if (j->cache.host[g] >= 0) {
+			j->cache.dirty |= (uint8_t) (1u << j->cache.host[g]);
+		}
+		j->known &= ~(1u << g);
+	}
+}
+
+// Guest g's constant value, when it is known.
+static bool constant(const struct Jit* j, int g, int32_t* v) {
+	*v = g ? j->value[g] : 0;
+	return !g || (j->known >> g & 1);
+}
+
+static void setKnown(struct Jit* j, int g, uint64_t v) {
+	if (g && v == sext32((uint32_t) v)) {
+		j->known |= 1u << g;
+		j->value[g] = (int32_t) v;
 	}
 }
 
@@ -262,6 +368,7 @@ static void setConst(struct Jit* j, int g, uint64_t v) {
 		int d = writeReg(j, g);
 		movConst(&j->e, d, v);
 		commit(j, g, d);
+		setKnown(j, g, v);
 	}
 }
 
@@ -275,7 +382,7 @@ static void setReg(struct Jit* j, int g, int r) {
 }
 
 static void exitAt(struct Jit* j, uint8_t* site, uint64_t pc, enum Kind kind, bool delay, bool skip) {
-	j->exits[j->exitCount++] = (struct Exit) { site, pc, kind, delay, skip, false, false, j->mark, skip ? j->branchStall : 0 };
+	j->exits[j->exitCount++] = (struct Exit) { site, pc, kind, delay, skip, false, false, j->mark, skip ? j->branchStall : 0, j->cache, false, 0 };
 }
 
 // Sets the flags for a branch condition and returns the condition under which it is taken.
@@ -303,13 +410,25 @@ static void emitMemory(struct Jit* j, struct Slow* slow);
 
 // Leaves the instruction for the interpreter, before it has changed anything, when cond holds.
 static void slowIf(struct Jit* j, int cond) {
-	j->slow->site[j->slow->sites++] = aBcond(&j->e, cond, NULL);
+	slowSite(j->slow, aBcond(&j->e, cond, NULL), &j->cache);
 }
 
-// The interpreter raises "coprocessor unusable" when Status.CU1 is off.
-static void needCop1(struct Jit* j) {
-	aLdr(&j->e, 16, CPU, CPU_OFF(cop0) + 8 * CP0_STATUS);
-	j->slow->site[j->slow->sites++] = aTbz(&j->e, 16, 29, NULL);
+// The interpreter raises "coprocessor unusable" when Status.CU1 is off; with fr, the instruction
+// needs the Status.FR the block was compiled with.
+static void needCop1(struct Jit* j, bool fr) {
+	if (j->cu1Seen && (j->frSeen || !fr)) {
+		return;
+	}
+	struct Emitter* e = &j->e;
+	aLdr(e, 16, CPU, CPU_OFF(cop0) + 8 * CP0_STATUS);
+	if (!j->cu1Seen) {
+		slowSite(j->slow, aTbz(e, 16, 29, NULL), &j->cache);
+	}
+	if (fr && !j->frSeen) {
+		slowSite(j->slow, j->fr ? aTbz(e, 16, 26, NULL) : aTbnz(e, 16, 26, NULL), &j->cache);
+	}
+	j->cu1Seen = true;
+	j->frSeen |= fr;
 }
 
 // Whether fpuExecute runs op without raising an exception: the moves (MFC1, DMFC1, CFC1, MTC1,
@@ -350,6 +469,10 @@ static unsigned fprOff(const struct Jit* j, int r) {
 // set, and the host's default NaN made the VR4300's.
 static void storeSingle(struct Jit* j, int fd) {
 	struct Emitter* e = &j->e;
+	if (j->fle) {
+		aStr(e, 0, CPU, fprOff(j, fd));
+		return;
+	}
 	aLdr(e, 17, CPU, CPU_OFF(fcr31));
 	uint8_t* keep = aTbz(e, 17, 24, NULL);
 	aLogicImm(e, A_ANDS_IMM, ZR, 0, 0x7F800000);
@@ -374,6 +497,10 @@ static unsigned fprOff64(const struct Jit* j, int r) {
 // set, and the host's default NaN made the VR4300's.
 static void storeDouble(struct Jit* j, int fd) {
 	struct Emitter* e = &j->e;
+	if (j->fle) {
+		aStrX(e, 0, CPU, fprOff64(j, fd));
+		return;
+	}
 	aLdr(e, 17, CPU, CPU_OFF(fcr31));
 	uint8_t* keep = aTbz(e, 17, 24, NULL);
 	emit32(e, 0xD374F801); // ubfx x1, x0, #52, #11: the exponent
@@ -451,8 +578,7 @@ static bool emitFpuFast(struct Jit* j, uint32_t op) {
 	if (!(fmt == 0 || fmt == 2 || fmt == 4 || single || dbl || (fmt == 20 && func == 32))) {
 		return false;
 	}
-	needCop1(j);
-	j->slow->site[j->slow->sites++] = j->fr ? aTbz(e, 16, 26, NULL) : aTbnz(e, 16, 26, NULL);
+	needCop1(j, true);
 	switch (fmt) {
 	case 0:
 		if (ft) {
@@ -541,8 +667,7 @@ static bool emitFpu(struct Jit* j, uint32_t op) {
 	if (fmt != 0 && fmt != 2 && fmt != 4) {
 		return false;
 	}
-	needCop1(j);
-	j->slow->site[j->slow->sites++] = j->fr ? aTbz(e, 16, 26, NULL) : aTbnz(e, 16, 26, NULL);
+	needCop1(j, true);
 	switch (fmt) {
 	case 0:
 		if (ft) {
@@ -842,7 +967,13 @@ static bool emitInline(struct Jit* j, uint32_t op, uint64_t pc, enum Kind* kind)
 			if (op >> 26 == 0x09) {
 				aSxtw(e, d, d);
 			}
+			int32_t v;
+			bool was = constant(j, rs, &v);
 			commit(j, rt, d);
+			if (was) {
+				uint64_t sum = (uint64_t) (int64_t) v + (uint64_t) (int64_t) imm;
+				setKnown(j, rt, op >> 26 == 0x09 ? sext32((uint32_t) sum) : sum);
+			}
 		}
 		return true;
 	case 0x0A: case 0x0B:
@@ -869,7 +1000,12 @@ static bool emitInline(struct Jit* j, uint32_t op, uint64_t pc, enum Kind* kind)
 			}
 			aMovImm(e, 1, (uint16_t) op);
 			aDp(e, alu[(op >> 26) - 0x0C] | W64, d, s, 1, S_LSL, 0);
+			int32_t v;
+			bool was = constant(j, rs, &v) && op >> 26 == 0x0D;
 			commit(j, rt, d);
+			if (was) {
+				setKnown(j, rt, (uint64_t) (int64_t) v | (uint16_t) op);
+			}
 		}
 		return true;
 	case 0x0F:
@@ -892,14 +1028,21 @@ static bool emitInline(struct Jit* j, uint32_t op, uint64_t pc, enum Kind* kind)
 		}
 		// The FPU's own code, called directly. Its stall counts. With HLE accuracy it raises nothing.
 		bool const probe = fpuProbed(op) && !j->fast;
-		needCop1(j);
+		needCop1(j, false);
+		writeBack(j);
+		if (j->fle) {
+			storePinned(e);
+		}
 		aMovX(e, 0, N);
 		aMovImm(e, 1, op);
 		aMovImm64(e, IP, (uint64_t) (uintptr_t) (j->fast ? (void*) fpuExecuteFast : probe ? (void*) fpuProbe : (void*) fpuExecute));
 		aBlr(e, IP);
+		if (j->fle) {
+			loadPinned(e);
+		}
 		forgetCallerSaved(&j->cache);
 		if (probe) {
-			j->slow->site[j->slow->sites++] = aTbz(e, 0, 0, NULL);
+			slowSite(j->slow, aTbz(e, 0, 0, NULL), &j->cache);
 		}
 		aLdr(e, 0, CPU, CPU_OFF(stall));
 		aDp(e, A_SUB | W64, LEFT, LEFT, 0, S_LSL, 0);
@@ -907,6 +1050,7 @@ static bool emitInline(struct Jit* j, uint32_t op, uint64_t pc, enum Kind* kind)
 		// Moves to a general register: it has a new value; r0 is undone, as the interpreter zeroes it.
 		if (((op >> 21) & 31) <= 2) {
 			forget(&j->cache, rt);
+			j->known &= ~(1u << rt);
 			if (!rt) {
 				aStrX(e, ZR, CPU, gprOff(0));
 			}
@@ -939,6 +1083,7 @@ static bool emitInline(struct Jit* j, uint32_t op, uint64_t pc, enum Kind* kind)
 		if (j->fast) {
 			return true;
 		}
+		writeBack(j);
 		aMov(e, 2, 0);
 		aMovX(e, 0, N);
 		aMovImm(e, 1, op);
@@ -965,7 +1110,7 @@ static bool emitInline(struct Jit* j, uint32_t op, uint64_t pc, enum Kind* kind)
 	int cc;
 	if (op >> 26 == 0x11) {
 		// BC1F, BC1T and the likely ones: FCR31's condition bit, the causes cleared first.
-		needCop1(j);
+		needCop1(j, false);
 		aLdr(e, 0, CPU, CPU_OFF(fcr31));
 		aLogicImm(e, A_AND_IMM, 0, 0, ~0x3F000u);
 		aStr(e, 0, CPU, CPU_OFF(fcr31));
@@ -986,6 +1131,9 @@ static bool emitInline(struct Jit* j, uint32_t op, uint64_t pc, enum Kind* kind)
 		movConst(e, 3, target);
 		aCselX(e, 2, 3, 2, cc);
 		aStrX(e, 2, CPU, CPU_OFF(nextPc));
+		if (j->inside) {
+			aCset(e, 29, cc);
+		}
 		*kind = BRANCH;
 	}
 	return true;
@@ -1016,6 +1164,7 @@ static void icacheCheck(struct Jit* j, uint32_t vaddr, uint32_t paddr, bool toSt
 	aMovImm(e, 1, paddr & ~31u);
 	aDp(e, A_SUBS, ZR, 0, 1, S_LSL, 0);
 	uint8_t* hit = aBcond(e, C_EQ, NULL);
+	flushDirty(e, &j->cache);
 	aPush(e, 2, 3, 16);
 	aMovX(e, 0, N);
 	aMovImm(e, 1, vaddr);
@@ -1034,9 +1183,9 @@ static void icacheCheck(struct Jit* j, uint32_t vaddr, uint32_t paddr, bool toSt
 	patchHere(e, hit);
 }
 
-// The idle loop at vaddr, when its I-cache lines are in: whole passes of two cycles up to one or two
-// cycles short of the limit, leaving the last instructions to run as usual.
-static void skipIdle(struct Emitter* e, uint32_t vaddr, uint32_t paddr, bool fast) {
+// The idle loop at vaddr, when its I-cache lines are in: whole passes of its two instructions up to a
+// pass or less short of the limit, leaving the last instructions to run as usual.
+static void skipIdle(struct Emitter* e, uint32_t vaddr, uint32_t paddr, bool fast, int opCycles) {
 	uint8_t* skip[3];
 	int sites = 0;
 	int lines = fast ? 0 : (paddr + 4) & 31 ? 1 : 2;
@@ -1050,8 +1199,8 @@ static void skipIdle(struct Emitter* e, uint32_t vaddr, uint32_t paddr, bool fas
 	aDpImm(e, A_SUBS_IMM | W64, ZR, LEFT, 1);
 	skip[sites++] = aBcond(e, C_LE, NULL);
 	aDpImm(e, A_SUB_IMM | W64, 0, LEFT, 1);
-	aLsrImmX(e, 0, 0, 1);
-	aDp(e, A_SUB | W64, LEFT, LEFT, 0, S_LSL, 1);
+	aLsrImmX(e, 0, 0, opCycles == 4 ? 3 : 1);
+	aDp(e, A_SUB | W64, LEFT, LEFT, 0, S_LSL, opCycles == 4 ? 3 : 1);
 	for (int i = 0; i < sites; ++i) {
 		patchHere(e, skip[i]);
 	}
@@ -1072,7 +1221,13 @@ static bool isBranchOp(uint32_t op) {
 	return false;
 }
 
-static void chain(struct Jit* j);
+// Branches to where the full state is written before going back to C.
+struct Sites {
+	uint8_t* at[16];
+	int count;
+};
+
+static void chain(struct Jit* j, struct Sites* miss);
 
 // The instruction through cpuJitStep, which adds its cycles. Leaves if it asks to or at the limit;
 // at the end of the block goes on to the next.
@@ -1120,10 +1275,16 @@ static void emitHelper(struct Jit* j, uint32_t op, uint64_t pc, uint32_t paddr, 
 	storeByte(e, CPU_OFF(nextInDelay), 0);
 	aDp(e, A_SUB | W64, 1, LIMIT, LEFT, S_LSL, 0);
 	storeN(e, 1, N64_OFF(cycles), 8);
+	if (j->fle) {
+		storePinned(e);
+	}
 	aMovX(e, 0, N);
 	aMovImm(e, 1, op);
 	aMovImm64(e, IP, (uint64_t) (uintptr_t) cpuJitStep);
 	aBlr(e, IP);
+	if (j->fle) {
+		loadPinned(e);
+	}
 	loadN(e, 1, N64_OFF(cycles), 8);
 	loadN(e, LIMIT, N64_OFF(jitLimit), 8);
 	aDp(e, A_SUB | W64, LEFT, LIMIT, 1, S_LSL, 0);
@@ -1141,7 +1302,7 @@ static void emitHelper(struct Jit* j, uint32_t op, uint64_t pc, uint32_t paddr, 
 	if (last) {
 		aLdrb(e, 0, CPU, CPU_OFF(nextInDelay));
 		aCbnz(e, 0, j->leave);
-		chain(j);
+		chain(j, NULL);
 	}
 }
 
@@ -1209,45 +1370,65 @@ static void emitMemory(struct Jit* j, struct Slow* slow) {
 	bool isStore = code >= 0x28 && code != 0x37 && code != 0x31 && code != 0x35;
 	int32_t offset = (int16_t) op;
 	if (fpu) {
-		needCop1(j);
+		needCop1(j, false);
 	}
 
-	// The address in 64 bits, which the interpreter takes when it isn't a 32-bit one sign-extended (an
-	// address error); the low 32 bits from here on.
-	int base = readReg(j, rs);
-	if (base == ZR) {
-		aMovImm(e, 0, (uint32_t) offset);
+	// With HLE accuracy an address known now (a constant base) that is kseg0's RDRAM, aligned, needs
+	// no checks: w6 is its physical address.
+	int32_t baseValue = 0;
+	bool const known = j->fast && constant(j, rs, &baseValue);
+	int64_t const at = (int64_t) baseValue + offset;
+	bool const direct = known && at == (int32_t) at && ((uint32_t) at ^ 0x80000000u) < RDRAM_SIZE && !((uint32_t) at & (uint32_t) (size - 1));
+	if (direct) {
+		aMovImm(e, 6, (uint32_t) at ^ 0x80000000u);
 	} else {
-		if (offset >= 0 && offset < 4096) {
-			aDpImm(e, A_ADD_IMM | W64, 0, base, (unsigned) offset);
-		} else if (offset < 0 && offset > -4096) {
-			aDpImm(e, A_SUB_IMM | W64, 0, base, (unsigned) -offset);
+		// The address in 64 bits, which the interpreter takes when it isn't a 32-bit one sign-extended (an
+		// address error); the low 32 bits from here on.
+		int base = readReg(j, rs);
+		if (base == ZR) {
+			aMovImm(e, 0, (uint32_t) offset);
 		} else {
-			aMovImm(e, 1, (uint32_t) offset);
-			aSxtw(e, 1, 1);
-			aDp(e, A_ADD | W64, 0, base, 1, S_LSL, 0);
+			if (offset >= 0 && offset < 4096) {
+				aDpImm(e, A_ADD_IMM | W64, 0, base, (unsigned) offset);
+			} else if (offset < 0 && offset > -4096) {
+				aDpImm(e, A_SUB_IMM | W64, 0, base, (unsigned) -offset);
+			} else {
+				aMovImm(e, 1, (uint32_t) offset);
+				aSxtw(e, 1, 1);
+				aDp(e, A_ADD | W64, 0, base, 1, S_LSL, 0);
+			}
+			if (!j->fle) {
+				emit32(e, 0xEB20C01F); // cmp x0, w0, sxtw
+				slowIf(j, C_NE);
+			}
 		}
-		aSxtw(e, 1, 0);
-		aDp(e, A_SUBS | W64, ZR, 0, 1, S_LSL, 0);
-		slowIf(j, C_NE);
+		aLogicImm(e, A_EOR_IMM, 6, 0, 0x80000000);
+		if (j->fast) {
+			// kseg0's RDRAM and aligned in one test; anything else through vpages in the cold code.
+			aLogicImm(e, A_ANDS_IMM, ZR, 6, 0xFF800000u | (j->fle ? 0 : (uint32_t) (size - 1)));
+			struct Miss* v = &j->mapped[j->mappedCount++];
+			v->site = aBcond(e, C_NE, NULL);
+			v->resume = e->p;
+			v->slow = slow;
+			v->size = size;
+			v->store = isStore;
+			v->cache = j->cache;
+			slow->keep = true;
+		} else {
+			// kseg0's RDRAM directly; other pages from vpages, where one not looked up lands past RDRAM.
+			aLsrImm(e, 2, 6, 23);
+			uint8_t* kseg0 = aCbz(e, 2, NULL);
+			aLsrImm(e, 1, 0, 12);
+			if (isStore) {
+				aDpImm(e, A_ADD_IMM | W64, 3, TLB, VPAGES * 4);
+				aLdst(e, L_LDR, 5, 3, 1, L_UXTW | 0x1000);
+			} else {
+				aLdst(e, L_LDR, 5, TLB, 1, L_UXTW | 0x1000);
+			}
+			aDp(e, A_ADD, 6, 0, 5, S_LSL, 0);
+			patchHere(e, kseg0);
+		}
 	}
-	// kseg0's RDRAM directly; other pages from vpages, where one not looked up lands past RDRAM.
-	aLogicImm(e, A_EOR_IMM, 6, 0, 0x80000000);
-	aLsrImm(e, 2, 6, 23);
-	uint8_t* kseg0 = aCbz(e, 2, NULL);
-	aLsrImm(e, 1, 0, 12);
-	if (isStore) {
-		aDpImm(e, A_ADD_IMM | W64, 3, TLB, VPAGES * 4);
-		aLdst(e, L_LDR, 5, 3, 1, L_UXTW | 0x1000);
-	} else {
-		aLdst(e, L_LDR, 5, TLB, 1, L_UXTW | 0x1000);
-	}
-	aDp(e, A_ADD, 6, 0, 5, S_LSL, 0);
-	if (j->fast) {
-		aLsrImm(e, 2, 6, 23);
-		slow->site[slow->sites++] = aCbnz(e, 2, NULL);
-	}
-	patchHere(e, kseg0);
 	// Stores go slow on any flag (code, RDP) unless the page has only code that they miss; loads
 	// on pages the RDP may still be drawing to. With the D-cache's data only its fills and
 	// write-backs reach memory, in C.
@@ -1274,13 +1455,7 @@ static void emitMemory(struct Jit* j, struct Slow* slow) {
 		w->cache = j->cache;
 	}
 
-	if (j->fast) {
-		// Aligned (and in RDRAM, from above).
-		if (size > 1) {
-			aLogicImm(e, A_ANDS_IMM, ZR, 0, size - 1);
-			slowIf(j, C_NE);
-		}
-	} else {
+	if (!j->fast) {
 		// The line index from the virtual address; a hit when its tag is this physical line and the
 		// address is aligned.
 		aUbfx(e, 1, 0, 4, 9);
@@ -1417,11 +1592,11 @@ static uint32_t fusedRunLength(const uint32_t* ops, uint32_t k, uint32_t count) 
 
 // The run, when nothing in it can leave its fast path: the cycles can't reach the limit, its
 // I-cache lines are in, the base is aligned for every access, all of them are in one RDRAM page with
-// no flags, and every D-cache line they span is in. Every access then hits and takes one cycle, so
-// the run is its loads and stores in order and its cycles at once. Anything else takes the
+// no flags, and every D-cache line they span is in. Every access then hits and takes no cycle more
+// than its instruction, so the run is its loads and stores in order and its cycles at once. Anything else takes the
 // instructions one by one (emitted after this), from the start of the run. Returns the branch to
 // the end of the run.
-static uint8_t* fuseRun(struct Jit* j, const uint32_t* ops, uint32_t len, uint32_t vaddr, uint32_t paddr) {
+static uint8_t* fuseRun(struct Jit* j, const uint32_t* ops, uint32_t len, uint32_t vaddr, uint32_t paddr, int prevMark) {
 	struct Emitter* e = &j->e;
 	uint8_t* out[96];
 	int sites = 0;
@@ -1436,9 +1611,22 @@ static uint8_t* fuseRun(struct Jit* j, const uint32_t* ops, uint32_t len, uint32
 		align = size > align ? size : align;
 		stores |= ops[i] >> 26 >= 0x28 && ops[i] >> 26 != 0x37;
 	}
-	// The base first: the instructions one by one hold it from here whichever way the checks go.
+	// Its load interlocks, as the instructions one by one take them; the first one's from the block
+	// before is known only when running, so the limit allows for it.
+	uint32_t cycles = len * (uint32_t) j->opCycles;
+	bool markCheck = false;
+	if (!j->fle) {
+		cycles += prevMark >= 0 && cpuLoadStall(ops[0], (uint8_t) prevMark);
+		for (uint32_t i = 1; i < len; ++i) {
+			cycles += cpuLoadStall(ops[i], cpuLoadMark(ops[i - 1]));
+		}
+		markCheck = prevMark < 0;
+	}
+	// The base first: the instructions one by one hold it from here whichever way the checks go. The
+	// run reads and writes the registers in memory.
+	writeBack(j);
 	int b = readReg(j, rs);
-	aMovImm(e, 1, len);
+	aMovImm(e, 1, cycles + markCheck);
 	aDp(e, A_SUBS | W64, ZR, LEFT, 1, S_LSL, 0);
 	out[sites++] = aBcond(e, C_LE, NULL);
 	for (uint32_t p = paddr & ~31u; p < paddr + 4 * len && !j->fast; p += 32) {
@@ -1527,6 +1715,10 @@ static uint8_t* fuseRun(struct Jit* j, const uint32_t* ops, uint32_t len, uint32
 	if (stores) {
 		aMovImm(e, 3, 1);
 	}
+	// The run moves registers through memory.
+	if (j->fle) {
+		storePinned(e);
+	}
 	for (uint32_t i = 0; i < len; ++i) {
 		uint32_t op = ops[i];
 		int rt = (op >> 16) & 31, code = op >> 26;
@@ -1557,12 +1749,20 @@ static uint8_t* fuseRun(struct Jit* j, const uint32_t* ops, uint32_t len, uint32
 		case 0x2B: if (rt) { aRev(e, 4, 4); } aStr(e, v, 7, d); break;
 		default: if (rt) { aRevX(e, 4, 4); } aStrX(e, v, 7, d);
 		}
-		// The line it wrote is dirty.
-		aAddImm(e, 1, 0, (int16_t) op - lo, 2);
-		aUbfx(e, 1, 1, 4, 9);
-		aLdst(e, L_STRB, 3, DIRTY, 1, L_UXTW);
+		// The line it wrote is dirty (with caches).
+		if (!j->fast) {
+			aAddImm(e, 1, 0, (int16_t) op - lo, 2);
+			aUbfx(e, 1, 1, 4, 9);
+			aLdst(e, L_STRB, 3, DIRTY, 1, L_UXTW);
+		}
 	}
-	aMovImm(e, 1, len);
+	if (j->fle) {
+		loadPinned(e);
+	}
+	if (markCheck) {
+		loadStallCheck(e, ops[0]);
+	}
+	aMovImm(e, 1, cycles);
 	aDp(e, A_SUB | W64, LEFT, LEFT, 1, S_LSL, 0);
 	uint8_t* done = aB(e, NULL);
 	for (int i = 0; i < sites; ++i) {
@@ -1579,6 +1779,9 @@ static void pollSkip(struct Jit* j, const uint32_t* ops, uint32_t count, uint32_
 	struct Emitter* e = &j->e;
 	uint8_t* out[64];
 	int sites = 0;
+	if (j->fle) {
+		storePinned(e);
+	}
 	if (checkPc) {
 		aLdrX(e, 0, CPU, CPU_OFF(pc));
 		movConst(e, 1, sext32(vaddr));
@@ -1644,77 +1847,112 @@ static void pollSkip(struct Jit* j, const uint32_t* ops, uint32_t count, uint32_
 
 void* jitLink(struct N64* n, uint32_t* site, uint32_t vaddr);
 
-// To the block at target when the pc is there: a jump that jitLink makes a direct one.
-static void linkTo(struct Jit* j, uint64_t target) {
+// The exits most passes take: the block's end, a branch inside it taken, a likely branch not taken.
+static bool hotExit(const struct Exit* x) {
+	return x->last || x->side || x->skip;
+}
+
+// A site's branch to cold code, through an unconditional one here.
+static uint8_t* farSite(struct Emitter* e, uint8_t* site) {
+	patchHere(e, site);
+	return aB(e, NULL);
+}
+
+// To the block at target when the pc is there (known: it is): a jump that jitLink makes a direct one.
+// Code the TLB maps keeps its page's vpages entry from then just after the jump, and goes on to the
+// code after this while the page maps elsewhere.
+static void linkTo(struct Jit* j, uint64_t target, struct Sites* miss, bool known) {
 	struct Emitter* e = &j->e;
-	aLdrX(e, 0, CPU, CPU_OFF(pc));
-	movConst(e, 1, target);
-	aDp(e, A_SUBS | W64, ZR, 0, 1, S_LSL, 0);
-	uint8_t* other = aBcond(e, C_NE, NULL);
-	// Code the TLB maps isn't jumped to directly (it may move): its entries here, kept as chain keeps
-	// them, find it without going back to C.
-	if (((uint32_t) target & 0xC0000000u) != 0x80000000u) {
-		chain(j);
-		patchHere(e, other);
-		return;
+	uint8_t* other = NULL;
+	if (!known) {
+		aLdrX(e, 0, CPU, CPU_OFF(pc));
+		movConst(e, 1, target);
+		aDp(e, A_SUBS | W64, ZR, 0, 1, S_LSL, 0);
+		other = aBcond(e, C_NE, NULL);
+	}
+	uint8_t* moved = NULL;
+	bool mapped = ((uint32_t) target & 0xC0000000u) != 0x80000000u;
+	if (mapped) {
+		aMovImm(e, 1, (uint32_t) target >> 12);
+		aLdst(e, L_LDR, 4, TLB, 1, L_UXTW | 0x1000);
+		emit32(e, 0x18000005 | 4 << 5);
+		aDp(e, A_SUBS, ZR, 4, 5, S_LSL, 0);
+		moved = aBcond(e, C_NE, NULL);
 	}
 	uint8_t* site = aB(e, NULL);
-	patchHere(e, site);
-	aMovX(e, 0, N);
-	aMovImm64(e, 1, (uint64_t) (uintptr_t) site);
-	aMovImm(e, 2, (uint32_t) target);
-	aMovImm64(e, IP, (uint64_t) (uintptr_t) jitLink);
-	aBlr(e, IP);
-	uint8_t* found = aCbnzX(e, 0, NULL);
-	aB(e, j->leave);
-	patchHere(e, found);
-	aBr(e, 0);
-	patchHere(e, other);
+	if (mapped) {
+		emit32(e, UINT32_MAX);
+	}
+	// The call, run once, goes with the cold code when there is some; a miss comes back here.
+	struct Emitter* c = j->cold ? j->cold : e;
+	uint8_t* missed = NULL;
+	if (miss && c != e) {
+		missed = e->p;
+		miss->at[miss->count++] = aB(e, NULL);
+	}
+	patchBranch(site, c->p);
+	aMovX(c, 0, N);
+	aMovImm64(c, 1, (uint64_t) (uintptr_t) site);
+	aMovImm(c, 2, (uint32_t) target);
+	aMovImm64(c, IP, (uint64_t) (uintptr_t) jitLink);
+	aBlr(c, IP);
+	uint8_t* found = aCbnzX(c, 0, NULL);
+	if (missed) {
+		aB(c, missed);
+	} else if (miss) {
+		miss->at[miss->count++] = aB(c, NULL);
+	} else {
+		aB(c, j->leave);
+	}
+	patchHere(c, found);
+	aBr(c, 0);
+	if (other) {
+		patchHere(e, other);
+	}
+	if (moved) {
+		patchHere(e, moved);
+	}
+}
+
+static void leaveIf(struct Jit* j, struct Sites* miss, int cond) {
+	if (miss) {
+		miss->at[miss->count++] = aBcond(&j->e, cond, NULL);
+	} else {
+		aBcond(&j->e, cond, j->leave);
+	}
 }
 
 // To the block at the pc: through the two entries kept after this code ({vaddr, gen, code}, the
-// latest first), else the jitTable (whose hit goes into the first entry), else the way out.
-static void chain(struct Jit* j) {
+// latest first), else the jitTable (whose hit goes into the first entry), else the way out. The first
+// entry is checked here, the rest in the shared code (chainRest), which comes back on a miss.
+static void chain(struct Jit* j, struct Sites* miss) {
 	struct Emitter* e = &j->e;
 	aLdrX(e, 0, CPU, CPU_OFF(pc));
 	aSxtw(e, 1, 0);
 	aDp(e, A_SUBS | W64, ZR, 1, 0, S_LSL, 0);
-	aBcond(e, C_NE, j->leave);
-	loadN(e, 4, N64_OFF(blockGen), 4);
+	leaveIf(j, miss, C_NE);
+	// Entries are good while their page maps where they were compiled (jitTag): w4, the address
+	// through vpages.
+	aLsrImm(e, 4, 0, 12);
+	aLdst(e, L_LDR, 4, TLB, 4, L_UXTW | 0x1000);
+	aDp(e, A_ADD, 4, 4, 0, S_LSL, 0);
 	uint8_t* adr = e->p;
 	emit32(e, 0);
-	uint8_t* miss[4];
-	for (int i = 0; i < 2; ++i) {
-		aLdpW(e, 3, 6, 2, 16 * i);
-		aDp(e, A_SUBS, ZR, 3, 0, S_LSL, 0);
-		miss[2 * i] = aBcond(e, C_NE, NULL);
-		aDp(e, A_SUBS, ZR, 6, 4, S_LSL, 0);
-		miss[2 * i + 1] = aBcond(e, C_NE, NULL);
-		aLdrX(e, 5, 2, 16 * i + 8);
-		aBr(e, 5);
-		if (i == 0) {
-			patchHere(e, miss[0]);
-		}
-	}
-	for (int i = 1; i < 4; ++i) {
-		patchHere(e, miss[i]);
-	}
-	aUbfx(e, 1, 0, 2, 14);
-	aAddImmX(e, 7, N, N64_OFF(jitTable));
-	aDp(e, A_ADD | W64, 7, 7, 1, S_LSL, 4);
-	aLdpW(e, 3, 6, 7, (unsigned) offsetof(struct JitEntry, vaddr));
+	aLdpW(e, 3, 6, 2, 0);
 	aDp(e, A_SUBS, ZR, 3, 0, S_LSL, 0);
-	aBcond(e, C_NE, j->leave);
+	uint8_t* other = aBcond(e, C_NE, NULL);
 	aDp(e, A_SUBS, ZR, 6, 4, S_LSL, 0);
-	aBcond(e, C_NE, j->leave);
-	aLdrX(e, 5, 7, (unsigned) offsetof(struct JitEntry, code));
-	aLdrX(e, 3, 2, 0);
-	aLdrX(e, 6, 2, 8);
-	aStrX(e, 3, 2, 16);
-	aStrX(e, 6, 2, 24);
-	aStpW(e, 0, 4, 2, 0);
-	aStrX(e, 5, 2, 8);
+	uint8_t* stale = aBcond(e, C_NE, NULL);
+	aLdrX(e, 5, 2, 8);
 	aBr(e, 5);
+	patchHere(e, other);
+	patchHere(e, stale);
+	aBl(e, j->arena + CHAIN_REST);
+	if (miss) {
+		miss->at[miss->count++] = aB(e, NULL);
+	} else {
+		aB(e, j->leave);
+	}
 	if ((uintptr_t) e->p & 7) {
 		emit32(e, 0xD503201F);
 	}
@@ -1731,14 +1969,49 @@ static void chain(struct Jit* j) {
 	}
 }
 
+// chain's second entry and the jitTable, from x0 = pc, w4 = its tag and x2 = the entries; back to
+// the caller on a miss.
+static void chainRest(struct Emitter* e) {
+	aLdpW(e, 3, 6, 2, 16);
+	aDp(e, A_SUBS, ZR, 3, 0, S_LSL, 0);
+	uint8_t* other = aBcond(e, C_NE, NULL);
+	aDp(e, A_SUBS, ZR, 6, 4, S_LSL, 0);
+	uint8_t* stale = aBcond(e, C_NE, NULL);
+	aLdrX(e, 5, 2, 24);
+	aBr(e, 5);
+	patchHere(e, other);
+	patchHere(e, stale);
+	aUbfx(e, 1, 0, 2, JIT_TABLE_BITS);
+	aAddImmX(e, 7, N, N64_OFF(jitTable));
+	aDp(e, A_ADD | W64, 7, 7, 1, S_LSL, 4);
+	aLdpW(e, 3, 6, 7, (unsigned) offsetof(struct JitEntry, vaddr));
+	aDp(e, A_SUBS, ZR, 3, 0, S_LSL, 0);
+	uint8_t* missed = aBcond(e, C_NE, NULL);
+	aDp(e, A_SUBS, ZR, 6, 4, S_LSL, 0);
+	uint8_t* missed2 = aBcond(e, C_NE, NULL);
+	aLdrX(e, 5, 7, (unsigned) offsetof(struct JitEntry, code));
+	aLdrX(e, 3, 2, 0);
+	aLdrX(e, 6, 2, 8);
+	aStrX(e, 3, 2, 16);
+	aStrX(e, 6, 2, 24);
+	aStpW(e, 0, 4, 2, 0);
+	aStrX(e, 5, 2, 8);
+	aBr(e, 5);
+	patchHere(e, missed);
+	patchHere(e, missed2);
+	aRet(e);
+}
+
 // To the block at the pc through the jitTable, else back to C.
 static void lookup(struct Emitter* e, uint8_t* leave) {
 	aLdrX(e, 0, CPU, CPU_OFF(pc));
 	aSxtw(e, 1, 0);
 	aDp(e, A_SUBS | W64, ZR, 1, 0, S_LSL, 0);
 	aBcond(e, C_NE, leave);
-	loadN(e, 4, N64_OFF(blockGen), 4);
-	aUbfx(e, 1, 0, 2, 14);
+	aLsrImm(e, 4, 0, 12);
+	aLdst(e, L_LDR, 4, TLB, 4, L_UXTW | 0x1000);
+	aDp(e, A_ADD, 4, 4, 0, S_LSL, 0);
+	aUbfx(e, 1, 0, 2, JIT_TABLE_BITS);
 	aAddImmX(e, 7, N, N64_OFF(jitTable));
 	aDp(e, A_ADD | W64, 7, 7, 1, S_LSL, 4);
 	aLdpW(e, 3, 6, 7, (unsigned) offsetof(struct JitEntry, vaddr));
@@ -1760,7 +2033,7 @@ static uint8_t* arenaGet(struct N64* n) {
 		return NULL;
 	}
 	n->jitArena = p;
-	struct Emitter e = { p, p, (uint8_t*) p + SHARED_SIZE };
+	struct Emitter e = { p, p, (uint8_t*) p + SHARED_SIZE - 8 };
 	aPush(&e, 29, 30, 96);
 	aStp(&e, 19, 20, 16);
 	aStp(&e, 21, 22, 32);
@@ -1775,10 +2048,17 @@ static uint8_t* arenaGet(struct N64* n) {
 	loadN(&e, RAM, N64_OFF(rdram), 8);
 	loadN(&e, TLB, N64_OFF(vpages), 8);
 	aAddImmX(&e, PAGES, N, N64_OFF(pageFlags));
-	aAddImmX(&e, DTAG, CPU, CPU_OFF(dcacheTag));
-	aAddImmX(&e, DIRTY, CPU, CPU_OFF(dcacheDirty));
+	if (n->fle) {
+		loadPinned(&e);
+	} else {
+		aAddImmX(&e, DTAG, CPU, CPU_OFF(dcacheTag));
+		aAddImmX(&e, DIRTY, CPU, CPU_OFF(dcacheDirty));
+	}
 	aBr(&e, 1);
 	n->jitLeave = e.p;
+	if (n->fle) {
+		storePinned(&e);
+	}
 	aDp(&e, A_SUB | W64, 0, LIMIT, LEFT, S_LSL, 0);
 	storeN(&e, 0, N64_OFF(cycles), 8);
 	aLdp(&e, 19, 20, 16);
@@ -1790,6 +2070,13 @@ static uint8_t* arenaGet(struct N64* n) {
 	aRet(&e);
 	n->jitRedispatch = e.p;
 	lookup(&e, n->jitLeave);
+	if (e.p > (uint8_t*) p + CHAIN_REST) {
+		munmap(p, ARENA_SIZE);
+		n->jitArena = NULL;
+		return NULL;
+	}
+	e.p = (uint8_t*) p + CHAIN_REST;
+	chainRest(&e);
 	__builtin___clear_cache((char*) p, (char*) e.p);
 	n->jitEnter = (void (*)(struct N64*, void*)) p;
 	return p;
@@ -1797,6 +2084,9 @@ static uint8_t* arenaGet(struct N64* n) {
 
 void jitReset(struct N64* n) {
 	n->jitUsed = SHARED_SIZE;
+	if (n->jitArena) {
+		*coldUsed(n) = 0;
+	}
 	n->linkCount = 0;
 	++n->blockGen;
 }
@@ -1821,8 +2111,11 @@ void jitUnlink(struct N64* n) {
 // NULL to leave.
 void* jitLink(struct N64* n, uint32_t* site, uint32_t vaddr) {
 	struct JitEntry* je = &n->jitTable[(vaddr >> 2) & (JIT_TABLE_SIZE - 1)];
-	if (je->vaddr != vaddr || je->gen != n->blockGen || n->linkGen != n->blockGen) {
+	if (je->vaddr != vaddr || je->gen != jitTag(n, vaddr) || n->linkGen != n->blockGen) {
 		return NULL;
+	}
+	if ((vaddr & 0xC0000000u) != 0x80000000u) {
+		site[1] = n->vpages[vaddr >> 12];
 	}
 	if (n->linkCount == n->linkCap) {
 		uint32_t cap = n->linkCap ? 2 * n->linkCap : 1024;
@@ -1856,20 +2149,25 @@ void* jitCompile(struct N64* n, const uint32_t* ops, uint32_t count, uint32_t va
 	if (n->jitUsed < SHARED_SIZE) {
 		n->jitUsed = SHARED_SIZE;
 	}
-	if (!arena || n->jitUsed + BLOCK_CODE_MAX > ARENA_SIZE) {
+	if (!arena || n->jitUsed + BLOCK_CODE_MAX > ARENA_SIZE / 2 || *coldUsed(n) + BLOCK_CODE_MAX > ARENA_SIZE / 2) {
 		return NULL;
 	}
 	static struct Jit jit;
 	struct Jit* j = &jit;
 	uint8_t* start = arena + n->jitUsed;
 	j->e = (struct Emitter) { start, start, start + BLOCK_CODE_MAX };
-	j->exitCount = j->slowCount = j->missCount = j->codeCheckCount = j->rdpWaitCount = 0;
+	j->exitCount = j->slowCount = j->missCount = j->codeCheckCount = j->rdpWaitCount = j->mappedCount = 0;
 	j->rdpThreads = n->rdpThreads > 0 || n->rdpGl;
 	j->rdpGl = n->rdpGl;
 	j->fast = n->fast;
+	j->fle = n->fast && n->fle;
 	j->plainCount = n->countCycles == 2;
+	j->opCycles = (int) n->opCycles;
 	j->cacheData = !n->compat && !n->fast;
 	j->fr = n->cpu.cop0[CP0_STATUS] & (1 << 26);
+	j->cu1Seen = j->frSeen = false;
+	j->cold = NULL;
+	j->arena = arena;
 	struct Emitter* e = &j->e;
 	j->leave = e->p;
 	aB(e, n->jitLeave);
@@ -1882,9 +2180,11 @@ void* jitCompile(struct N64* n, const uint32_t* ops, uint32_t count, uint32_t va
 		storeByte(e, CPU_OFF(pollTried), 0);
 	}
 	uint8_t* again = e->p;
+	// FLE: the cycles of the instructions since the last count.
+	int pending = 0;
 
 	if (blockIsIdleLoop(ops, count, vaddr)) {
-		skipIdle(e, vaddr, paddr, j->fast);
+		skipIdle(e, vaddr, paddr, j->fast, j->opCycles);
 	}
 	// A conditional branch or jump at the end back to the start.
 	bool loopsBack = false;
@@ -1914,6 +2214,7 @@ void* jitCompile(struct N64* n, const uint32_t* ops, uint32_t count, uint32_t va
 	}
 
 	cacheClear(&j->cache);
+	j->known = 0;
 	bool delay = false;
 	// A fused run's end, where its fast path joins the instructions one by one.
 	uint8_t* fusedDone = NULL;
@@ -1921,13 +2222,16 @@ void* jitCompile(struct N64* n, const uint32_t* ops, uint32_t count, uint32_t va
 	for (uint32_t k = 0; k < count; ++k) {
 		uint32_t op = ops[k], p = paddr + k * 4;
 		if (fusedDone && k == fusedEnd) {
+			writeBack(j);
 			patchHere(e, fusedDone);
 			cacheClear(&j->cache);
+			j->known = 0;
+			j->cu1Seen = j->frSeen = false;
 			fusedDone = NULL;
 		}
 		uint32_t run = delay ? 0 : fusedRunLength(ops, k, count);
 		if (run && !fusedDone) {
-			fusedDone = fuseRun(j, ops + k, run, vaddr + 4 * k, p);
+			fusedDone = fuseRun(j, ops + k, run, vaddr + 4 * k, p, k ? cpuLoadMark(ops[k - 1]) : -1);
 			fusedEnd = k + run;
 		}
 		uint64_t pc = sext32(vaddr + k * 4);
@@ -1937,17 +2241,24 @@ void* jitCompile(struct N64* n, const uint32_t* ops, uint32_t count, uint32_t va
 		uint8_t* mark = e->p;
 		int exits = j->exitCount, misses = j->missCount, codeChecks = j->codeCheckCount;
 		struct Cache cache = j->cache;
+		uint32_t const known = j->known;
+		int32_t values[32];
+		memcpy(values, j->value, sizeof(values));
 		bool branch = isBranchOp(op);
+		// A branch inside the block (see throughBranch), and its delay slot, after which the block
+		// leaves if the branch is taken; either through the interpreter leaves the block there.
+		bool inside = branch && !delay && k + 2 < count, afterInside = delay && !last;
 		struct Slow* slow = &j->slows[j->slowCount];
 		int const prevMark = k ? cpuLoadMark(ops[k - 1]) : -1;
 		j->mark = cpuLoadMark(op);
 		j->branchStall = prevMark >= 0 ? (int8_t) cpuLoadStall(op, (uint8_t) prevMark) : -1;
-		*slow = (struct Slow) { .op = op, .paddr = p, .pc = pc, .delay = delay, .lineStart = lineStart, .last = last, .prevMark = prevMark,
+		*slow = (struct Slow) { .op = op, .paddr = p, .pc = pc, .delay = delay, .lineStart = lineStart, .last = last || inside || afterInside, .prevMark = prevMark,
 		                    .nextStall = k + 1 < count && cpuLoadStall(ops[k + 1], cpuLoadMark(op)) };
 		j->slow = slow;
 		j->extraCycles = 0;
 		j->interruptCheck = false;
 		j->jumped = false;
+		j->inside = inside;
 		// A branch's I-cache check comes first (a likely branch not taken leaves inside it); the rest
 		// check after, so slow paths and Count reads see the cycles before this fetch.
 		if (lineStart && branch && !delay && !j->fast) {
@@ -1957,12 +2268,21 @@ void* jitCompile(struct N64* n, const uint32_t* ops, uint32_t count, uint32_t va
 			if (lineStart && !branch && !j->fast) {
 				icacheCheck(j, (uint32_t) pc, p, false);
 			}
-			if (prevMark >= 0) {
-				j->extraCycles += cpuLoadStall(op, (uint8_t) prevMark);
+			if (j->fle) {
+				// No load interlocks; the cycles go at the exits.
+				pending += j->opCycles + j->extraCycles;
+				if (last || afterInside || j->interruptCheck || j->jumped || pending > 4000) {
+					aDpImm(e, A_SUBS_IMM | W64, LEFT, LEFT, (unsigned) pending);
+					pending = 0;
+				}
 			} else {
-				loadStallCheck(e, op);
+				if (prevMark >= 0) {
+					j->extraCycles += cpuLoadStall(op, (uint8_t) prevMark);
+				} else {
+					loadStallCheck(e, op);
+				}
+				aDpImm(e, A_SUBS_IMM | W64, LEFT, LEFT, j->opCycles + j->extraCycles);
 			}
-			aDpImm(e, A_SUBS_IMM | W64, LEFT, LEFT, 1 + j->extraCycles);
 			if (j->interruptCheck) {
 				// An interrupt now due is taken before the next instruction.
 				exitAt(j, aCbnz(e, 2, NULL), pc, kind, delay, false);
@@ -1975,6 +2295,16 @@ void* jitCompile(struct N64* n, const uint32_t* ops, uint32_t count, uint32_t va
 				j->exits[j->exitCount - 1].last = true;
 			} else if (!j->fast) {
 				// hle checks the limit at the block's end only.
+				exitAt(j, aBcond(e, C_LE, NULL), pc, kind, delay, false);
+			}
+			if (afterInside) {
+				// Taken, out to the target; not, on with the block if there are cycles left, as at a
+				// block's end.
+				uint32_t b = ops[k - 1], at = vaddr + 4 * (k - 1);
+				exitAt(j, aCbnz(e, 29, NULL), pc, kind, delay, false);
+				j->exits[j->exitCount - 1].side = true;
+				j->exits[j->exitCount - 1].to = sext32(at + 4 + ((uint32_t) (int16_t) b << 2));
+				aDp(e, A_SUBS | W64, ZR, LEFT, ZR, S_LSL, 0);
 				exitAt(j, aBcond(e, C_LE, NULL), pc, kind, delay, false);
 			}
 			if (slow->sites || slow->keep) {
@@ -1990,113 +2320,214 @@ void* jitCompile(struct N64* n, const uint32_t* ops, uint32_t count, uint32_t va
 		j->missCount = misses;
 		j->codeCheckCount = codeChecks;
 		j->cache = cache;
-		emitHelper(j, op, pc, p, delay, lineStart, last, prevMark, slow->nextStall);
+		j->known = known;
+		memcpy(j->value, values, sizeof(values));
+		writeBack(j);
+		j->cu1Seen = j->frSeen = false;
+		emitHelper(j, op, pc, p, delay, lineStart, last || inside || afterInside, prevMark, slow->nextStall);
+		if (inside || afterInside) {
+			break;
+		}
 		// The interpreter may have changed any register, and the call the scratch ones.
 		cacheClear(&j->cache);
+		j->known = 0;
 		delay = branch;
 	}
 
-	// Stores to a page with code only: on unless they hit a word a block holds (n64HoldsCode), its
-	// bit in codeWords. An aligned store touches one word, or two for SD.
-	for (int i = 0; i < j->codeCheckCount; ++i) {
-		struct Miss* k = &j->codeChecks[i];
-		patchHere(e, k->site);
-		// Past RDRAM, the interpreter. On a page the RDP draws to or reads, it waits for the RDP
-		// there in C first.
-		aLsrImm(e, 2, 6, 23);
-		k->slow->site[k->slow->sites++] = aCbnz(e, 2, NULL);
-		aLogicImm(e, A_ANDS_IMM, ZR, 1, PAGE_RDP);
-		uint8_t* noRdp = aBcond(e, C_EQ, NULL);
-		rdpWaitCall(e, (const void*) cpuRdpWaitWrite, k->size);
-		reloadPool(e, &k->cache);
-		aLsrImm(e, 1, 6, 12);
-		aLdst(e, L_LDRB, 1, PAGES, 1, L_UXTW);
-		patchHere(e, noRdp);
-		aTbz(e, 1, 0, k->resume);
-		aAddImmX(e, IP, N, N64_OFF(codeWords));
-		aLsrImm(e, 2, 6, 5);
-		aLdst(e, L_LDRB, 2, IP, 2, L_UXTW);
-		aUbfx(e, 3, 6, 2, 3);
-		aDp(e, A_LSRV, 2, 2, 3, S_LSL, 0);
-		aLogicImm(e, A_ANDS_IMM, ZR, 2, k->size == 8 ? 3 : 1);
-		k->slow->site[k->slow->sites++] = aBcond(e, C_NE, NULL);
-		aB(e, k->resume);
-	}
+	// Leaving after an inline instruction: the state the interpreter would have after it. The hot
+	// exits first, straight after the block, then the branches to the cold code, the cold code itself
+	// and the cold exits.
+	struct Emitter hot;
+	uint8_t* const hotLeave = j->leave;
+	uint8_t* const coldStart = arena + ARENA_SIZE / 2 + *coldUsed(n);
+	struct Emitter cold = { coldStart, coldStart, coldStart + BLOCK_CODE_MAX };
+	uint8_t* const coldLeave = cold.p;
+	aB(&cold, n->jitLeave);
+	j->cold = &cold;
+	for (int pass = 1; pass >= 0; --pass) {
+	if (pass == 0) {
+		// To the cold code: a branch here each, which reaches it (a conditional one may not).
+		for (int i = 0; i < j->codeCheckCount; ++i) {
+			j->codeChecks[i].site = farSite(e, j->codeChecks[i].site);
+		}
+		for (int i = 0; i < j->rdpWaitCount; ++i) {
+			j->rdpWaits[i].site = farSite(e, j->rdpWaits[i].site);
+		}
+		for (int i = 0; i < j->missCount; ++i) {
+			j->misses[i].site = farSite(e, j->misses[i].site);
+		}
+		for (int i = 0; i < j->mappedCount; ++i) {
+			j->mapped[i].site = farSite(e, j->mapped[i].site);
+		}
+		for (int i = 0; i < j->slowCount; ++i) {
+			for (int k = 0; k < j->slows[i].sites; ++k) {
+				j->slows[i].site[k] = farSite(e, j->slows[i].site[k]);
+			}
+		}
+		for (int i = 0; i < j->exitCount; ++i) {
+			if (!hotExit(&j->exits[i])) {
+				j->exits[i].site = farSite(e, j->exits[i].site);
+			}
+		}
+		hot = j->e;
+		j->e = cold;
+		j->leave = coldLeave;
+		j->cold = NULL;
+		// Stores to a page with code only: on unless they hit a word a block holds (n64HoldsCode), its
+		// bit in codeWords. An aligned store touches one word, or two for SD.
+		for (int i = 0; i < j->codeCheckCount; ++i) {
+			struct Miss* k = &j->codeChecks[i];
+			patchHere(e, k->site);
+			flushDirty(e, &k->cache);
+			struct Cache clean = k->cache;
+			clean.dirty = 0;
+			// Past RDRAM, the interpreter. On a page the RDP draws to or reads, it waits for the RDP
+			// there in C first.
+			aLsrImm(e, 2, 6, 23);
+			slowSite(k->slow, aCbnz(e, 2, NULL), &clean);
+			aLogicImm(e, A_ANDS_IMM, ZR, 1, PAGE_RDP);
+			uint8_t* noRdp = aBcond(e, C_EQ, NULL);
+			rdpWaitCall(e, (const void*) cpuRdpWaitWrite, k->size);
+			reloadPool(e, &k->cache);
+			aLsrImm(e, 1, 6, 12);
+			aLdst(e, L_LDRB, 1, PAGES, 1, L_UXTW);
+			patchHere(e, noRdp);
+			uint8_t* coded = aTbnz(e, 1, 0, NULL);
+			aB(e, k->resume);
+			patchHere(e, coded);
+			aAddImmX(e, IP, N, N64_OFF(codeWords));
+			aLsrImm(e, 2, 6, 5);
+			aLdst(e, L_LDRB, 2, IP, 2, L_UXTW);
+			aUbfx(e, 3, 6, 2, 3);
+			aDp(e, A_LSRV, 2, 2, 3, S_LSL, 0);
+			aLogicImm(e, A_ANDS_IMM, ZR, 2, k->size == 8 ? 3 : 1);
+			slowSite(k->slow, aBcond(e, C_NE, NULL), &clean);
+			aB(e, k->resume);
+		}
 
-	// Loads from pages the RDP may still be drawing to wait for it in C, then go on inline: the same
-	// path (and time) whichever renderer draws and however long it keeps the pages.
-	for (int i = 0; i < j->rdpWaitCount; ++i) {
-		struct Miss* w = &j->rdpWaits[i];
-		patchHere(e, w->site);
-		rdpWaitCall(e, (const void*) cpuRdpWaitRead, w->size);
-		reloadPool(e, &w->cache);
-		aB(e, w->resume);
-	}
+		// With HLE accuracy, a page the TLB maps through vpages (one not looked up lands past RDRAM), and
+		// an aligned address; else the interpreter.
+		for (int i = 0; i < j->mappedCount; ++i) {
+			struct Miss* v = &j->mapped[i];
+			patchHere(e, v->site);
+			aLsrImm(e, 1, 0, 12);
+			if (v->store) {
+				aDpImm(e, A_ADD_IMM | W64, 3, TLB, VPAGES * 4);
+				aLdst(e, L_LDR, 5, 3, 1, L_UXTW | 0x1000);
+			} else {
+				aLdst(e, L_LDR, 5, TLB, 1, L_UXTW | 0x1000);
+			}
+			aDp(e, A_ADD, 6, 0, 5, S_LSL, 0);
+			aLsrImm(e, 2, 6, 23);
+			slowSite(v->slow, aCbnz(e, 2, NULL), &v->cache);
+			if (v->size > 1) {
+				aLogicImm(e, A_ANDS_IMM, ZR, 0, v->size - 1);
+				slowSite(v->slow, aBcond(e, C_NE, NULL), &v->cache);
+			}
+			aB(e, v->resume);
+		}
 
-	// D-cache misses, filled (and a dirty line written back) in C. A misaligned address, one past
-	// RDRAM, or a write-back over code, takes the slow path instead.
-	for (int i = 0; i < j->missCount; ++i) {
-		struct Miss* m = &j->misses[i];
-		patchHere(e, m->site);
-		if (m->size > 1) {
-			aLogicImm(e, A_ANDS_IMM, ZR, 0, m->size - 1);
-			m->slow->site[m->slow->sites++] = aBcond(e, C_NE, NULL);
+		// Loads from pages the RDP may still be drawing to wait for it in C, then go on inline: the same
+		// path (and time) whichever renderer draws and however long it keeps the pages.
+		for (int i = 0; i < j->rdpWaitCount; ++i) {
+			struct Miss* w = &j->rdpWaits[i];
+			patchHere(e, w->site);
+			flushDirty(e, &w->cache);
+			rdpWaitCall(e, (const void*) cpuRdpWaitRead, w->size);
+			reloadPool(e, &w->cache);
+			aB(e, w->resume);
 		}
-		aLsrImm(e, 2, 6, 23);
-		m->slow->site[m->slow->sites++] = aCbnz(e, 2, NULL);
-		if (m->glLoad) {
-			// A line coming in from a page the GPU draws to (a game invalidates its cache before
-			// reading what the RDP drew) waits for the GPU first.
-			aLsrImm(e, 3, 6, 12);
-			aLdst(e, L_LDRB, 3, PAGES, 3, L_UXTW);
-			uint8_t* ready = aTbz(e, 3, 1, NULL);
-			rdpWaitCall(e, (const void*) cpuRdpWaitRead, 16);
-			patchHere(e, ready);
+
+		// D-cache misses, filled (and a dirty line written back) in C. A misaligned address, one past
+		// RDRAM, or a write-back over code, takes the slow path instead.
+		for (int i = 0; i < j->missCount; ++i) {
+			struct Miss* m = &j->misses[i];
+			patchHere(e, m->site);
+			flushDirty(e, &m->cache);
+			struct Cache clean = m->cache;
+			clean.dirty = 0;
+			if (m->size > 1) {
+				aLogicImm(e, A_ANDS_IMM, ZR, 0, m->size - 1);
+				slowSite(m->slow, aBcond(e, C_NE, NULL), &clean);
+			}
+			aLsrImm(e, 2, 6, 23);
+			slowSite(m->slow, aCbnz(e, 2, NULL), &clean);
+			if (m->glLoad) {
+				// A line coming in from a page the GPU draws to (a game invalidates its cache before
+				// reading what the RDP drew) waits for the GPU first.
+				aLsrImm(e, 3, 6, 12);
+				aLdst(e, L_LDRB, 3, PAGES, 3, L_UXTW);
+				uint8_t* ready = aTbz(e, 3, 1, NULL);
+				rdpWaitCall(e, (const void*) cpuRdpWaitRead, 16);
+				patchHere(e, ready);
+			}
+			aPush(e, 0, 6, 16);
+			aMov(e, 1, 0);
+			aMov(e, 2, 6);
+			aMovX(e, 0, N);
+			aDp(e, A_SUB | W64, 3, LIMIT, LEFT, S_LSL, 0);
+			aMovImm(e, 4, (m->slow->op >> 26) >= 0x28);
+			aMovImm64(e, IP, (uint64_t) (uintptr_t) cpuDcacheMiss);
+			aBlr(e, IP);
+			aMov(e, 4, 0);
+			aPop(e, 0, 6, 16);
+			aDpImm(e, A_ADDS_IMM, ZR, 4, 1);
+			slowSite(m->slow, aBcond(e, C_EQ, NULL), &clean);
+			aDp(e, A_SUB | W64, LEFT, LEFT, 4, S_LSL, 0);
+			reloadPool(e, &m->cache);
+			aUbfx(e, 1, 0, 4, 9);
+			aB(e, m->resume);
 		}
-		aPush(e, 0, 6, 16);
-		aMov(e, 1, 0);
-		aMov(e, 2, 6);
-		aMovX(e, 0, N);
-		aDp(e, A_SUB | W64, 3, LIMIT, LEFT, S_LSL, 0);
-		aMovImm(e, 4, (m->slow->op >> 26) >= 0x28);
-		aMovImm64(e, IP, (uint64_t) (uintptr_t) cpuDcacheMiss);
-		aBlr(e, IP);
-		aMov(e, 4, 0);
-		aPop(e, 0, 6, 16);
-		aDpImm(e, A_ADDS_IMM, ZR, 4, 1);
-		m->slow->site[m->slow->sites++] = aBcond(e, C_EQ, NULL);
-		aDp(e, A_SUB | W64, LEFT, LEFT, 4, S_LSL, 0);
-		reloadPool(e, &m->cache);
-		aUbfx(e, 1, 0, 4, 9);
-		aB(e, m->resume);
-	}
-	for (int i = 0; i < j->slowCount; ++i) {
-		struct Slow* sl = &j->slows[i];
-		for (int k = 0; k < sl->sites; ++k) {
-			patchHere(e, sl->site[k]);
-		}
-		emitHelper(j, sl->op, sl->pc, sl->paddr, sl->delay, sl->lineStart, sl->last, sl->prevMark, sl->nextStall);
-		if (!sl->last) {
-			// The registers the fast path holds from here, as the interpreter left them.
-			for (int k = 0; k < POOL; ++k) {
-				if (sl->cache.guest[k] >= 0) {
-					aLdrX(e, pool[k], CPU, gprOff(sl->cache.guest[k]));
+		for (int i = 0; i < j->slowCount; ++i) {
+			struct Slow* sl = &j->slows[i];
+			// Sites with new register values store them first.
+			uint8_t* stored[8];
+			int storedCount = 0;
+			for (int k = 0; k < sl->sites; ++k) {
+				if (sl->siteCache[k].dirty) {
+					patchHere(e, sl->site[k]);
+					flushDirty(e, &sl->siteCache[k]);
+					stored[storedCount++] = aB(e, NULL);
 				}
 			}
-			aB(e, sl->resume);
+			for (int k = 0; k < sl->sites; ++k) {
+				if (!sl->siteCache[k].dirty) {
+					patchHere(e, sl->site[k]);
+				}
+			}
+			for (int k = 0; k < storedCount; ++k) {
+				patchHere(e, stored[k]);
+			}
+			// Everything is in memory now: nothing for the helper's I-cache check to write back from
+			// registers the rest of the block assigned.
+			cacheClear(&j->cache);
+			emitHelper(j, sl->op, sl->pc, sl->paddr, sl->delay, sl->lineStart, sl->last, sl->prevMark, sl->nextStall);
+			if (!sl->last) {
+				// The registers the fast path holds from here, as the interpreter left them.
+				for (int k = 0; k < POOL; ++k) {
+					if (sl->cache.guest[k] >= 0) {
+						aLdrX(e, pool[k], CPU, gprOff(sl->cache.guest[k]));
+					}
+				}
+				aB(e, sl->resume);
+			}
 		}
 	}
-
-	// Leaving after an inline instruction: the state the interpreter would have after it.
 	for (int i = 0; i < j->exitCount; ++i) {
 		struct Exit* x = &j->exits[i];
-		patchHere(e, x->site);
-		if (x->stall < 0) {
-			loadStallCheck(e, ops[((uint32_t) x->pc - vaddr) >> 2]);
-		} else if (x->stall) {
-			aDpImm(e, A_SUB_IMM | W64, LEFT, LEFT, x->stall);
+		if (hotExit(x) != (pass == 1)) {
+			continue;
 		}
-		storeByte(e, CPU_OFF(loadMark), x->mark);
+		patchHere(e, x->site);
+		flushDirty(e, &x->cache);
+		if (!j->fle) {
+			if (x->stall < 0) {
+				loadStallCheck(e, ops[((uint32_t) x->pc - vaddr) >> 2]);
+			} else if (x->stall) {
+				aDpImm(e, A_SUB_IMM | W64, LEFT, LEFT, x->stall);
+			}
+			storeByte(e, CPU_OFF(loadMark), x->mark);
+		}
 		if (loopsBack && x->last && x->delay && !x->skip) {
 			// A loop going round again with cycles left: straight back to the start, before the
 			// state for leaving, which the next pass writes anew (a poll loop skipping what passes
@@ -2111,12 +2542,57 @@ void* jitCompile(struct N64* n, const uint32_t* ops, uint32_t count, uint32_t va
 				aLdrb(e, 0, CPU, CPU_OFF(pollTried));
 				uint8_t* tried = aCbnz(e, 0, NULL);
 				storeByte(e, CPU_OFF(pollTried), 1);
-				pollSkip(j, ops, count, vaddr, paddr, pollPass, reload, false);
+				pollSkip(j, ops, count, vaddr, paddr, pollPass * (uint32_t) j->opCycles, reload, false);
 				patchHere(e, tried);
 			}
 			aB(e, again);
 			patchHere(e, away);
 			patchHere(e, spent);
+		}
+		bool moved = false;
+		// With HLE accuracy, on to the next block with only pc (and the load mark) written: it writes the
+		// rest before anything reads it. The full state below where it goes back to C instead.
+		if (j->fast && !x->jumped && !x->skip && (x->side || (x->last && x->kind == PLAIN))) {
+			struct Sites full = { .count = 0 };
+			aDp(e, A_SUBS | W64, ZR, LEFT, ZR, S_LSL, 0);
+			full.at[full.count++] = aBcond(e, C_LE, NULL);
+			// A block's one end (after a jump or no branch at all) is where its last exit goes.
+			bool known = x->side || (endCount == 1 && !pollPass);
+			if (x->side) {
+				movConst(e, 0, x->to);
+			} else if (known) {
+				movConst(e, 0, ends[0]);
+			} else if (x->delay) {
+				aLdrX(e, 0, CPU, CPU_OFF(nextPc));
+			} else {
+				movConst(e, 0, x->pc + 4);
+			}
+			aStrX(e, 0, CPU, CPU_OFF(pc));
+			if (x->side) {
+				linkTo(j, x->to, &full, true);
+			} else {
+				if (pollPass) {
+					pollSkip(j, ops, count, vaddr, paddr, pollPass * (uint32_t) j->opCycles, reload, true);
+				}
+				for (int k = 0; k < endCount; ++k) {
+					linkTo(j, ends[k], &full, known);
+				}
+			}
+			// A known kseg0 target is always linked to; mapped ones go on here when their page moved.
+			if (!known || ((uint32_t) (x->side ? x->to : ends[0]) & 0xC0000000u) != 0x80000000u) {
+				chain(j, &full);
+			}
+			// The full state is cold.
+			for (int k = 0; k < full.count; ++k) {
+				patchHere(e, full.at[k]);
+			}
+			uint8_t* far = aB(e, NULL);
+			hot = j->e;
+			j->e = cold;
+			j->leave = coldLeave;
+			j->cold = NULL;
+			patchHere(e, far);
+			moved = true;
 		}
 		storeConst(e, CPU_OFF(curPc), x->pc);
 		storeByte(e, CPU_OFF(inDelay), x->delay);
@@ -2126,7 +2602,7 @@ void* jitCompile(struct N64* n, const uint32_t* ops, uint32_t count, uint32_t va
 			continue;
 		}
 		if (x->skip) {
-			aDpImm(e, A_SUB_IMM | W64, LEFT, LEFT, 2);
+			aDpImm(e, A_SUB_IMM | W64, LEFT, LEFT, 2 * j->opCycles);
 			storeConst(e, CPU_OFF(pc), x->pc + 8);
 			storeConst(e, CPU_OFF(nextPc), x->pc + 12);
 		} else if (x->delay) {
@@ -2137,30 +2613,47 @@ void* jitCompile(struct N64* n, const uint32_t* ops, uint32_t count, uint32_t va
 				storeConst(e, CPU_OFF(nextPc), x->pc + 8);
 			}
 		}
-		if (x->last && !(x->kind != PLAIN && !x->skip)) {
+		if (x->side) {
+			aDp(e, A_SUBS | W64, ZR, LEFT, ZR, S_LSL, 0);
+			aBcond(e, C_LE, j->leave);
+			linkTo(j, x->to, NULL, false);
+			chain(j, NULL);
+		} else if (x->last && !(x->kind != PLAIN && !x->skip)) {
 			aDp(e, A_SUBS | W64, ZR, LEFT, ZR, S_LSL, 0);
 			aBcond(e, C_LE, j->leave);
 			if (pollPass) {
-				pollSkip(j, ops, count, vaddr, paddr, pollPass, reload, true);
+				pollSkip(j, ops, count, vaddr, paddr, pollPass * (uint32_t) j->opCycles, reload, true);
 			}
 			for (int k = 0; k < endCount; ++k) {
-				linkTo(j, ends[k]);
+				linkTo(j, ends[k], NULL, false);
 			}
-			chain(j);
+			chain(j, NULL);
 		} else if (x->skip) {
 			aDp(e, A_SUBS | W64, ZR, LEFT, ZR, S_LSL, 0);
 			aBcond(e, C_LE, j->leave);
-			linkTo(j, x->pc + 8);
-			chain(j);
+			linkTo(j, x->pc + 8, NULL, false);
+			chain(j, NULL);
 		} else {
 			aB(e, j->leave);
 		}
+		if (moved) {
+			cold = j->e;
+			j->e = hot;
+			j->leave = hotLeave;
+			j->cold = &cold;
+		}
+	}
 	}
 
-	if (e->p > e->end) {
+	cold = j->e;
+	j->e = hot;
+	j->cold = NULL;
+	if (e->p > e->end || cold.p > cold.end) {
 		return NULL;
 	}
 	__builtin___clear_cache((char*) start, (char*) e->p);
+	__builtin___clear_cache((char*) coldStart, (char*) cold.p);
 	n->jitUsed += (size_t) (e->p - start + 15) & ~(size_t) 15;
+	*coldUsed(n) += (size_t) (cold.p - coldStart + 15) & ~(size_t) 15;
 	return entry;
 }
