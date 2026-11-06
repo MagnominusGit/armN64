@@ -109,6 +109,7 @@ bool n64StateLoad(struct N64* n, const void* data, size_t size, bool quick) {
 	n->blockGen = was->blockGen + !sameTlb;
 	n->useBlocks = was->useBlocks, n->useJit = was->useJit;
 	n->jitArena = was->jitArena, n->jitUsed = was->jitUsed, n->jitEnter = was->jitEnter, n->jitLeave = was->jitLeave;
+	n->jitRedispatch = was->jitRedispatch;
 	memcpy(n->jitTable, was->jitTable, sizeof(n->jitTable));
 	n->links = was->links, n->linkCount = was->linkCount, n->linkCap = was->linkCap, n->linkGen = was->linkGen;
 	n->vpages = was->vpages;
