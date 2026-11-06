@@ -114,6 +114,7 @@ struct Gl {
 	void (*Flush)(void);
 	// GL_NV_texture_barrier, where there is no framebuffer fetch.
 	void (*TextureBarrierNV)(void);
+	void (*RenderbufferStorageMultisample)(GLenum, GLsizei, GLenum, GLsizei, GLsizei);
 };
 
 // A color image the GPU draws into: its texture and framebuffer, whether the texture has the
@@ -125,6 +126,9 @@ struct Target {
 	// Rows loaded from RDRAM since the GPU last gave its pixels back.
 	int loadedRows;
 	int dirtyFrom, dirtyTo;
+	// With multisampling: the color drawn to, and whether the texture lacks what was drawn there.
+	GLuint msaa, msaaFramebuffer;
+	bool unresolved;
 	uint64_t used;
 	// Rows whose pages are flagged for rdpWait since the last sync.
 	int marked;
@@ -203,6 +207,11 @@ struct Glr {
 	GLuint depth, vertexArray, vertexBuffer, vertexShader;
 	// The depth alone, to clear all of it: through a smaller color image only that much clears.
 	GLuint depthFramebuffer;
+	// Multisampling (N64_GL_MSAA, with framebuffer fetch only): samples a pixel, the depth the targets'
+	// multisampled colors share, and the program that copies rows into one.
+	int samples;
+	GLuint msaaDepth, msaaDepthFramebuffer, pushProgram;
+	GLint pushSource, pushScale;
 	// Drawing a triangle into the depth image (depthTriangle).
 	bool depthImage;
 	// A program read COMBINED where it is the previous pixel's: from then on each primitive's last
@@ -253,9 +262,14 @@ static void useFramebuffer(struct Glr* g, GLuint framebuffer) {
 
 static void useScissor(struct Glr* g, bool on, int x, int y, int w, int h);
 
+static void resolve(struct Glr* g, struct Target* t);
+
 // Rows from to to - 1 between a target and the texture at the RDP's resolution, scaled (nearest).
 static void blitRows(struct Glr* g, struct Target* t, int from, int to, bool toTarget) {
 	struct Gl* gl = &g->gl;
+	if (!toTarget) {
+		resolve(g, t);
+	}
 	int const k = g->scale, w = (int) t->width;
 	useScissor(g, false, 0, 0, 0, 0);
 	gl->BindFramebuffer(GL_READ_FRAMEBUFFER, toTarget ? g->nativeFramebuffer : t->framebuffer);
@@ -267,6 +281,58 @@ static void blitRows(struct Glr* g, struct Target* t, int from, int to, bool toT
 	}
 	gl->BindFramebuffer(GL_FRAMEBUFFER, g->nativeFramebuffer);
 	g->applied.framebuffer = g->nativeFramebuffer;
+}
+
+// Where a target is drawn: its multisampled color when there is one, which the texture then lacks.
+static GLuint drawTo(struct Glr* g, struct Target* t) {
+	if (!g->samples) {
+		return t->framebuffer;
+	}
+	t->unresolved = true;
+	return t->msaaFramebuffer;
+}
+
+// The multisampled color into the target's texture, before anything reads it.
+static void resolve(struct Glr* g, struct Target* t) {
+	if (!g->samples || !t->unresolved) {
+		return;
+	}
+	struct Gl* gl = &g->gl;
+	int const w = (int) t->width * g->scale, h = TARGET_ROWS * g->scale;
+	useScissor(g, false, 0, 0, 0, 0);
+	gl->BindFramebuffer(GL_READ_FRAMEBUFFER, t->msaaFramebuffer);
+	gl->BindFramebuffer(GL_DRAW_FRAMEBUFFER, t->framebuffer);
+	gl->BlitFramebuffer(0, 0, w, h, 0, 0, w, h, GL_COLOR_BUFFER_BIT, GL_NEAREST);
+	gl->BindFramebuffer(GL_FRAMEBUFFER, t->framebuffer);
+	g->applied.framebuffer = t->framebuffer;
+	t->unresolved = false;
+}
+
+static void useTexture(struct Glr* g, int unit, GLuint texture);
+
+// Rows from to to - 1 of source (at the RDP's resolution when it is the native texture) into the
+// target's multisampled color, which a blit can't write.
+static void pushRows(struct Glr* g, struct Target* t, GLuint source, int from, int to) {
+	if (!g->samples) {
+		return;
+	}
+	struct Gl* gl = &g->gl;
+	int const k = g->scale;
+	gl->BindFramebuffer(GL_FRAMEBUFFER, t->msaaFramebuffer);
+	gl->Viewport(0, 0, (GLsizei) t->width * k, TARGET_ROWS * k);
+	gl->Enable(GL_SCISSOR_TEST);
+	gl->Scissor(0, from * k, (GLsizei) t->width * k, (to - from) * k);
+	gl->Disable(GL_DEPTH_TEST);
+	gl->Disable(GL_BLEND);
+	gl->Disable(GL_POLYGON_OFFSET_FILL);
+	gl->DepthMask(0);
+	gl->UseProgram(g->pushProgram);
+	gl->ActiveTexture(GL_TEXTURE0);
+	gl->BindTexture(GL_TEXTURE_2D, source);
+	gl->Uniform1i(g->pushSource, 0);
+	gl->Uniform1i(g->pushScale, source == g->native ? k : 1);
+	gl->DrawArrays(5, 0, 4);
+	memset(&g->applied, 0xFF, sizeof(g->applied));
 }
 
 static void useTexture(struct Glr* g, int unit, GLuint texture) {
@@ -961,6 +1027,7 @@ static void loadPixels(struct N64* n, struct Glr* g, struct Target* t, int from,
 	if (g->scale > 1) {
 		blitRows(g, t, from, to, true);
 	}
+	pushRows(g, t, g->scale > 1 ? g->native : t->texture, from, to);
 }
 
 static void flushBatch(struct N64* n, struct Glr* g);
@@ -1009,7 +1076,23 @@ static struct Target* target(struct N64* n, struct Glr* g, uint32_t addr, uint32
 			gl->ClearDepthf(1.0f);
 			gl->ClearStencil(0);
 			gl->Clear(GL_DEPTH_BUFFER_BIT | GL_STENCIL_BUFFER_BIT);
+			if (g->samples) {
+				useFramebuffer(g, g->msaaDepthFramebuffer);
+				gl->Clear(GL_DEPTH_BUFFER_BIT | GL_STENCIL_BUFFER_BIT);
+			}
 			g->depthReady = true;
+		}
+		if (g->samples) {
+			if (!t->msaa) {
+				gl->GenRenderbuffers(1, &t->msaa);
+				gl->GenFramebuffers(1, &t->msaaFramebuffer);
+			}
+			gl->BindRenderbuffer(GL_RENDERBUFFER, t->msaa);
+			gl->RenderbufferStorageMultisample(GL_RENDERBUFFER, g->samples, GL_RGBA8, (GLsizei) width * g->scale, TARGET_ROWS * g->scale);
+			useFramebuffer(g, t->msaaFramebuffer);
+			gl->FramebufferRenderbuffer(GL_FRAMEBUFFER, GL_COLOR_ATTACHMENT0, GL_RENDERBUFFER, t->msaa);
+			gl->FramebufferRenderbuffer(GL_FRAMEBUFFER, GL_DEPTH_STENCIL_ATTACHMENT, GL_RENDERBUFFER, g->msaaDepth);
+			t->unresolved = false;
 		}
 		t->addr = addr, t->width = width, t->size = size;
 		t->loadedRows = 0;
@@ -1055,6 +1138,7 @@ static void writePixels(struct N64* n, struct Target* t, int from, int to) {
 	if (g->scale > 1) {
 		blitRows(g, t, from, to, false);
 	} else {
+		resolve(g, t);
 		useFramebuffer(g, t->framebuffer);
 	}
 	gl->ReadPixels(0, from, (GLsizei) t->width, to - from, GL_RGBA, GL_UNSIGNED_BYTE, g->image);
@@ -1241,7 +1325,7 @@ static void flushBatch(struct N64* n, struct Glr* g) {
 	struct DrawState* s = &g->state;
 	struct Program* p = s->program;
 	struct Applied* a = &g->applied;
-	useFramebuffer(g, s->target->framebuffer);
+	useFramebuffer(g, drawTo(g, s->target));
 	if (a->viewport != (int) s->target->width) {
 		gl->Viewport(0, 0, (GLsizei) s->target->width * g->scale, TARGET_ROWS * g->scale);
 		a->viewport = (int) s->target->width;
@@ -1777,6 +1861,10 @@ static void draw(struct N64* n, struct RDP* r, const uint64_t* w, int op) {
 			useDepthMask(g, true);
 			gl->ClearDepthf(1.0f);
 			gl->Clear(GL_DEPTH_BUFFER_BIT);
+			if (g->samples) {
+				useFramebuffer(g, g->msaaDepthFramebuffer);
+				gl->Clear(GL_DEPTH_BUFFER_BIT);
+			}
 			// And in RDRAM, for the triangles the RDP draws.
 			rdpDrawSoftware(n, r, w, op);
 			return;
@@ -1797,7 +1885,7 @@ static void draw(struct N64* n, struct RDP* r, const uint64_t* w, int op) {
 			}
 			flushBatch(n, g);
 			struct Gl* gl = &g->gl;
-			useFramebuffer(g, g->state.target->framebuffer);
+			useFramebuffer(g, drawTo(g, g->state.target));
 			int sx0 = x0 >> 2 > g->state.scissor[0] ? x0 >> 2 : g->state.scissor[0];
 			// The scissor's right edge is in in fill mode.
 			int sx1 = (x1 >> 2) < (int) (r->scissorX1 >> 2) ? (x1 >> 2) + 1 : (int) (r->scissorX1 >> 2) + 1;
@@ -1897,6 +1985,7 @@ unsigned glrPicture(struct N64* n, uint32_t origin, uint32_t stride, int size, i
 		flushBatch(n, g);
 		*x = (int) (offset % (stride * bytes) / bytes);
 		*y = (int) row;
+		resolve(g, t);
 		return t->framebuffer;
 	}
 	// A target the GPU drew part of: the rows it didn't draw come from RDRAM (borders a game clears
@@ -1920,6 +2009,7 @@ unsigned glrPicture(struct N64* n, uint32_t origin, uint32_t stride, int size, i
 		}
 		*x = (int) (offset % (stride * bytes) / bytes);
 		*y = (int) row;
+		resolve(g, t);
 		return t->framebuffer;
 	}
 	return 0;
@@ -1934,6 +2024,11 @@ bool glrRead(struct N64* n, unsigned framebuffer, int x, int y, int w, int h, ui
 	int const k = g->scale;
 	glesUse(g->gles);
 	flushBatch(n, g);
+	for (int i = 0; i < TARGETS; ++i) {
+		if (g->target[i].texture && g->target[i].framebuffer == framebuffer) {
+			resolve(g, &g->target[i]);
+		}
+	}
 	useFramebuffer(g, framebuffer);
 	g->gl.ReadPixels(x * k, y * k, w * k, h * k, GL_RGBA, GL_UNSIGNED_BYTE, out);
 	return true;
@@ -2088,6 +2183,57 @@ struct Glr* glrCreate(struct N64* n) {
 		glrDestroy(g);
 		n->rdpGl = false;
 		return NULL;
+	}
+	// Multisampling, where the shaders blend (framebuffer fetch reads each sample's own color).
+	const char* msaa = n->settings ? n->settings("N64_GL_MSAA") : getenv("N64_GL_MSAA");
+	*(void**) &gl->RenderbufferStorageMultisample = glesProc(g->gles, "glRenderbufferStorageMultisample");
+	if (msaa && atoi(msaa) > 1 && g->fetch && !g->barrier && gl->RenderbufferStorageMultisample) {
+		GLint most = 0;
+		gl->GetIntegerv(0x8D57, &most);
+		g->samples = atoi(msaa) < most ? atoi(msaa) : most;
+		static const char pushVertex[] =
+			"#version 300 es\n"
+			"void main() {\n"
+			"	vec2 p = vec2(float(gl_VertexID & 1), float(gl_VertexID >> 1));\n"
+			"	gl_Position = vec4(p * 2.0 - 1.0, 0.0, 1.0);\n"
+			"}\n";
+		static const char pushFragment[] =
+			"#version 300 es\n"
+			"precision highp float;\n"
+			"uniform highp sampler2D uSource;\n"
+			"uniform int uScale;\n"
+			"out vec4 oColor;\n"
+			"void main() {\n"
+			"	oColor = texelFetch(uSource, ivec2(gl_FragCoord.xy) / uScale, 0);\n"
+			"}\n";
+		GLuint vs = compile(g, GL_VERTEX_SHADER, pushVertex), fs = compile(g, GL_FRAGMENT_SHADER, pushFragment);
+		GLint ok = 0;
+		if (vs && fs) {
+			g->pushProgram = gl->CreateProgram();
+			gl->AttachShader(g->pushProgram, vs);
+			gl->AttachShader(g->pushProgram, fs);
+			gl->LinkProgram(g->pushProgram);
+			gl->GetProgramiv(g->pushProgram, GL_LINK_STATUS, &ok);
+		}
+		if (vs) {
+			gl->DeleteShader(vs);
+		}
+		if (fs) {
+			gl->DeleteShader(fs);
+		}
+		if (ok && g->samples > 1) {
+			g->pushSource = gl->GetUniformLocation(g->pushProgram, "uSource");
+			g->pushScale = gl->GetUniformLocation(g->pushProgram, "uScale");
+			gl->GenRenderbuffers(1, &g->msaaDepth);
+			gl->BindRenderbuffer(GL_RENDERBUFFER, g->msaaDepth);
+			gl->RenderbufferStorageMultisample(GL_RENDERBUFFER, g->samples, GL_DEPTH24_STENCIL8, 1024 * g->scale, TARGET_ROWS * g->scale);
+			gl->GenFramebuffers(1, &g->msaaDepthFramebuffer);
+			useFramebuffer(g, g->msaaDepthFramebuffer);
+			gl->FramebufferRenderbuffer(GL_FRAMEBUFFER, GL_DEPTH_STENCIL_ATTACHMENT, GL_RENDERBUFFER, g->msaaDepth);
+			fprintf(stderr, "GL renderer: %dx multisampling\n", g->samples);
+		} else {
+			g->samples = 0;
+		}
 	}
 	return g;
 }
