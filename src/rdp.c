@@ -132,7 +132,7 @@ static int zDecompress(uint16_t v) {
 
 // ---- Framebuffer
 
-static struct Color readPixel(struct N64* n, struct RDP* r, int x, int y) {
+static inline __attribute__((always_inline)) struct Color readPixel(struct N64* n, struct RDP* r, int x, int y) {
 	uint32_t i = y * r->colorWidth + x;
 	if (r->colorSize == 1) {
 		int v = n->rdram[(r->colorAddr + i) & (RDRAM_SIZE - 1)];
@@ -785,7 +785,7 @@ static i4 ext9x4(i4 v) {
 
 // combine() through the inputs setupCombiner found, for modes without noise; color and alpha
 // keep the same 9 bits ((x & 0x1FFFF) >> 8 is (x >> 8) & 0x1FF).
-static struct Color combineInputs(const struct Stage* s, bool raw) {
+static inline __attribute__((always_inline)) struct Color combineInputs(const struct Stage* s, bool raw) {
 	i4 a = input4(&s->a, s->alpha[0]), b = input4(&s->b, s->alpha[1]);
 	i4 m = input4(&s->m, s->alpha[2]), d = input4(&s->d, s->alpha[3]);
 	if (!raw) {
@@ -795,12 +795,12 @@ static struct Color combineInputs(const struct Stage* s, bool raw) {
 	return color((((a - b) * m + (d << 8) + 0x80) >> 8) & 0x1FF);
 }
 
-static struct Color combineCycle(struct RDP* r, struct Pixel* p, int cycle) {
+static inline __attribute__((always_inline)) struct Color combineCycle(struct RDP* r, struct Pixel* p, int cycle) {
 	// Converted texels can be outside 0-255: then the 9-bit rules apply.
 	return r->stage[cycle].noise ? combine(r, p, cycle) : combineInputs(&r->stage[cycle], r->stage[cycle].raw && !r->texConvert);
 }
 
-static struct Color blendColor(struct RDP* r, struct Color pixel, struct Color memory, struct Pixel* p, int cycle, bool divide) {
+static inline __attribute__((always_inline)) struct Color blendColor(struct RDP* r, struct Color pixel, struct Color memory, struct Pixel* p, int cycle, bool divide) {
 	const uint8_t* sel = r->blendSel[cycle];
 	int sp = sel[0], sa = sel[1], sm = sel[2], sb = sel[3];
 	const struct Color* choices[4] = { &pixel, &memory, &r->blend, &r->fog };
@@ -830,7 +830,7 @@ static struct Color blendColor(struct RDP* r, struct Color pixel, struct Color m
 }
 
 // The blender's first input (P) for a cycle, without blending.
-static struct Color blendInput(struct RDP* r, struct Color pixel, struct Color memory, int cycle) {
+static inline __attribute__((always_inline)) struct Color blendInput(struct RDP* r, struct Color pixel, struct Color memory, int cycle) {
 	int sp = r->blendSel[cycle][0];
 	struct Color out = sp == 0 ? pixel : sp == 1 ? memory : sp == 2 ? r->blend : r->fog;
 	out.a = pixel.a;
@@ -840,7 +840,7 @@ static struct Color blendInput(struct RDP* r, struct Color pixel, struct Color m
 // The depth test (with the stored depth slope: coplanar and decal tests, and whether an
 // antialiased edge blends), then the blender, and the coverage and depth written.
 // The combiner's output for a pixel, which the next pixel's first cycle reads as COMBINED.
-static struct Color combinePixel(struct RDP* r, struct Pixel* p) {
+static inline __attribute__((always_inline)) struct Color combinePixel(struct RDP* r, struct Pixel* p) {
 	// One-cycle mode runs the combiner's second-cycle equation.
 	p->combined = r->lastCombined;
 	struct Color c = combineCycle(r, p, r->cycleType == 1 ? 0 : 1);
