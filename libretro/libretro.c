@@ -127,8 +127,16 @@ static struct retro_core_option_v2_definition optionDefinitions[] = {
 	  "Fill 4:3 stretches the picture; TV 4:3 keeps a TV's borders; Square Pixels shows each pixel square.",
 	  NULL, "video", { { "fill", "Fill 4:3" }, { "tv", "TV 4:3" }, { "square", "Square Pixels" }, { NULL, NULL } }, "fill" },
 	{ "armn64_crop_overscan", "Crop Overscan", NULL,
-	  "Hides the picture's edges as a TV's frame did, with the black lines many games leave there.",
-	  NULL, "video", { { "enabled", "On" }, { "disabled", "Off" }, { NULL, NULL } }, "enabled" },
+	  "Hides the picture's edges as a TV's frame did, with the black lines many games leave there. Custom: each side's own amount, below.",
+	  NULL, "video", { { "enabled", "On" }, { "disabled", "Off" }, { "custom", "Custom" }, { NULL, NULL } }, "enabled" },
+	{ "armn64_crop_top", "Crop Top", NULL, "With Crop Overscan Custom: the console's pixels hidden at the top.",
+	  NULL, "video", { { "0", "0" }, { "2", "2" }, { "4", "4" }, { "6", "6" }, { "8", "8" }, { "10", "10" }, { "12", "12" }, { "16", "16" }, { "20", "20" }, { "24", "24" }, { NULL, NULL } }, "8" },
+	{ "armn64_crop_bottom", "Crop Bottom", NULL, "With Crop Overscan Custom: the console's pixels hidden at the bottom.",
+	  NULL, "video", { { "0", "0" }, { "2", "2" }, { "4", "4" }, { "6", "6" }, { "8", "8" }, { "10", "10" }, { "12", "12" }, { "16", "16" }, { "20", "20" }, { "24", "24" }, { NULL, NULL } }, "8" },
+	{ "armn64_crop_left", "Crop Left", NULL, "With Crop Overscan Custom: the console's pixels hidden at the left.",
+	  NULL, "video", { { "0", "0" }, { "2", "2" }, { "4", "4" }, { "6", "6" }, { "8", "8" }, { "10", "10" }, { "12", "12" }, { "16", "16" }, { "20", "20" }, { "24", "24" }, { NULL, NULL } }, "10" },
+	{ "armn64_crop_right", "Crop Right", NULL, "With Crop Overscan Custom: the console's pixels hidden at the right.",
+	  NULL, "video", { { "0", "0" }, { "2", "2" }, { "4", "4" }, { "6", "6" }, { "8", "8" }, { "10", "10" }, { "12", "12" }, { "16", "16" }, { "20", "20" }, { "24", "24" }, { NULL, NULL } }, "10" },
 	{ "armn64_vi_filters", "TV Filters", NULL,
 	  "The console's antialiasing and dither filters, as a TV showed them. Auto: on with Balanced and Accurate.",
 	  NULL, "video", { { "auto", "Auto" }, { "on", "On" }, { "off", "Off" }, { NULL, NULL } }, "auto" },
@@ -254,13 +262,18 @@ static const char* overclock(void) {
 // Hides the options that do nothing with the others' values. The frontend calls it when an option
 // changes; returns whether that changed which are shown.
 static bool showOptions(void) {
-	static bool shownSet, shown[16];
+	static bool shownSet, shown[24];
 	bool const hle = highLevel(), gl = !strcmp(renderer(), "gl"), gpu = !strcmp(renderer(), "gpu");
+	bool const custom = optionIs(environment, "armn64_crop_overscan", "custom");
 	struct {
 		const char* key;
 		bool shown;
 	} const options[] = {
 		{ "armn64_resolution", gl || gpu },
+		{ "armn64_crop_top", custom },
+		{ "armn64_crop_bottom", custom },
+		{ "armn64_crop_left", custom },
+		{ "armn64_crop_right", custom },
 		{ "armn64_gl_fb_effects", gl },
 		{ "armn64_gl_precompile", gl },
 		{ "armn64_gl_shaders", gl },
@@ -711,10 +724,30 @@ static bool askHardwareContext(void) {
 static void setGeometry(int width, int height);
 
 // The columns and rows hidden at each edge of a picture made at k times its size (Crop Overscan).
-static void overscan(int width, int height, int k, int* x, int* y) {
-	bool const crop = !optionIs(environment, "armn64_crop_overscan", "disabled");
-	*x = crop ? width / k / 30 * k : 0;
-	*y = crop ? height / k / 30 * k : 0;
+struct Crop {
+	int left, top, right, bottom;
+};
+
+// The pixels hidden at each side of a picture made at k times its size (Crop Overscan): a thirtieth
+// of the picture each side, or each side's own amount with Custom.
+static struct Crop overscan(int width, int height, int k) {
+	if (optionIs(environment, "armn64_crop_overscan", "disabled")) {
+		return (struct Crop) { 0, 0, 0, 0 };
+	}
+	if (!optionIs(environment, "armn64_crop_overscan", "custom")) {
+		int const x = width / k / 30 * k, y = height / k / 30 * k;
+		return (struct Crop) { x, y, x, y };
+	}
+	static const char* const keys[4] = { "armn64_crop_left", "armn64_crop_top", "armn64_crop_right", "armn64_crop_bottom" };
+	int side[4];
+	for (int i = 0; i < 4; ++i) {
+		const char* v = optionValue(environment, keys[i]);
+		side[i] = (v ? atoi(v) : 8) * k;
+	}
+	// At least a pixel of the picture stays.
+	side[2] = side[0] + side[2] >= width ? 0 : side[2], side[0] = side[0] >= width ? 0 : side[0];
+	side[3] = side[1] + side[3] >= height ? 0 : side[3], side[1] = side[1] >= height ? 0 : side[1];
+	return (struct Crop) { side[0], side[1], side[2], side[3] };
 }
 
 // The VI's picture into the frontend's framebuffer, upside down as GL keeps it: from the GL buffer
@@ -735,13 +768,12 @@ static void present(int width, int height, unsigned buffer) {
 		gl.TexSubImage2D(GL_TEXTURE_2D, 0, 0, 0, width, height, GL_RGBA, GL_UNSIGNED_BYTE, presentRgba);
 	}
 	int const k = n64PictureScale(machine);
-	int cx, cy;
-	overscan(width, height, k, &cx, &cy);
-	int const w = width - 2 * cx, h = height - 2 * cy;
+	struct Crop const c = overscan(width, height, k);
+	int const w = width - c.left - c.right, h = height - c.top - c.bottom;
 	setGeometry(w, h);
 	gl.BindFramebuffer(GL_READ_FRAMEBUFFER, presentFramebuffer);
 	gl.BindFramebuffer(GL_DRAW_FRAMEBUFFER, (unsigned) hw.get_current_framebuffer());
-	gl.BlitFramebuffer(cx, cy, cx + w, cy + h, 0, h, w, 0, GL_COLOR_BUFFER_BIT, GL_NEAREST);
+	gl.BlitFramebuffer(c.left, c.top, c.left + w, c.top + h, 0, h, w, 0, GL_COLOR_BUFFER_BIT, GL_NEAREST);
 	glrForget(machine);
 	videoRefresh(RETRO_HW_FRAME_BUFFER_VALID, (unsigned) w, (unsigned) h, 0);
 }
@@ -751,13 +783,12 @@ static void present(int width, int height, unsigned buffer) {
 static void presentGl(unsigned framebuffer, int x, int y, int width, int height) {
 	int const k = machine->glrScale;
 	gl.Disable(GL_SCISSOR_TEST);
-	int cx, cy;
-	overscan(width, height, k, &cx, &cy);
-	int const w = width - 2 * cx, h = height - 2 * cy;
+	struct Crop const c = overscan(width, height, k);
+	int const w = width - c.left - c.right, h = height - c.top - c.bottom;
 	setGeometry(w, h);
 	gl.BindFramebuffer(GL_READ_FRAMEBUFFER, framebuffer);
 	gl.BindFramebuffer(GL_DRAW_FRAMEBUFFER, (unsigned) hw.get_current_framebuffer());
-	gl.BlitFramebuffer(x * k + cx, y * k + cy, x * k + cx + w, y * k + cy + h, 0, h, w, 0, GL_COLOR_BUFFER_BIT, GL_NEAREST);
+	gl.BlitFramebuffer(x * k + c.left, y * k + c.top, x * k + c.left + w, y * k + c.top + h, 0, h, w, 0, GL_COLOR_BUFFER_BIT, GL_NEAREST);
 	glrForget(machine);
 	videoRefresh(RETRO_HW_FRAME_BUFFER_VALID, (unsigned) w, (unsigned) h, 0);
 }
@@ -1222,10 +1253,10 @@ static void setGeometry(int width, int height) {
 // A picture made on the CPU (0x00RRGGBB) to the frontend.
 static void showPicture(int width, int height, bool shared) {
 	if (!shared) {
-		int cx, cy;
-		overscan(width, height, 1, &cx, &cy);
-		setGeometry(width - 2 * cx, height - 2 * cy);
-		videoRefresh(picture + (size_t) cy * width + cx, (unsigned) (width - 2 * cx), (unsigned) (height - 2 * cy), (size_t) width * 4);
+		struct Crop const c = overscan(width, height, 1);
+		int const w = width - c.left - c.right, h = height - c.top - c.bottom;
+		setGeometry(w, h);
+		videoRefresh(picture + (size_t) c.top * width + c.left, (unsigned) w, (unsigned) h, (size_t) width * 4);
 	} else if (hwReady) {
 		present(width, height, 0);
 	}
