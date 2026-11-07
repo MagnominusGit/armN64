@@ -16,16 +16,13 @@ static i4 splat4(int v) {
 	return (i4) { v, v, v, v };
 }
 
+// Lane by lane: through memory, ARM cores can't take a channel back from the vector's store.
 static i4 lanes(struct Color c) {
-	i4 v;
-	memcpy(&v, &c, sizeof(v));
-	return v;
+	return (i4) { c.r, c.g, c.b, c.a };
 }
 
 static struct Color color(i4 v) {
-	struct Color c;
-	memcpy(&c, &v, sizeof(c));
-	return c;
+	return (struct Color) { v[0], v[1], v[2], v[3] };
 }
 
 static bool ownsRow(const struct RDP* r, int y) {
