@@ -146,6 +146,9 @@ static struct retro_core_option_v2_definition optionDefinitions[] = {
 	{ "armn64_gl_msaa", "Anti-Aliasing", NULL,
 	  "Smooths the GL renderer's edges and closes the hairline gaps between triangles that the console's own anti-aliasing hides. Costs GPU time. Applies on Restart.",
 	  NULL, "video", { { "off", "Off" }, { "2", "2x" }, { "4", "4x" }, { "8", "8x" }, { NULL, NULL } }, "off" },
+	{ "armn64_gl_filter", "Texture Filtering", NULL,
+	  "With GL. Console: the N64's own three-texel filter. Smooth: four texels, as PC games filter (softer, without the N64's slight diagonal look). Sharp: no filtering, each texel a square. Textures a game draws unfiltered stay so. Applies on Restart.",
+	  NULL, "video", { { "console", "Console" }, { "smooth", "Smooth" }, { "sharp", "Sharp" }, { NULL, NULL } }, "console" },
 	{ "armn64_gl_seal", "Seal Edges", NULL,
 	  "Opaque triangles reach half a pixel past their edges, so the background no longer shows through the cracks between them. Applies on Restart.",
 	  NULL, "video", { { "disabled", "Off" }, { "enabled", "On" }, { NULL, NULL } }, "disabled" },
@@ -275,6 +278,7 @@ static bool showOptions(void) {
 		{ "armn64_crop_left", custom },
 		{ "armn64_crop_right", custom },
 		{ "armn64_gl_fb_effects", gl },
+		{ "armn64_gl_filter", gl },
 		{ "armn64_gl_precompile", gl },
 		{ "armn64_gl_shaders", gl },
 		{ "armn64_gl_msaa", gl },
@@ -410,6 +414,10 @@ static const char* settings(const char* name) {
 	if (!strcmp(name, "N64_WIDESCREEN")) {
 		const char* v = optionValue(environment, "armn64_widescreen");
 		return v && strcmp(v, "disabled") ? v : "0";
+	}
+	if (!strcmp(name, "N64_GL_FILTER")) {
+		const char* v = optionValue(environment, "armn64_gl_filter");
+		return v ? v : "console";
 	}
 	if (!strcmp(name, "N64_GL_SEAL")) {
 		return optionIs(environment, "armn64_gl_seal", "enabled") ? "1" : "0";

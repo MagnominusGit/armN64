@@ -245,6 +245,9 @@ struct Glr {
 	// Shader Accuracy Fast (N64_GL_SHADERS=fast): the combiner and perspective in the GPU's floats, and
 	// no dither.
 	bool simple;
+	// N64_GL_FILTER: textures filtered as the RDP does (0), with four texels (1, smooth) or not at
+	// all (2, sharp).
+	int filter;
 	// FLE: the simple shaders, and tiles the GPU's sampler wraps and filters as the RDP does sampled by it.
 	bool fle;
 	// A pixel nobody sees, and a texture for every unit, to draw a program once with.
@@ -570,9 +573,11 @@ static const char fragmentHead[] =
 	"	ivec2 s = clamp(wrapCoord(st.x, a.x, a.z, b.x, b.z, c.x, fs), 0, image.x - 1);\n"
 	"	ivec2 tt = clamp(wrapCoord(st.y, a.y, a.w, b.y, b.w, c.y, ft), 0, image.y - 1);\n"
 	"	vec4 c0 = tileTexel(t, image, s.x, tt.x);\n"
-	"	if (c.z == 0) return c0;\n"
+	"	if (c.z == 0 || TEX_FILTER == 2) return c0;\n"
 	"	vec4 c1 = tileTexel(t, image, s.y, tt.x), c2 = tileTexel(t, image, s.x, tt.y);\n"
 	"	float x = float(fs) / 32.0, y = float(ft) / 32.0;\n"
+	// Texture Filtering Smooth: four texels, as GPUs filter, instead of the RDP's three.
+	"	if (TEX_FILTER == 1) return mix(mix(c0, c1, x), mix(c2, tileTexel(t, image, s.y, tt.y), x), y);\n"
 	"	if (fs + ft < 32) return c0 + (c1 - c0) * x + (c2 - c0) * y;\n"
 	"	vec4 c3 = tileTexel(t, image, s.y, tt.y);\n"
 	"	return c3 + (c2 - c3) * (1.0 - x) + (c1 - c3) * (1.0 - y);\n"
@@ -580,7 +585,7 @@ static const char fragmentHead[] =
 	// FLE: a tile the GPU's sampler wraps and filters (c.w set) sampled by it at the texel the RDP's
 	// coordinate falls on (half a texel on to filter as the RDP does); else as the RDP does.
 	"vec4 sampleFast(sampler2D t, ivec4 a, ivec4 b, ivec4 c, ivec4 image, vec2 stf, ivec2 st) {\n"
-	"	if (c.w == 0) return sampleTile(t, a, b, c, image, st);\n"
+	"	if (c.w == 0 || TEX_FILTER == 2) return sampleTile(t, a, b, c, image, st);\n"
 	"	vec2 scale = vec2(a.x < 11 ? 1.0 / float(1 << a.x) : float(1 << (16 - a.x)), a.y < 11 ? 1.0 / float(1 << a.y) : float(1 << (16 - a.y)));\n"
 	"	vec2 texel = (stf * scale - vec2(a.zw) * 8.0) / 32.0 + (c.z != 0 ? 0.5 : 0.001);\n"
 	"	return texture(t, texel / vec2(image.xy));\n"
@@ -763,10 +768,11 @@ static struct Program* program(struct Glr* g, struct ProgramKey key) {
 	if (g->fetch && !g->barrier) {
 		// The image's pixel in oColor before the shader writes it.
 		const char* out = strstr(fragmentHead, "out vec4 oColor;");
-		snprintf(source, sizeof(source), "#version 300 es\n#extension GL_EXT_shader_framebuffer_fetch : require\n%.*sinout%s",
-		         (int) (out - fragmentHead - strlen("#version 300 es\n")), fragmentHead + strlen("#version 300 es\n"), out + 3);
+		snprintf(source, sizeof(source), "#version 300 es\n#extension GL_EXT_shader_framebuffer_fetch : require\n#define TEX_FILTER %d\n%.*sinout%s",
+		         g->filter, (int) (out - fragmentHead - strlen("#version 300 es\n")), fragmentHead + strlen("#version 300 es\n"), out + 3);
 	} else {
-		snprintf(source, sizeof(source), "%s%s", fragmentHead, g->barrier ? "uniform highp sampler2D uMemory;\n" : "");
+		snprintf(source, sizeof(source), "#version 300 es\n#define TEX_FILTER %d\n%s%s", g->filter, fragmentHead + strlen("#version 300 es\n"),
+		         g->barrier ? "uniform highp sampler2D uMemory;\n" : "");
 	}
 	// rdp.c's noise: a hash of the pixel (at the RDP's resolution), the primitive's number and what
 	// it is for (the combiner's channels 0-2, the dither 4).
@@ -2532,6 +2538,8 @@ struct Glr* glrCreate(struct N64* n) {
 	const char* shaders = n->settings ? n->settings("N64_GL_SHADERS") : getenv("N64_GL_SHADERS");
 	g->fle = n->fle;
 	g->simple = g->fle || (shaders && !strcmp(shaders, "fast"));
+	const char* filter = n->settings ? n->settings("N64_GL_FILTER") : getenv("N64_GL_FILTER");
+	g->filter = filter && !strcmp(filter, "smooth") ? 1 : filter && !strcmp(filter, "sharp") ? 2 : 0;
 	// The programs the game used before, made now rather than at the draws that first need them.
 	const char* precompile = n->settings ? n->settings("N64_GL_PRECOMPILE") : getenv("N64_GL_PRECOMPILE");
 	bool const preload = !(precompile && *precompile == '0'), stepped = precompile && *precompile == '2';
