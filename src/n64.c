@@ -132,7 +132,8 @@ static void start(struct N64* n) {
 	n->opCycles = 1;
 	n->emulatorLike = n->accuracy != ACCURACY_LLE;
 	n->rspPlainTiming = n->accuracy != ACCURACY_LLE;
-	n->fast = n->accuracy == ACCURACY_HLE;
+	const char* cpuTiming = setting(n, "N64_CPU_TIMING");
+	n->fast = n->accuracy == ACCURACY_HLE && !(cpuTiming && !strcmp(cpuTiming, "exact"));
 	const char* idleSkip = setting(n, "N64_IDLESKIP");
 	n->idle.enabled = n->accuracy == ACCURACY_HLE && !(idleSkip && idleSkip[0] == '0');
 	n->hleCheck = setting(n, "N64HLECHECK") != NULL;

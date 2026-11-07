@@ -111,6 +111,9 @@ static struct retro_core_option_v2_definition optionDefinitions[] = {
 	{ "armn64_overclock", "Overclock", NULL,
 	  "A faster CPU, RSP and RDP for less slowdown and shorter loading; the boot keeps the real speed. Applies on Restart.",
 	  NULL, "system", { { "1", "Off" }, { "1.5", "1.5x" }, { "2", "2x" }, { "2.5", "2.5x" }, { "3", "3x" }, { "4", "4x" }, { NULL, NULL } }, "1" },
+	{ "armn64_cpu_timing", "CPU Timing", NULL,
+	  "With Fast and Fastest. Exact: the CPU's caches take as long as on the console, as with Accurate; for demos that replay recorded input and drift off course without it. About a third slower. Applies on Restart.",
+	  NULL, "system", { { "fast", "Fast" }, { "exact", "Exact" }, { NULL, NULL } }, "fast" },
 	{ "armn64_renderer", "Renderer", NULL,
 	  "GL is fastest and can draw sharper, but isn't exact; GPU and CPU are. Applies on Restart.",
 	  NULL, "video", { { "gl", "GL (Fast)" }, { "gpu", "GPU (Exact)" }, { "cpu", "CPU (Exact)" }, { NULL, NULL } }, "gl" },
@@ -251,6 +254,7 @@ static bool showOptions(void) {
 		const char* key;
 		bool shown;
 	} const options[] = {
+		{ "armn64_cpu_timing", hle },
 		{ "armn64_resolution", gl },
 		{ "armn64_gl_fb_effects", gl },
 		{ "armn64_gl_precompile", gl },
@@ -328,6 +332,9 @@ static const char* settings(const char* name) {
 	}
 	if (!strcmp(name, "N64_OVERCLOCK")) {
 		return overclock();
+	}
+	if (!strcmp(name, "N64_CPU_TIMING")) {
+		return optionIs(environment, "armn64_cpu_timing", "exact") ? "exact" : "fast";
 	}
 	if (!strcmp(name, "N64_GL_SCALE")) {
 		scale[0] = (char) ('0' + glScale());
