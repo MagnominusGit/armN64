@@ -1888,6 +1888,7 @@ bool cpuJitStep(struct N64* n, uint32_t op) {
 	struct CPU* c = &n->cpu;
 	uint64_t pc = c->pc;
 	uint32_t gen = n->blockGen, code = n->codeGen;
+	uint64_t const status = c->cop0[CP0_STATUS];
 	if (!uncachedWord(n, op)) {
 		execute(n, op);
 	}
@@ -1897,7 +1898,10 @@ bool cpuJitStep(struct N64* n, uint32_t op) {
 	n->jitLimit = n->eventAt < n->jitFire ? n->eventAt : n->jitFire;
 	bool timer = op >> 26 == 0x10 && (RS == 0x04 || RS == 0x05) && (RD == CP0_COUNT || RD == CP0_COMPARE);
 	bool icache = op >> 26 == 0x2F && ((op >> 16) & 3) == 0;
-	return c->pc != pc || n->blockGen != gen || n->codeGen != code || interruptPending(n) || timer || icache || !cpuPlainMode(n);
+	// Status.CU1 or FR changed: the FPU code after it is compiled for the old mode.
+	bool fpuMode = (c->cop0[CP0_STATUS] ^ status) & (1u << 29 | 1u << 26);
+	return c->pc != pc || n->blockGen != gen || n->codeGen != code || interruptPending(n) || timer || icache || fpuMode ||
+	       !cpuPlainMode(n);
 }
 
 void cpuStep(struct N64* n) {
