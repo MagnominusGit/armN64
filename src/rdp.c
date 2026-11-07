@@ -79,12 +79,6 @@ static bool readsLastPixel(const struct RDP* r) {
 	return r->stage[r->cycleType == 1 ? 0 : 1].readsCombined && (r->cycleType != 1 || r->stage[1].readsCombined || r->alphaCompare);
 }
 
-static bool usesNoise(const struct RDP* r) {
-	uint64_t m = r->otherModes;
-	return r->stage[r->cycleType == 1 ? 0 : 1].noise || (r->cycleType == 1 && r->stage[1].noise) || ((m >> 38) & 3) == 2 || ((m >> 36) & 3) == 2 ||
-	       ((m & 1) && ((m >> 1) & 1));
-}
-
 // A pixel's dither: three bits for each colour channel (red lowest) and alpha's.
 static inline void ditherAt(const struct RDP* r, int x, int y, int* rgb, int* alpha) {
 	int const modeRgb = r->ditherRgb, modeAlpha = r->ditherAlpha;
@@ -2307,7 +2301,7 @@ static void submit(struct N64* n, struct RDP* r, const uint64_t* w, int op, int 
 			}
 		}
 		bool shades = !(op == 0x36 && r->cycleType == 3) && !((op == 0x24 || op == 0x25) && r->cycleType == 2);
-		if (shades && (readsLastPixel(r) || usesNoise(r))) {
+		if (shades && readsLastPixel(r)) {
 			header |= ENTRY_ALONE;
 		}
 	}
