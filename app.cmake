@@ -8,7 +8,7 @@ set(APP_JAVA_PACKAGE org.armn64.app)
 set(APP_JAVA_CLASS Armn64)
 # Its version, and how it's built: the CMake option that turns it on, its target, and the packages'
 # other CMake arguments.
-set(APP_VERSION 0.1)
+set(APP_VERSION 1.0)
 set(APP_BUILD_OPTION ARMN64_APP)
 set(APP_BUILD_TARGET armn64-app)
 # The packages run on any 64-bit ARM or x86-64 machine, not only the Cortex-A55's kind.
