@@ -831,7 +831,7 @@ static void triangle(struct N64* n, struct Hle* h, const struct ScreenVertex* a,
 		for (int j = 0; j < 3; ++j) {
 			struct ScreenVertex v = *corners[j];
 			if (flat) {
-				v.r = flat->r, v.g = flat->g, v.b = flat->b, v.a = flat->a;
+				v.r = flat->r, v.g = flat->g, v.b = flat->b, v.a = h->geometry & GEOM_FOG ? v.a : flat->a;
 			}
 			if (!persp) {
 				v.s *= v.invW * k, v.t *= v.invW * k;
@@ -863,7 +863,9 @@ static void triangle(struct N64* n, struct Hle* h, const struct ScreenVertex* a,
 		GRADIENT(s1->r * 255, s2->r * 255, s3->r * 255, st[0], dx[0], de[0], dy[0]);
 		GRADIENT(s1->g * 255, s2->g * 255, s3->g * 255, st[1], dx[1], de[1], dy[1]);
 		GRADIENT(s1->b * 255, s2->b * 255, s3->b * 255, st[2], dx[2], de[2], dy[2]);
-		GRADIENT(s1->a * 255, s2->a * 255, s3->a * 255, st[3], dx[3], de[3], dy[3]);
+		// Fog's alpha stays each corner's own, as the microcodes keep it with flat shading.
+		const struct ScreenVertex* f1 = h->geometry & GEOM_FOG ? a : s1, * f2 = h->geometry & GEOM_FOG ? b : s2, * f3 = h->geometry & GEOM_FOG ? c : s3;
+		GRADIENT(f1->a * 255, f2->a * 255, f3->a * 255, st[3], dx[3], de[3], dy[3]);
 		const int32_t* rows[4] = { st, dx, de, dy };
 		for (int r = 0; r < 4; r += 2) {
 			const int32_t* p = rows[r], * q = rows[r + 1];
