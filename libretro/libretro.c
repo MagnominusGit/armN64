@@ -112,7 +112,7 @@ static struct retro_core_option_v2_definition optionDefinitions[] = {
 	  "A faster CPU, RSP and RDP for less slowdown and shorter loading; the boot keeps the real speed. Applies on Restart.",
 	  NULL, "system", { { "1", "Off" }, { "1.5", "1.5x" }, { "2", "2x" }, { "2.5", "2.5x" }, { "3", "3x" }, { "4", "4x" }, { NULL, NULL } }, "1" },
 	{ "armn64_renderer", "Renderer", NULL,
-	  "GL is fastest and can draw above the N64's resolution, but isn't exact. GPU and CPU draw exactly as the console does at its own resolution: GPU on the graphics chip, CPU on the processor. GPU can also draw higher (Resolution), close to exact. Applies on Restart.",
+	  "GL is fastest and can draw above the N64's resolution, but isn't exact. GPU and CPU draw exactly as the console does at its own resolution: GPU on the graphics chip, CPU on the processor. GPU can also draw higher (Resolution), close to exact. GPU is for desktop graphics cards: on handhelds it runs below full speed, so use CPU or GL there. Applies on Restart.",
 	  NULL, "video", { { "gl", "GL (Fast, HD)" }, { "gpu", "GPU (Exact, HD)" }, { "cpu", "CPU (Exact, Native)" }, { NULL, NULL } }, "gl" },
 	{ "armn64_resolution", "Resolution", NULL,
 	  "The GL and GPU renderers' resolution. Auto fits the display with GL and is Native with GPU, which is exact only at Native. Applies on Restart.",
