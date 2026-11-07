@@ -81,6 +81,8 @@ static struct {
 	void (*MemoryBarrier)(unsigned);
 } gl;
 static unsigned presentTexture, presentFramebuffer;
+// The texture's size: 640 by 480, larger only for a picture that needs it (the GPU RDP's at its scale).
+static int presentWidth, presentHeight;
 static uint32_t presentRgba[640 * 480];
 // RetroArch fills saveMemory from the save file after the game loads: it goes to the machine on the
 // first run.
@@ -681,7 +683,8 @@ static void hwReset(void) {
 	}
 	gl.GenTextures(1, &presentTexture);
 	gl.BindTexture(GL_TEXTURE_2D, presentTexture);
-	gl.TexImage2D(GL_TEXTURE_2D, 0, GL_RGBA8, 640 * (int) maxScale, 480 * (int) maxScale, 0, GL_RGBA, GL_UNSIGNED_BYTE, NULL);
+	gl.TexImage2D(GL_TEXTURE_2D, 0, GL_RGBA8, 640, 480, 0, GL_RGBA, GL_UNSIGNED_BYTE, NULL);
+	presentWidth = 640, presentHeight = 480;
 	gl.GenFramebuffers(1, &presentFramebuffer);
 	gl.BindFramebuffer(GL_READ_FRAMEBUFFER, presentFramebuffer);
 	gl.FramebufferTexture2D(GL_READ_FRAMEBUFFER, GL_COLOR_ATTACHMENT0, GL_TEXTURE_2D, presentTexture, 0);
@@ -764,6 +767,10 @@ static struct Crop overscan(int width, int height, int k) {
 static void present(int width, int height, unsigned buffer) {
 	gl.Disable(GL_SCISSOR_TEST);
 	gl.BindTexture(GL_TEXTURE_2D, presentTexture);
+	if (width > presentWidth || height > presentHeight) {
+		presentWidth = width > presentWidth ? width : presentWidth, presentHeight = height > presentHeight ? height : presentHeight;
+		gl.TexImage2D(GL_TEXTURE_2D, 0, GL_RGBA8, presentWidth, presentHeight, 0, GL_RGBA, GL_UNSIGNED_BYTE, NULL);
+	}
 	if (buffer) {
 		gl.MemoryBarrier(GL_PIXEL_BUFFER_BARRIER_BIT);
 		gl.BindBuffer(GL_PIXEL_UNPACK_BUFFER, buffer);
