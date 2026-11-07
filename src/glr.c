@@ -473,6 +473,12 @@ static const char fragmentHead[] =
 	// rdp.c's clamp9: the combiner keeps 9 bits; 0x100-0x17F saturate, 0x180-0x1FF are negative.
 	"vec4 clamp9(vec4 v) { v = mod(v, 512.0); return mix(mix(v, vec4(255.0), step(256.0, v)), vec4(0.0), step(384.0, v)); }\n"
 	"float e8(float v) { return floor(v * 255.0 + 0.5); }\n"
+	// The first of two cycles' 9-bit result as the second cycle takes it (rdp.c ext9 for its A, B and
+	// D, sign9 for its multiplier).
+	"vec3 x9(vec3 v) { v = floor(v * 255.0 + 0.5); return v - 512.0 * step(384.0, v); }\n"
+	"float x9(float v) { v = floor(v * 255.0 + 0.5); return v - 512.0 * step(384.0, v); }\n"
+	"vec3 s9(vec3 v) { v = floor(v * 255.0 + 0.5); return v - 512.0 * step(256.0, v); }\n"
+	"float s9(float v) { v = floor(v * 255.0 + 0.5); return v - 512.0 * step(256.0, v); }\n"
 	// A texel and the one after it on an axis (the coordinate a whole texel on, as the filter takes
 	// it), and the fraction of the first.
 	"ivec2 wrapCoord(int c, int shift, int lo, int hi, int cm, int mask, out int frac) {\n"
@@ -644,8 +650,9 @@ static const char* input8(char* out, size_t size, const char* input) {
 }
 
 // One combiner cycle as GLSL, in the RDP's integers: ((a - b) * m + d * 256 + 128) / 256 for color and
-// alpha, kept in 9 bits and saturated as the RDP does; simple, in floats clamped to 0-1.
-static void cycleSource(char* out, size_t size, uint64_t c, int cycle, bool simple) {
+// alpha, kept in 9 bits and saturated as the RDP does; simple, in floats clamped to 0-1. The first of
+// two cycles (first) leaves its 9 bits as they are, for the second to read sign-extended.
+static void cycleSource(char* out, size_t size, uint64_t c, int cycle, bool simple, bool first, bool afterFirst) {
 	int a = cycle ? (c >> 37) & 15 : (c >> 52) & 15, m = cycle ? (c >> 32) & 31 : (c >> 47) & 31;
 	int b = cycle ? (c >> 24) & 15 : (c >> 28) & 15, d = cycle ? (c >> 6) & 7 : (c >> 15) & 7;
 	int aa = cycle ? (c >> 21) & 7 : (c >> 44) & 7, ab = cycle ? (c >> 3) & 7 : (c >> 12) & 7;
@@ -656,10 +663,17 @@ static void cycleSource(char* out, size_t size, uint64_t c, int cycle, bool simp
 		return;
 	}
 	char in[8][64];
-	snprintf(out, size, "	combined = clamp9(floor((vec4((%s - %s) * %s, (%s - %s) * %s) + vec4(%s, %s) * 256.0 + 128.0) / 256.0)) / 255.0;\n",
-	         input8(in[0], 64, rgbInput(0, a)), input8(in[1], 64, rgbInput(1, b)), input8(in[2], 64, rgbInput(2, m)),
-	         input8(in[3], 64, alphaInput(aa, false)), input8(in[4], 64, alphaInput(ab, false)), input8(in[5], 64, alphaInput(am, true)),
-	         input8(in[6], 64, rgbInput(3, d)), input8(in[7], 64, alphaInput(ad, false)));
+	input8(in[0], 64, rgbInput(0, a)), input8(in[1], 64, rgbInput(1, b)), input8(in[2], 64, rgbInput(2, m));
+	input8(in[3], 64, alphaInput(aa, false)), input8(in[4], 64, alphaInput(ab, false)), input8(in[5], 64, alphaInput(am, true));
+	input8(in[6], 64, rgbInput(3, d)), input8(in[7], 64, alphaInput(ad, false));
+	for (int k = 0; k < 8 && afterFirst; ++k) {
+		if (!strncmp(in[k], "e8(combined", 11) || !strncmp(in[k], "e8(vec3(combined", 16)) {
+			memcpy(in[k], k == 2 || k == 5 ? "s9" : "x9", 2);
+		}
+	}
+	snprintf(out, size, first ? "	combined = mod(floor((vec4((%s - %s) * %s, (%s - %s) * %s) + vec4(%s, %s) * 256.0 + 128.0) / 256.0), 512.0) / 255.0;\n"
+	                          : "	combined = clamp9(floor((vec4((%s - %s) * %s, (%s - %s) * %s) + vec4(%s, %s) * 256.0 + 128.0) / 256.0)) / 255.0;\n",
+	         in[0], in[1], in[2], in[3], in[4], in[5], in[6], in[7]);
 }
 
 // The blender's P and A for a cycle (pixel, memory, blend color, fog): P as the color and A as the
@@ -862,13 +876,13 @@ static struct Program* program(struct Glr* g, struct ProgramKey key) {
 		strcat(source, "	combined = tex0;\n");
 	} else {
 		if (cycleType == 1) {
-			cycleSource(line, sizeof(line), key.combine, 0, g->simple);
+			cycleSource(line, sizeof(line), key.combine, 0, g->simple, true, false);
 			strcat(source, line);
 			// The second cycle sees the pipelined texels: texel 1 as texel 0, and texel 0 as texel 1
 			// (rdp.c's shadePixel).
 			strcat(source, "	vec4 swapped = tex0;\n	tex0 = tex1;\n	tex1 = swapped;\n");
 		}
-		cycleSource(line, sizeof(line), key.combine, 1, g->simple);
+		cycleSource(line, sizeof(line), key.combine, 1, g->simple, false, cycleType == 1);
 		strcat(source, line);
 	}
 	if (key.modes & MODE_CVG_ALPHA) {
