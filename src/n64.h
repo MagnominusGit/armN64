@@ -561,6 +561,8 @@ void cheatsClear(struct Cheats*);
 void cheatsSet(struct Cheats*, unsigned index, bool enabled, const char* code);
 void cheatsApply(struct N64*, const struct Cheats*);
 bool n64PictureStart(struct N64*, int* width, int* height);
+// The last picture's scale: the GPU RDP's high-resolution one (N64_GPU_SCALE), else 1.
+int n64PictureScale(struct N64*);
 // After n64PictureStart, the GL buffer holding the picture in RGBA bytes (with the GPU RDP, in its
 // context); 0 when it is elsewhere.
 unsigned n64PictureBuffer(struct N64*);
@@ -648,6 +650,9 @@ void rdpWait(struct N64*);
 void rdpWaitFor(struct N64*, uint32_t addr, uint32_t len);
 void rdpWaitRead(struct N64*, uint32_t addr, uint32_t len);
 struct Gles* rdpGpuShare(struct N64*, uint32_t addr, uint32_t len);
+int rdpGpuScale(struct N64*);
+int* rdpGpuViProgram(struct N64*);
+bool rdpGpuHires(struct N64*, uint32_t origin, int stride, bool wide, int rows, int* base, int* x, int* y);
 void rdpWaitDrawn(struct N64*, uint32_t addr, uint32_t len);
 bool frameSkipped(struct N64*, uint32_t origin);
 // A color image at addr: whether a skipped frame is drawn into it.

@@ -112,10 +112,10 @@ static struct retro_core_option_v2_definition optionDefinitions[] = {
 	  "A faster CPU, RSP and RDP for less slowdown and shorter loading; the boot keeps the real speed. Applies on Restart.",
 	  NULL, "system", { { "1", "Off" }, { "1.5", "1.5x" }, { "2", "2x" }, { "2.5", "2.5x" }, { "3", "3x" }, { "4", "4x" }, { NULL, NULL } }, "1" },
 	{ "armn64_renderer", "Renderer", NULL,
-	  "GL is fastest and can draw above the N64's resolution, but isn't exact. GPU and CPU draw exactly as the console does, at its own resolution: GPU on the graphics chip, CPU on the processor. Applies on Restart.",
-	  NULL, "video", { { "gl", "GL (Fast, HD)" }, { "gpu", "GPU (Exact, Native)" }, { "cpu", "CPU (Exact, Native)" }, { NULL, NULL } }, "gl" },
+	  "GL is fastest and can draw above the N64's resolution, but isn't exact. GPU and CPU draw exactly as the console does at its own resolution: GPU on the graphics chip, CPU on the processor. GPU can also draw higher (Resolution), close to exact. Applies on Restart.",
+	  NULL, "video", { { "gl", "GL (Fast, HD)" }, { "gpu", "GPU (Exact, HD)" }, { "cpu", "CPU (Exact, Native)" }, { NULL, NULL } }, "gl" },
 	{ "armn64_resolution", "Resolution", NULL,
-	  "The GL renderer's resolution; Auto fits the display. Applies on Restart.",
+	  "The GL and GPU renderers' resolution. Auto fits the display with GL and is Native with GPU, which is exact only at Native. Applies on Restart.",
 	  NULL, "video", { { "auto", "Auto" }, { "1", "Native" }, { "2", "2x" }, { "3", "3x" }, { "4", "4x" }, { "5", "5x" }, { "6", "6x" }, { "7", "7x" }, { "8", "8x" }, { NULL, NULL } }, "auto" },
 	{ "armn64_widescreen", "Widescreen", NULL,
 	  "16:9 and 16:10 draw more of the scene at the sides, with Library graphics; games may leave out things just off the 4:3 edges, and full-screen pictures stay stretched. Picture Only shows the picture that wide and changes nothing else, for a game's own widescreen cheat code (any graphics). Applies on Restart.",
@@ -246,12 +246,12 @@ static const char* overclock(void) {
 // changes; returns whether that changed which are shown.
 static bool showOptions(void) {
 	static bool shownSet, shown[16];
-	bool const hle = highLevel(), gl = !strcmp(renderer(), "gl");
+	bool const hle = highLevel(), gl = !strcmp(renderer(), "gl"), gpu = !strcmp(renderer(), "gpu");
 	struct {
 		const char* key;
 		bool shown;
 	} const options[] = {
-		{ "armn64_resolution", gl },
+		{ "armn64_resolution", gl || gpu },
 		{ "armn64_gl_fb_effects", gl },
 		{ "armn64_gl_precompile", gl },
 		{ "armn64_gl_shaders", gl },
@@ -328,6 +328,12 @@ static const char* settings(const char* name) {
 	}
 	if (!strcmp(name, "N64_OVERCLOCK")) {
 		return overclock();
+	}
+	if (!strcmp(name, "N64_GPU_SCALE")) {
+		// GPU: Native unless a resolution is chosen (Auto keeps it exact).
+		const char* value = optionValue(environment, "armn64_resolution");
+		scale[0] = !strcmp(renderer(), "gpu") && value && *value >= '1' && *value <= '8' ? *value : '1';
+		return scale;
 	}
 	if (!strcmp(name, "N64_GL_SCALE")) {
 		scale[0] = (char) ('0' + glScale());
@@ -641,7 +647,7 @@ static void hwReset(void) {
 	}
 	gl.GenTextures(1, &presentTexture);
 	gl.BindTexture(GL_TEXTURE_2D, presentTexture);
-	gl.TexImage2D(GL_TEXTURE_2D, 0, GL_RGBA8, 640, 480, 0, GL_RGBA, GL_UNSIGNED_BYTE, NULL);
+	gl.TexImage2D(GL_TEXTURE_2D, 0, GL_RGBA8, 640 * (int) maxScale, 480 * (int) maxScale, 0, GL_RGBA, GL_UNSIGNED_BYTE, NULL);
 	gl.GenFramebuffers(1, &presentFramebuffer);
 	gl.BindFramebuffer(GL_READ_FRAMEBUFFER, presentFramebuffer);
 	gl.FramebufferTexture2D(GL_READ_FRAMEBUFFER, GL_COLOR_ATTACHMENT0, GL_TEXTURE_2D, presentTexture, 0);
@@ -716,8 +722,9 @@ static void present(int width, int height, unsigned buffer) {
 		}
 		gl.TexSubImage2D(GL_TEXTURE_2D, 0, 0, 0, width, height, GL_RGBA, GL_UNSIGNED_BYTE, presentRgba);
 	}
+	int const k = n64PictureScale(machine);
 	int cx, cy;
-	overscan(width, height, 1, &cx, &cy);
+	overscan(width, height, k, &cx, &cy);
 	int const w = width - 2 * cx, h = height - 2 * cy;
 	setGeometry(w, h);
 	gl.BindFramebuffer(GL_READ_FRAMEBUFFER, presentFramebuffer);

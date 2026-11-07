@@ -5,6 +5,12 @@
 precision highp int;
 layout(local_size_x = 16, local_size_y = 16) in;
 
+#ifdef VI_HIRES
+// The GPU RDP's high-resolution picture as it is (no filters): u[0] its first index in hiImage, u[1]
+// its row's length, u[2] 32-bit pixels, u[3] and u[4] the picture's size, u[5] and u[6] its first
+// pixel there, u[7] gamma.
+layout(std430, binding = 6) readonly buffer HiImages { uint hiImage[]; };
+#endif
 #ifdef VI_SHARED
 // Run in the GPU RDP's context: all of RDRAM from its buffer, the hidden bits after it, and the
 // picture in RGBA bytes for a texture.
@@ -114,6 +120,22 @@ int gamma(int v) {
 }
 
 void main() {
+#ifdef VI_HIRES
+	int hx = int(gl_GlobalInvocationID.x), hy = int(gl_GlobalInvocationID.y);
+	if (hx >= u[3] || hy >= u[4]) {
+		return;
+	}
+	uint hv = hiImage[u[0] + (u[6] + hy) * u[1] + u[5] + hx];
+	ivec3 hc = u[2] != 0 ? ivec3(int(hv >> 24), int((hv >> 16) & 255u), int((hv >> 8) & 255u))
+	                     : ivec3(int((hv >> 11) & 31u), int((hv >> 6) & 31u), int((hv >> 1) & 31u));
+	if (u[2] == 0) {
+		hc = hc << 3 | hc >> 2;
+	}
+	if (u[7] != 0) {
+		hc = ivec3(gamma(hc.r), gamma(hc.g), gamma(hc.b));
+	}
+	picture[hy * u[3] + hx] = uint(hc.r) | uint(hc.g) << 8 | uint(hc.b) << 16 | 0xFF000000u;
+#else
 	corner = ivec2(gl_WorkGroupID.xy) * 16;
 	int lastX = min(corner.x + 15, u[3] - 1), lastY = min(corner.y + 15, u[4] - 1);
 	for (int i = int(gl_LocalInvocationIndex); i < 22 * 18; i += 256) {
@@ -150,5 +172,6 @@ void main() {
 	picture[y * u[3] + x] = uint(v.r) | uint(v.g) << 8 | uint(v.b) << 16 | 0xFF000000u;
 #else
 	picture[y * u[3] + x] = uint(v.r) << 16 | uint(v.g) << 8 | uint(v.b);
+#endif
 #endif
 }

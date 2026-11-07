@@ -2522,7 +2522,19 @@ enum {
 	GPU_PATCHES_MAX = 1 << 20,
 	GPU_KIND_TRIANGLE = 0, GPU_KIND_TEXRECT = 1, GPU_KIND_FILL = 2, GPU_KIND_RECT = 3,
 	GPU_PAGE_BATCH = 1, GPU_PAGE_OWNED = 2, GPU_PAGE_MARKED = 4,
-	GPU_VARIANTS = 48, GPU_RANGES = 256,
+	GPU_VARIANTS = 96, GPU_RANGES = 256,
+	// High-resolution images (N64_GPU_SCALE), colour or depth (a depth image is cleared as a colour
+	// one), each up to 640 by 480 pixels at the scale.
+	GPU_HI_IMAGES = 6, GPU_HI_ROWS = 480,
+};
+
+// A high-resolution copy of a colour or depth image at the scale: its pixels as RDRAM keeps them;
+// rows staleFrom to staleTo changed in RDRAM since (filled from it before use).
+struct GpuHi {
+	uint32_t addr;
+	int width, size, rows;
+	int staleFrom, staleTo;
+	uint64_t used;
 };
 
 // What a batch's primitives use, for the shader variant that leaves out the rest (rdp_gpu.glsl's
@@ -2583,7 +2595,43 @@ struct Gpu {
 	uint32_t patchUsed;
 	uint32_t* apply;
 	size_t applyCount, applyCap;
+	// N64_GPU_SCALE: the scale (1 for none), the images, and the program that fills one's rows.
+	int hiScale, hiFillProgram;
+	// The VI's program for its picture (n64.c: index + 1, -1 when it doesn't build).
+	int viProgram;
+	struct GpuHi hi[GPU_HI_IMAGES];
+	uint64_t hiUses;
 };
+
+// Rows u[3] to u[4] of a high-resolution image filled from RDRAM: u[0] its first index, u[1] the
+// image's address, u[2] its width, u[5] its pixel size (1 to 3), u[6] the scale.
+static const char hiFillSource[] =
+	"#version 310 es\n"
+	"layout(local_size_x = 16, local_size_y = 16) in;\n"
+	"layout(std430, binding = 0) readonly buffer Rdram { uint rdram[]; };\n"
+	"layout(std430, binding = 6) buffer HiImages { uint hiImage[]; };\n"
+	"uniform int u[8];\n"
+	"uint rbyte(uint a) { return (rdram[a >> 2] >> ((a & 3u) * 8u)) & 255u; }\n"
+	"void main() {\n"
+	"	int k = u[6], hx = int(gl_GlobalInvocationID.x), hy = int(gl_GlobalInvocationID.y) + u[3] * k;\n"
+	"	int x = hx / k, y = hy / k;\n"
+	"	if (x >= u[2] || y >= u[4]) {\n"
+	"		return;\n"
+	"	}\n"
+	"	uint i = uint(y * u[2] + x), a = uint(u[1]), v;\n"
+	"	const uint mask = 0x7FFFFFu;\n"
+	"	if (u[5] == 1) {\n"
+	"		v = rbyte((a + i) & mask);\n"
+	"	} else if (u[5] == 3) {\n"
+	"		uint b = (a + i * 4u) & (mask & ~3u);\n"
+	"		v = rbyte(b) << 24 | rbyte(b + 1u) << 16 | rbyte(b + 2u) << 8 | rbyte(b + 3u);\n"
+	"	} else {\n"
+	"		uint b = (a + i * 2u) & (mask & ~1u);\n"
+	"		v = rbyte(b) << 8 | rbyte(b + 1u) | (rbyte(mask + 1u + (b >> 1)) & 3u) << 16;\n"
+	"	}\n"
+	"	int at = u[0] + hy * u[2] * k + hx;\n"
+	"	hiImage[at] = v;\n"
+	"}\n";
 
 static const char gatherSource[] =
 	"#version 310 es\n"
@@ -2657,6 +2705,92 @@ static struct Gpu* gpuCreate(void) {
 	return g;
 }
 
+// The high-resolution images' slots: each 640 by GPU_HI_ROWS at the scale.
+static size_t hiSlot(const struct Gpu* g) {
+	return (size_t) 640 * g->hiScale * GPU_HI_ROWS * g->hiScale;
+}
+
+static void hiStart(struct Gpu* g, int scale) {
+	g->hiScale = 1;
+	if (scale < 2) {
+		return;
+	}
+	char error[2048] = "";
+	g->hiFillProgram = glesAddProgram(g->gl, hiFillSource, error, sizeof(error));
+	if (g->hiFillProgram < 0) {
+		fprintf(stderr, "GPU RDP high resolution unavailable (%s)\n", error);
+		return;
+	}
+	g->hiScale = scale;
+	glesData(g->gl, 6, NULL, hiSlot(g) * GPU_HI_IMAGES * 4);
+}
+
+// Rows [from, to) of RDRAM's [addr, addr + len) changed outside the GPU's drawing: the images there
+// fill those rows again from it before use.
+static void hiStale(struct Gpu* g, uint32_t addr, uint32_t len) {
+	for (int i = 0; g->hiScale > 1 && i < GPU_HI_IMAGES; ++i) {
+		struct GpuHi* h = &g->hi[i];
+		uint32_t bytes = h->size == 3 ? 4 : h->size == 1 ? 1 : 2, line = (uint32_t) h->width * bytes;
+		if (!h->used || addr >= h->addr + line * GPU_HI_ROWS || addr + len <= h->addr) {
+			continue;
+		}
+		int from = addr > h->addr ? (int) ((addr - h->addr) / line) : 0;
+		int to = (int) ((addr + len - h->addr + line - 1) / line);
+		to = to > GPU_HI_ROWS ? GPU_HI_ROWS : to;
+		h->staleFrom = h->staleTo > h->staleFrom && h->staleFrom < from ? h->staleFrom : from;
+		h->staleTo = to > h->staleTo ? to : h->staleTo;
+	}
+}
+
+// The GPU's RDRAM as new as RDRAM over [addr, addr + len).
+static void gpuOwn(struct N64* n, struct Gpu* g, uint32_t addr, uint32_t len) {
+	FOR_PAGES(addr, len, p) {
+		if (!(g->page[p] & GPU_PAGE_OWNED)) {
+			glesSubData(g->gl, 0, (size_t) p << 12, &n->rdram[(size_t) p << 12], 0x1000);
+			glesSubData(g->gl, 0, RDRAM_SIZE + ((size_t) p << 11), &n->hidden[(size_t) p << 11], 0x800);
+			g->page[p] |= GPU_PAGE_OWNED;
+		}
+	}
+}
+
+// An image's stale rows filled from the GPU's RDRAM.
+static void hiRefresh(struct N64* n, struct Gpu* g, struct GpuHi* h) {
+	if (h->staleTo <= h->staleFrom) {
+		return;
+	}
+	uint32_t bytes = h->size == 3 ? 4 : h->size == 1 ? 1 : 2, line = (uint32_t) h->width * bytes;
+	gpuOwn(n, g, h->addr + (uint32_t) h->staleFrom * line, (uint32_t) (h->staleTo - h->staleFrom) * line);
+	int k = g->hiScale, slot = (int) (h - g->hi);
+	int u[8] = { (int) (hiSlot(g) * (size_t) slot), (int) h->addr, h->width, h->staleFrom, h->staleTo, h->size, k, 0 };
+	glesSelectProgram(g->gl, g->hiFillProgram);
+	glesUniforms(g->gl, u, 8);
+	glesDispatch(g->gl, (unsigned) (h->width * k + 15) / 16, (unsigned) ((h->staleTo - h->staleFrom) * k + 15) / 16);
+	h->staleFrom = h->staleTo = 0;
+}
+
+// The high-resolution image for RDRAM's image at addr (made from it the first time, else the least
+// recently used one's slot): its first index, or -1 when it can't have one.
+static int hiImage(struct N64* n, struct Gpu* g, uint32_t addr, int width, int size) {
+	if (g->hiScale < 2 || !addr || width > 640) {
+		return -1;
+	}
+	struct GpuHi* list = g->hi;
+	int at = -1, oldest = 0;
+	for (int i = 0; i < GPU_HI_IMAGES; ++i) {
+		if (list[i].used && list[i].addr == addr && list[i].width == width && list[i].size == size) {
+			at = i;
+		}
+		oldest = list[i].used < list[oldest].used ? i : oldest;
+	}
+	if (at < 0) {
+		at = oldest;
+		list[at] = (struct GpuHi) { addr, width, size, GPU_HI_ROWS, 0, GPU_HI_ROWS, 0 };
+	}
+	list[at].used = ++g->hiUses;
+	hiRefresh(n, g, &list[at]);
+	return (int) (hiSlot(g) * (size_t) at);
+}
+
 static void gpuDestroy(struct Gpu* g) {
 	glesDestroy(g->gl);
 	free(g->states);
@@ -2683,7 +2817,7 @@ static int gpuVariant(struct Gpu* g, int features) {
 	for (int i = 0; i < F_FLAGS; ++i) {
 		at += snprintf(source + at, sizeof(source) - (size_t) at, "#define %s %d\n", featureNames[i], (features >> i) & 1);
 	}
-	at += snprintf(source + at, sizeof(source) - (size_t) at, "#define F_CSIZE %d\n", features >> F_FLAGS);
+	at += snprintf(source + at, sizeof(source) - (size_t) at, "#define F_CSIZE %d\n#define F_HIRES %d\n", (features >> F_FLAGS) & 3, (features >> (F_FLAGS + 2)) & 1);
 	snprintf(source + at, sizeof(source) - (size_t) at, "%s", body);
 	char error[2048] = "";
 	int program = glesAddProgram(g->gl, source, error, sizeof(error));
@@ -2855,6 +2989,7 @@ static void gpuSubmit(struct N64* n, struct RDP* r);
 // it lets go (loaded again when it needs them). False when it can't (a list is full): a sync, then.
 static bool gpuWrite(struct N64* n, struct RDP* r, uint32_t addr, uint32_t len) {
 	struct Gpu* g = r->gpu;
+	hiStale(g, addr, len);
 	bool marked = false;
 	FOR_PAGES(addr, len, p) {
 		marked |= (g->page[p] & GPU_PAGE_MARKED) != 0;
@@ -3069,6 +3204,7 @@ static void gpuSubmit(struct N64* n, struct RDP* r) {
 			}
 			glesSubData(g->gl, 0, (size_t) p << 12, &n->rdram[(size_t) p << 12], (size_t) run << 12);
 			glesSubData(g->gl, 0, RDRAM_SIZE + ((size_t) p << 11), &n->hidden[(size_t) p << 11], (size_t) run << 11);
+			hiStale(g, (uint32_t) p << 12, (uint32_t) run << 12);
 			for (int k = 0; k < run; ++k) {
 				g->page[p + k] |= GPU_PAGE_OWNED;
 			}
@@ -3149,12 +3285,24 @@ static void gpuSubmit(struct N64* n, struct RDP* r) {
 	// 16-bit pixels go back a word at a time when no word holds pixels of two tiles.
 	bool words = !g->edge && r->colorSize == 2 && !(r->colorAddr & 7) && !(r->colorWidth & 3) && !(r->zAddr & 7);
 	g->edge = false;
-	int u[12] = { (int) binsAt, (int) listsAt, tx0, ty0, (int) across, (int) g->lastUsed, (int) r->colorAddr, (int) r->colorWidth,
-	              r->colorSize, (int) r->zAddr, words, 0 };
-	glesSelectProgram(g->gl, gpuVariant(g, g->features | r->colorSize << F_FLAGS));
+	// The high-resolution images as they were before this batch, for it to draw on too.
+	int hiColor = hiImage(n, g, r->colorAddr, (int) r->colorWidth, r->colorSize);
+	int hiDepth = hiColor >= 0 && r->zAddr ? hiImage(n, g, r->zAddr, (int) r->colorWidth, 2) : -1;
+	int u[16] = { (int) binsAt, (int) listsAt, tx0, ty0, (int) across, (int) g->lastUsed, (int) r->colorAddr, (int) r->colorWidth,
+	              r->colorSize, (int) r->zAddr, words, g->hiScale, hiColor, hiDepth, GPU_HI_ROWS, 0 };
+	int const features = g->features | r->colorSize << F_FLAGS;
+	glesSelectProgram(g->gl, gpuVariant(g, features));
 	g->features = 0;
-	glesUniforms(g->gl, u, 12);
+	glesUniforms(g->gl, u, 16);
 	glesDispatch(g->gl, across, down);
+	// Program 0 (the full one, for a variant that didn't build) would draw RDRAM again.
+	int const hiProgram = hiColor >= 0 ? gpuVariant(g, features | 4 << F_FLAGS) : 0;
+	if (hiProgram) {
+		u[10] = 0;
+		glesSelectProgram(g->gl, hiProgram);
+		glesUniforms(g->gl, u, 16);
+		glesDispatch(g->gl, across * (unsigned) g->hiScale, down * (unsigned) g->hiScale);
+	}
 	g->batchBase[g->batchCount] = g->lastUsed;
 	g->batchTiles[g->batchCount++] = across * down;
 	g->lastUsed += across * down * 3;
@@ -3353,6 +3501,41 @@ static void gpuSyncRead(struct N64* n, struct RDP* r, uint32_t addr, uint32_t le
 	}
 }
 
+// The GPU RDP's high-resolution scale (N64_GPU_SCALE), 1 without one.
+int rdpGpuScale(struct N64* n) {
+	return n->rdp && n->rdp->gpu ? n->rdp->gpu->hiScale : 1;
+}
+
+// Where the VI keeps its high-resolution program's index in the GPU RDP's context.
+int* rdpGpuViProgram(struct N64* n) {
+	return n->rdp && n->rdp->gpu ? &n->rdp->gpu->viProgram : NULL;
+}
+
+// The high-resolution image holding the picture the VI shows from origin (stride pixels a row,
+// 32-bit when wide, rows of it), its newest rows filled in, after rdpGpuShare: its first index and the
+// picture's first pixel there (at the scale). False without one.
+bool rdpGpuHires(struct N64* n, uint32_t origin, int stride, bool wide, int rows, int* base, int* x, int* y) {
+	struct Gpu* g = n->rdp && n->rdp->gpu ? n->rdp->gpu : NULL;
+	int const size = wide ? 3 : 2;
+	uint32_t const bytes = wide ? 4 : 2;
+	for (int i = 0; g && g->hiScale > 1 && i < GPU_HI_IMAGES; ++i) {
+		struct GpuHi* h = &g->hi[i];
+		if (!h->used || h->width != stride || h->size != size || origin < h->addr || (origin - h->addr) % bytes) {
+			continue;
+		}
+		uint32_t const offset = (origin - h->addr) / bytes;
+		int const top = (int) (offset / (uint32_t) stride), left = (int) (offset % (uint32_t) stride);
+		if (top + rows > GPU_HI_ROWS) {
+			continue;
+		}
+		hiRefresh(n, g, h);
+		*base = (int) (hiSlot(g) * (size_t) i);
+		*x = left * g->hiScale, *y = top * g->hiScale;
+		return true;
+	}
+	return false;
+}
+
 // The GPU RDP's context, with its copy of RDRAM [addr, addr + len) and those bytes' hidden bits
 // as new as RDRAM's, for work on the GPU that reads them after what it drew (the VI); NULL without
 // the GPU RDP. Nothing waits: the GPU takes the work in order.
@@ -3369,6 +3552,7 @@ struct Gles* rdpGpuShare(struct N64* n, uint32_t addr, uint32_t len) {
 		if (!(g->page[p] & GPU_PAGE_OWNED)) {
 			glesSubData(g->gl, 0, (size_t) p << 12, &n->rdram[(size_t) p << 12], 0x1000);
 			glesSubData(g->gl, 0, RDRAM_SIZE + ((size_t) p << 11), &n->hidden[(size_t) p << 11], 0x800);
+			hiStale(g, (uint32_t) p << 12, 0x1000);
 		}
 	}
 	return g->gl;
@@ -3445,6 +3629,10 @@ static void gpuCommand(struct N64* n, struct RDP* r, const uint64_t* w, int op) 
 		--r->seq;
 		execute(n, r, w, op);
 		// Drawn here, so newer than the GPU's copy.
+		hiStale(g, color, colorLen);
+		if (depth) {
+			hiStale(g, z, zLen);
+		}
 		FOR_PAGES(color, colorLen, p) {
 			g->page[p] &= ~GPU_PAGE_OWNED;
 			n->pageFlags[p] &= ~PAGE_RDP_READS;
@@ -3597,6 +3785,10 @@ static struct RDP* beginCommands(struct N64* n, uint64_t* begin) {
 	if (n->rdpGpu && !r->gpu) {
 		r->gpu = gpuCreate();
 		n->rdpGpu = r->gpu != NULL;
+		const char* scale = n->settings ? n->settings("N64_GPU_SCALE") : getenv("N64_GPU_SCALE");
+		if (r->gpu) {
+			hiStart(r->gpu, scale ? atoi(scale) : 1);
+		}
 	}
 	if (n->rdpGl && !n->glr) {
 		n->glr = glrCreate(n);

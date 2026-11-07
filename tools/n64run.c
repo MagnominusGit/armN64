@@ -2,6 +2,7 @@
 #define _GNU_SOURCE
 #include "n64.h"
 #include "rdp.h"
+#include "gles.h"
 
 #include <stdio.h>
 #include <stdlib.h>
@@ -103,6 +104,28 @@ static uint8_t* readFile(const char* path, size_t* size) {
 	}
 	fclose(f);
 	return data;
+}
+
+// N64HISHOT=path: the GPU's picture at its scale, from n64PictureStart (N64_GPU_SCALE).
+static void writeGpuPicture(struct N64* n, const char* path) {
+	int w, h;
+	unsigned buffer;
+	if (!n64PictureStart(n, &w, &h) || !(buffer = n64PictureBuffer(n)) || !w || !h) {
+		return;
+	}
+	const uint32_t* px = glesMap(n->pictureGles, n->pictureBinding, 0, (size_t) w * h * 4);
+	FILE* out = px ? fopen(path, "wb") : NULL;
+	if (out) {
+		fprintf(out, "P6\n%d %d\n255\n", w, h);
+		for (int i = 0; i < w * h; ++i) {
+			uint8_t c[3] = { (uint8_t) px[i], (uint8_t) (px[i] >> 8), (uint8_t) (px[i] >> 16) };
+			fwrite(c, 1, 3, out);
+		}
+		fclose(out);
+	}
+	if (px) {
+		glesUnmap(n->pictureGles, n->pictureBinding);
+	}
 }
 
 static void writePicture(struct N64* n, const char* path) {
@@ -413,6 +436,11 @@ int main(int argc, char** argv) {
 		const char* shotFields = getenv("N64SHOTFIELDS");
 		int shotEvery = atoi(getenv("N64SHOTEVERY") ? getenv("N64SHOTEVERY") : "300");
 		bool takeShot = shotFields ? shotField(shotFields, f + 1) : shotEvery > 0 && (f + 1) % shotEvery == 0;
+		if (getenv("N64HISHOT") && takeShot) {
+			char path[1024];
+			snprintf(path, sizeof(path), "%s-%05d.ppm", getenv("N64HISHOT"), f + 1);
+			writeGpuPicture(n, path);
+		}
 		if (getenv("N64SHOTS") && takeShot) {
 			char path[1024];
 			snprintf(path, sizeof(path), "%s-%05d.ppm", getenv("N64SHOTS"), f + 1);

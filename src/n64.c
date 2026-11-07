@@ -607,8 +607,9 @@ static void viWait(struct N64* n, const struct ViSetup* s) {
 }
 
 // Starts the filters on the GPU: uploads the rows they read (y-1 to h, columns -3 to w+2) and their
-// hidden bits. False when the GPU can't start or the rows wrap around RDRAM.
-static bool viGpuStart(struct N64* n, const struct ViSetup* s) {
+// hidden bits. False when the GPU can't start or the rows wrap around RDRAM. With scale, the GPU RDP's
+// high-resolution picture instead when it has the one shown, and its scale there (else 1).
+static bool viGpuStart(struct N64* n, const struct ViSetup* s, int* scale) {
 	uint32_t a0, bytes;
 	struct Gles* shared = viRange(s, &a0, &bytes) && n->viSharedProgram >= 0 ? rdpGpuShare(n, a0, bytes) : NULL;
 	if (shared && !n->viSharedProgram) {
@@ -619,9 +620,35 @@ static bool viGpuStart(struct N64* n, const struct ViSetup* s) {
 		if (index < 0) {
 			fprintf(stderr, "GPU VI beside the GPU RDP unavailable (%s)\n", error);
 		} else {
-			glesData(shared, 4, NULL, 640 * 480 * 4);
+			glesData(shared, 4, NULL, (size_t) 640 * 480 * 4 * rdpGpuScale(n) * rdpGpuScale(n));
 		}
 		n->viSharedProgram = index < 0 ? -1 : index + 1;
+	}
+	if (scale) {
+		*scale = 1;
+	}
+	int const k = shared && scale ? rdpGpuScale(n) : 1;
+	int* const hiresProgram = k > 1 ? rdpGpuViProgram(n) : NULL;
+	if (hiresProgram && n->viSharedProgram > 0 && !*hiresProgram) {
+		static char source[1 << 16];
+		snprintf(source, sizeof(source), "#version 310 es\n#define VI_SHARED 1\n#define VI_HIRES 1\n%s", strchr(viGpuSource, '\n') + 1);
+		char error[512] = "";
+		int index = glesAddProgram(shared, source, error, sizeof(error));
+		if (index < 0) {
+			fprintf(stderr, "GPU VI at high resolution unavailable (%s)\n", error);
+		}
+		*hiresProgram = index < 0 ? -1 : index + 1;
+	}
+	// The GPU RDP's high-resolution picture when it has the one shown: as it is, at its scale.
+	int base, hx, hy;
+	if (hiresProgram && *hiresProgram > 0 && rdpGpuHires(n, s->origin, s->stride, s->wide, s->h, &base, &hx, &hy)) {
+		glesSelectProgram(shared, *hiresProgram - 1);
+		int u[8] = { base, s->stride * k, s->wide, s->w * k, s->h * k, hx, hy, s->gammaOn };
+		glesUniforms(shared, u, 8);
+		glesDispatch(shared, (unsigned) (s->w * k + 15) / 16, (unsigned) (s->h * k + 15) / 16);
+		n->pictureGles = shared, n->pictureBinding = 4, n->pictureRgba = true;
+		*scale = k;
+		return true;
 	}
 	// With the GPU RDP asked for, the VI runs in its context or on the CPU, never in one of its own.
 	if (n->rdpGpu && !(shared && n->viSharedProgram > 0)) {
@@ -722,6 +749,13 @@ float n64TvAspect(struct N64* n) {
 	return viSetup(n, &s) ? s.tvAspect : 4.0f / 3.0f;
 }
 
+static int pictureScale = 1;
+
+int n64PictureScale(struct N64* n) {
+	(void) n;
+	return pictureScale;
+}
+
 bool n64PictureStart(struct N64* n, int* width, int* height) {
 	struct ViSetup s;
 	if (!n->viGpu || !viSetup(n, &s)) {
@@ -739,13 +773,15 @@ bool n64PictureStart(struct N64* n, int* width, int* height) {
 		*height = n->lastHeight;
 		return true;
 	}
-	n->lastWidth = s.w, n->lastHeight = s.h;
-	if (!viGpuStart(n, &s)) {
+	int scale;
+	if (!viGpuStart(n, &s, &scale)) {
 		*width = *height = 0;
 		return false;
 	}
-	*width = s.w;
-	*height = s.h;
+	pictureScale = scale;
+	*width = s.w * scale;
+	*height = s.h * scale;
+	n->lastWidth = *width, n->lastHeight = *height;
 	return true;
 }
 
@@ -950,7 +986,7 @@ static int viPicture(struct N64* n, uint32_t* out, int* width, int* height) {
 	int w = s.w, h = s.h;
 	*width = w;
 	*height = h;
-	if (n->viGpu && viGpuStart(n, &s)) {
+	if (n->viGpu && viGpuStart(n, &s, NULL)) {
 		const uint32_t* picture = glesMap(n->pictureGles, n->pictureBinding, 0, (size_t) w * h * 4);
 		if (picture) {
 			for (int i = 0; i < w * h; ++i) {

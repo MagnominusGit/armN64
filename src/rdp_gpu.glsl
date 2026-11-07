@@ -11,8 +11,10 @@ layout(std430, binding = 2) buffer Data { int data[]; };
 layout(std430, binding = 3) writeonly buffer Last { uint lastOut[]; };
 
 // 0 bins, 1 bin lists, 2 first tile x, 3 first tile y, 4 tiles across, 5 lastOut base, 6 color image,
-// 7 its width, 8 its pixel size, 9 depth image
-uniform int u[12];
+// 7 its width, 8 its pixel size, 9 depth image, 10 16-bit pixels stored a word at a time; with F_HIRES
+// 11 the scale, 12 and 13 the color and depth images' first index in hiImage (-1 for none), 14 the
+// rows they hold
+uniform int u[16];
 
 // What the batch's primitives use (rdp.c gpuFeatures): the compiler leaves out the rest. Without
 // these defines the shader draws everything.
@@ -34,10 +36,22 @@ uniform int u[12];
 #define F_TLUT 1
 #define F_CSIZE 0
 #endif
+#ifndef F_HIRES
+#define F_HIRES 0
+#endif
 const bool HAS_TRI = F_TRI != 0, HAS_TEXRECT = F_TEXRECT != 0, HAS_FILL = F_FILL != 0, HAS_RECT = F_RECT != 0;
 const bool HAS_SHADE = F_SHADE != 0, HAS_ZTRI = F_ZTRI != 0, HAS_TEX = F_TEX != 0, HAS_LOD = F_LOD != 0;
 const bool HAS_PERSP = F_PERSP != 0, HAS_TWO = F_TWO != 0, HAS_COPY = F_COPY != 0, HAS_BILERP = F_BILERP != 0;
 const bool HAS_CONV = F_CONV != 0, HAS_ZBUF = F_ZBUF != 0, HAS_TLUT = F_TLUT != 0;
+// The picture at u[11] times the resolution, beside the native one in RDRAM: each invocation one of a
+// pixel's u[11] by u[11] parts, drawn at its centre into the high-resolution images (pixels as RDRAM
+// holds them, the hidden bits above 16-bit ones).
+const bool HIRES = F_HIRES != 0;
+#if F_HIRES
+layout(std430, binding = 6) buffer HiImages { uint hiImage[]; };
+#endif
+int gK = 1, gSi = 0, gSj = 0, gHiAt = 0;
+bool gHiIn = false;
 
 // The color image's pixel size: fixed for the variant, else the batch's.
 int colorSize() {
@@ -241,12 +255,31 @@ void loadPixel(int x, int y) {
 		fbHidden = rhidden();
 	}
 	zAt = (uint(u[9]) + i * 2u) & (RDRAM_MASK & ~1u);
+#if F_HIRES
+	uint hc = hiImage[u[12] + gHiAt];
+	fbColor = size == 3 ? hc : hc & 0xFFFFu;
+	fbHidden = (hc >> 16) & 3u;
+	uint hz = HAS_ZBUF && u[13] >= 0 ? hiImage[u[13] + gHiAt] : 0u;
+	fbZ = hz & 0xFFFFu;
+	fbZHidden = (hz >> 16) & 3u;
+	colorDirty = zDirty = false;
+	return;
+#endif
 	fbZ = HAS_ZBUF && u[9] != 0 ? rhalf(zAt) : 0u;
 	fbZHidden = HAS_ZBUF && u[9] != 0 ? rhiddenAt(RDRAM_MASK + 1u + (zAt >> 1)) : 0u;
 	colorDirty = zDirty = false;
 }
 
 void storePixel() {
+#if F_HIRES
+	if (colorDirty) {
+		hiImage[u[12] + gHiAt] = colorSize() == 3 ? fbColor : fbColor | fbHidden << 16;
+	}
+	if (HAS_ZBUF && zDirty && u[13] >= 0) {
+		hiImage[u[13] + gHiAt] = fbZ | fbZHidden << 16;
+	}
+	return;
+#endif
 	if (colorDirty) {
 		int size = colorSize();
 		if (size == 1) {
@@ -1038,7 +1071,13 @@ void drawPrim(int p, int x, int y, ivec4 span) {
 		int t = data[p + P_TRI];
 		int yh = data[t + T_YH];
 		int mask = 0;
-		for (int k = 0; k < 4; ++k) {
+		if (HIRES) {
+			// The part's centre against the sub-scanline it lies on: all or nothing.
+			int k = ((2 * gSj + 1) * 4) / (2 * gK), e = x * 8 + ((2 * gSi + 1) * 8) / (2 * gK);
+			int l8 = span[k] & 0xFFFF, r8 = span[k] >> 16;
+			mask = e >= l8 && e < r8 ? 0xFF : 0;
+		}
+		for (int k = 0; k < 4 && !HIRES; ++k) {
 			int l8 = span[k] & 0xFFFF, r8 = span[k] >> 16;
 			for (int j = 0; j < 2; ++j) {
 				int e = x * 8 + (k & 1) * 2 + j * 4;
@@ -1069,6 +1108,7 @@ void drawPrim(int p, int x, int y, ivec4 span) {
 			for (int i = 0; i < 4; ++i) {
 				int dx = data[p + P_SDX + i], dyv = data[t + T_SDY + i];
 				int v = rowAttribute(data[t + T_SV + i], data[t + T_SDE + i], dyv, dx, dy, xfrac, doOffset) + (dx & ~0x1F) * dxp;
+				v += HIRES ? (dx & ~0x1F) / gK * gSi + dyv / gK * gSj : 0;
 				int snapped = sext16(sext16(v >> 14) << 2);
 				snapped = sext16(snapped + sext16(xoff * sext16(dx >> 14)) + sext16(yoff * sext16(dyv >> 14)));
 				c[i] = clamp9(snapped >> 4);
@@ -1078,6 +1118,7 @@ void drawPrim(int p, int x, int y, ivec4 span) {
 		if (HAS_ZTRI && (flags & 1) != 0) {
 			int dz = data[p + P_ZDX], dzy = data[t + T_ZDY];
 			int v = rowAttribute(data[t + T_ZV], data[t + T_ZDE], dzy, dz, dy, xfrac, doOffset) + dz * dxp;
+			v += HIRES ? dz / gK * gSi + dzy / gK * gSj : 0;
 			int snapped = ((v >> 10) << 2) + xoff * (dz >> 10) + yoff * (dzy >> 10);
 			int z = bitfieldExtract((snapped >> 5) - 0x20000, 0, 19) + 0x20000;
 			pZ = clamp(z, 0, 0x3FFFF);
@@ -1090,6 +1131,7 @@ void drawPrim(int p, int x, int y, ivec4 span) {
 			for (int i = 0; i < 3; ++i) {
 				int step = data[p + P_TDX + i] & ~0x1F;
 				stw[i] = rowAttribute(data[t + T_TV + i], data[t + T_TDE + i], data[p + P_TDY + i], data[p + P_TDX + i], dy, xfrac, doOffset) + step * dxp;
+				stw[i] += HIRES ? step / gK * gSi + data[p + P_TDY + i] / gK * gSj : 0;
 				stwX[i] = stw[i] + (flip ? step : -step);
 				stwY[i] = stw[i] + (data[p + P_TDY + i] & ~0x7FFF);
 			}
@@ -1106,6 +1148,11 @@ void drawPrim(int p, int x, int y, ivec4 span) {
 		int dx = x - data[p + P_CX0], dy = y - data[p + P_CY0];
 		int s = ((s0 << 5) + (flip ? dy * dsdx : dx * dsdx)) >> 5;
 		int t = ((t0 << 5) + (flip ? dx * dtdy : dy * dtdy)) >> 5;
+		if (HIRES && cycleType < 2) {
+			int hx = dx * gK + gSi, hy = dy * gK + gSj;
+			s = ((s0 << 5) + (flip ? hy : hx) * dsdx / gK) >> 5;
+			t = ((t0 << 5) + (flip ? hx : hy) * dtdy / gK) >> 5;
+		}
 		st = ivec2(s, t);
 		tex = true;
 		lod = HAS_LOD && cycleType < 2 && (((omHi >> 16) & 1u) != 0u || lodFracUsed());
@@ -1221,6 +1268,16 @@ void main() {
 	ivec2 tileXY = ivec2(gl_WorkGroupID.xy) + ivec2(u[2], u[3]);
 	int x = tileXY.x * 16 + int(gl_LocalInvocationID.x);
 	int y = tileXY.y * 16 + int(gl_LocalInvocationID.y);
+	if (HIRES) {
+		// Each tile as u[11] by u[11] workgroups, a 16 by 16 block of parts each.
+		gK = u[11];
+		ivec2 wg = ivec2(gl_WorkGroupID.xy);
+		tileXY = wg / gK + ivec2(u[2], u[3]);
+		ivec2 hi = tileXY * 16 * gK + (wg % gK) * 16 + ivec2(gl_LocalInvocationID.xy);
+		x = hi.x / gK, y = hi.y / gK, gSi = hi.x % gK, gSj = hi.y % gK;
+		gHiIn = x < u[7] && y < u[14];
+		gHiAt = gHiIn ? hi.y * u[7] * gK + hi.x : 0;
+	}
 	int bin = u[0] + (tileXY.y * TILES_ACROSS + tileXY.x) * 2;
 	int first = data[bin], count = data[bin + 1];
 
@@ -1277,6 +1334,11 @@ void main() {
 			barrier();
 		}
 	}
+#if F_HIRES
+	if (count > 0 && gHiIn) {
+		storePixel();
+	}
+#else
 	if (u[10] == 0) {
 		if (count > 0) {
 			storePixel();
@@ -1300,4 +1362,5 @@ void main() {
 		lastOut[out0 + 1u] = uint(keyColor.r & 0x1FF) | uint(keyColor.g & 0x1FF) << 9 | uint(keyColor.b & 0x1FF) << 18;
 		lastOut[out0 + 2u] = uint(keyColor.a & 0x1FF);
 	}
+#endif
 }
