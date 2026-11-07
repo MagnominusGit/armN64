@@ -34,6 +34,11 @@ uniform int u[16];
 #define F_CONV 1
 #define F_ZBUF 1
 #define F_TLUT 1
+#define F_T4 1
+#define F_T8 1
+#define F_T16 1
+#define F_YUV 1
+#define F_T32 1
 #define F_CSIZE 0
 #endif
 #ifndef F_HIRES
@@ -357,7 +362,7 @@ ivec4 texel(int t, int s, int tt) {
 	bool tlut = HAS_TLUT && ((omHi >> 15) & 1u) != 0u;
 	int format = tileField(t, T_FORMAT);
 	int size = tileField(t, T_SIZE);
-	if (size == 0) {
+	if (F_T4 != 0 && size == 0) {
 		int a = (base + (s >> 1)) ^ swap;
 		int v = int((s & 1) != 0 ? tmemByte(a) & 15u : tmemByte(a) >> 4);
 		if (format == 2 || tlut) {
@@ -370,7 +375,7 @@ ivec4 texel(int t, int s, int tt) {
 		int i = v * 17;
 		return ivec4(i, i, i, i);
 	}
-	if (size == 1) {
+	if (F_T8 != 0 && size == 1) {
 		int v = int(tmemByte((base + s) ^ swap));
 		if (format == 2 || tlut) {
 			return tlutColor(v);
@@ -380,13 +385,13 @@ ivec4 texel(int t, int s, int tt) {
 		}
 		return ivec4(v, v, v, v);
 	}
-	if (size == 2) {
-		if (format == 1) {
-			int a = (base & 0x7FF) + s;
-			int y = int(tmemByte((a ^ swap) | 0x800));
-			int u = int(tmemByte(((a & ~1) ^ swap) & 0x7FF)), v = int(tmemByte(((a | 1) ^ swap) & 0x7FF));
-			return ivec4(u - 128, v - 128, y, y);
-		}
+	if (F_YUV != 0 && size == 2 && format == 1) {
+		int a = (base & 0x7FF) + s;
+		int y = int(tmemByte((a ^ swap) | 0x800));
+		int u = int(tmemByte(((a & ~1) ^ swap) & 0x7FF)), v = int(tmemByte(((a | 1) ^ swap) & 0x7FF));
+		return ivec4(u - 128, v - 128, y, y);
+	}
+	if (F_T16 != 0 && size == 2) {
 		int a = (base + s * 2) ^ swap;
 		int v = int(tmemByte(a) << 8 | tmemByte(a + 1));
 		if (format == 3) {
@@ -397,6 +402,9 @@ ivec4 texel(int t, int s, int tt) {
 		}
 		int cr = (v >> 11) & 31, cg = (v >> 6) & 31, cb = (v >> 1) & 31;
 		return ivec4(cr << 3 | cr >> 2, cg << 3 | cg >> 2, cb << 3 | cb >> 2, (v & 1) != 0 ? 255 : 0);
+	}
+	if (F_T32 == 0) {
+		return ivec4(0);
 	}
 	int a = (base & 0x7FF) + s * 2;
 	a ^= swap;

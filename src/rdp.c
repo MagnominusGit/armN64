@@ -2522,7 +2522,7 @@ enum {
 	GPU_PATCHES_MAX = 1 << 20,
 	GPU_KIND_TRIANGLE = 0, GPU_KIND_TEXRECT = 1, GPU_KIND_FILL = 2, GPU_KIND_RECT = 3,
 	GPU_PAGE_BATCH = 1, GPU_PAGE_OWNED = 2, GPU_PAGE_MARKED = 4,
-	GPU_VARIANTS = 96, GPU_RANGES = 256,
+	GPU_VARIANTS = 256, GPU_RANGES = 256,
 	// High-resolution images (N64_GPU_SCALE), colour or depth (a depth image is cleared as a colour
 	// one), each up to 640 by 480 pixels at the scale.
 	GPU_HI_IMAGES = 6, GPU_HI_ROWS = 480,
@@ -2542,10 +2542,11 @@ struct GpuHi {
 enum {
 	F_TRI = 1 << 0, F_TEXRECT = 1 << 1, F_FILL = 1 << 2, F_RECT = 1 << 3, F_SHADE = 1 << 4, F_ZTRI = 1 << 5, F_TEX = 1 << 6,
 	F_LOD = 1 << 7, F_PERSP = 1 << 8, F_TWO = 1 << 9, F_COPY = 1 << 10, F_BILERP = 1 << 11, F_CONV = 1 << 12, F_ZBUF = 1 << 13,
-	F_TLUT = 1 << 14, F_FLAGS = 15,
+	F_TLUT = 1 << 14, F_T4 = 1 << 15, F_T8 = 1 << 16, F_T16 = 1 << 17, F_YUV = 1 << 18, F_T32 = 1 << 19, F_FLAGS = 20,
 };
 static const char* const featureNames[F_FLAGS] = { "F_TRI", "F_TEXRECT", "F_FILL", "F_RECT", "F_SHADE", "F_ZTRI", "F_TEX", "F_LOD",
-	                                                   "F_PERSP", "F_TWO", "F_COPY", "F_BILERP", "F_CONV", "F_ZBUF", "F_TLUT" };
+	                                                   "F_PERSP", "F_TWO", "F_COPY", "F_BILERP", "F_CONV", "F_ZBUF", "F_TLUT",
+	                                                   "F_T4", "F_T8", "F_T16", "F_YUV", "F_T32" };
 
 struct Gpu {
 	struct Gles* gl;
@@ -2831,7 +2832,7 @@ static int gpuVariant(struct Gpu* g, int features) {
 }
 
 // What a primitive uses, as gpuVariant's features (conservative: the shader's own tests decide).
-static int gpuFeatures(struct RDP* r, int op) {
+static int gpuFeatures(struct RDP* r, int op, int tile) {
 	uint64_t m = r->otherModes;
 	int f = 0;
 	bool tex;
@@ -2848,6 +2849,14 @@ static int gpuFeatures(struct RDP* r, int op) {
 	if (tex) {
 		f |= F_TEX | (((m >> 48) & 1) || lodFracUsed(r) ? F_LOD : 0) | ((m >> 45) & 1 ? F_BILERP : 0) | ((m >> 47) & 1 ? F_TLUT : 0);
 		f |= !((m >> 43) & 1) || !((m >> 42) & 1) || ((m >> 41) & 1) ? F_CONV : 0;
+		// The texel sizes its tiles have (all of them with mipmaps): the shader decodes only those,
+		// as one with every size runs slowly on phones' GPUs.
+		for (int k = 0; k < 8; ++k) {
+			if ((f & F_LOD) || k == tile || k == ((tile + 1) & 7)) {
+				const struct Tile* t = &r->tile[k];
+				f |= t->size == 0 ? F_T4 : t->size == 1 ? F_T8 : t->size == 3 ? F_T32 : t->format == 1 ? F_YUV : F_T16;
+			}
+		}
 	}
 	f |= r->cycleType == 1 ? F_TWO : 0;
 	f |= r->zAddr && (((m >> 4) & 1) || ((m >> 5) & 1)) ? F_ZBUF : 0;
@@ -3686,7 +3695,7 @@ static void gpuCommand(struct N64* n, struct RDP* r, const uint64_t* w, int op) 
 		p[2] = x0, p[3] = y0, p[4] = x1, p[5] = y1;
 	}
 	g->entries += ((p[4] >> 4) - ((p[25] ? 0 : p[2]) >> 4) + 1) * (((p[5] + p[25]) >> 4) - (p[3] >> 4) + 1);
-	g->features |= gpuFeatures(r, op);
+	g->features |= gpuFeatures(r, op, p[6] & 7);
 	g->edge |= p[4] >= (int) r->colorWidth;
 	p[1] = gpuState(g, r);
 	gpuMark(n, g, color, colorLen);
