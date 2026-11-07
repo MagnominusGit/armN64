@@ -426,17 +426,19 @@ static inline __attribute__((always_inline)) struct Color sampleAs(struct RDP* r
 	return color((((t10 - b) * fx + (t01 - b) * fy + 0x10) >> 5) + b);
 }
 
-static struct Color sample(struct RDP* r, int tileIndex, int s, int t, bool filter) {
+// The texel through out: a struct returned in registers goes through the stack in parts, which on
+// ARM cores the load back can't take from the stores.
+static void sample(struct RDP* r, int tileIndex, int s, int t, bool filter, struct Color* out) {
 	struct Tile* tile = &r->tile[tileIndex & 7];
 	bool bilerp = filter && ((r->otherModes >> 52) & 3) < 2;
 	switch (texelKind(r, tile)) {
-#define SAMPLE_AS(kind) case kind: return sampleAs(r, tile, s, t, bilerp, kind);
+#define SAMPLE_AS(kind) case kind: *out = sampleAs(r, tile, s, t, bilerp, kind); return;
 	SAMPLE_AS(TK_I4) SAMPLE_AS(TK_IA4) SAMPLE_AS(TK_CI4) SAMPLE_AS(TK_CI4_IA) SAMPLE_AS(TK_I8) SAMPLE_AS(TK_IA8)
 	SAMPLE_AS(TK_CI8) SAMPLE_AS(TK_CI8_IA) SAMPLE_AS(TK_YUV16) SAMPLE_AS(TK_IA16) SAMPLE_AS(TK_CI16) SAMPLE_AS(TK_CI16_IA)
 	SAMPLE_AS(TK_RGBA16)
 #undef SAMPLE_AS
 	default:
-		return sampleAs(r, tile, s, t, bilerp, TK_RGBA32);
+		*out = sampleAs(r, tile, s, t, bilerp, TK_RGBA32);
 	}
 }
 
@@ -491,7 +493,7 @@ static void textures(struct RDP* r, struct Pixel* p, int t1, int t2, int s, int 
 	uint64_t m = r->otherModes;
 	int cycleType = (m >> 52) & 3;
 	bool filter0 = cycleType >= 2 || ((m >> 43) & 1), filter1 = (m >> 42) & 1, convertOne = (m >> 41) & 1;
-	p->tex0 = sample(r, t1, s, t, filter0);
+	sample(r, t1, s, t, filter0, &p->tex0);
 	struct Color first = p->tex0;
 	if (!filter0) {
 		p->tex0 = convert(r, p->tex0);
@@ -501,7 +503,7 @@ static void textures(struct RDP* r, struct Pixel* p, int t1, int t2, int s, int 
 	} else if (convertOne) {
 		p->tex1 = convert(r, first);
 	} else {
-		p->tex1 = sample(r, t2, s, t, filter1);
+		sample(r, t2, s, t, filter1, &p->tex1);
 		if (!filter1) {
 			p->tex1 = convert(r, p->tex1);
 		}
