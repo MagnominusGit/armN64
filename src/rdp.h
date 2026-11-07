@@ -68,6 +68,10 @@ struct RDP {
 	int k0, k1, k2, k3;
 	// RDP clocks spent on the commands so far.
 	uint64_t clocks;
+	// The part of a clock carried to the next command; the depth-tested pixels since the last full
+	// sync, and the share of them taken to pass the test.
+	double clockPart, zPass;
+	uint64_t zPixels;
 	// The pixel being drawn, and where the combiner's inputs come from for the current combine mode.
 	struct Pixel pix;
 	struct Stage stage[2];

@@ -1,6 +1,7 @@
 #include "n64.h"
 #include "gles.h"
 #include "rdp.h"
+#include "rdp_timing.h"
 
 #include <pthread.h>
 #include <stdio.h>
@@ -47,6 +48,7 @@ static struct RDP* state(struct N64* n) {
 			n->rdp->rowCount = 1;
 			setupCombiner(n->rdp);
 			setupModes(n->rdp);
+			n->rdp->zPass = 0.75;
 		}
 	}
 	return n->rdp;
@@ -1728,28 +1730,16 @@ static int commandWords(int op) {
 	return op == 0x24 || op == 0x25 ? 2 : 1;
 }
 
-// The RDP's time for a primitive, from its shape alone: one or two clocks a pixel by cycle type,
-// four pixels a clock to fill or copy, and a fixed setup per triangle and texture rectangle. Rough
-// (FLE), a triangle's pixels are its area: half its height times its width at the middle corner.
-static uint64_t primitiveClocks(struct RDP* r, const uint64_t* w, int op, bool rough) {
+// FLE's RDP time for a primitive, from its shape alone: one or two clocks a pixel by cycle type, four
+// pixels a clock to fill or copy, and a fixed setup per triangle and texture rectangle; a triangle's
+// pixels are its area, half its height times its width at the middle corner.
+static uint64_t roughClocks(struct RDP* r, const uint64_t* w, int op) {
 	int perPixel = r->cycleType == 1 ? 2 : 1;
 	if (op >= 0x08 && op <= 0x0F) {
 		struct Edges e = edges(w);
-		if (rough) {
-			double const height = (e.yl - e.yh) / 4.0;
-			double const width = fabs((e.xh + (double) e.dxh * (e.ym - e.yh) / 4.0 - e.xl) / 65536.0);
-			return height > 0 ? (uint64_t) (height * width / 2) * (uint64_t) perPixel + 20 : 20;
-		}
-		uint64_t pixels = 0;
-		int first, end;
-		triangleRows(r, &e, &first, &end);
-		for (int y = first; y < end; ++y) {
-			struct Span sp;
-			if (span(r, &e, y, &sp) && sp.x1 >= sp.x0) {
-				pixels += (uint64_t) (sp.x1 - sp.x0 + 1);
-			}
-		}
-		return pixels * perPixel + 20;
+		double const height = (e.yl - e.yh) / 4.0;
+		double const width = fabs((e.xh + (double) e.dxh * (e.ym - e.yh) / 4.0 - e.xl) / 65536.0);
+		return height > 0 ? (uint64_t) (height * width / 2) * (uint64_t) perPixel + 20 : 20;
 	}
 	int x0, y0, x1, y1;
 	if (op == 0x24 || op == 0x25) {
@@ -1775,6 +1765,157 @@ static uint64_t primitiveClocks(struct RDP* r, const uint64_t* w, int op, bool r
 		return r->cycleType == 3 ? pixels / (r->colorSize == 3 ? 2 : 4) : pixels * perPixel;
 	}
 	return (r->cycleType == 2 ? pixels / 4 : pixels * perPixel) + 10;
+}
+
+// The RDP's time from the costs measured on consoles (rdp_timing.h, with the model around them from
+// Nekokabu's ares, a1f969d: ares/n64/rdp/timing.cpp): every span by its mode, width and place in its
+// 64-byte RDRAM block, every primitive's setup, texture loads and syncs. The tables are for
+// primitives drawn one after another on an idle console; in a running game the other bus masters
+// make spans 13% (reading the color or depth image) or 19% (only writing) slower, the VI's scan-out
+// 7% more for the first, and each span that reads them costs 40 clocks more for a primitive placed
+// anywhere else than after the one before.
+static enum rdp_tm_mode timingMode(const struct RDP* r) {
+	bool const c32 = r->colorSize == 3, two = r->cycleType == 1;
+	if (r->cycleType == 3) {
+		return c32 ? RDP_TM_FILL32 : RDP_TM_FILL16;
+	} else if (r->cycleType == 2) {
+		return RDP_TM_COPY16;
+	} else if (r->imageRead && r->zCompare && r->zUpdate) {
+		return two ? (c32 ? RDP_TM_2CYC32_BLEND_ZPASS : RDP_TM_2CYC16_BLEND_ZPASS) : (c32 ? RDP_TM_1CYC32_BLEND_ZPASS : RDP_TM_1CYC16_BLEND_ZPASS);
+	} else if (r->imageRead) {
+		return two ? (c32 ? RDP_TM_2CYC32_BLEND : RDP_TM_2CYC16_BLEND) : (c32 ? RDP_TM_1CYC32_BLEND : RDP_TM_1CYC16_BLEND);
+	} else if (r->zCompare || r->zUpdate) {
+		return two ? (c32 ? RDP_TM_2CYC32_ZPASS : RDP_TM_2CYC16_ZPASS) : (c32 ? RDP_TM_1CYC32_ZPASS : RDP_TM_1CYC16_ZPASS);
+	}
+	return two ? (c32 ? RDP_TM_2CYC32 : RDP_TM_2CYC16) : (c32 ? RDP_TM_1CYC32 : RDP_TM_1CYC16);
+}
+
+static bool timingMemoryBound(const struct RDP* r) {
+	return r->cycleType < 2 && (r->imageRead || r->zCompare || r->zUpdate);
+}
+
+static double timingScale(const struct N64* n, bool memoryBound) {
+	return memoryBound ? 1.13 * ((n->vi.reg[0] & 3) >= 2 ? 1.07 : 1) : 1.19;
+}
+
+// A span of pixels from (x, y) of the color image.
+static double spanCost(const struct N64* n, struct RDP* r, enum rdp_tm_mode mode, int x, int y, int pixels) {
+	if (pixels <= 0) {
+		return 0;
+	}
+	int const bytes = r->colorSize == 3 ? 4 : r->colorSize == 2 ? 2 : 1;
+	uint32_t address = r->colorAddr + (uint32_t) y * (r->colorWidth * (uint32_t) bytes) + (uint32_t) x * (uint32_t) bytes;
+	int w = pixels;
+	if (bytes == 1) {
+		// 8-bit images weren't measured: the 16-bit tables at the same byte count.
+		address = r->colorAddr + (uint32_t) y * r->colorWidth + (uint32_t) (x >> 1) * 2;
+		w = (pixels + 1) >> 1;
+	}
+	if (r->cycleType == 2 && bytes == 4) {
+		w = pixels * 2;
+	}
+	w = w > 4096 ? 4096 : w;
+	double cost = rdp_tm_span(mode, address, w);
+	if (r->cycleType < 2 && (r->zCompare || r->zUpdate)) {
+		// The tables have spans whose pixels all pass the depth test and all fail it; compare-only
+		// and update-only only for 1-cycle 16-bit, scaled for the other modes.
+		bool const c32 = r->colorSize == 3, two = r->cycleType == 1;
+		double const pass = rdp_tm_span(two ? (c32 ? RDP_TM_2CYC32_ZPASS : RDP_TM_2CYC16_ZPASS) : (c32 ? RDP_TM_1CYC32_ZPASS : RDP_TM_1CYC16_ZPASS), address, w);
+		double const fail = rdp_tm_span(two ? (c32 ? RDP_TM_2CYC32_ZFAIL : RDP_TM_2CYC16_ZFAIL) : (c32 ? RDP_TM_1CYC32_ZFAIL : RDP_TM_1CYC16_ZFAIL), address, w);
+		r->zPixels += (uint64_t) pixels;
+		if (r->zCompare && r->zUpdate) {
+			cost += (fail - pass) * (1 - r->zPass);
+		} else {
+			double const ref = rdp_tm_span(RDP_TM_1CYC16_ZPASS, address, w);
+			double const partial = rdp_tm_span(r->zCompare ? RDP_TM_1CYC16_ZCMP : RDP_TM_1CYC16_ZUPD, address, w);
+			cost += partial * (ref > 0 ? pass / ref : 1) - pass;
+		}
+	}
+	double const pipe = pixels * (r->cycleType >= 2 ? bytes / 8.0 : r->cycleType == 1 ? 2.0 : 1.0);
+	bool const memoryBound = timingMemoryBound(r);
+	cost = (cost < pipe ? pipe : cost) * timingScale(n, memoryBound);
+	return memoryBound ? cost + 40 : cost;
+}
+
+static double timingCost(const struct N64* n, struct RDP* r, const uint64_t* w, int op) {
+	uint64_t const c = w[0];
+	enum rdp_tm_mode const mode = timingMode(r);
+	if (op >= 0x08 && op <= 0x0F) {
+		struct Edges e = edges(w);
+		double cost = 0;
+		int first, end, widest = 0;
+		triangleRows(r, &e, &first, &end);
+		for (int y = first; y < end; ++y) {
+			struct Span sp;
+			if (span(r, &e, y, &sp) && sp.x1 >= sp.x0) {
+				int const pixels = sp.x1 - sp.x0 + 1;
+				widest = pixels > widest ? pixels : widest;
+				cost += spanCost(n, r, mode, sp.x0, y, pixels);
+			}
+		}
+		return cost + rdp_tm_prim_overhead(mode, widest ? widest : 1) + (op & 6 ? 3 : 0);
+	}
+	if (op == 0x24 || op == 0x25 || op == 0x36) {
+		int cx0, cy0, x0, y0, x1, y1;
+		rdpRectBounds(r, c, &cx0, &cy0, &x0, &y0, &x1, &y1);
+		double cost = 0;
+		int const width = x1 >= x0 ? x1 - x0 + 1 : 0;
+		for (int y = y0; width && y <= y1; ++y) {
+			cost += spanCost(n, r, mode, x0, y, width);
+		}
+		return cost + rdp_tm_prim_overhead(mode, width ? width : 1);
+	}
+	int const sl = (c >> 44) & 0xFFF, tl = (c >> 32) & 0xFFF, sh = (c >> 12) & 0xFFF, th = c & 0xFFF;
+	// Bytes of texels times two (4-bit ones are one).
+	int const size = r->texSize;
+#define TEXEL_BYTES2(t) ((uint32_t) (t) << (size == 3 ? 3 : size == 2 ? 2 : size == 1 ? 1 : 0))
+	switch (op) {
+	case 0x26:
+	case 0x27:
+	case 0x28:
+		return rdp_tm_sync(op);
+	case 0x29:
+		return RDP_TM_LIST_BASE;
+	case 0x30:
+		return rdp_tm_load_tlut(sh >> 2 >= sl >> 2 ? (sh >> 2) - (sl >> 2) + 1 : 0) * timingScale(n, false);
+	case 0x33: {
+		uint32_t const bytes = TEXEL_BYTES2(sh >= sl ? sh - sl + 1 : 0) >> 1;
+		return rdp_tm_load_block((int) (bytes + 1) >> 1) * timingScale(n, false);
+	}
+	case 0x34: {
+		int const s0 = sl >> 2, t0 = tl >> 2, s1 = sh >> 2, t1 = th >> 2;
+		int const height = t1 >= t0 ? t1 - t0 + 1 : 0;
+		uint32_t const stride = TEXEL_BYTES2(r->texWidth) >> 1;
+		uint32_t const address = r->texAddr + (uint32_t) t0 * stride + (TEXEL_BYTES2(s0) >> 1);
+		return rdp_tm_load_tile(address, stride, (int) (TEXEL_BYTES2(s1 >= s0 ? s1 - s0 + 1 : 0) >> 1), height > 1024 ? 1024 : height) * timingScale(n, false);
+	}
+	}
+#undef TEXEL_BYTES2
+	return rdp_tm_state_cmd(n->dp.status & 1);
+}
+
+// A command's RDP clocks: rough with FLE.
+static uint64_t commandClocks(const struct N64* n, struct RDP* r, const uint64_t* w, int op) {
+	if (n->fle) {
+		return roughClocks(r, w, op);
+	}
+	double const cost = timingCost(n, r, w, op) + r->clockPart;
+	uint64_t const clocks = cost > 0 ? (uint64_t) cost : 0;
+	r->clockPart = cost > 0 ? cost - (double) clocks : 0;
+	return clocks;
+}
+
+// At a full sync, the share of depth-tested pixels that pass from the frame's overdraw: of n layers
+// drawn in any order the k-th passes with chance 1/k, so H(n)/n of them.
+static void timingFrame(struct RDP* r) {
+	double const area = (double) ((r->scissorX1 - r->scissorX0) >> 2) * ((r->scissorY1 - r->scissorY0) >> 2);
+	if (area > 0 && r->zPixels) {
+		double layers = (double) r->zPixels / area;
+		layers = layers < 1 ? 1 : layers;
+		double const pass = (log(layers) + 0.5772 + 0.5 / layers) / layers;
+		r->zPass = pass > 1 ? 1 : pass < 0.5 ? 0.5 : pass;
+	}
+	r->zPixels = 0;
 }
 
 // Every command but the full sync, drawing the rows r owns.
@@ -3473,6 +3614,8 @@ static void command(struct N64* n, struct RDP* r, const uint64_t* w, int op, int
 			gpuSubmit(n, r);
 		}
 		++n->stats.dpSyncs;
+		r->clocks += commandClocks(n, r, w, op);
+		timingFrame(r);
 		uint64_t at = begin + r->clocks * 3 / 2;
 		if (n->accuracy == ACCURACY_HLE && at < n->sp.hleDoneAt) {
 			at = n->sp.hleDoneAt;
@@ -3505,20 +3648,20 @@ static void command(struct N64* n, struct RDP* r, const uint64_t* w, int op, int
 		} else {
 			glrSkip(n, w, op);
 		}
-		uint64_t clocks = primitiveClocks(r, w, op, n->fle);
+		uint64_t clocks = commandClocks(n, r, w, op);
 		r->clocks += clocks;
 		n->dp.bufBusy += (uint32_t) clocks;
 		n->dp.pipeBusy += (uint32_t) clocks;
 		return;
 	}
 	if (n->skip.on && skipCommand(n, w, op)) {
-		uint64_t clocks = primitiveClocks(r, w, op, n->fle);
+		uint64_t clocks = commandClocks(n, r, w, op);
 		r->clocks += clocks;
 		n->dp.bufBusy += (uint32_t) clocks;
 		n->dp.pipeBusy += (uint32_t) clocks;
 		return;
 	}
-	uint64_t clocks = primitiveClocks(r, w, op, n->fle);
+	uint64_t clocks = commandClocks(n, r, w, op);
 	r->clocks += clocks;
 	n->dp.bufBusy += (uint32_t) clocks;
 	n->dp.pipeBusy += (uint32_t) clocks;
