@@ -104,8 +104,11 @@ void pifBoot(struct N64* n) {
 	n->riReg[1] = 0x40;
 	n->riReg[3] = 0x14;
 	n->riReg[4] = 0x00063634;
-	put32(&n->rdram[0x318], RDRAM_SIZE);
-	put32(&n->rdram[0x3F0], RDRAM_SIZE);
+	// The memory size games read (osMemSize): without the Expansion Pak (N64_EXPANSION=0), 4 MiB.
+	const char* expansion = n->settings ? n->settings("N64_EXPANSION") : getenv("N64_EXPANSION");
+	uint32_t const memory = expansion && expansion[0] == '0' ? 0x400000 : RDRAM_SIZE;
+	put32(&n->rdram[0x318], memory);
+	put32(&n->rdram[0x3F0], memory);
 	// A dump without boot code (development cartridges were loaded another way): what the 6102's
 	// leaves for the game, its first MiB at the entry point and the boot values at 0x300.
 	bool blank = !disk && n->romSize > 0x1000;

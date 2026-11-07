@@ -106,11 +106,14 @@ static struct retro_core_option_v2_category optionCategories[] = {
 // the options that do nothing with the others' values.
 static struct retro_core_option_v2_definition optionDefinitions[] = {
 	{ "armn64_accuracy", "Accuracy", NULL,
-	  "Fastest: Fast with shortcuts for speed (looser CPU timing); some effects may differ. Fast: built-in microcodes, loose timing. Balanced: each game's own microcode. Accurate: cycle for cycle. Applies on Restart.",
+	  "Fastest: Fast with shortcuts for speed (looser CPU timing); some effects may differ. Fast: built-in audio microcodes, loose timing. Balanced: the game's own audio microcode, closer timing. Accurate: cycle for cycle. Graphics follow Graphics Microcode in every mode. Applies on Restart.",
 	  NULL, "system", { { "fle", "Fastest (FLE)" }, { "hle", "Fast (HLE)" }, { "mle", "Balanced (MLE)" }, { "lle", "Accurate (LLE)" }, { NULL, NULL } }, "hle" },
 	{ "armn64_overclock", "Overclock", NULL,
 	  "A faster CPU, RSP and RDP for less slowdown and shorter loading; the boot keeps the real speed. Applies on Restart.",
 	  NULL, "system", { { "1", "Off" }, { "1.5", "1.5x" }, { "2", "2x" }, { "2.5", "2.5x" }, { "3", "3x" }, { "4", "4x" }, { NULL, NULL } }, "1" },
+	{ "armn64_expansion", "Expansion Pak", NULL,
+	  "The 4 MB memory add-on most later games use and some need. Off: as without one, for games and hacks that run differently with it. Applies on Restart.",
+	  NULL, "system", { { "enabled", "On" }, { "disabled", "Off" }, { NULL, NULL } }, "enabled" },
 	{ "armn64_renderer", "Renderer", NULL,
 	  "GL is fastest and can draw above the N64's resolution, but isn't exact. GPU and CPU draw exactly as the console does at its own resolution: GPU on the graphics chip, CPU on the processor. GPU can also draw higher (Resolution), close to exact. GPU is for desktop graphics cards: on handhelds it runs below full speed, so use CPU or GL there. Applies on Restart.",
 	  NULL, "video", { { "gl", "GL (Fast, HD)" }, { "gpu", "GPU (Exact, HD)" }, { "cpu", "CPU (Exact, Native)" }, { NULL, NULL } }, "gl" },
@@ -152,9 +155,15 @@ static struct retro_core_option_v2_definition optionDefinitions[] = {
 	{ "armn64_stick_gate", "Octagonal Stick Gate", NULL,
 	  "Shapes the stick's range like the N64 controller's octagonal gate instead of a circle.",
 	  NULL, "input", { { "disabled", "Off" }, { "enabled", "On" }, { NULL, NULL } }, "disabled" },
+	{ "armn64_stick_deadzone", "Stick Deadzone", NULL,
+	  "Ignores the stick this close to its middle, for sticks that drift; past it the full range still reaches the full tilt.",
+	  NULL, "input", { { "0", "Off" }, { "5", "5%" }, { "10", "10%" }, { "15", "15%" }, { "20", "20%" }, { "25", "25%" }, { "30", "30%" }, { NULL, NULL } }, "0" },
 	{ "armn64_stick_sensitivity", "Stick Sensitivity", NULL,
 	  "Scales the stick, for sticks that reach further or less far than the N64's. Above 1x reaches the full tilt sooner.",
 	  NULL, "input", { { "50", "0.5x" }, { "60", "0.6x" }, { "70", "0.7x" }, { "80", "0.8x" }, { "90", "0.9x" }, { "100", "1.0x" }, { "110", "1.1x" }, { "120", "1.2x" }, { "130", "1.3x" }, { "140", "1.4x" }, { "150", "1.5x" }, { "160", "1.6x" }, { "170", "1.7x" }, { "180", "1.8x" }, { "190", "1.9x" }, { "200", "2.0x" }, { NULL, NULL } }, "100" },
+	{ "armn64_face_c", "C Buttons on Face Buttons", NULL,
+	  "R2 held: the face buttons press the C buttons in the same places (top C-Up, left C-Left, bottom C-Down, right C-Right), and not A and B. For controllers without a good right stick. Not with Left / Right Stick, Both Sticks or Dual Controllers, which use R2.",
+	  NULL, "input", { { "disabled", "Off" }, { "enabled", "R2 + Face Buttons" }, { NULL, NULL } }, "disabled" },
 	{ "armn64_control_swap", "Control Swap", NULL,
 	  "D-Pad / Left Stick: the D-pad moves the control stick, the left stick presses the D-pad, and L1 presses Z and L2 presses L. Both Sticks: the two sticks added together move the control stick (no C buttons on the right stick), and L2 or R2 presses Z. Left / Right Stick: the right stick moves the control stick and the left stick presses the C buttons, and R2 presses Z instead of L2. The hotkeys switch them while playing.",
 	  NULL, "input", { { "disabled", "Off" }, { "dpad", "D-Pad / Left Stick" }, { "both", "Both Sticks" }, { "sticks", "Left / Right Stick" }, { NULL, NULL } }, "disabled" },
@@ -325,6 +334,9 @@ static const char* settings(const char* name) {
 	static char threads[4], scale[2];
 	if (!strcmp(name, "N64_ACCURACY")) {
 		return accuracy();
+	}
+	if (!strcmp(name, "N64_EXPANSION")) {
+		return optionIs(environment, "armn64_expansion", "disabled") ? "0" : "1";
 	}
 	if (!strcmp(name, "N64_OVERCLOCK")) {
 		return overclock();
@@ -944,7 +956,15 @@ void retro_reset(void) {
 static void stick(int ix, int iy, bool gate, int* x, int* y) {
 	const char* sensitivity = optionValue(environment, "armn64_stick_sensitivity");
 	double const k = sensitivity ? atoi(sensitivity) / 100.0 : 1;
-	double dx = ix / 32768.0 * (k > 0 ? k : 1), dy = iy / 32768.0 * (k > 0 ? k : 1);
+	double dx = ix / 32768.0, dy = iy / 32768.0;
+	// The deadzone, round, and the rest of the range stretched to the full tilt.
+	const char* deadzone = optionValue(environment, "armn64_stick_deadzone");
+	double const dz = deadzone ? atoi(deadzone) / 100.0 : 0, length = sqrt(dx * dx + dy * dy);
+	if (dz > 0) {
+		double const scale = length <= dz ? 0 : (length - dz) / (1 - dz) / length;
+		dx *= scale, dy *= scale;
+	}
+	dx *= k > 0 ? k : 1, dy *= k > 0 ? k : 1;
 	if (!gate) {
 		dx = dx < -1 ? -1 : dx > 1 ? 1 : dx;
 		dy = dy < -1 ? -1 : dy > 1 ? 1 : dy;
@@ -1076,6 +1096,13 @@ static uint32_t readController(unsigned port, int hand) {
 		// The C buttons from the other stick, pushed past halfway.
 		int const cx = AXIS(cStick, RETRO_DEVICE_ID_ANALOG_X), cy = AXIS(cStick, RETRO_DEVICE_ID_ANALOG_Y);
 		state |= (cy < -16384 ? 1u << 19 : 0) | (cy > 16384 ? 1u << 18 : 0) | (cx < -16384 ? 1u << 17 : 0) | (cx > 16384 ? 1u << 16 : 0);
+	}
+	// C Buttons on Face Buttons: with R2 held, the face buttons as the C buttons in their places, and
+	// not A and B.
+	if (hand == HAND_BOTH && !swapSticks && !bothSticks && optionIs(environment, "armn64_face_c", "enabled") && PRESSED(RETRO_DEVICE_ID_JOYPAD_R2)) {
+		state &= ~(3u << 30);
+		state |= (PRESSED(RETRO_DEVICE_ID_JOYPAD_X) ? 1u << 19 : 0) | (PRESSED(RETRO_DEVICE_ID_JOYPAD_B) ? 1u << 18 : 0) |
+		         (PRESSED(RETRO_DEVICE_ID_JOYPAD_Y) ? 1u << 17 : 0) | (PRESSED(RETRO_DEVICE_ID_JOYPAD_A) ? 1u << 16 : 0);
 	}
 	// The D-pad and the stick, one as the other when swapped: the D-pad as the stick pushed all the
 	// way, the stick as the D-pad pushed past halfway.
