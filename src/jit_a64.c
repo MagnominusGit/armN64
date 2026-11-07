@@ -693,6 +693,160 @@ static bool emitFpu(struct Jit* j, uint32_t op) {
 	}
 }
 
+// Leaves for the interpreter when the operand in w0 (x0 with dbl) is denormal, infinite or NaN; x1
+// keeps it shifted left once (no sign).
+static void fpuNormal(struct Jit* j, bool dbl) {
+	struct Emitter* e = &j->e;
+	if (dbl) {
+		emit32(e, 0xD37FF801); // lsl x1, x0, #1
+		aMovImm64(e, 2, 0x0020000000000000ull);
+		aDp(e, A_SUB | W64, 3, 1, 2, S_LSL, 0);
+		aMovImm64(e, 2, 0xFFC0000000000000ull);
+		aDp(e, A_SUBS | W64, ZR, 3, 2, S_LSL, 0);
+	} else {
+		aLslImm(e, 1, 0, 1);
+		aMovImm(e, 2, 0x01000000);
+		aDp(e, A_SUB, 3, 1, 2, S_LSL, 0);
+		aMovImm(e, 2, 0xFE000000);
+		aDp(e, A_SUBS, ZR, 3, 2, S_LSL, 0);
+	}
+	uint8_t* normal = aBcond(e, C_LO, NULL);
+	slowSite(j->slow, dbl ? aCbnzX(e, 1, NULL) : aCbnz(e, 1, NULL), &j->cache);
+	patchHere(e, normal);
+}
+
+// With LLE and MLE accuracy, MOV, NEG, ABS, the four operations and C.cond in S and D, for the
+// Status.FR the block was compiled with, where fpu.c takes no exception path: operands normal or zero,
+// the host raising no more than inexact, inexact not enabled, the result not denormal. Anything else
+// the interpreter runs.
+static bool emitFpuExact(struct Jit* j, uint32_t op) {
+	struct Emitter* e = &j->e;
+	int const fmt = (op >> 21) & 31, func = op & 0x3F, ft = (op >> 16) & 31, fs = (op >> 11) & 31, fd = (op >> 6) & 31;
+	bool const dbl = fmt == 17, arith = func <= 3, compare = func >= 0x30, sign = func == 5 || func == 7;
+	if ((fmt != 16 && fmt != 17) || !(arith || compare || sign || func == 6)) {
+		return false;
+	}
+	needCop1(j, true);
+	// The first operand as fpu.c's sOf and dOf find it, the second and the result as named.
+	unsigned const a = CPU_OFF(fpr) + 8 * (unsigned) (j->fr ? fs : fs & ~1), b = CPU_OFF(fpr) + 8 * (unsigned) ft;
+	unsigned const d = CPU_OFF(fpr) + 8 * (unsigned) fd;
+	if (func == 6) {
+		aLdrX(e, 0, CPU, a);
+		aStrX(e, 0, CPU, d);
+		return true;
+	}
+	if (compare) {
+		for (int k = 0; k < 2; ++k) {
+			if (dbl) {
+				aLdrX(e, 0, CPU, k ? b : a);
+				emit32(e, 0xD37FF801); // lsl x1, x0, #1
+				aMovImm64(e, 2, 0xFFE0000000000000ull);
+				aDp(e, A_SUBS | W64, ZR, 1, 2, S_LSL, 0);
+			} else {
+				aLdr(e, 0, CPU, k ? b : a);
+				aLslImm(e, 1, 0, 1);
+				aMovImm(e, 2, 0xFF000000);
+				aDp(e, A_SUBS, ZR, 1, 2, S_LSL, 0);
+			}
+			slowIf(j, C_HI);
+		}
+		if (dbl) {
+			emit32(e, 0xFD400000 | (a / 8) << 10 | (unsigned) CPU << 5 | 0); // ldr d0
+			emit32(e, 0xFD400000 | (b / 8) << 10 | (unsigned) CPU << 5 | 1); // ldr d1
+			emit32(e, 0x1E602000 | 1 << 16 | 0 << 5); // fcmp d0, d1
+		} else {
+			aFldr(e, 0, CPU, a);
+			aFldr(e, 1, CPU, b);
+			emit32(e, 0x1E202000 | 1 << 16 | 0 << 5); // fcmp s0, s1
+		}
+		aMovImm(e, 0, 0);
+		static const int conds[3] = { C_AL, C_EQ, C_MI };
+		for (int k = 1; k < 3; ++k) {
+			if (func & (1 << k)) {
+				aCset(e, 1, conds[k]);
+				aDp(e, A_ORR, 0, 0, 1, S_LSL, 0);
+			}
+		}
+		aLdr(e, 1, CPU, CPU_OFF(fcr31));
+		aLogicImm(e, A_AND_IMM, 1, 1, ~0x3F000u);
+		aBfi(e, 1, 0, 23, 1);
+		aStr(e, 1, CPU, CPU_OFF(fcr31));
+		return true;
+	}
+	if (sign) {
+		if (dbl) {
+			aLdrX(e, 0, CPU, a);
+		} else {
+			aLdr(e, 0, CPU, a);
+		}
+		fpuNormal(j, dbl);
+		if (dbl) {
+			emit32(e, func == 7 ? 0xD2410000 : 0x9240F800); // eor x0, x0, #1 << 63 / and x0, x0, #~(1 << 63)
+		} else {
+			aLogicImm(e, func == 7 ? A_EOR_IMM : A_AND_IMM, 0, 0, func == 7 ? 0x80000000u : 0x7FFFFFFFu);
+		}
+		aStrX(e, 0, CPU, d);
+		aLdr(e, 1, CPU, CPU_OFF(fcr31));
+		aLogicImm(e, A_AND_IMM, 1, 1, ~0x3F000u);
+		aStr(e, 1, CPU, CPU_OFF(fcr31));
+		return true;
+	}
+	// The stall in x5: the operation's cycles, or 2 in all (1 more) when an operand is zero or, for
+	// MUL, a power of two (fpu.c early).
+	uint32_t const cycles = fpuCycles(fmt, func);
+	aMovImm(e, 5, cycles);
+	aMovImm(e, 6, cycles > 1 ? 1 : cycles);
+	for (int k = 0; k < 2; ++k) {
+		if (dbl) {
+			aLdrX(e, 0, CPU, k ? b : a);
+		} else {
+			aLdr(e, 0, CPU, k ? b : a);
+		}
+		fpuNormal(j, dbl);
+		aDp(e, A_SUBS | W64, ZR, 1, ZR, S_LSL, 0);
+		aCselX(e, 5, 6, 5, C_EQ);
+		if (func == 2) {
+			if (dbl) {
+				emit32(e, 0xD374CC02); // lsl x2, x0, #12
+			} else {
+				aLslImm(e, 2, 0, 9);
+			}
+			aDp(e, (dbl ? A_SUBS | W64 : A_SUBS), ZR, 2, ZR, S_LSL, 0);
+			aCselX(e, 5, 6, 5, C_EQ);
+		}
+	}
+	// The host's flags cleared, the operation, its flags: anything but inexact goes the other way.
+	emit32(e, 0xD51B443F); // msr fpsr, xzr
+	if (dbl) {
+		emit32(e, 0xFD400000 | (a / 8) << 10 | (unsigned) CPU << 5 | 0); // ldr d0
+		emit32(e, 0xFD400000 | (b / 8) << 10 | (unsigned) CPU << 5 | 1); // ldr d1
+		aFop(e, (const uint32_t[]) { F_ADD, F_SUB, F_MUL, F_DIV }[func] | 0x00400000, 0, 0, 1);
+		emit32(e, 0x9E660000); // fmov x0, d0
+	} else {
+		aFldr(e, 0, CPU, a);
+		aFldr(e, 1, CPU, b);
+		aFop(e, (const uint32_t[]) { F_ADD, F_SUB, F_MUL, F_DIV }[func], 0, 0, 1);
+		emit32(e, 0x1E260000); // fmov w0, s0
+	}
+	emit32(e, 0xD53B4424); // mrs x4, fpsr
+	aLogicImm(e, A_ANDS_IMM, ZR, 4, 0xF);
+	slowIf(j, C_NE);
+	// A denormal result (exact, so no underflow flag).
+	fpuNormal(j, dbl);
+	// Inexact: its cause, and its flag unless enabled (then the exception, the other way).
+	aLdr(e, 2, CPU, CPU_OFF(fcr31));
+	aLogicImm(e, A_AND_IMM, 2, 2, ~0x3F000u);
+	uint8_t* exact = aTbz(e, 4, 4, NULL);
+	slowSite(j->slow, aTbnz(e, 2, 7, NULL), &j->cache);
+	aLogicImm(e, A_ORR_IMM, 2, 2, 0x1000);
+	aLogicImm(e, A_ORR_IMM, 2, 2, 0x4);
+	patchHere(e, exact);
+	aStr(e, 2, CPU, CPU_OFF(fcr31));
+	aStrX(e, 0, CPU, d);
+	aDp(e, A_SUB | W64, LEFT, LEFT, 5, S_LSL, 0);
+	return true;
+}
+
 // MFC0 and DMFC0 of anything but Random and the registers that read the latch; MTC0 and DMTC0 of EPC
 // and ErrorEPC.
 static bool emitCop0(struct Jit* j, uint32_t op) {
@@ -1023,7 +1177,7 @@ static bool emitInline(struct Jit* j, uint32_t op, uint64_t pc, enum Kind* kind)
 		if (!fpuOpValid(op) && !fpuProbed(op)) {
 			return false;
 		}
-		if (j->fast ? emitFpuFast(j, op) : emitFpu(j, op)) {
+		if (j->fast ? emitFpuFast(j, op) : emitFpu(j, op) || emitFpuExact(j, op)) {
 			return true;
 		}
 		// The FPU's own code, called directly. Its stall counts. With HLE accuracy it raises nothing.
