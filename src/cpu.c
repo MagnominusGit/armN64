@@ -419,6 +419,35 @@ static uint32_t vpageUnknown(uint32_t page) {
 	return ((RDRAM_SIZE >> 12) - page) << 12;
 }
 
+void cpuCachesFromState(struct N64* n, bool keptData) {
+	struct CPU* c = &n->cpu;
+	if (keptData == (!n->compat && !n->fast)) {
+		return;
+	}
+	// To mle or hle the lines not written back go to RDRAM; to lle the valid lines are filled from it.
+	for (uint32_t i = 0; i < 512; ++i) {
+		uint32_t const a = dcacheAddress(c, i);
+		if (c->dcacheTag[i] == DCACHE_NONE || a + 16 > RDRAM_SIZE) {
+			continue;
+		}
+		if (!keptData) {
+			memcpy(c->dcacheData[i], n->rdram + a, 16);
+		} else if (c->dcacheDirty[i]) {
+			memcpy(n->rdram + a, c->dcacheData[i], 16);
+			if (n->pageFlags[a >> 12] & PAGE_CODE) {
+				blocksInvalidatePage(n, a >> 12);
+			}
+		}
+		c->dcacheDirty[i] = false;
+	}
+	for (uint32_t i = 0; i < 512 && !keptData; ++i) {
+		uint32_t const a = icacheAddress(c, i);
+		if (c->icacheTag[i] != DCACHE_NONE && a + 32 <= RDRAM_SIZE) {
+			memcpy(c->icacheData[i], n->rdram + a, 32);
+		}
+	}
+}
+
 void cpuTlbChanged(struct N64* n) {
 	if (n->vpageFillCount > VPAGE_FILLED) {
 		for (uint32_t page = 0; page < VPAGES; ++page) {

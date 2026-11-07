@@ -89,6 +89,7 @@ bool n64StateLoad(struct N64* n, const void* data, size_t size, bool quick) {
 	const uint8_t* at = (const uint8_t*) data + sizeof(h);
 	memcpy(n, at, sizeof(*n));
 	at += sizeof(*n);
+	bool const keptData = !n->compat && !n->fast;
 
 	// The running machine's memory, code, renderers, settings and input.
 	n->rdram = was->rdram, n->hidden = was->hidden, n->rom = was->rom, n->romSize = was->romSize;
@@ -156,6 +157,7 @@ bool n64StateLoad(struct N64* n, const void* data, size_t size, bool quick) {
 	}
 	memcpy(n->rdram, at, RDRAM_SIZE);
 	memset(n->dirtyPages, 0, sizeof(n->dirtyPages));
+	cpuCachesFromState(n, keptData);
 	at += RDRAM_SIZE;
 	if (!keepGl) {
 		memcpy(n->hidden, at, RDRAM_SIZE / 2);

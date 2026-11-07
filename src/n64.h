@@ -574,6 +574,9 @@ bool n64GlPrecompile(struct N64*, double ms, int* done, int* total);
 void cpuReset(struct N64*);
 // The TLB or ASID changed: forgets the pages compiled loads and stores looked up.
 void cpuTlbChanged(struct N64*);
+// A state loaded in another accuracy: the caches made to match how this one keeps them (keptData: the
+// state's lle kept the lines' data, which mle and hle leave in RDRAM).
+void cpuCachesFromState(struct N64*, bool keptData);
 void cpuStep(struct N64*);
 void cpuStepOp(struct N64*, uint32_t op, uint32_t paddr);
 bool cpuJitReady(struct N64*);
