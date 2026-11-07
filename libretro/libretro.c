@@ -156,7 +156,7 @@ static struct retro_core_option_v2_definition optionDefinitions[] = {
 	  "Scales the stick, for sticks that reach further or less far than the N64's. Above 1x reaches the full tilt sooner.",
 	  NULL, "input", { { "50", "0.5x" }, { "60", "0.6x" }, { "70", "0.7x" }, { "80", "0.8x" }, { "90", "0.9x" }, { "100", "1.0x" }, { "110", "1.1x" }, { "120", "1.2x" }, { "130", "1.3x" }, { "140", "1.4x" }, { "150", "1.5x" }, { "160", "1.6x" }, { "170", "1.7x" }, { "180", "1.8x" }, { "190", "1.9x" }, { "200", "2.0x" }, { NULL, NULL } }, "100" },
 	{ "armn64_control_swap", "Control Swap", NULL,
-	  "D-Pad / Left Stick: the D-pad moves the control stick, the left stick presses the D-pad, and L1 presses Z and L2 presses L. Both Sticks: the two sticks added together move the control stick (no C buttons on the right stick). Left / Right Stick: the right stick moves the control stick and the left stick presses the C buttons. The hotkeys switch them while playing.",
+	  "D-Pad / Left Stick: the D-pad moves the control stick, the left stick presses the D-pad, and L1 presses Z and L2 presses L. Both Sticks: the two sticks added together move the control stick (no C buttons on the right stick). Left / Right Stick: the right stick moves the control stick and the left stick presses the C buttons, and the shoulders swap sides: R2 presses Z, R1 presses L and L1 presses R. The hotkeys switch them while playing.",
 	  NULL, "input", { { "disabled", "Off" }, { "dpad", "D-Pad / Left Stick" }, { "both", "Both Sticks" }, { "sticks", "Left / Right Stick" }, { NULL, NULL } }, "disabled" },
 	{ "armn64_swap_hotkeys", "Control Swap Hotkeys", NULL,
 	  "On player 1's controller: Start or Select held with any D-pad direction switches D-Pad / Left Stick (the game doesn't see the D-pad meanwhile, and a quick press of Start alone reaches it as you let go); Start or Select with R3 switches Left / Right Stick; L3 and R3 pressed together switch Both Sticks. Each switches its swap on, or off if it's on.",
@@ -1037,15 +1037,16 @@ enum { HAND_BOTH, HAND_LEFT, HAND_RIGHT };
 static uint32_t readController(unsigned port, int hand) {
 	bool const swapDpad = optionIs(environment, "armn64_control_swap", "dpad"), swapShoulders = swapDpad;
 	// Left / Right Stick (not with Dual Controllers, where each hand has its own): the right stick as
-	// the control stick, the left as the C buttons.
+	// the control stick, the left as the C buttons, and the shoulders mirrored (Z beside the stick).
 	bool const swapSticks = hand == HAND_BOTH && optionIs(environment, "armn64_control_swap", "sticks");
 	unsigned const mainStick = swapSticks ? RETRO_DEVICE_INDEX_ANALOG_RIGHT : RETRO_DEVICE_INDEX_ANALOG_LEFT;
 	unsigned const cStick = swapSticks ? RETRO_DEVICE_INDEX_ANALOG_LEFT : RETRO_DEVICE_INDEX_ANALOG_RIGHT;
 	// Both Sticks: the two added together as the control stick, and no C buttons from either.
 	bool const bothSticks = hand == HAND_BOTH && optionIs(environment, "armn64_control_swap", "both");
 	bool const gate = optionIs(environment, "armn64_stick_gate", "enabled");
-	int const z = swapShoulders ? RETRO_DEVICE_ID_JOYPAD_L : RETRO_DEVICE_ID_JOYPAD_L2;
-	int const l = swapShoulders ? RETRO_DEVICE_ID_JOYPAD_L2 : RETRO_DEVICE_ID_JOYPAD_L;
+	int const z = swapShoulders ? RETRO_DEVICE_ID_JOYPAD_L : swapSticks ? RETRO_DEVICE_ID_JOYPAD_R2 : RETRO_DEVICE_ID_JOYPAD_L2;
+	int const l = swapShoulders ? RETRO_DEVICE_ID_JOYPAD_L2 : swapSticks ? RETRO_DEVICE_ID_JOYPAD_R : RETRO_DEVICE_ID_JOYPAD_L;
+	int const r = swapSticks ? RETRO_DEVICE_ID_JOYPAD_L : RETRO_DEVICE_ID_JOYPAD_R;
 	#define PRESSED(id) pressed(port, (id))
 	#define AXIS(index, id) inputState(port, RETRO_DEVICE_ANALOG, (index), (id))
 	uint32_t state = 0;
@@ -1060,7 +1061,7 @@ static uint32_t readController(unsigned port, int hand) {
 	state |= (PRESSED(RETRO_DEVICE_ID_JOYPAD_B) ? 1u << 31 : 0) | (PRESSED(RETRO_DEVICE_ID_JOYPAD_Y) ? 1u << 30 : 0) | (PRESSED(z) ? 1u << 29 : 0) |
 	         (PRESSED(RETRO_DEVICE_ID_JOYPAD_START) ? 1u << 28 : 0) | (PRESSED(l) ? 1u << 21 : 0);
 	if (hand == HAND_BOTH) {
-		state |= PRESSED(RETRO_DEVICE_ID_JOYPAD_R) ? 1u << 20 : 0;
+		state |= PRESSED(r) ? 1u << 20 : 0;
 	}
 	if (hand == HAND_BOTH && !bothSticks) {
 		// The C buttons from the other stick, pushed past halfway.
