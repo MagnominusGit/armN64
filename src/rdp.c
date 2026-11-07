@@ -1528,14 +1528,34 @@ static inline __attribute__((always_inline)) void triangleAs(struct N64* n, stru
 	}
 }
 
+bool rdpTexelsUsed(const struct RDP* r) {
+	uint64_t c = r->combine;
+	int const rgbAB[4] = { (c >> 52) & 15, (c >> 37) & 15, (c >> 28) & 15, (c >> 24) & 15 }, rgbC[2] = { (c >> 47) & 31, (c >> 32) & 31 };
+	int const rgbD[2] = { (c >> 15) & 7, (c >> 6) & 7 }, alpha[6] = { (c >> 44) & 7, (c >> 21) & 7, (c >> 12) & 7, (c >> 3) & 7, (c >> 9) & 7, c & 7 };
+	int const alphaC[2] = { (c >> 41) & 7, (c >> 18) & 7 };
+	bool used = false;
+	for (int i = 0; i < 4; ++i) {
+		used |= rgbAB[i] == 1 || rgbAB[i] == 2;
+	}
+	for (int i = 0; i < 2; ++i) {
+		used |= rgbC[i] == 1 || rgbC[i] == 2 || rgbC[i] == 8 || rgbC[i] == 9 || rgbD[i] == 1 || rgbD[i] == 2 || alphaC[i] == 1 || alphaC[i] == 2;
+	}
+	for (int i = 0; i < 6; ++i) {
+		used |= alpha[i] == 1 || alpha[i] == 2;
+	}
+	return used;
+}
+
+// A triangle without texture coefficients still runs the texture unit, at S, T and W of zero.
 static void triangle(struct N64* n, struct RDP* r, const uint64_t* w, int op, bool lastOnly) {
-	bool const shade = op & 4, tex = op & 2, zbuf = op & 1;
+	int const kind = (op & 7) | (!(op & 2) && rdpTexelsUsed(r) ? 2 : 0);
+	bool const shade = op & 4, tex = kind & 2, zbuf = op & 1;
 	if (lastOnly || r->cycleType > 1) {
 		triangleAs(n, r, w, op, lastOnly, shade, tex, zbuf, -1);
 		return;
 	}
 #define TRIANGLE_AS(k) case k: triangleAs(n, r, w, op, false, (k) & 4, (k) & 2, (k) & 1, (k) >> 3); return;
-	switch ((op & 7) | r->cycleType << 3) {
+	switch (kind | r->cycleType << 3) {
 		TRIANGLE_AS(0) TRIANGLE_AS(1) TRIANGLE_AS(2) TRIANGLE_AS(3) TRIANGLE_AS(4) TRIANGLE_AS(5) TRIANGLE_AS(6) TRIANGLE_AS(7)
 		TRIANGLE_AS(8) TRIANGLE_AS(9) TRIANGLE_AS(10) TRIANGLE_AS(11) TRIANGLE_AS(12) TRIANGLE_AS(13) TRIANGLE_AS(14) TRIANGLE_AS(15)
 	}
@@ -2682,8 +2702,8 @@ static int gpuFeatures(struct RDP* r, int op) {
 	int f = 0;
 	bool tex;
 	if (op >= 0x08 && op <= 0x0F) {
-		f |= F_TRI | (op & 4 ? F_SHADE : 0) | (op & 1 ? F_ZTRI : 0) | ((op & 2) && ((m >> 51) & 1) ? F_PERSP : 0);
-		tex = op & 2;
+		tex = (op & 2) || rdpTexelsUsed(r);
+		f |= F_TRI | (op & 4 ? F_SHADE : 0) | (op & 1 ? F_ZTRI : 0) | (tex && ((m >> 51) & 1) ? F_PERSP : 0);
 	} else if (op == 0x24 || op == 0x25) {
 		f |= F_TEXRECT | (r->cycleType == 2 ? F_COPY : 0);
 		tex = true;
@@ -2962,7 +2982,11 @@ static bool gpuTriangle(struct Gpu* g, struct RDP* r, const uint64_t* w, int op,
 	p[6] = (w[0] >> 48) & 7;
 	p[7] = (w[0] >> 51) & 7;
 	p[8] = (int32_t) g->rowCount;
-	p[10] = op & 7;
+	// Without texture coefficients the texture unit still samples, at S, T and W of zero.
+	if (!tex && rdpTexelsUsed(r)) {
+		memset(&p[15], 0, 6 * sizeof(p[0]));
+	}
+	p[10] = (op & 7) | (rdpTexelsUsed(r) ? 2 : 0);
 	g->rowCount += GPU_TRI_SIZE;
 	return true;
 }

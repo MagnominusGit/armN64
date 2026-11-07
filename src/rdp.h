@@ -137,6 +137,9 @@ void glrSyncRange(struct N64*, uint32_t addr, uint32_t len);
 unsigned glrPicture(struct N64*, uint32_t origin, uint32_t stride, int size, int rows, int* x, int* y);
 // The RDP's own drawing of a primitive, into RDRAM.
 void rdpDrawSoftware(struct N64*, struct RDP*, const uint64_t* w, int op);
+// Whether the combiner reads a texel in either cycle: a triangle without texture coefficients still
+// samples then, at S, T and W of zero.
+bool rdpTexelsUsed(const struct RDP*);
 // What the last pixel a primitive draws leaves for the next one's COMBINED input (lastCombined),
 // for a primitive another renderer draws.
 void rdpLastCombined(struct N64*, struct RDP*, const uint64_t* w, int op);

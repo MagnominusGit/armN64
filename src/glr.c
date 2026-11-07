@@ -1927,6 +1927,13 @@ static void triangle(struct N64* n, struct Glr* g, struct RDP* r, const struct G
 	uint32_t c = q->flags;
 	// Depth from the primitive's needs no depth per corner (NFL Quarterback Club 99's shadows).
 	bool z = (c & 1) || (r->zAddr && r->zPrim), tex = c & 2, shade = c & 4, persp = (c >> 16) & 1;
+	// Without texture coefficients the texel is the one at the RDP's S and T for zeros: W of zero
+	// saturates the perspective divide.
+	bool const fixedTexel = !tex && rdpTexelsUsed(r);
+	float const fixedSt = persp ? 0x7FFF / 32.0f : 0;
+	if (fixedTexel) {
+		tex = true, persp = false;
+	}
 	float top = 1e9f, bottom = -1e9f;
 	for (int k = 0; k < 3; ++k) {
 		top = q->v[k][1] < top ? q->v[k][1] : top;
@@ -1940,7 +1947,7 @@ static void triangle(struct N64* n, struct Glr* g, struct RDP* r, const struct G
 	float maxW = fmaxf(q->v[0][3], fmaxf(q->v[1][3], q->v[2][3]));
 	float k = maxW > 0 ? 0.5f / maxW : 0.5f;
 	for (int i = 0; i < 3; ++i) {
-		vertex(g, q->v[i][0], q->v[i][1], q->v[i][2], q->v[i][3] * k, &q->v[i][4], q->v[i][8], q->v[i][9]);
+		vertex(g, q->v[i][0], q->v[i][1], q->v[i][2], q->v[i][3] * k, &q->v[i][4], fixedTexel ? fixedSt : q->v[i][8], fixedTexel ? fixedSt : q->v[i][9]);
 	}
 }
 
