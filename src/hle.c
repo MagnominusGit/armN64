@@ -1204,12 +1204,13 @@ static void cullOrEnd(struct Hle* h, int first, int last, bool* end) {
 	if (first < 0 || last >= VERTICES || first > last) {
 		return;
 	}
-	// Ends the list when every vertex is outside the same side of the view (NoN draws what lies in
-	// front of the near plane, so that side doesn't count).
-	uint32_t all = h->noNear ? 0x2F : 0x3F;
+	// Ends the list when every vertex is outside the same side of the view (NoN draws what lies
+	// nearer than the near plane, so on that side only what is behind the eye counts).
+	uint32_t all = 0x3F;
 	for (int i = first; i <= last; ++i) {
 		const struct Vertex* v = &h->v[i];
-		uint32_t code = (v->x < -v->w) | (v->x > v->w) << 1 | (v->y < -v->w) << 2 | (v->y > v->w) << 3 | (v->z < -v->w) << 4 | (v->z > v->w) << 5;
+		bool const near = h->noNear ? v->w < 0 : v->z < -v->w;
+		uint32_t code = (v->x < -v->w) | (v->x > v->w) << 1 | (v->y < -v->w) << 2 | (v->y > v->w) << 3 | near << 4 | (v->z > v->w) << 5;
 		all &= code;
 	}
 	if (all) {
