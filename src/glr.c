@@ -1561,7 +1561,7 @@ static void flushBatch(struct N64* n, struct Glr* g) {
 	if (a->offset != s->decal) {
 		if (s->decal) {
 			gl->Enable(GL_POLYGON_OFFSET_FILL);
-			gl->PolygonOffset(-1, -1);
+			gl->PolygonOffset((float) -g->scale, -1);
 		} else {
 			gl->Disable(GL_POLYGON_OFFSET_FILL);
 		}
@@ -1612,14 +1612,14 @@ static void flushBatch(struct N64* n, struct Glr* g) {
 			gl->ColorMask(0, 0, 0, 0);
 			gl->DepthMask(0);
 			gl->DepthFunc(GL_GEQUAL);
-			gl->PolygonOffset(1, 1);
+			gl->PolygonOffset((float) g->scale, 1);
 			gl->StencilFunc(GL_ALWAYS, g->stencilRef, 0xFF);
 			gl->StencilOp(GL_KEEP, GL_KEEP, GL_REPLACE);
 			gl->DrawArrays(GL_TRIANGLES, first, g->batchCount);
 			gl->ColorMask(1, 1, 1, 1);
 			gl->DepthMask(s->depthWrite);
 			gl->DepthFunc(GL_LEQUAL);
-			gl->PolygonOffset(-1, -1);
+			gl->PolygonOffset((float) -g->scale, -1);
 			gl->StencilFunc(GL_EQUAL, g->stencilRef, 0xFF);
 			gl->StencilOp(GL_KEEP, GL_KEEP, GL_KEEP);
 			gl->DrawArrays(GL_TRIANGLES, first, g->batchCount);
