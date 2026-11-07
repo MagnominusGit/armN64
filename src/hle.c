@@ -4390,7 +4390,7 @@ static void runList(struct N64* n, struct Hle* h, uint32_t pc) {
 				} else if (index == 0x10 && h->cbfd) {
 					cbfdCoordMod(h, w0, w1);
 				} else if (index == 4 && offset == 0x14) {
-					h->clipRatio = (float) ((int16_t) w1 > 0 ? (int16_t) w1 : 1);
+					h->clipRatio = (float) (-(int16_t) w1 > 0 ? -(int16_t) w1 : 1);
 				} else if (index == 6) {
 					h->segments[(offset / 4) & 15] = w1 & 0xFFFFFF;
 				} else if (index == 8 && h->am && (offset & 0xFF) == 0x0C) {
@@ -4661,7 +4661,7 @@ static void runList(struct N64* n, struct Hle* h, uint32_t pc) {
 					int l = (int) (((w1 - 0x80000000u) >> 5) - 1);
 					h->lights = l < 0 ? 0 : l > LIGHTS ? LIGHTS : l;
 				} else if (index == 4 && offset == 0x14) {
-					h->clipRatio = (float) ((int16_t) w1 > 0 ? (int16_t) w1 : 1);
+					h->clipRatio = (float) (-(int16_t) w1 > 0 ? -(int16_t) w1 : 1);
 				} else if (index == 6) {
 					h->segments[(offset / 4) & 15] = w1 & 0xFFFFFF;
 				} else if (index == 8) {
