@@ -71,7 +71,6 @@ static const uint8_t ditherMatrix[2][16] = {
 	{ 0, 4, 1, 5, 4, 0, 5, 1, 3, 7, 2, 6, 7, 3, 6, 2 },
 };
 
-// Whether the pixels take noise: from the combiner, a noise dither or the alpha test's dither.
 // Whether a pixel depends on the one drawn before it: the first cycle's COMBINED is that pixel's
 // result, and in two cycles the first's own result counts only through the second's COMBINED or
 // the alpha compare (New Tetris's first cycle only passes it on).
@@ -1947,8 +1946,8 @@ struct Renderers {
 	uint16_t marked[RDRAM_SIZE >> 12];
 	int markedCount;
 	uint8_t since[RDRAM_SIZE >> 12];
-	// For each page, where in the stream the last command drawing to it ends.
-	uint64_t drawnUntil[RDRAM_SIZE >> 12];
+	// For each page, where in the stream the last command drawing to it, and loading from it, ends.
+	uint64_t drawnUntil[RDRAM_SIZE >> 12], loadedUntil[RDRAM_SIZE >> 12];
 	uint16_t sinceList[RDRAM_SIZE >> 12];
 	int sinceCount;
 };
@@ -2153,6 +2152,8 @@ static void mark(struct N64* n, struct Renderers* all, uint32_t addr, uint32_t l
 		n->pageFlags[p] |= flag;
 		if (flag == PAGE_RDP_WRITES) {
 			all->drawnUntil[p] = until;
+		} else {
+			all->loadedUntil[p] = until;
 		}
 		if (!all->since[p]) {
 			all->sinceList[all->sinceCount++] = (uint16_t) p;
@@ -2162,10 +2163,27 @@ static void mark(struct N64* n, struct Renderers* all, uint32_t addr, uint32_t l
 	n->rdpPending = true;
 }
 
-// Waits until the RDP commands drawing to [addr, addr + len) are drawn, not the rest (the
-// renderers keep going); the pages stay flagged for the next full wait.
-// The CPU or a DMA is about to touch RDRAM [addr, addr + len) on a page the RDP draws to: with the
-// GL renderer only the GPU's own rows matter, else everything waits.
+// Waits until the RDP commands drawing to [addr, addr + len) are drawn, and with loads the ones
+// loading from it, not the rest (the renderers keep going); the pages stay flagged for the next full
+// wait.
+static void waitPages(struct N64* n, struct Renderers* all, uint32_t addr, uint32_t len, bool loads) {
+	uint64_t until = 0;
+	FOR_PAGES(addr, len, p) {
+		if ((n->pageFlags[p] & PAGE_RDP_WRITES) && all->drawnUntil[p] > until) {
+			until = all->drawnUntil[p];
+		}
+		if (loads && (n->pageFlags[p] & PAGE_RDP_READS) && all->loadedUntil[p] > until) {
+			until = all->loadedUntil[p];
+		}
+	}
+	if (until > oldestDone(all)) {
+		waitFor(all, until);
+	}
+}
+
+// The CPU or a DMA is about to touch RDRAM [addr, addr + len) on a page the RDP draws to or loads
+// from: with the GL renderer only the GPU's own rows matter; with renderer threads, the commands that
+// draw there or load from there.
 void rdpWaitFor(struct N64* n, uint32_t addr, uint32_t len) {
 	if (n->rdp && n->rdp->gpu && !n->glr) {
 		if (!gpuWrite(n, n->rdp, addr, len)) {
@@ -2180,7 +2198,12 @@ void rdpWaitFor(struct N64* n, uint32_t addr, uint32_t len) {
 		}
 		return;
 	}
-	rdpWait(n);
+	struct Renderers* all = n->rdp ? n->rdp->renderers : NULL;
+	if (!all) {
+		rdpWait(n);
+	} else if (n->rdpPending) {
+		waitPages(n, all, addr, len, true);
+	}
 }
 
 // As rdpWaitFor, for a read: with the GPU drawing, only bytes it drew wait (a write waits for the
@@ -2192,7 +2215,11 @@ void rdpWaitRead(struct N64* n, uint32_t addr, uint32_t len) {
 		}
 		return;
 	}
-	rdpWaitFor(n, addr, len);
+	if (n->glr) {
+		rdpWaitFor(n, addr, len);
+		return;
+	}
+	rdpWaitDrawn(n, addr, len);
 }
 
 void rdpWaitDrawn(struct N64* n, uint32_t addr, uint32_t len) {
@@ -2209,15 +2236,7 @@ void rdpWaitDrawn(struct N64* n, uint32_t addr, uint32_t len) {
 		rdpWait(n);
 		return;
 	}
-	uint64_t until = 0;
-	FOR_PAGES(addr, len, p) {
-		if ((n->pageFlags[p] & PAGE_RDP_WRITES) && all->drawnUntil[p] > until) {
-			until = all->drawnUntil[p];
-		}
-	}
-	if (until > oldestDone(all)) {
-		waitFor(all, until);
-	}
+	waitPages(n, all, addr, len, false);
 }
 
 // The RDRAM a texture load reads, as loadTile and loadTlut address it (rounded up a little).
@@ -2273,7 +2292,7 @@ static void submit(struct N64* n, struct RDP* r, const uint64_t* w, int op, int 
 		if (touchedSince(all, addr, len, SINCE_DRAWN)) {
 			barrier(all);
 		}
-		mark(n, all, addr, len, PAGE_RDP_READS, SINCE_LOADED, 0);
+		mark(n, all, addr, len, PAGE_RDP_READS, SINCE_LOADED, atomic_load_explicit(&all->written, memory_order_relaxed) + 1 + words);
 	} else if ((op >= 0x08 && op <= 0x0F) || op == 0x24 || op == 0x25 || op == 0x36) {
 		int y0, y1;
 		primitiveRows(r, w, op, &y0, &y1);
