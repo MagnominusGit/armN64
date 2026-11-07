@@ -489,9 +489,8 @@ static struct Color convert(const struct RDP* r, struct Color c) {
 
 // Both texels of a pixel: each cycle filters (bilinear when the sample type says so) or converts
 // from YUV; with convert-one the second cycle converts the first's texel.
-static void textures(struct RDP* r, struct Pixel* p, int t1, int t2, int s, int t) {
+static inline __attribute__((always_inline)) void textures(struct RDP* r, struct Pixel* p, int t1, int t2, int s, int t, int cycleType) {
 	uint64_t m = r->otherModes;
-	int cycleType = (m >> 52) & 3;
 	bool filter0 = cycleType >= 2 || ((m >> 43) & 1), filter1 = (m >> 42) & 1, convertOne = (m >> 41) & 1;
 	sample(r, t1, s, t, filter0, &p->tex0);
 	struct Color first = p->tex0;
@@ -840,11 +839,11 @@ static inline __attribute__((always_inline)) struct Color blendInput(struct RDP*
 // The depth test (with the stored depth slope: coplanar and decal tests, and whether an
 // antialiased edge blends), then the blender, and the coverage and depth written.
 // The combiner's output for a pixel, which the next pixel's first cycle reads as COMBINED.
-static inline __attribute__((always_inline)) struct Color combinePixel(struct RDP* r, struct Pixel* p) {
+static inline __attribute__((always_inline)) struct Color combinePixel(struct RDP* r, struct Pixel* p, int cycleType) {
 	// One-cycle mode runs the combiner's second-cycle equation.
 	p->combined = r->lastCombined;
-	struct Color c = combineCycle(r, p, r->cycleType == 1 ? 0 : 1);
-	if (r->cycleType == 1) {
+	struct Color c = combineCycle(r, p, cycleType == 1 ? 0 : 1);
+	if (cycleType == 1) {
 		// The second cycle sees the pipelined texels: texel 1 as texel 0 (and texel 0 as texel 1, as
 		// paraLLEl-RDP has it for the next pixel's).
 		struct Color t = p->tex0;
@@ -856,12 +855,11 @@ static inline __attribute__((always_inline)) struct Color combinePixel(struct RD
 	return c;
 }
 
-static void shadePixel(struct N64* n, struct RDP* r, int x, int y, struct Pixel* p) {
+static inline __attribute__((always_inline)) void shadePixel(struct N64* n, struct RDP* r, int x, int y, struct Pixel* p, int cycleType) {
 	p->x = x, p->y = y;
-	int cycleType = r->cycleType;
 	int z = r->zPrim ? r->primZ : p->z;
 	z = z < 0 ? 0 : z > 0x3FFFF ? 0x3FFFF : z;
-	struct Color c = combinePixel(r, p);
+	struct Color c = combinePixel(r, p, cycleType);
 	r->lastPos = r->seq << 24 | (uint64_t) y << 12 | (uint32_t) x;
 	c = (struct Color) { clamp9(c.r), clamp9(c.g), clamp9(c.b), clamp9(c.a) };
 	int rgbDither, alphaDither;
@@ -1184,7 +1182,7 @@ static void textureRect(struct N64* n, struct RDP* r, uint64_t w0, uint64_t w1, 
 				int sy = s + (flip ? dsdx >> 5 : 0), ty = t + (flip ? 0 : dtdy >> 5);
 				p->lodFrac = levelOfDetail(r, tile, s, t, sx, tx, sy, ty, &t1, &t2);
 			}
-			textures(r, p, t1, t2, s, t);
+			textures(r, p, t1, t2, s, t, cycleType);
 			if (cycleType == 2) {
 				if ((r->otherModes & 1) && p->tex0.a == 0) {
 					continue;
@@ -1207,10 +1205,10 @@ static void textureRect(struct N64* n, struct RDP* r, uint64_t w0, uint64_t w1, 
 			p->cvbit = true;
 			if (lastOnly) {
 				p->x = x, p->y = y;
-				combinePixel(r, p);
+				combinePixel(r, p, cycleType);
 				return;
 			}
-			shadePixel(n, r, x, y, p);
+			shadePixel(n, r, x, y, p, cycleType);
 		}
 	}
 }
@@ -1437,9 +1435,11 @@ static void rowAttributes(const struct Edges* t, const struct Attributes* a, int
 	}
 }
 
-// lastOnly: only the last pixel drawn, combined (rdpLastCombined).
-static void triangle(struct N64* n, struct RDP* r, const uint64_t* w, int op, bool lastOnly) {
-	bool shade = op & 4, tex = op & 2, zbuf = op & 1;
+// lastOnly: only the last pixel drawn, combined (rdpLastCombined). triangle() picks a copy with
+// what the primitive has (shade, texture, depth) and its cycle type fixed, cycle -1 for the rest.
+static inline __attribute__((always_inline)) void triangleAs(struct N64* n, struct RDP* r, const uint64_t* w, int op, bool lastOnly, bool shade,
+                                                               bool tex, bool zbuf, int cycle) {
+	int const cycleType = cycle >= 0 ? cycle : r->cycleType;
 	int tile = (w[0] >> 48) & 7;
 	struct Edges e = edges(w);
 	struct Attributes a = attributes(w, op);
@@ -1457,13 +1457,13 @@ static void triangle(struct N64* n, struct RDP* r, const uint64_t* w, int op, bo
 			continue;
 		}
 		// In fill mode a row takes the fill colour, as a fill rectangle's does (Lemon's FillTriangle).
-		if (r->cycleType == 3) {
+		if (cycleType == 3) {
 			fillRect(n, r, sp.x0, y, sp.x1, y);
 			continue;
 		}
 		int32_t row[8];
 		int baseX;
-		rowAttributes(&e, &a, y, r->cycleType == 2, row, &baseX);
+		rowAttributes(&e, &a, y, cycleType == 2, row, &baseX);
 		// Pixels whose samples (eighths 0 to 6) are inside all four sub-scanlines are covered whole.
 		int32_t inLeft = 0, inRight = INT32_MAX;
 		for (int k = 0; k < 4; ++k) {
@@ -1517,16 +1517,30 @@ static void triangle(struct N64* n, struct RDP* r, const uint64_t* w, int op, bo
 					texCoords(stwY[0], stwY[1], stwY[2], persp, &sy, &ty);
 					p->lodFrac = levelOfDetail(r, tile, s, t, sx, tx, sy, ty, &t1, &t2);
 				}
-				textures(r, p, t1, t2, s, t);
+				textures(r, p, t1, t2, s, t, cycleType);
 			}
 			if (lastOnly) {
 				p->x = x, p->y = y;
-				combinePixel(r, p);
+				combinePixel(r, p, cycleType);
 				return;
 			}
-			shadePixel(n, r, x, y, p);
+			shadePixel(n, r, x, y, p, cycleType);
 		}
 	}
+}
+
+static void triangle(struct N64* n, struct RDP* r, const uint64_t* w, int op, bool lastOnly) {
+	bool const shade = op & 4, tex = op & 2, zbuf = op & 1;
+	if (lastOnly || r->cycleType > 1) {
+		triangleAs(n, r, w, op, lastOnly, shade, tex, zbuf, -1);
+		return;
+	}
+#define TRIANGLE_AS(k) case k: triangleAs(n, r, w, op, false, (k) & 4, (k) & 2, (k) & 1, (k) >> 3); return;
+	switch ((op & 7) | r->cycleType << 3) {
+		TRIANGLE_AS(0) TRIANGLE_AS(1) TRIANGLE_AS(2) TRIANGLE_AS(3) TRIANGLE_AS(4) TRIANGLE_AS(5) TRIANGLE_AS(6) TRIANGLE_AS(7)
+		TRIANGLE_AS(8) TRIANGLE_AS(9) TRIANGLE_AS(10) TRIANGLE_AS(11) TRIANGLE_AS(12) TRIANGLE_AS(13) TRIANGLE_AS(14) TRIANGLE_AS(15)
+	}
+#undef TRIANGLE_AS
 }
 
 // ---- Texture loads
@@ -1861,7 +1875,7 @@ static void execute(struct N64* n, struct RDP* r, const uint64_t* w, int op) {
 					struct Pixel* p = &r->pix;
 					*p = (struct Pixel) { .cvg = 8, .cvbit = true };
 					p->z = r->primZ;
-					shadePixel(n, r, x, y, p);
+					shadePixel(n, r, x, y, p, r->cycleType);
 				}
 			}
 		}
