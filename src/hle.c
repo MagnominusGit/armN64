@@ -4625,6 +4625,10 @@ static void runList(struct N64* n, struct Hle* h, uint32_t pc) {
 				}
 				break;
 			case 0xAF:
+				// Fast3D has no G_LOAD_UCODE: its microcode passes over the command.
+				if (h->family == FAMILY_F3D) {
+					break;
+				}
 				if (!loadMicrocode(n, h, w1, (w0 & 0xFFFF) + 1)) {
 					return;
 				}
