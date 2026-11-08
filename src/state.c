@@ -102,9 +102,8 @@ bool n64StateLoad(struct N64* n, const void* data, size_t size, bool quick) {
 	for (uint32_t p = 0; p < (RDRAM_SIZE >> 12); ++p) {
 		n->pageFlags[p] = was->pageFlags[p] & (keepGl ? 0xFF : PAGE_CODE);
 	}
-	if (keepGl) {
-		n->rdpPending = was->rdpPending;
-	}
+	// Pending work is this machine's renderers', never the state's (another machine's, with netplay).
+	n->rdpPending = keepGl && was->rdpPending;
 	n->pageFlags[RDRAM_SIZE >> 12] = 0xFF;
 	// The same TLB maps the same: the code for each address and the pages found stand.
 	bool const sameTlb = !memcmp(n->cpu.tlb, was->cpu.tlb, sizeof(n->cpu.tlb));
