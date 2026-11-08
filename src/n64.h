@@ -783,6 +783,7 @@ void glrForget(struct N64*);
 // A task waiting where its display list branches to itself (the CPU still writing it); a look
 // whether it can go on.
 bool hleWaiting(struct N64*);
+uint32_t hleTaskEnd(struct N64*);
 void hleResume(struct N64*);
 // The CPU changed an SP signal: a task waiting on one goes on.
 void hleSignalled(struct N64*);

@@ -188,6 +188,9 @@ struct Hle {
 	float squeeze;
 	uint32_t imageWidth;
 	bool rectHalf, rectFlip;
+	// A graphics task drawn here that yielded: its time left, for when the scheduler starts it again.
+	bool yielding;
+	uint64_t yieldLeft;
 };
 
 static uint32_t rd32(struct N64* n, uint32_t a) {
@@ -5141,6 +5144,16 @@ static void finishTask(struct N64* n, struct Hle* h) {
 }
 
 void hleSignalled(struct N64* n) {
+	// A graphics task drawn here gives way when the scheduler asks it to yield (signal 0), as its
+	// microcode would at its next command.
+	struct Hle* h = n->hle;
+	if (h && (n->sp.status & 0x80) && !h->yielding && !h->waiting && !h->stalled && n->sp.hleDoneAt > n->cycles + 4096 &&
+	    be32(&n->sp.mem[0xFC0]) == 1 && be32(&n->sp.mem[0xFF8])) {
+		h->yielding = true;
+		h->yieldLeft = n->sp.hleDoneAt - n->cycles;
+		n->sp.hleDoneAt = n->cycles + 4096;
+		n64Event(n, n->sp.hleDoneAt);
+	}
 	// The picture processor, when not busy, answers at once.
 	if (n->hle && n->hle->family == FAMILY_GBPPU && n->hle->waiting && n->sp.hleDoneAt && n->cycles >= n->hle->gbReadyAt) {
 		gbRun(n, n->hle);
@@ -5151,6 +5164,15 @@ void hleSignalled(struct N64* n) {
 		n->sp.hleDoneAt = n->cycles;
 		n64Event(n, n->cycles);
 	}
+}
+
+// The status bits a task run here ends with: yielded (signal 1) or done (signal 2), halted at a break.
+uint32_t hleTaskEnd(struct N64* n) {
+	if (n->hle && n->hle->yielding) {
+		n->hle->yielding = false;
+		return 0x103;
+	}
+	return 0x203;
 }
 
 bool hleWaiting(struct N64* n) {
@@ -5234,7 +5256,8 @@ bool hleGraphics(struct N64* n, bool dry) {
 	uint32_t list = be32(task + 0x30) & 0xFFFFFF;
 	if (be32(task + 4) & 1) {
 		if (n->hle && n->hle->doneList == list && !dry) {
-			n->sp.hleDoneAt = n->cycles + 4096;
+			n->sp.hleDoneAt = n->cycles + (n->hle->yieldLeft ? n->hle->yieldLeft : 4096);
+			n->hle->yieldLeft = 0;
 			return true;
 		}
 		return false;

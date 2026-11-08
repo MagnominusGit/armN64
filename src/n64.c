@@ -351,9 +351,9 @@ void n64RunField(struct N64* n) {
 			hleResume(n);
 		} else if (n->sp.hleDoneAt && n->cycles >= n->sp.hleDoneAt) {
 			// A task run at high level ends as its microcode would: halted at a break with the
-			// task-done signal.
+			// task-done signal, or yielded when the scheduler asked it to give way.
 			n->sp.hleDoneAt = 0;
-			n->sp.status |= 0x203;
+			n->sp.status |= hleTaskEnd(n);
 			if (n->sp.status & 0x40) {
 				n64Interrupt(n, MI_SP, true);
 			}
