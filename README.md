@@ -83,9 +83,11 @@ The options' help texts are short; the details are here.
   the GPU to hand it back. Fast: they use the last one in memory.
 
 **Input**
-- **C Buttons on Face Buttons.** With R2 held, the face buttons press the C buttons in the same
-  places (top C-Up, left C-Left, bottom C-Down, right C-Right) instead of A and B. Not with
-  Left / Right Stick, Both Sticks or Dual Controllers, which use R2.
+
+The bottom face button is A, the left one B, the right one C-Down and the top one C-Left.
+- **C Buttons on Face Buttons.** On by default. With R2 held, the face buttons press the C buttons
+  in the same places (top C-Up, left C-Left, bottom C-Down, right C-Right) instead of A and B. Not
+  with Left / Right Stick, Both Sticks or Dual Controllers, which use R2.
 - **Control Swap.** D-Pad / Left Stick: the D-pad moves the control stick, the left stick presses
   the D-pad, L1 presses Z and L2 presses L. Both Sticks: the two sticks added together move the
   control stick (no C buttons on the right stick), and L2 or R2 presses Z. Left / Right Stick: the

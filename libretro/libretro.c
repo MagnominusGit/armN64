@@ -859,6 +859,8 @@ static void describeInput(void) {
 	} controls[] = {
 		{ RETRO_DEVICE_JOYPAD, 0, RETRO_DEVICE_ID_JOYPAD_B, "A" },
 		{ RETRO_DEVICE_JOYPAD, 0, RETRO_DEVICE_ID_JOYPAD_Y, "B" },
+		{ RETRO_DEVICE_JOYPAD, 0, RETRO_DEVICE_ID_JOYPAD_A, "C-Down" },
+		{ RETRO_DEVICE_JOYPAD, 0, RETRO_DEVICE_ID_JOYPAD_X, "C-Left" },
 		{ RETRO_DEVICE_JOYPAD, 0, RETRO_DEVICE_ID_JOYPAD_L2, "Z" },
 		{ RETRO_DEVICE_JOYPAD, 0, RETRO_DEVICE_ID_JOYPAD_L, "L" },
 		{ RETRO_DEVICE_JOYPAD, 0, RETRO_DEVICE_ID_JOYPAD_R, "R" },
@@ -1145,11 +1147,13 @@ static uint32_t readController(unsigned port, int hand) {
 		state |= (cy < -16384 ? 1u << 19 : 0) | (cy > 16384 ? 1u << 18 : 0) | (cx < -16384 ? 1u << 17 : 0) | (cx > 16384 ? 1u << 16 : 0);
 	}
 	// C Buttons on Face Buttons: with R2 held, the face buttons as the C buttons in their places, and
-	// not A and B.
+	// not A and B. Otherwise east and north are C-Down and C-Left.
 	if (hand == HAND_BOTH && !swapSticks && !bothSticks && optionIs(environment, "armn64_face_c", "enabled") && PRESSED(RETRO_DEVICE_ID_JOYPAD_R2)) {
 		state &= ~(3u << 30);
 		state |= (PRESSED(RETRO_DEVICE_ID_JOYPAD_X) ? 1u << 19 : 0) | (PRESSED(RETRO_DEVICE_ID_JOYPAD_B) ? 1u << 18 : 0) |
 		         (PRESSED(RETRO_DEVICE_ID_JOYPAD_Y) ? 1u << 17 : 0) | (PRESSED(RETRO_DEVICE_ID_JOYPAD_A) ? 1u << 16 : 0);
+	} else if (hand == HAND_BOTH) {
+		state |= (PRESSED(RETRO_DEVICE_ID_JOYPAD_A) ? 1u << 18 : 0) | (PRESSED(RETRO_DEVICE_ID_JOYPAD_X) ? 1u << 17 : 0);
 	}
 	// The D-pad and the stick, one as the other when swapped: the D-pad as the stick pushed all the
 	// way, the stick as the D-pad pushed past halfway.
