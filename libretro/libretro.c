@@ -1332,6 +1332,9 @@ void retro_run(void) {
 	bool shared = hw.context_type != RETRO_HW_CONTEXT_NONE;
 	if (!shared) {
 		glesResume();
+	} else if (hwReady) {
+		// The frontend drew in this context since the last frame.
+		glrForget(machine);
 	}
 	inputPoll();
 	if (pakManager(shared)) {

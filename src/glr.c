@@ -36,6 +36,9 @@ enum {
 	GL_ZERO = 0, GL_ONE = 1, GL_SRC_ALPHA = 0x302, GL_ONE_MINUS_SRC_ALPHA = 0x303, GL_CONSTANT_ALPHA = 0x8003,
 	GL_VERTEX_SHADER = 0x8B31, GL_FRAGMENT_SHADER = 0x8B30, GL_COMPILE_STATUS = 0x8B81, GL_LINK_STATUS = 0x8B82,
 	GL_PACK_ALIGNMENT = 0x0D05, GL_UNPACK_ALIGNMENT = 0x0CF5,
+	GL_UNPACK_ROW_LENGTH = 0x0CF2, GL_UNPACK_SKIP_ROWS = 0x0CF3, GL_UNPACK_SKIP_PIXELS = 0x0CF4, GL_PACK_ROW_LENGTH = 0x0D02,
+	GL_PACK_SKIP_ROWS = 0x0D03, GL_PACK_SKIP_PIXELS = 0x0D04, GL_PIXEL_PACK_BUFFER = 0x88EB, GL_PIXEL_UNPACK_BUFFER = 0x88EC,
+	GL_CULL_FACE = 0x0B44,
 };
 
 // LEVELS: the tiles a primitive's texels can come from (the level of detail picks up to eight), each
@@ -2630,7 +2633,24 @@ void glrStateReplaced(struct Glr* g) {
 
 void glrForget(struct N64* n) {
 	if (n->glr) {
+		struct Gl* gl = &n->glr->gl;
 		memset(&n->glr->applied, 0xFF, sizeof(n->glr->applied));
+		// What the renderer never sets but relies on, as a frontend may leave it (RetroArch's glcore
+		// driver leaves its upload row length).
+		gl->PixelStorei(GL_UNPACK_ROW_LENGTH, 0);
+		gl->PixelStorei(GL_UNPACK_SKIP_ROWS, 0);
+		gl->PixelStorei(GL_UNPACK_SKIP_PIXELS, 0);
+		gl->PixelStorei(GL_UNPACK_ALIGNMENT, 1);
+		gl->PixelStorei(GL_PACK_ROW_LENGTH, 0);
+		gl->PixelStorei(GL_PACK_SKIP_ROWS, 0);
+		gl->PixelStorei(GL_PACK_SKIP_PIXELS, 0);
+		gl->PixelStorei(GL_PACK_ALIGNMENT, 1);
+		gl->BindBuffer(GL_PIXEL_UNPACK_BUFFER, 0);
+		gl->BindBuffer(GL_PIXEL_PACK_BUFFER, 0);
+		gl->Disable(GL_CULL_FACE);
+		gl->Disable(GL_STENCIL_TEST);
+		gl->Disable(GL_DITHER);
+		gl->ColorMask(1, 1, 1, 1);
 	}
 }
 
