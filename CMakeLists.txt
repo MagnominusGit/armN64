@@ -9,6 +9,10 @@ if(NOT CMAKE_BUILD_TYPE)
 endif()
 # No fused multiply-adds: the FPU and RDP must round the same on every host.
 add_compile_options(-Wall -Wextra -Wno-unused-parameter -ffp-contract=off -fno-math-errno)
+# GCC 10's SLP vectorizer copies struct N64's misaligned arrays with aligned SSE moves (state loads crash).
+if(CMAKE_C_COMPILER_ID STREQUAL "GNU" AND CMAKE_C_COMPILER_VERSION VERSION_LESS 11)
+	add_compile_options(-fno-tree-slp-vectorize)
+endif()
 # Off where the toolchain picks the CPU (a distribution's package for each device).
 option(ARMN64_TUNE "Build for x86-64-v2 or the Cortex-A55" ON)
 if(CMAKE_SYSTEM_PROCESSOR MATCHES "x86_64|AMD64")
