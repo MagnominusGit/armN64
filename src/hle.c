@@ -1133,13 +1133,12 @@ static void viewport(struct N64* n, struct Hle* h, uint32_t a) {
 	}
 }
 
-// G_BRANCH_Z: whether the vertex's depth on screen (16.16, the viewport's 0-0x3FF range) is at most
-// the limit gSPBranchLessZ made.
+// G_BRANCH_Z: whether the vertex's depth on screen (the viewport's 0-0x3FF range) is at most the
+// limit, which is in the same units, or past the far end (a vertex behind the eye too).
 static bool branchZ(const struct Hle* h, int index, uint32_t limit) {
 	const struct Vertex* v = &h->v[index];
 	float z = (v->w != 0 ? v->z / v->w : 0) * h->vscale[2] + h->vtrans[2];
-	int64_t fixed = (int64_t) (z * 65536.0f);
-	return fixed <= (int64_t) limit;
+	return z > 0x3FF || z <= (float) (int32_t) limit;
 }
 
 // The mask's bits cleared, then the data put in as it is (the microcodes don't mask it).
