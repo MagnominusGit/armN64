@@ -74,6 +74,8 @@ struct Hle {
 	// The NoN microcodes (Star Fox 64's F3DEX, Ocarina of Time's F3DZEX) don't clip at the near
 	// plane: what lies in front of it is drawn, its depth held at the near end.
 	bool noNear;
+	// F3DZEX: G_BRANCH_Z tests the vertex's w, not its depth.
+	bool branchW;
 	// S2DEX: the 2D matrix (A to D, the offset in pixels, the base scales), the object render mode,
 	// the state words texture loads and G_SELECT_DL test, and G_RDPHALF_0's half of a selection.
 	float objA, objB, objC, objD, objX, objY, objBaseX, objBaseY;
@@ -1134,9 +1136,13 @@ static void viewport(struct N64* n, struct Hle* h, uint32_t a) {
 }
 
 // G_BRANCH_Z: whether the vertex's depth on screen (the viewport's 0-0x3FF range) is at most the
-// limit, which is in the same units, or past the far end (a vertex behind the eye too).
+// limit, which is in the same units, or past the far end (a vertex behind the eye too). F3DZEX's
+// limit is a distance, against the vertex's w.
 static bool branchZ(const struct Hle* h, int index, uint32_t limit) {
 	const struct Vertex* v = &h->v[index];
+	if (h->branchW) {
+		return v->w <= (float) (int32_t) limit;
+	}
 	float z = (v->w != 0 ? v->z / v->w : 0) * h->vscale[2] + h->vtrans[2];
 	return z > 0x3FF || z <= (float) (int32_t) limit;
 }
@@ -4798,6 +4804,7 @@ static void ucodeFlags(struct N64* n, struct Hle* h, uint32_t code, uint32_t dat
 	h->texa = name && !strncmp(name, "F3DTEX/A", 8);
 	h->am = name && !strncmp(name, "F3DAM", 5);
 	h->noNear = name && strstr(name, ".NoN");
+	h->branchW = name && !strncmp(name, "F3DZEX", 6);
 	h->cbfd = name && !strncmp(name, "F3DEXBG", 7);
 }
 
