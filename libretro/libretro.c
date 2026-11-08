@@ -175,7 +175,7 @@ static struct retro_core_option_v2_definition optionDefinitions[] = {
 	  NULL, "input", { { "50", "0.5x" }, { "60", "0.6x" }, { "70", "0.7x" }, { "80", "0.8x" }, { "90", "0.9x" }, { "100", "1.0x" }, { "110", "1.1x" }, { "120", "1.2x" }, { "130", "1.3x" }, { "140", "1.4x" }, { "150", "1.5x" }, { "160", "1.6x" }, { "170", "1.7x" }, { "180", "1.8x" }, { "190", "1.9x" }, { "200", "2.0x" }, { NULL, NULL } }, "100" },
 	{ "armn64_face_c", "C Buttons on Face Buttons", NULL,
 	  "Holding R2, the face buttons press the C buttons in their places. Not with the stick swaps that use R2 or with Dual Controllers.",
-	  NULL, "input", { { "disabled", "Off" }, { "enabled", "R2 + Face Buttons" }, { NULL, NULL } }, "disabled" },
+	  NULL, "input", { { "disabled", "Off" }, { "enabled", "R2 + Face Buttons" }, { NULL, NULL } }, "enabled" },
 	{ "armn64_control_swap", "Control Swap", NULL,
 	  "D-Pad / Left Stick: swaps the two (L1 is Z). Both Sticks: either stick moves the stick. Left / Right Stick: swaps the sticks (R2 is Z).",
 	  NULL, "input", { { "disabled", "Off" }, { "dpad", "D-Pad / Left Stick" }, { "both", "Both Sticks" }, { "sticks", "Left / Right Stick" }, { NULL, NULL } }, "disabled" },
