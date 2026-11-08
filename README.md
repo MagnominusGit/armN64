@@ -37,8 +37,10 @@ in Issues.
 - `tools/n64run.c` runs a ROM headless and writes the last picture.
 - `libretro/` the libretro core (`armn64_libretro`): a field each run, the VI's picture, the AI's
   samples at 44.1 kHz, controller 1 and the cartridge's save memory (EEPROM, then SRAM or flash).
-- `armulators/` the code shared with armGBA (submodule): the code generators, the libretro
-  core's helpers and the standalone app.
+- `armulators/` the code shared with armGBA (submodule), needed for the standalone app only.
+- `shared/` the Armulators files the core builds from, copied so the core builds without the
+  submodule: the code generators, the libretro core's helpers and the Pak manager's font (Inter,
+  OFL). `tools/check-shared.sh` compares them with the submodule after an update.
 - `app.cmake` and `app/` armN64's standalone app: Armulators' app with the core linked in, its
   names, systems, keys and icons, and its hooks. The GPU renderers draw in a GL context the app
   makes for the core, as RetroArch does.

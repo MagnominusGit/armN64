@@ -51,32 +51,34 @@ foreach(GLSL rdp_gpu vi_gpu)
 endforeach()
 target_include_directories(n64 PUBLIC src PRIVATE ${CMAKE_BINARY_DIR}/generated)
 find_package(Threads REQUIRED)
-# Code shared with armGBA: the code generators, and the libretro core's helpers.
-add_subdirectory(armulators)
-target_link_libraries(n64 m Threads::Threads ${CMAKE_DL_LIBS} armulators-emit)
+# What the core shares with Armulators, copied into shared/ (tools/check-shared.sh compares): the
+# code generators, the libretro core's helpers and the Pak manager's font.
+target_include_directories(n64 PRIVATE shared/emit)
+target_link_libraries(n64 m Threads::Threads ${CMAKE_DL_LIBS})
 
 add_executable(n64run tools/n64run.c)
 target_link_libraries(n64run n64)
 
 # The libretro core.
-# The Controller Pak manager's font (Armulators' Inter, OFL) as a C array.
-set(PAKS_FONT ${CMAKE_CURRENT_SOURCE_DIR}/armulators/app/fonts/Inter-Medium.otf)
+# The Controller Pak manager's font (Inter, OFL) as a C array.
+set(PAKS_FONT ${CMAKE_CURRENT_SOURCE_DIR}/shared/fonts/Inter-Medium.otf)
 add_custom_command(OUTPUT ${CMAKE_CURRENT_BINARY_DIR}/paks_font.inc
-	COMMAND ${CMAKE_COMMAND} -DFONTS=${PAKS_FONT} -DOUT=${CMAKE_CURRENT_BINARY_DIR}/paks_font.inc -P ${CMAKE_CURRENT_SOURCE_DIR}/armulators/app/fonts/embed.cmake
-	DEPENDS ${PAKS_FONT} ${CMAKE_CURRENT_SOURCE_DIR}/armulators/app/fonts/embed.cmake VERBATIM)
+	COMMAND ${CMAKE_COMMAND} -DFONTS=${PAKS_FONT} -DOUT=${CMAKE_CURRENT_BINARY_DIR}/paks_font.inc -P ${CMAKE_CURRENT_SOURCE_DIR}/shared/fonts/embed.cmake
+	DEPENDS ${PAKS_FONT} ${CMAKE_CURRENT_SOURCE_DIR}/shared/fonts/embed.cmake VERBATIM)
 set(PAKS_SOURCES libretro/paks.c ${CMAKE_CURRENT_BINARY_DIR}/paks_font.inc)
-set(PAKS_INCLUDES ${CMAKE_CURRENT_BINARY_DIR} ${CMAKE_CURRENT_SOURCE_DIR}/armulators/app)
+set(PAKS_INCLUDES ${CMAKE_CURRENT_BINARY_DIR} ${CMAKE_CURRENT_SOURCE_DIR}/shared)
 
-add_library(armn64_libretro SHARED libretro/libretro.c ${PAKS_SOURCES})
-target_include_directories(armn64_libretro PRIVATE ${PAKS_INCLUDES})
-target_link_libraries(armn64_libretro n64 armulators-libretro)
+add_library(armn64_libretro SHARED libretro/libretro.c shared/libretro/options.c ${PAKS_SOURCES})
+target_include_directories(armn64_libretro PRIVATE ${PAKS_INCLUDES} shared/libretro)
+target_link_libraries(armn64_libretro n64)
 set_target_properties(armn64_libretro PROPERTIES PREFIX "")
-target_link_options(armn64_libretro PRIVATE -Wl,--version-script=${ARMULATORS_LINK_SCRIPT} -Wl,--no-undefined)
+target_link_options(armn64_libretro PRIVATE -Wl,--version-script=${CMAKE_CURRENT_SOURCE_DIR}/shared/libretro/link.T -Wl,--no-undefined)
 
-# armn64, the standalone app: Armulators' (armulators/app) with the core linked in, named by
-# app.cmake, with its own rules from app/.
+# armn64, the standalone app: Armulators' (armulators/app, the only part that needs the submodule)
+# with the core linked in, named by app.cmake, with its own rules from app/.
 option(ARMN64_APP "Build armn64, the standalone SDL2 app" OFF)
 if(ARMN64_APP)
+	add_subdirectory(armulators)
 	armulators_app(armn64-app DESCRIPTOR ${CMAKE_CURRENT_SOURCE_DIR}/app.cmake
 		SOURCES libretro/libretro.c ${PAKS_SOURCES} app/hooks.c INCLUDES ${CMAKE_CURRENT_SOURCE_DIR}/libretro ${PAKS_INCLUDES} LIBS n64)
 endif()
