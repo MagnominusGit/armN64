@@ -163,7 +163,7 @@ static struct retro_core_option_v2_definition optionDefinitions[] = {
 	  NULL, "gl", { { "exact", "Exact" }, { "fast", "Fast" }, { NULL, NULL } }, "exact" },
 	{ "armn64_gl_precompile", "Shader Precompile", NULL,
 	  "Builds the shaders a game used before as it starts, with a progress bar, for fewer stutters while playing.",
-	  NULL, "gl", { { "disabled", "Off" }, { "enabled", "On" }, { NULL, NULL } }, "disabled" },
+	  NULL, "gl", { { "enabled", "On" }, { "disabled", "Off" }, { NULL, NULL } }, "enabled" },
 	{ "armn64_stick_gate", "Octagonal Stick Gate", NULL,
 	  "Shapes the stick's range like the N64 controller's octagonal gate instead of a circle.",
 	  NULL, "input", { { "disabled", "Off" }, { "enabled", "On" }, { NULL, NULL } }, "disabled" },

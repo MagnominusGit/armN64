@@ -67,7 +67,7 @@ GL, Resolution with GL or GPU, the custom crops with Crop Overscan Custom, and s
 | | Seal Edges | Off, On |
 | | Shader Accuracy | Accurate, Fast |
 | | Framebuffer Effects | Exact, Fast |
-| | Shader Precompile | Off, On |
+| | Shader Precompile | On, Off |
 | Input | Octagonal Stick Gate | Off, On |
 | | Stick Deadzone | Off, 5% to 30% |
 | | Stick Sensitivity | 1.0x, 0.5x to 2.0x |
