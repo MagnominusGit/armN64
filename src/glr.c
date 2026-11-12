@@ -2260,10 +2260,21 @@ bool glrDrew(struct N64* n, uint32_t addr, uint32_t len) {
 	return false;
 }
 
-// The framebuffer of the color image the VI shows from origin (rows rows, stride pixels a row, size
-// 2 or 3), when the GPU drew some of those rows since its pixels last went back to RDRAM: x and y
-// of the picture's first pixel in it. 0 otherwise: RDRAM has the picture.
-unsigned glrPicture(struct N64* n, uint32_t origin, uint32_t stride, int size, int rows, int* x, int* y) {
+// Where in a target the VI's picture starts, from origin's offset there. A picture that starts near a
+// row's end and runs past it starts left of the next row (an origin a few pixels before a row).
+static void pictureStart(uint32_t offset, uint32_t stride, uint32_t bytes, int width, int* x, int* y) {
+	*x = (int) (offset % (stride * bytes) / bytes);
+	*y = (int) (offset / (stride * bytes));
+	if (*x > (int) stride / 2 && *x + width > (int) stride) {
+		*x -= (int) stride;
+		++*y;
+	}
+}
+
+// The framebuffer of the color image the VI shows from origin (width by rows pixels, stride pixels a
+// row, size 2 or 3), when the GPU drew some of those rows since its pixels last went back to RDRAM:
+// x and y of the picture's first pixel in it. 0 otherwise: RDRAM has the picture.
+unsigned glrPicture(struct N64* n, uint32_t origin, uint32_t stride, int size, int width, int rows, int* x, int* y) {
 	struct Glr* g = n->glr;
 	uint32_t const bytes = size == 3 ? 4 : 2;
 	for (int i = 0; i < TARGETS; ++i) {
@@ -2271,14 +2282,15 @@ unsigned glrPicture(struct N64* n, uint32_t origin, uint32_t stride, int size, i
 		if (!t->texture || t->size != size || t->width != stride || t->dirtyTo <= t->dirtyFrom || origin < t->addr) {
 			continue;
 		}
-		uint32_t const offset = origin - t->addr, row = offset / (stride * bytes);
-		if ((int) row < t->dirtyFrom || (int) row + rows > t->dirtyTo) {
+		int col, row;
+		pictureStart(origin - t->addr, stride, bytes, width, &col, &row);
+		if (row < t->dirtyFrom || row + rows > t->dirtyTo) {
 			continue;
 		}
 		glesUse(g->gles);
 		flushBatch(n, g);
-		*x = (int) (offset % (stride * bytes) / bytes);
-		*y = (int) row;
+		*x = col;
+		*y = row;
 		resolve(g, t);
 		return t->framebuffer;
 	}
@@ -2289,20 +2301,21 @@ unsigned glrPicture(struct N64* n, uint32_t origin, uint32_t stride, int size, i
 		if (!t->texture || t->size != size || t->width != stride || t->dirtyTo <= t->dirtyFrom || origin < t->addr) {
 			continue;
 		}
-		uint32_t const offset = origin - t->addr, row = offset / (stride * bytes);
-		if ((int) row + rows > TARGET_ROWS || (int) row >= t->dirtyTo || (int) row + rows <= t->dirtyFrom) {
+		int col, row;
+		pictureStart(origin - t->addr, stride, bytes, width, &col, &row);
+		if (row + rows > TARGET_ROWS || row >= t->dirtyTo || row + rows <= t->dirtyFrom) {
 			continue;
 		}
 		glesUse(g->gles);
 		flushBatch(n, g);
-		if ((int) row < t->dirtyFrom) {
-			loadPixels(n, g, t, (int) row, t->dirtyFrom);
+		if (row < t->dirtyFrom) {
+			loadPixels(n, g, t, row, t->dirtyFrom);
 		}
-		if ((int) row + rows > t->dirtyTo) {
-			loadPixels(n, g, t, t->dirtyTo, (int) row + rows);
+		if (row + rows > t->dirtyTo) {
+			loadPixels(n, g, t, t->dirtyTo, row + rows);
 		}
-		*x = (int) (offset % (stride * bytes) / bytes);
-		*y = (int) row;
+		*x = col;
+		*y = row;
 		resolve(g, t);
 		return t->framebuffer;
 	}

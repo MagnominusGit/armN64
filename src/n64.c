@@ -705,9 +705,14 @@ bool n64GlPicture(struct N64* n, unsigned* framebuffer, int* x, int* y, int* wid
 	if (!n->glr || !viSetup(n, &s)) {
 		return false;
 	}
-	*framebuffer = glrPicture(n, s.origin, s.stride, s.wide ? 3 : 2, s.h, x, y);
+	*framebuffer = glrPicture(n, s.origin, s.stride, s.wide ? 3 : 2, s.w, s.h, x, y);
 	*width = s.w;
 	*height = s.h;
+	// Columns left of the framebuffer (the end of the row before) are left out
+	if (*x < 0) {
+		*width += *x;
+		*x = 0;
+	}
 	return *framebuffer != 0;
 }
 
