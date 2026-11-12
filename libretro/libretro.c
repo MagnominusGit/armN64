@@ -786,12 +786,15 @@ static void present(int width, int height, unsigned buffer) {
 	int const k = n64PictureScale(machine);
 	struct Crop const c = overscan(width, height, k);
 	int const w = width - c.left - c.right, h = height - c.top - c.bottom;
-	setGeometry(w, h);
+	// With the GL renderer, a picture from RDRAM goes out at its scale too: the frontend's picture
+	// keeps its size when a game shows one and then the other.
+	int const up = machine->glr && machine->glrScale > k ? machine->glrScale / k : 1;
+	setGeometry(w * up, h * up);
 	gl.BindFramebuffer(GL_READ_FRAMEBUFFER, presentFramebuffer);
 	gl.BindFramebuffer(GL_DRAW_FRAMEBUFFER, (unsigned) hw.get_current_framebuffer());
-	gl.BlitFramebuffer(c.left, c.top, c.left + w, c.top + h, 0, h, w, 0, GL_COLOR_BUFFER_BIT, GL_NEAREST);
+	gl.BlitFramebuffer(c.left, c.top, c.left + w, c.top + h, 0, h * up, w * up, 0, GL_COLOR_BUFFER_BIT, GL_NEAREST);
 	glrForget(machine);
-	videoRefresh(RETRO_HW_FRAME_BUFFER_VALID, (unsigned) w, (unsigned) h, 0);
+	videoRefresh(RETRO_HW_FRAME_BUFFER_VALID, (unsigned) (w * up), (unsigned) (h * up), 0);
 }
 
 // The GL renderer's picture from its framebuffer into the frontend's, upside down as GL keeps it, at
@@ -799,7 +802,11 @@ static void present(int width, int height, unsigned buffer) {
 static void presentGl(unsigned framebuffer, int x, int y, int width, int height) {
 	int const k = machine->glrScale;
 	gl.Disable(GL_SCISSOR_TEST);
-	struct Crop const c = overscan(width, height, k);
+	struct Crop c = overscan(width, height, k);
+	// Columns left of the framebuffer (a picture starting at the end of the row before) are cropped too
+	if (x * k + c.left < 0) {
+		c.left = -x * k;
+	}
 	int const w = width - c.left - c.right, h = height - c.top - c.bottom;
 	setGeometry(w, h);
 	gl.BindFramebuffer(GL_READ_FRAMEBUFFER, framebuffer);
