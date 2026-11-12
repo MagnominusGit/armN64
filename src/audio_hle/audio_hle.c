@@ -152,15 +152,15 @@ static ucode_func_t try_video_task_detection(struct hle_t* hle)
 }
 
 /* The audio task in DMEM (type 2), or a graphics task of re2.c's or hvqm.c's, run on dram when its microcode is
- * known; false leaves it alone. */
-static bool audioHleRun(struct N64* n, uint8_t* dram)
+ * known: the cycles its microcode takes. 0 leaves it alone. */
+static uint64_t audioHleRun(struct N64* n, uint8_t* dram)
 {
     uint32_t type = be32(&n->sp.mem[0xFC0]);
     if (type != 1 && type != 2) {
-        return false;
+        return 0;
     }
     if (!n->hleAudio && !(n->hleAudio = calloc(1, sizeof(struct hle_t)))) {
-        return false;
+        return 0;
     }
     struct hle_t* hle = n->hleAudio;
     hle->dram = dram;
@@ -173,11 +173,13 @@ static bool audioHleRun(struct N64* n, uint8_t* dram)
     }
     ucode_func_t run = type == 2 ? try_audio_task_detection(hle) : try_video_task_detection(hle);
     if (!run) {
-        return false;
+        return 0;
     }
     run(hle);
     hle_written(hle);
-    return true;
+    /* Video frames take their microcode's time on the RSP, which a game's threads wait out (its music
+     * stops when they end early). */
+    return run == &decode_video_frame_task ? 407600 : run == &fill_video_double_buffer_task ? 422900 : 4096;
 }
 
 /* armN64: the bytes of DRAM the task wrote last, for the machine (the RDP's pages, compiled code);
@@ -194,11 +196,12 @@ void hle_written(struct hle_t* hle)
 bool audioHle(struct N64* n)
 {
     bool graphics = be32(&n->sp.mem[0xFC0]) == 1;
-    if ((graphics && n->gfxRsp) || !audioHleRun(n, n->rdram)) {
+    uint64_t const time = graphics && n->gfxRsp ? 0 : audioHleRun(n, n->rdram);
+    if (!time) {
         return false;
     }
     n->stats.audioHleTasks += !graphics;
-    n->sp.hleDoneAt = n->cycles + 4096;
+    n->sp.hleDoneAt = n->cycles + time;
     return true;
 }
 
