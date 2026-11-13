@@ -125,7 +125,7 @@ static struct retro_core_option_v2_definition optionDefinitions[] = {
 	  NULL, "video", { { "gl", "GL (Fast, HD)" }, { "gpu", "GPU (Exact, HD)" }, { "cpu", "CPU (Exact, Native)" }, { NULL, NULL } }, "gl" },
 	{ "armn64_resolution", "Resolution", NULL,
 	  "GL and GPU drawing resolution. Auto fits the display with GL and is Native with GPU (exact only at Native). Applies on Restart.",
-	  NULL, "video", { { "auto", "Auto" }, { "1", "Native" }, { "2", "2x" }, { "3", "3x" }, { "4", "4x" }, { "5", "5x" }, { "6", "6x" }, { "7", "7x" }, { "8", "8x" }, { NULL, NULL } }, "auto" },
+	  NULL, "video", { { "auto", "Auto" }, { "1", "Native" }, { "2", "2x" }, { "3", "3x" }, { "4", "4x" }, { "5", "5x" }, { "6", "6x" }, { "7", "7x" }, { "8", "8x" }, { NULL, NULL } }, "2" },
 	{ "armn64_widescreen", "Widescreen", NULL,
 	  "16:9 and 16:10 draw more at the sides (Library graphics); things just off the 4:3 edges may be missing. Picture Only: for games' own wide modes.",
 	  NULL, "video", { { "disabled", "Off" }, { "16:9", "16:9" }, { "16:10", "16:10" }, { "16:9-picture", "16:9 Picture Only" }, { "16:10-picture", "16:10 Picture Only" }, { NULL, NULL } }, "disabled" },

@@ -56,7 +56,7 @@ GL, Resolution with GL or GPU, the custom crops with Crop Overscan Custom, and s
 | | Frame Skip (applies on restart) | Off, Auto, Every Other Frame |
 | | Expansion Pak (applies on restart) | On, Off |
 | Video | Renderer (applies on restart) | GL (Fast, HD), GPU (Exact, HD), CPU (Exact, Native) |
-| | Resolution (GL and GPU; applies on restart) | Auto, Native, 2x to 8x |
+| | Resolution (GL and GPU; applies on restart) | 2x, Auto, Native, 3x to 8x |
 | | Widescreen | Off, 16:9, 16:10, 16:9 Picture Only, 16:10 Picture Only |
 | | Aspect Ratio | Fill 4:3, TV 4:3, Square Pixels |
 | | Crop Overscan | On, Off, Custom |
