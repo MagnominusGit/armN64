@@ -55,6 +55,7 @@ struct Gl {
 	GLenum (*CheckFramebufferStatus)(GLenum);
 	void (*DeleteFramebuffers)(GLsizei, const GLuint*);
 	void (*GenRenderbuffers)(GLsizei, GLuint*);
+	void (*DeleteRenderbuffers)(GLsizei, const GLuint*);
 	void (*BindRenderbuffer)(GLenum, GLuint);
 	void (*RenderbufferStorage)(GLenum, GLenum, GLsizei, GLsizei);
 	void (*GenTextures)(GLsizei, GLuint*);
@@ -138,6 +139,10 @@ struct Target {
 	int marked;
 	// The CPU read back what the GPU drew in its first rows (READ_BACK_ROWS).
 	bool cpuReads;
+	// The rows its texture has: as many as the color image's primitives have reached (a multiple of
+	// 16, TARGET_ROWS at most), as a tiled GPU loads and stores all of them for each pass. Drawing
+	// still maps TARGET_ROWS rows, the ones past it clipped.
+	int height;
 };
 
 // What the fragment shader is made for.
@@ -218,8 +223,13 @@ struct Glr {
 	struct Gl gl;
 	struct Target target[TARGETS];
 	GLuint depth, vertexArray, vertexBuffer, vertexShader;
-	// The depth alone, to clear all of it: through a smaller color image only that much clears.
+	// The depth alone, to clear all of it: through a smaller color image only that much clears. Its
+	// size: as wide and tall as the targets and depth uploads so far (depthSize).
 	GLuint depthFramebuffer;
+	uint32_t depthWidth;
+	int depthRows;
+	// A target's taller texture, for its rows to be copied in (grow).
+	GLuint growFramebuffer;
 	// Multisampling (N64_GL_MSAA, with framebuffer fetch only): samples a pixel, the depth the targets'
 	// multisampled colors share, and the program that copies rows into one.
 	int samples;
@@ -342,7 +352,7 @@ static void resolve(struct Glr* g, struct Target* t) {
 		return;
 	}
 	struct Gl* gl = &g->gl;
-	int const w = (int) t->width * g->scale, h = TARGET_ROWS * g->scale;
+	int const w = (int) t->width * g->scale, h = t->height * g->scale;
 	useScissor(g, false, 0, 0, 0, 0);
 	gl->BindFramebuffer(GL_READ_FRAMEBUFFER, t->msaaFramebuffer);
 	gl->BindFramebuffer(GL_DRAW_FRAMEBUFFER, t->framebuffer);
@@ -430,7 +440,7 @@ static bool loadGl(struct Glr* g) {
 	struct Gl* gl = &g->gl;
 #define GLFN(name) (*(void**) &gl->name = glesProc(g->gles, "gl" #name), gl->name != NULL)
 	return GLFN(GenFramebuffers) && GLFN(BindFramebuffer) && GLFN(BlitFramebuffer) && GLFN(FramebufferTexture2D) && GLFN(FramebufferRenderbuffer) &&
-	       GLFN(CheckFramebufferStatus) && GLFN(DeleteFramebuffers) && GLFN(GenRenderbuffers) && GLFN(BindRenderbuffer) &&
+	       GLFN(CheckFramebufferStatus) && GLFN(DeleteFramebuffers) && GLFN(GenRenderbuffers) && GLFN(DeleteRenderbuffers) && GLFN(BindRenderbuffer) &&
 	       GLFN(RenderbufferStorage) && GLFN(GenTextures) && GLFN(DeleteTextures) && GLFN(BindTexture) && GLFN(ActiveTexture) &&
 	       GLFN(TexImage2D) && GLFN(TexSubImage2D) && GLFN(TexParameteri) && GLFN(Viewport) && GLFN(Scissor) && GLFN(Enable) &&
 	       GLFN(Disable) && GLFN(ClearColor) && GLFN(ClearDepthf) && GLFN(Clear) && GLFN(DepthFunc) && GLFN(DepthMask) &&
@@ -1230,6 +1240,87 @@ static void forgetRows(struct Glr* g, uint32_t addr, uint32_t len, struct Target
 	}
 }
 
+// A target's texture (and multisampled color) at its width and height, contents undefined.
+static void allocate(struct Glr* g, struct Target* t, uint32_t width) {
+	struct Gl* gl = &g->gl;
+	uploadTexture(g, t->texture);
+	gl->TexImage2D(GL_TEXTURE_2D, 0, GL_RGBA8, (GLsizei) width * g->scale, t->height * g->scale, 0, GL_RGBA, GL_UNSIGNED_BYTE, NULL);
+	if (g->samples && t->msaa) {
+		gl->BindRenderbuffer(GL_RENDERBUFFER, t->msaa);
+		gl->RenderbufferStorageMultisample(GL_RENDERBUFFER, g->samples, GL_RGBA8, (GLsizei) width * g->scale, t->height * g->scale);
+		t->unresolved = false;
+	}
+}
+
+// The depth the targets share made at least width by rows, as a tiled GPU loads and stores all of it
+// for each pass: a larger one at the far plane, with what the smaller one held.
+static void depthSize(struct N64* n, struct Glr* g, uint32_t width, int rows) {
+	if (width <= g->depthWidth && rows <= g->depthRows) {
+		return;
+	}
+	struct Gl* gl = &g->gl;
+	int const k = g->scale;
+	flushBatch(n, g);
+	uint32_t const w = width > g->depthWidth ? width : g->depthWidth;
+	int const h = rows > g->depthRows ? rows : g->depthRows;
+	GLuint fresh, framebuffer;
+	gl->GenRenderbuffers(1, &fresh);
+	gl->BindRenderbuffer(GL_RENDERBUFFER, fresh);
+	gl->RenderbufferStorage(GL_RENDERBUFFER, GL_DEPTH24_STENCIL8, (GLsizei) w * k, h * k);
+	gl->GenFramebuffers(1, &framebuffer);
+	gl->BindFramebuffer(GL_FRAMEBUFFER, framebuffer);
+	gl->FramebufferRenderbuffer(GL_FRAMEBUFFER, GL_DEPTH_STENCIL_ATTACHMENT, GL_RENDERBUFFER, fresh);
+	useScissor(g, false, 0, 0, 0, 0);
+	useDepthMask(g, true);
+	gl->ClearDepthf(1.0f);
+	gl->ClearStencil(0);
+	gl->Clear(GL_DEPTH_BUFFER_BIT | GL_STENCIL_BUFFER_BIT);
+	gl->BindFramebuffer(GL_READ_FRAMEBUFFER, g->depthFramebuffer);
+	gl->BlitFramebuffer(0, 0, (GLint) g->depthWidth * k, g->depthRows * k, 0, 0, (GLint) g->depthWidth * k, g->depthRows * k,
+	                    GL_DEPTH_BUFFER_BIT | GL_STENCIL_BUFFER_BIT, GL_NEAREST);
+	gl->DeleteFramebuffers(1, &framebuffer);
+	gl->DeleteRenderbuffers(1, &g->depth);
+	g->depth = fresh, g->depthWidth = w, g->depthRows = h;
+	gl->BindFramebuffer(GL_FRAMEBUFFER, g->depthFramebuffer);
+	gl->FramebufferRenderbuffer(GL_FRAMEBUFFER, GL_DEPTH_STENCIL_ATTACHMENT, GL_RENDERBUFFER, g->depth);
+	for (int i = 0; i < TARGETS; ++i) {
+		if (g->target[i].texture) {
+			gl->BindFramebuffer(GL_FRAMEBUFFER, g->target[i].framebuffer);
+			gl->FramebufferRenderbuffer(GL_FRAMEBUFFER, GL_DEPTH_STENCIL_ATTACHMENT, GL_RENDERBUFFER, g->depth);
+		}
+	}
+	memset(&g->applied, 0xFF, sizeof(g->applied));
+}
+
+// A target given more rows (a multiple of 16): its texture and multisampled color replaced by taller
+// ones, with what the GPU has in the rows it had.
+static void grow(struct N64* n, struct Glr* g, struct Target* t, int height) {
+	struct Gl* gl = &g->gl;
+	flushBatch(n, g);
+	resolve(g, t);
+	GLuint const old = t->texture;
+	int const w = (int) t->width * g->scale, h = t->height * g->scale;
+	gl->GenTextures(1, &t->texture);
+	t->height = height;
+	allocate(g, t, t->width);
+	gl->TexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_NEAREST);
+	gl->TexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_NEAREST);
+	if (!g->growFramebuffer) {
+		gl->GenFramebuffers(1, &g->growFramebuffer);
+	}
+	useScissor(g, false, 0, 0, 0, 0);
+	gl->BindFramebuffer(GL_DRAW_FRAMEBUFFER, g->growFramebuffer);
+	gl->FramebufferTexture2D(GL_DRAW_FRAMEBUFFER, GL_COLOR_ATTACHMENT0, GL_TEXTURE_2D, t->texture, 0);
+	gl->BindFramebuffer(GL_READ_FRAMEBUFFER, t->framebuffer);
+	gl->BlitFramebuffer(0, 0, w, h, 0, 0, w, h, GL_COLOR_BUFFER_BIT, GL_NEAREST);
+	gl->BindFramebuffer(GL_FRAMEBUFFER, t->framebuffer);
+	gl->FramebufferTexture2D(GL_FRAMEBUFFER, GL_COLOR_ATTACHMENT0, GL_TEXTURE_2D, t->texture, 0);
+	gl->DeleteTextures(1, &old);
+	memset(&g->applied, 0xFF, sizeof(g->applied));
+	pushRows(g, t, t->texture, 0, h / g->scale);
+	depthSize(n, g, t->width, height);
+}
+
 // The target for a color image, its texture loaded from RDRAM (rows) when the GPU last gave its
 // pixels back.
 static struct Target* target(struct N64* n, struct Glr* g, uint32_t addr, uint32_t width, int size, int rows) {
@@ -1241,6 +1332,8 @@ static struct Target* target(struct N64* n, struct Glr* g, uint32_t addr, uint32
 		}
 	}
 	struct Gl* gl = &g->gl;
+	rows = rows < 1 ? 1 : rows > TARGET_ROWS ? TARGET_ROWS : rows;
+	int const height = (rows + 15) & ~15;
 	if (!t) {
 		t = &g->target[0];
 		for (int i = 0; i < TARGETS; ++i) {
@@ -1260,15 +1353,18 @@ static struct Target* target(struct N64* n, struct Glr* g, uint32_t addr, uint32
 			gl->GenTextures(1, &t->texture);
 			gl->GenFramebuffers(1, &t->framebuffer);
 		}
-		uploadTexture(g, t->texture);
-		gl->TexImage2D(GL_TEXTURE_2D, 0, GL_RGBA8, (GLsizei) width * g->scale, TARGET_ROWS * g->scale, 0, GL_RGBA, GL_UNSIGNED_BYTE, NULL);
+		t->height = height;
+		allocate(g, t, width);
+		depthSize(n, g, width, height);
 		gl->TexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_NEAREST);
 		gl->TexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_NEAREST);
 		useFramebuffer(g, t->framebuffer);
 		gl->FramebufferTexture2D(GL_FRAMEBUFFER, GL_COLOR_ATTACHMENT0, GL_TEXTURE_2D, t->texture, 0);
 		gl->FramebufferRenderbuffer(GL_FRAMEBUFFER, GL_DEPTH_STENCIL_ATTACHMENT, GL_RENDERBUFFER, g->depth);
 		if (!g->depthReady) {
-			// The depth the targets share starts at the far plane, not as the driver left it.
+			// The depth the targets share starts at the far plane, not as the driver left it (all of
+			// it, through its own framebuffer: a target's may have fewer rows).
+			useFramebuffer(g, g->depthFramebuffer);
 			useScissor(g, false, 0, 0, 0, 0);
 			useDepthMask(g, true);
 			gl->ClearDepthf(1.0f);
@@ -1286,7 +1382,7 @@ static struct Target* target(struct N64* n, struct Glr* g, uint32_t addr, uint32
 				gl->GenFramebuffers(1, &t->msaaFramebuffer);
 			}
 			gl->BindRenderbuffer(GL_RENDERBUFFER, t->msaa);
-			gl->RenderbufferStorageMultisample(GL_RENDERBUFFER, g->samples, GL_RGBA8, (GLsizei) width * g->scale, TARGET_ROWS * g->scale);
+			gl->RenderbufferStorageMultisample(GL_RENDERBUFFER, g->samples, GL_RGBA8, (GLsizei) width * g->scale, t->height * g->scale);
 			useFramebuffer(g, t->msaaFramebuffer);
 			gl->FramebufferRenderbuffer(GL_FRAMEBUFFER, GL_COLOR_ATTACHMENT0, GL_RENDERBUFFER, t->msaa);
 			gl->FramebufferRenderbuffer(GL_FRAMEBUFFER, GL_DEPTH_STENCIL_ATTACHMENT, GL_RENDERBUFFER, g->msaaDepth);
@@ -1296,9 +1392,10 @@ static struct Target* target(struct N64* n, struct Glr* g, uint32_t addr, uint32
 		t->cpuReads = false;
 		t->loadedRows = 0;
 		t->dirtyFrom = t->dirtyTo = 0;
+	} else if (height > t->height) {
+		grow(n, g, t, height);
 	}
 	t->used = ++g->clock;
-	rows = rows > TARGET_ROWS ? TARGET_ROWS : rows;
 	// Another color image over these rows (the same address at another width, say): what it drew
 	// goes back to RDRAM first, and both load again from there.
 	uint32_t rowBytes = width * (size == 3 ? 4 : size == 1 ? 1 : 2), from = addr, to = addr + (uint32_t) rows * rowBytes;
@@ -1680,9 +1777,12 @@ static void flushBatch(struct N64* n, struct Glr* g) {
 			// The RDP's decal passes only within the depth slope either way (rdp.c, z mode 3): first
 			// the pixels no more than that in front marked, then those no more than that behind drawn.
 			if (++g->stencilRef > 255) {
+				// All of the stencil, through the depth's framebuffer (a target's may have fewer rows).
+				useFramebuffer(g, g->samples ? g->msaaDepthFramebuffer : g->depthFramebuffer);
 				useScissor(g, false, 0, 0, 0, 0);
 				gl->ClearStencil(0);
 				gl->Clear(GL_STENCIL_BUFFER_BIT);
+				useFramebuffer(g, drawTo(g, s->target));
 				useScissor(g, true, s->scissor[0], s->scissor[1], s->scissor[2] - s->scissor[0], s->scissor[3] - s->scissor[1]);
 				g->stencilRef = 1;
 			}
@@ -2149,6 +2249,7 @@ static void depthUpload(struct N64* n, struct Glr* g, int x0, int y0, int x1, in
 		return;
 	}
 	flushBatch(n, g);
+	depthSize(n, g, (uint32_t) x1, y1);
 	for (int y = 0; y < h; ++y) {
 		for (int x = 0; x < w; ++x) {
 			depth[y * w + x] = rdpDepthIn(n, g->zAddr, g->zWidth, x0 + x, y0 + y);
@@ -2574,6 +2675,9 @@ unsigned glrPicture(struct N64* n, uint32_t origin, uint32_t stride, int size, i
 		}
 		glesUse(g->gles);
 		flushBatch(n, g);
+		if (row + rows > t->height) {
+			grow(n, g, t, (row + rows + 15) & ~15);
+		}
 		if (row < t->dirtyFrom) {
 			loadPixels(n, g, t, row, t->dirtyFrom);
 		}
@@ -2723,7 +2827,8 @@ struct Glr* glrCreate(struct N64* n) {
 	n->glrScale = g->scale;
 	const char* seal = n->settings ? n->settings("N64_GL_SEAL") : getenv("N64_GL_SEAL");
 	g->seal = seal && *seal == '1' ? 0.5f / (float) g->scale : 0;
-	gl->RenderbufferStorage(GL_RENDERBUFFER, GL_DEPTH24_STENCIL8, 1024 * g->scale, TARGET_ROWS * g->scale);
+	gl->RenderbufferStorage(GL_RENDERBUFFER, GL_DEPTH24_STENCIL8, 16 * g->scale, 16 * g->scale);
+	g->depthWidth = 16, g->depthRows = 16;
 	gl->GenFramebuffers(1, &g->depthFramebuffer);
 	useFramebuffer(g, g->depthFramebuffer);
 	gl->FramebufferRenderbuffer(GL_FRAMEBUFFER, GL_DEPTH_STENCIL_ATTACHMENT, GL_RENDERBUFFER, g->depth);
