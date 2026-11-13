@@ -1153,6 +1153,45 @@ void rdpRectBounds(struct RDP* r, uint64_t w0, int* cx0, int* cy0, int* x0, int*
 	rectBounds(r, w0, cx0, cy0, x0, y0, x1, y1);
 }
 
+// Copy mode's texture rectangle for one kind of texel, as textureRect draws it: each pixel's texel
+// (no filter), held back by the alpha compare, written (into an 8-bit image from an 8-bit tile, the
+// texel's byte itself). The pixel left as the last one's is.
+static inline __attribute__((always_inline)) void copyRect(struct N64* n, struct RDP* r, int tile, int s0, int t0, int dsdx, int dtdy, bool flip,
+                                                           int cx0, int cy0, int x0, int y0, int x1, int y1, enum TexelKind kind) {
+	const struct Tile* tl = &r->tile[tile & 7];
+	bool const alphaTest = r->otherModes & 1, bytes = r->colorSize == 1 && tl->size == 1;
+	struct Color last = { 0 };
+	bool any = false;
+	for (int y = y0; y <= y1; ++y) {
+		if (!ownsRow(r, y)) {
+			continue;
+		}
+		for (int x = x0; x <= x1; ++x) {
+			int dx = x - cx0, dy = y - cy0;
+			int s = ((s0 << 5) + (flip ? dy * dsdx : dx * dsdx)) >> 5;
+			int t = ((t0 << 5) + (flip ? dx * dtdy : dy * dtdy)) >> 5;
+			struct Color c = sampleAs(r, tl, s, t, false, kind);
+			last = c, any = true;
+			if (alphaTest && c.a == 0) {
+				continue;
+			}
+			if (bytes) {
+				int f;
+				int ss = wrapCoord(s, tl->shiftS, tl->sl, tl->sh, tl->cmS, tl->maskS, &f);
+				int tt = wrapCoord(t0Coord(t0, flip ? dx : dy, dtdy), tl->shiftT, tl->tl, tl->th, tl->cmT, tl->maskT, &f);
+				uint32_t a = (tl->tmem * 8 + tt * tl->line * 8 + ss) ^ (tt & 1 ? 4 : 0);
+				n->rdram[(r->colorAddr + y * r->colorWidth + x) & (RDRAM_SIZE - 1)] = tmemByte(r, a);
+				continue;
+			}
+			writePixel(n, r, x, y, c);
+		}
+	}
+	if (any) {
+		r->pix = (struct Pixel) { 0 };
+		r->pix.tex0 = r->pix.tex1 = last;
+	}
+}
+
 static void textureRect(struct N64* n, struct RDP* r, uint64_t w0, uint64_t w1, bool flip, bool lastOnly) {
 	int tile = (w0 >> 24) & 7;
 	int s0 = (int16_t) (w1 >> 48), t0 = (int16_t) (w1 >> 32);
@@ -1164,6 +1203,17 @@ static void textureRect(struct N64* n, struct RDP* r, uint64_t w0, uint64_t w1, 
 	int cx0, cy0, x0, y0, x1, y1;
 	rectBounds(r, w0, &cx0, &cy0, &x0, &y0, &x1, &y1);
 	r->maxLevel = 0;
+	if (cycleType == 2 && !lastOnly) {
+		switch (texelKind(r, &r->tile[tile & 7])) {
+#define COPY_AS(kind) case kind: copyRect(n, r, tile, s0, t0, dsdx, dtdy, flip, cx0, cy0, x0, y0, x1, y1, kind); return;
+		COPY_AS(TK_I4) COPY_AS(TK_IA4) COPY_AS(TK_CI4) COPY_AS(TK_CI4_IA) COPY_AS(TK_I8) COPY_AS(TK_IA8) COPY_AS(TK_CI8)
+		COPY_AS(TK_CI8_IA) COPY_AS(TK_YUV16) COPY_AS(TK_IA16) COPY_AS(TK_CI16) COPY_AS(TK_CI16_IA) COPY_AS(TK_RGBA16)
+#undef COPY_AS
+		default:
+			copyRect(n, r, tile, s0, t0, dsdx, dtdy, flip, cx0, cy0, x0, y0, x1, y1, TK_RGBA32);
+			return;
+		}
+	}
 	bool doLod = cycleType < 2 && (((r->otherModes >> 48) & 1) || lodFracUsed(r));
 	for (int y = lastOnly ? y1 : y0; y <= y1; ++y) {
 		if (!lastOnly && !ownsRow(r, y)) {
