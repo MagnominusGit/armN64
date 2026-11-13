@@ -1461,9 +1461,17 @@ static void reject(struct Hle* h) {
 	h->rejectedNow = true;
 }
 
-static int family(struct N64* n, uint32_t code, uint32_t data, uint32_t size);
-static bool isFlx(struct N64* n, uint32_t code, uint32_t data, uint32_t size);
-static void ucodeFlags(struct N64* n, struct Hle* h, uint32_t code, uint32_t data, uint32_t size);
+// What a microcode's name makes of it (family, isFlx, ucodeFlags), kept for later tasks and loads of
+// the same code and data while their bytes stay the same.
+struct UcodeSeen {
+	uint32_t code, data, size;
+	int family;
+	bool flx, lines, texa, am, noNear, branchW, cbfd;
+	uint8_t bytes[0x1000 + 1024];
+};
+
+static const struct UcodeSeen* ucodeSeen(struct N64* n, uint32_t code, uint32_t data, uint32_t size);
+static void useUcode(struct Hle* h, const struct UcodeSeen* s);
 static void ucodeName(struct N64* n, uint32_t code, uint32_t data, uint32_t dataSize, char* out, size_t size);
 
 // G_LOAD_UCODE: the list goes on in another microcode (its data named by G_RDPHALF_1); F3DEX's takes
@@ -1476,9 +1484,9 @@ static bool loadMicrocode(struct N64* n, struct Hle* h, uint32_t code, uint32_t 
 		h->cbfdAdvanced = true;
 		return true;
 	}
-	int f = family(n, address(h, code), address(h, h->half1), dataSize);
-	h->flx = isFlx(n, address(h, code), address(h, h->half1), dataSize);
-	ucodeFlags(n, h, address(h, code), address(h, h->half1), dataSize);
+	const struct UcodeSeen* seen = ucodeSeen(n, address(h, code), address(h, h->half1), dataSize);
+	int f = seen->family;
+	useUcode(h, seen);
 	if (f == FAMILY_NONE) {
 		char name[40];
 		ucodeName(n, address(h, code), address(h, h->half1), dataSize, name, sizeof(name));
@@ -4799,16 +4807,16 @@ void hleUcodeName(struct N64* n, char* out, size_t size) {
 }
 
 // The line microcodes, F3DTEX/A and F3DAM, by name.
-static void ucodeFlags(struct N64* n, struct Hle* h, uint32_t code, uint32_t data, uint32_t size) {
+static void ucodeFlags(struct N64* n, struct UcodeSeen* s, uint32_t code, uint32_t data, uint32_t size) {
 	char text[48];
 	ucodeName(n, code, data, size, text, sizeof(text));
 	const char* name = gfxName(text);
-	h->lines = name && !strncmp(name, "L3DEX", 5);
-	h->texa = name && !strncmp(name, "F3DTEX/A", 8);
-	h->am = name && !strncmp(name, "F3DAM", 5);
-	h->noNear = name && strstr(name, ".NoN");
-	h->branchW = name && !strncmp(name, "F3DZEX", 6);
-	h->cbfd = name && !strncmp(name, "F3DEXBG", 7);
+	s->lines = name && !strncmp(name, "L3DEX", 5);
+	s->texa = name && !strncmp(name, "F3DTEX/A", 8);
+	s->am = name && !strncmp(name, "F3DAM", 5);
+	s->noNear = name && strstr(name, ".NoN");
+	s->branchW = name && !strncmp(name, "F3DZEX", 6);
+	s->cbfd = name && !strncmp(name, "F3DEXBG", 7);
 }
 
 static bool isFlx(struct N64* n, uint32_t code, uint32_t data, uint32_t size) {
@@ -4816,6 +4824,52 @@ static bool isFlx(struct N64* n, uint32_t code, uint32_t data, uint32_t size) {
 	ucodeName(n, code, data, size, text, sizeof(text));
 	const char* name = gfxName(text);
 	return name && !strncmp(name, "F3DFLX", 6);
+}
+
+static int family(struct N64* n, uint32_t code, uint32_t data, uint32_t size);
+
+static bool sameBytes(const struct N64* n, uint32_t addr, const uint8_t* bytes, uint32_t length) {
+	addr &= RDRAM_SIZE - 1;
+	if (addr + length <= RDRAM_SIZE) {
+		return !memcmp(&n->rdram[addr], bytes, length);
+	}
+	for (uint32_t i = 0; i < length; ++i) {
+		if (n->rdram[(addr + i) & (RDRAM_SIZE - 1)] != bytes[i]) {
+			return false;
+		}
+	}
+	return true;
+}
+
+static const struct UcodeSeen* ucodeSeen(struct N64* n, uint32_t code, uint32_t data, uint32_t size) {
+	static _Thread_local struct UcodeSeen seen[4];
+	static _Thread_local int count, next;
+	uint32_t const length = size < 0x1000 ? size : 0x1000;
+	for (int i = 0; i < count; ++i) {
+		struct UcodeSeen* s = &seen[i];
+		if (s->code == code && s->data == data && s->size == size && sameBytes(n, data, s->bytes, length) &&
+		    sameBytes(n, code, s->bytes + length, 1024)) {
+			return s;
+		}
+	}
+	struct UcodeSeen* s = &seen[next];
+	next = (next + 1) % 4, count += count < 4;
+	s->code = code, s->data = data, s->size = size;
+	for (uint32_t i = 0; i < length; ++i) {
+		s->bytes[i] = n->rdram[(data + i) & (RDRAM_SIZE - 1)];
+	}
+	for (uint32_t i = 0; i < 1024; ++i) {
+		s->bytes[length + i] = n->rdram[(code + i) & (RDRAM_SIZE - 1)];
+	}
+	s->family = family(n, code, data, size);
+	s->flx = isFlx(n, code, data, size);
+	ucodeFlags(n, s, code, data, size);
+	return s;
+}
+
+static void useUcode(struct Hle* h, const struct UcodeSeen* s) {
+	h->flx = s->flx, h->lines = s->lines, h->texa = s->texa, h->am = s->am, h->noNear = s->noNear, h->branchW = s->branchW,
+	h->cbfd = s->cbfd;
 }
 
 static int family(struct N64* n, uint32_t code, uint32_t data, uint32_t size) {
@@ -5263,7 +5317,8 @@ bool hleGraphics(struct N64* n, bool dry) {
 		return false;
 	}
 	uint32_t data = be32(task + 0x18) & 0xFFFFFF, dataSize = be32(task + 0x1C);
-	int f = family(n, code, data, dataSize);
+	const struct UcodeSeen* seen = ucodeSeen(n, code, data, dataSize);
+	int f = seen->family;
 	// Perfect Dark's microcode has no name: it is known by its code.
 	if (f == FAMILY_NONE && ucode == 0xB0811E2Fu) {
 		f = FAMILY_F3DPD;
@@ -5332,9 +5387,8 @@ bool hleGraphics(struct N64* n, bool dry) {
 		gbStart(n, h);
 		return true;
 	}
-	h->flx = isFlx(n, code, data, dataSize);
+	useUcode(h, seen);
 	h->wrus = wrus;
-	ucodeFlags(n, h, code, data, dataSize);
 	h->cbfdAdvanced = false;
 	h->dkr = dkr, h->jfg = ucode == 0x26EDE132u;
 	h->dkrBillboard = false, h->dkrVertex = 0, h->dkrMtxOffset = h->dkrVtxOffset = h->dkrTexTable = 0;
