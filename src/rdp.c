@@ -2367,10 +2367,7 @@ void rdpWaitFor(struct N64* n, uint32_t addr, uint32_t len) {
 		return;
 	}
 	if (n->glr) {
-		if (n->rdpPending && glrDrew(n, addr, len)) {
-			glrSync(n);
-		}
-		glrWritten(n, addr, len);
+		glrTouched(n, addr, len, true);
 		return;
 	}
 	struct Renderers* all = n->rdp ? n->rdp->renderers : NULL;
@@ -2391,9 +2388,7 @@ void rdpWaitRead(struct N64* n, uint32_t addr, uint32_t len) {
 		return;
 	}
 	if (n->glr) {
-		if (n->rdpPending && glrDrew(n, addr, len)) {
-			glrSync(n);
-		}
+		glrTouched(n, addr, len, false);
 		return;
 	}
 	rdpWaitDrawn(n, addr, len);

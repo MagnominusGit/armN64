@@ -1187,6 +1187,30 @@ static void loadPixels(struct N64* n, struct Glr* g, struct Target* t, int from,
 
 static void flushBatch(struct N64* n, struct Glr* g);
 
+// The pages of RDRAM [addr, addr + len) wait for the GPU (rdpWaitFor) or no longer do.
+static void markPages(struct N64* n, uint32_t addr, uint32_t len, bool wait) {
+	uint32_t const first = (addr & (RDRAM_SIZE - 1)) >> 12, last = ((addr + len - 1) & (RDRAM_SIZE - 1)) >> 12;
+	for (uint32_t p = first;; p = (p + 1) & ((RDRAM_SIZE >> 12) - 1)) {
+		n->pageFlags[p] = wait ? n->pageFlags[p] | PAGE_RDP_WRITES : n->pageFlags[p] & ~PAGE_RDP;
+		if (p == last) {
+			break;
+		}
+	}
+}
+
+// RDRAM [addr, addr + len) changed under the targets (but keep): their rows there load from it again.
+static void forgetRows(struct Glr* g, uint32_t addr, uint32_t len, struct Target* keep) {
+	for (int i = 0; i < TARGETS; ++i) {
+		struct Target* t = &g->target[i];
+		uint32_t const row = t->width * (t->size == 3 ? 4 : t->size == 1 ? 1 : 2);
+		if (t == keep || !t->texture || !row || addr + len <= t->addr || addr >= t->addr + (uint32_t) t->loadedRows * row) {
+			continue;
+		}
+		int const first = addr > t->addr ? (int) ((addr - t->addr) / row) : 0;
+		t->loadedRows = first < t->loadedRows ? first : t->loadedRows;
+	}
+}
+
 // The target for a color image, its texture loaded from RDRAM (rows) when the GPU last gave its
 // pixels back.
 static struct Target* target(struct N64* n, struct Glr* g, uint32_t addr, uint32_t width, int size, int rows) {
@@ -1290,6 +1314,7 @@ static void writePixels(struct N64* n, struct Target* t, int from, int to) {
 	uint32_t start = t->addr + (uint32_t) from * t->width * bytes;
 	// First, as it may give back another target's rows (through g->image).
 	n64RdramWrite(n, start & (RDRAM_SIZE - 1), (uint32_t) (to - from) * t->width * bytes);
+	forgetRows(g, start, (uint32_t) (to - from) * t->width * bytes, t);
 	if (g->scale > 1) {
 		blitRows(g, t, from, to, false);
 	} else {
@@ -1833,14 +1858,7 @@ static bool drawRows(struct N64* n, struct Glr* g, struct RDP* r, int rows, int 
 	}
 	// Reads and writes of the pages of the rows drawn wait for the GPU (rdpWaitFor).
 	if (t->marked < t->dirtyTo) {
-		uint32_t bytes = r->colorSize == 3 ? 4 : r->colorSize == 1 ? 1 : 2;
-		uint32_t first = (r->colorAddr & (RDRAM_SIZE - 1)) >> 12, last = ((r->colorAddr + (uint32_t) t->dirtyTo * r->colorWidth * bytes - 1) & (RDRAM_SIZE - 1)) >> 12;
-		for (uint32_t p = first;; p = (p + 1) & ((RDRAM_SIZE >> 12) - 1)) {
-			n->pageFlags[p] |= PAGE_RDP_WRITES;
-			if (p == last) {
-				break;
-			}
-		}
+		markPages(n, r->colorAddr, (uint32_t) t->dirtyTo * r->colorWidth * (r->colorSize == 3 ? 4 : r->colorSize == 1 ? 1 : 2), true);
 		t->marked = t->dirtyTo;
 	}
 	n->rdpPending = true;
@@ -2296,11 +2314,14 @@ static void draw(struct N64* n, struct RDP* r, const uint64_t* w, int op) {
 		return;
 	}
 	if (r->colorSize == 1) {
-		// 8-bit images (masks programs read back, Blast Corps'): the RDP's own pixels.
+		// 8-bit images (masks programs read back, Blast Corps', Conker's): the RDP's own pixels, after
+		// the GPU's rows there go back, and before targets there load them again.
+		uint32_t const lo = r->colorAddr, len = r->colorWidth * (uint32_t) ((r->scissorY1 + 3) >> 2);
 		if (n->rdpPending) {
-			glrSync(n);
+			glrSyncRange(n, lo, len);
 		}
 		rdpDrawSoftware(n, r, w, op);
+		forgetRows(g, lo, len, NULL);
 		return;
 	}
 	if (op >= 0x08 && op <= 0x0F) {
@@ -2415,6 +2436,45 @@ void glrDraw(struct N64* n, struct RDP* r, const uint64_t* w, int op) {
 	if (n->glr->chained && (triangle || op == 0x24 || op == 0x25) && r->cycleType < 2 && r->colorSize != 1 &&
 	    !((triangle || op == 0x24 || op == 0x25) && r->zAddr && r->colorAddr == r->zAddr && r->colorSize == 2)) {
 		rdpLastCombined(n, r, w, op);
+	}
+}
+
+// RDRAM [addr, addr + len) about to be read or written by the CPU or a DMA: each target that drew
+// there gives its rows back, the others stay on the GPU; for a write, the rows there load again and
+// what of the depth image it covers goes into the GPU's depth before the next draw.
+void glrTouched(struct N64* n, uint32_t addr, uint32_t len, bool write) {
+	struct Glr* g = n->glr;
+	bool gave = false;
+	for (int i = 0; n->rdpPending && i < TARGETS; ++i) {
+		struct Target* t = &g->target[i];
+		uint32_t const row = t->width * (t->size == 3 ? 4 : t->size == 1 ? 1 : 2);
+		uint32_t const from = t->addr + (uint32_t) t->dirtyFrom * row, to = t->addr + (uint32_t) t->dirtyTo * row;
+		if (!t->texture || t->dirtyTo <= t->dirtyFrom || addr >= to || addr + len <= from) {
+			continue;
+		}
+		glesUse(g->gles);
+		flushBatch(n, g);
+		g->fastValid = false;
+		++n->stats.glSyncs;
+		int const rows = t->marked > t->dirtyTo ? t->marked : t->dirtyTo;
+		markPages(n, t->addr, (uint32_t) rows * row, false);
+		writePixels(n, t, t->dirtyFrom, t->dirtyTo);
+		t->dirtyFrom = t->dirtyTo = 0;
+		// Its pages no longer wait, so RDRAM may change unseen before the GPU draws here again.
+		t->loadedRows = 0;
+		t->marked = 0;
+		gave = true;
+	}
+	// The pages it shared with targets still drawing wait again.
+	for (int i = 0; gave && i < TARGETS; ++i) {
+		struct Target* t = &g->target[i];
+		if (t->texture && t->marked) {
+			markPages(n, t->addr, (uint32_t) t->marked * t->width * (t->size == 3 ? 4 : t->size == 1 ? 1 : 2), true);
+		}
+	}
+	if (write) {
+		forgetRows(g, addr, len, NULL);
+		glrWritten(n, addr, len);
 	}
 }
 
@@ -2576,14 +2636,7 @@ void glrSync(struct N64* n) {
 		struct Target* t = &g->target[i];
 		int rows = t->marked > t->dirtyTo ? t->marked : t->dirtyTo;
 		if (t->texture && rows) {
-			uint32_t bytes = t->size == 3 ? 4 : t->size == 1 ? 1 : 2;
-			uint32_t first = (t->addr & (RDRAM_SIZE - 1)) >> 12, last = ((t->addr + (uint32_t) rows * t->width * bytes - 1) & (RDRAM_SIZE - 1)) >> 12;
-			for (uint32_t p = first;; p = (p + 1) & ((RDRAM_SIZE >> 12) - 1)) {
-				n->pageFlags[p] &= ~PAGE_RDP;
-				if (p == last) {
-					break;
-				}
-			}
+			markPages(n, t->addr, (uint32_t) rows * t->width * (t->size == 3 ? 4 : t->size == 1 ? 1 : 2), false);
 		}
 		if (t->texture && t->dirtyTo > t->dirtyFrom) {
 			writePixels(n, t, t->dirtyFrom, t->dirtyTo);
