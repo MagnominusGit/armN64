@@ -134,6 +134,9 @@ bool glrDrew(struct N64*, uint32_t addr, uint32_t len);
 bool glrFastEffects(struct N64*);
 bool glrShows(struct N64*, uint32_t origin);
 void glrSyncRange(struct N64*, uint32_t addr, uint32_t len);
+// RDRAM about to be written by the CPU or a DMA: what of the depth image it covers goes into the GPU's
+// depth before the next draw.
+void glrWritten(struct N64*, uint32_t addr, uint32_t len);
 unsigned glrPicture(struct N64*, uint32_t origin, uint32_t stride, int size, int width, int rows, int* x, int* y);
 // The RDP's own drawing of a primitive, into RDRAM.
 void rdpDrawSoftware(struct N64*, struct RDP*, const uint64_t* w, int op);
@@ -145,6 +148,8 @@ bool rdpTexelsUsed(const struct RDP*);
 void rdpLastCombined(struct N64*, struct RDP*, const uint64_t* w, int op);
 // The depth image's depth at a pixel, 0 to 1.
 float rdpDepthAt(struct N64*, struct RDP*, int x, int y);
+// The same in the depth image at zAddr, width pixels a row.
+float rdpDepthIn(struct N64*, uint32_t zAddr, uint32_t width, int x, int y);
 
 // The RGBA8 texels (red in the low byte) of a tile's first w x h, as the samplers read TMEM.
 void rdpTileImage(struct RDP*, int tile, int w, int h, bool convert, uint32_t* out);

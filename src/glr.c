@@ -23,7 +23,7 @@ typedef intptr_t GLsizeiptr;
 typedef unsigned char GLboolean;
 
 enum {
-	GL_TEXTURE_2D = 0x0DE1, GL_RGBA = 0x1908, GL_RGBA8 = 0x8058, GL_UNSIGNED_BYTE = 0x1401, GL_UNSIGNED_INT = 0x1405, GL_FLOAT = 0x1406,
+	GL_TEXTURE_2D = 0x0DE1, GL_RGBA = 0x1908, GL_RGBA8 = 0x8058, GL_UNSIGNED_BYTE = 0x1401, GL_UNSIGNED_INT = 0x1405, GL_FLOAT = 0x1406, GL_R32F = 0x822E, GL_RED = 0x1903,
 	GL_FRAMEBUFFER = 0x8D40, GL_READ_FRAMEBUFFER = 0x8CA8, GL_DRAW_FRAMEBUFFER = 0x8CA9, GL_COLOR_ATTACHMENT0 = 0x8CE0, GL_DEPTH_ATTACHMENT = 0x8D00, GL_RENDERBUFFER = 0x8D41,
 	GL_DEPTH_COMPONENT24 = 0x81A6, GL_FRAMEBUFFER_COMPLETE = 0x8CD5, GL_DEPTH_STENCIL_ATTACHMENT = 0x821A, GL_DEPTH24_STENCIL8 = 0x88F0,
 	GL_STENCIL_TEST = 0x0B90, GL_EXTENSIONS = 0x1F03, GL_MAX_TEXTURE_SIZE = 0x0D33, GL_MAX_RENDERBUFFER_SIZE = 0x84E8, GL_STENCIL_BUFFER_BIT = 0x400, GL_KEEP = 0x1E00, GL_REPLACE = 0x1E01, GL_EQUAL = 0x202, GL_GEQUAL = 0x206,
@@ -225,6 +225,15 @@ struct Glr {
 	GLint pushSource, pushScale;
 	// Drawing a triangle into the depth image (depthTriangle).
 	bool depthImage;
+	// The depth image (zWidth pixels a row at zAddr, zRows rows): what the RDP's rectangles, the CPU or
+	// a DMA wrote there since the GPU's depth took it (x0, y0, x1, y1 of zRect: Resident Evil 2's
+	// backgrounds) goes into the GPU's depth before the next draw. Its pages are marked for the writes to
+	// be seen (again once a picture, zMark). The program that writes it.
+	bool zForce, zMark;
+	uint32_t zAddr, zWidth;
+	int zRows, zRect[4];
+	GLuint zProgram, zTexture;
+	GLint zSource, zParams;
 	// A program read COMBINED where it is the previous pixel's: from then on each primitive's last
 	// pixel is combined in software for the next (rdpLastCombined).
 	bool chained;
@@ -2052,6 +2061,155 @@ static int rawCorners(const struct RDP* r, const uint64_t* w, int op, struct Glr
 	#undef SPLIT
 }
 
+// The program that writes depth from RDRAM (depthUpload): each pixel at scale its depth image pixel's,
+// from origin on.
+static void depthProgram(struct Glr* g) {
+	static const char vertex[] =
+		"#version 300 es\n"
+		"void main() {\n"
+		"	vec2 p = vec2(float(gl_VertexID & 1), float(gl_VertexID >> 1));\n"
+		"	gl_Position = vec4(p * 2.0 - 1.0, 0.0, 1.0);\n"
+		"}\n";
+	static const char fragment[] =
+		"#version 300 es\n"
+		"precision highp float;\n"
+		"uniform highp sampler2D uDepth;\n"
+		"uniform ivec4 uParams;\n"
+		"void main() {\n"
+		"	gl_FragDepth = texelFetch(uDepth, ivec2(gl_FragCoord.xy) / uParams.z - uParams.xy, 0).r;\n"
+		"}\n";
+	struct Gl* gl = &g->gl;
+	GLuint vs = compile(g, GL_VERTEX_SHADER, vertex), fs = compile(g, GL_FRAGMENT_SHADER, fragment);
+	GLint ok = 0;
+	if (vs && fs) {
+		g->zProgram = gl->CreateProgram();
+		gl->AttachShader(g->zProgram, vs);
+		gl->AttachShader(g->zProgram, fs);
+		gl->LinkProgram(g->zProgram);
+		gl->GetProgramiv(g->zProgram, GL_LINK_STATUS, &ok);
+	}
+	if (vs) {
+		gl->DeleteShader(vs);
+	}
+	if (fs) {
+		gl->DeleteShader(fs);
+	}
+	if (!ok) {
+		g->zProgram = 0;
+		return;
+	}
+	g->zSource = gl->GetUniformLocation(g->zProgram, "uDepth");
+	g->zParams = gl->GetUniformLocation(g->zProgram, "uParams");
+}
+
+// Pixels x0, y0 to x1, y1 (not included) of the depth image in RDRAM into the GPU's depth.
+static void depthUpload(struct N64* n, struct Glr* g, int x0, int y0, int x1, int y1) {
+	int const w = x1 - x0, h = y1 - y0;
+	float* depth = malloc((size_t) w * (size_t) h * sizeof(float));
+	if (!depth) {
+		return;
+	}
+	flushBatch(n, g);
+	for (int y = 0; y < h; ++y) {
+		for (int x = 0; x < w; ++x) {
+			depth[y * w + x] = rdpDepthIn(n, g->zAddr, g->zWidth, x0 + x, y0 + y);
+		}
+	}
+	struct Gl* gl = &g->gl;
+	int const k = g->scale;
+	gl->ActiveTexture(GL_TEXTURE0);
+	if (!g->zTexture) {
+		gl->GenTextures(1, &g->zTexture);
+		gl->BindTexture(GL_TEXTURE_2D, g->zTexture);
+		gl->TexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_NEAREST);
+		gl->TexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_NEAREST);
+	}
+	gl->BindTexture(GL_TEXTURE_2D, g->zTexture);
+	gl->TexImage2D(GL_TEXTURE_2D, 0, GL_R32F, w, h, 0, GL_RED, GL_FLOAT, depth);
+	free(depth);
+	GLuint const framebuffers[2] = { g->depthFramebuffer, g->samples ? g->msaaDepthFramebuffer : 0 };
+	for (int i = 0; i < 2 && framebuffers[i]; ++i) {
+		gl->BindFramebuffer(GL_FRAMEBUFFER, framebuffers[i]);
+		gl->Viewport(0, 0, 1024 * k, TARGET_ROWS * k);
+		gl->Enable(GL_SCISSOR_TEST);
+		gl->Scissor(x0 * k, y0 * k, w * k, h * k);
+		gl->Enable(GL_DEPTH_TEST);
+		gl->DepthFunc(GL_ALWAYS);
+		gl->DepthMask(1);
+		gl->Disable(GL_BLEND);
+		gl->Disable(GL_POLYGON_OFFSET_FILL);
+		gl->ColorMask(0, 0, 0, 0);
+		gl->UseProgram(g->zProgram);
+		gl->Uniform1i(g->zSource, 0);
+		int const params[4] = { x0, y0, k, 0 };
+		gl->Uniform4iv(g->zParams, 1, params);
+		gl->DrawArrays(5, 0, 4);
+	}
+	gl->ColorMask(1, 1, 1, 1);
+	memset(&g->applied, 0xFF, sizeof(g->applied));
+}
+
+// Pixels x0, y0 to x1, y1 (not included) of the depth image are to go into the GPU's depth.
+static void depthWritten(struct Glr* g, int x0, int y0, int x1, int y1) {
+	x0 = x0 > 0 ? x0 : 0, y0 = y0 > 0 ? y0 : 0;
+	x1 = x1 < (int) g->zWidth ? x1 : (int) g->zWidth, y1 = y1 < g->zRows ? y1 : g->zRows;
+	if (x1 <= x0 || y1 <= y0) {
+		return;
+	}
+	if (!g->zForce) {
+		g->zRect[0] = x0, g->zRect[1] = y0, g->zRect[2] = x1, g->zRect[3] = y1;
+		g->zForce = true;
+		return;
+	}
+	g->zRect[0] = x0 < g->zRect[0] ? x0 : g->zRect[0], g->zRect[1] = y0 < g->zRect[1] ? y0 : g->zRect[1];
+	g->zRect[2] = x1 > g->zRect[2] ? x1 : g->zRect[2], g->zRect[3] = y1 > g->zRect[3] ? y1 : g->zRect[3];
+}
+
+// Before a draw: a new depth image (or a taller one) goes into the GPU's depth whole, its pages are
+// marked, and what was written there since goes in.
+static void depthFromRdram(struct N64* n, struct Glr* g, struct RDP* r) {
+	int const rows = (int) ((r->scissorY1 + 3) >> 2) < TARGET_ROWS ? (int) ((r->scissorY1 + 3) >> 2) : TARGET_ROWS;
+	if (!g->zProgram || !r->zAddr || !r->colorWidth || r->colorWidth > 1024 || rows <= 0) {
+		return;
+	}
+	if (g->zAddr != r->zAddr || g->zWidth != r->colorWidth || rows > g->zRows) {
+		g->zAddr = r->zAddr, g->zWidth = r->colorWidth, g->zRows = rows;
+		g->zForce = false, g->zMark = true;
+		depthWritten(g, 0, 0, (int) g->zWidth, g->zRows);
+	}
+	if (g->zMark) {
+		g->zMark = false;
+		uint32_t const first = (g->zAddr & (RDRAM_SIZE - 1)) >> 12, last = ((g->zAddr + g->zWidth * (uint32_t) g->zRows * 2 - 1) & (RDRAM_SIZE - 1)) >> 12;
+		for (uint32_t p = first;; p = (p + 1) & ((RDRAM_SIZE >> 12) - 1)) {
+			n->pageFlags[p] |= PAGE_RDP_WRITES;
+			if (p == last) {
+				break;
+			}
+		}
+	}
+	if (g->zForce) {
+		g->zForce = false;
+		depthUpload(n, g, g->zRect[0], g->zRect[1], g->zRect[2], g->zRect[3]);
+	}
+}
+
+// A rectangle into the depth image (Resident Evil 2 copies its backgrounds' depth there): in RDRAM as
+// the RDP draws it, and into the GPU's depth before the next draw.
+static void depthRectangle(struct N64* n, struct Glr* g, struct RDP* r, const uint64_t* w, int op) {
+	rdpDrawSoftware(n, r, w, op);
+	int x0, y0, x1, y1;
+	if (op == 0x36) {
+		uint64_t const c = w[0];
+		x1 = (int) ((c >> 44) & 0xFFF) >> 2, y1 = (int) ((c >> 32) & 0xFFF) >> 2, x0 = (int) ((c >> 12) & 0xFFF) >> 2, y0 = (int) (c & 0xFFF) >> 2;
+	} else {
+		int cx0, cy0;
+		rdpRectBounds(r, w[0], &cx0, &cy0, &x0, &y0, &x1, &y1);
+	}
+	if (g->zAddr == r->zAddr && g->zWidth == r->colorWidth) {
+		depthWritten(g, x0, y0, x1 + 1, y1 + 1);
+	}
+}
+
 // A triangle into the depth image (Pilotwings 64's shadow masks): in RDRAM as the RDP draws it, and
 // into the GPU's depth at the depth it left in the middle.
 static void depthTriangle(struct N64* n, struct Glr* g, struct RDP* r, const uint64_t* w, int op, const struct GlrCorners* q, int count) {
@@ -2105,6 +2263,14 @@ static void draw(struct N64* n, struct RDP* r, const uint64_t* w, int op) {
 	g->seq = r->seq;
 	uint64_t c = w[0];
 	const struct GlrCorners* q = op >= 0x08 && op <= 0x0F ? queued(g, w) : NULL;
+	bool const intoDepth = r->zAddr && r->colorAddr == r->zAddr && r->colorSize == 2;
+	if (intoDepth && (op == 0x24 || op == 0x25 || (op == 0x36 && r->cycleType != 3))) {
+		depthRectangle(n, g, r, w, op);
+		return;
+	}
+	if (!(intoDepth && op == 0x36)) {
+		depthFromRdram(n, g, r);
+	}
 	// A triangle in fill mode: the RDP's own pixels, in the fill colour.
 	if (op >= 0x08 && op <= 0x0F && r->cycleType == 3) {
 		glrSync(n);
@@ -2238,9 +2404,23 @@ void glrDraw(struct N64* n, struct RDP* r, const uint64_t* w, int op) {
 	// keeps it already).
 	bool triangle = op >= 0x08 && op <= 0x0F;
 	if (n->glr->chained && (triangle || op == 0x24 || op == 0x25) && r->cycleType < 2 && r->colorSize != 1 &&
-	    !(triangle && r->zAddr && r->colorAddr == r->zAddr && r->colorSize == 2)) {
+	    !((triangle || op == 0x24 || op == 0x25) && r->zAddr && r->colorAddr == r->zAddr && r->colorSize == 2)) {
 		rdpLastCombined(n, r, w, op);
 	}
+}
+
+// RDRAM [addr, addr + len) about to be written by the CPU or a DMA: what of the depth image it covers
+// goes into the GPU's depth before the next draw.
+void glrWritten(struct N64* n, uint32_t addr, uint32_t len) {
+	struct Glr* g = n->glr;
+	uint32_t const row = g->zWidth * 2, size = row * (uint32_t) g->zRows;
+	if (!row || addr + len <= g->zAddr || addr >= g->zAddr + size) {
+		return;
+	}
+	uint32_t const from = addr > g->zAddr ? addr - g->zAddr : 0, to = addr + len - g->zAddr < size ? addr + len - g->zAddr : size;
+	int const y0 = (int) (from / row), y1 = (int) ((to - 1) / row) + 1;
+	bool const oneRow = y1 == y0 + 1;
+	depthWritten(g, oneRow ? (int) (from % row / 2) : 0, y0, oneRow ? (int) ((to - 1) % row / 2) + 1 : (int) g->zWidth, y1);
 }
 
 bool glrFastEffects(struct N64* n) {
@@ -2343,6 +2523,7 @@ bool glrRead(struct N64* n, unsigned framebuffer, int x, int y, int w, int h, ui
 
 bool glrShows(struct N64* n, uint32_t origin) {
 	struct Glr* g = n->glr;
+	g->zMark = true;
 	for (int i = 0; i < TARGETS; ++i) {
 		struct Target* t = &g->target[i];
 		if (t->texture && origin >= t->addr && origin - t->addr < t->width * 4 * 8) {
@@ -2512,6 +2693,7 @@ struct Glr* glrCreate(struct N64* n) {
 		n->rdpGl = false;
 		return NULL;
 	}
+	depthProgram(g);
 	// Multisampling, where the shaders blend (framebuffer fetch reads each sample's own color).
 	const char* msaa = n->settings ? n->settings("N64_GL_MSAA") : getenv("N64_GL_MSAA");
 	*(void**) &gl->RenderbufferStorageMultisample = glesProc(g->gles, "glRenderbufferStorageMultisample");
@@ -2625,6 +2807,7 @@ bool glrPrecompile(struct N64* n, double ms, int* done, int* total) {
 // them holds.
 void glrStateLoaded(struct Glr* g) {
 	memset(g->tileTexture, 0, sizeof(g->tileTexture));
+	g->zWidth = 0, g->zForce = false;
 	g->queueRead = g->queueWrite;
 	g->fastValid = false;
 	memset(&g->applied, 0xFF, sizeof(g->applied));

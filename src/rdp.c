@@ -2370,6 +2370,7 @@ void rdpWaitFor(struct N64* n, uint32_t addr, uint32_t len) {
 		if (n->rdpPending && glrDrew(n, addr, len)) {
 			glrSync(n);
 		}
+		glrWritten(n, addr, len);
 		return;
 	}
 	struct Renderers* all = n->rdp ? n->rdp->renderers : NULL;
@@ -2390,7 +2391,9 @@ void rdpWaitRead(struct N64* n, uint32_t addr, uint32_t len) {
 		return;
 	}
 	if (n->glr) {
-		rdpWaitFor(n, addr, len);
+		if (n->rdpPending && glrDrew(n, addr, len)) {
+			glrSync(n);
+		}
 		return;
 	}
 	rdpWaitDrawn(n, addr, len);
@@ -3786,6 +3789,11 @@ void rdpLastCombined(struct N64* n, struct RDP* r, const uint64_t* w, int op) {
 float rdpDepthAt(struct N64* n, struct RDP* r, int x, int y) {
 	x = x < 0 ? 0 : x >= (int) r->colorWidth ? (int) r->colorWidth - 1 : x;
 	return (float) zDecompress(zRead(n, r, x, y < 0 ? 0 : y)) / 0x3FFFF;
+}
+
+float rdpDepthIn(struct N64* n, uint32_t zAddr, uint32_t width, int x, int y) {
+	uint32_t a = (zAddr + ((uint32_t) y * width + (uint32_t) x) * 2) & (RDRAM_SIZE - 2);
+	return (float) zDecompress((uint16_t) (n->rdram[a] << 8 | n->rdram[a + 1])) / 0x3FFFF;
 }
 
 // Starts a run of commands: the renderers or the GPU on first use, and when the RDP can take them.
