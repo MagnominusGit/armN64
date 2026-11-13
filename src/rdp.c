@@ -1706,6 +1706,19 @@ static void loadTlut(struct N64* n, struct RDP* r, uint64_t w) {
 	// From row tl of the image, as a tile load reads (GoldenEye 007's faces).
 	uint32_t const base = r->texAddr + ((uint32_t) (r->texWidth * tl + sl) << (vs - 1));
 	uint32_t const offset = (t->tmem * 8 & 0xFFF) >> 1;
+	// A 16-bit image through a 4-bit tile from an even address: each texel's two bytes in four
+	// halfwords in turn, as the loop below puts them.
+	if (vs - ts == 2 && !(base & 1) && !r->tmemSource) {
+		for (int texel = 0; texel < texels && texel < 0x200; ++texel) {
+			uint32_t const from = base + ((uint32_t) texel << 1);
+			uint8_t const hi = n->rdram[from & (RDRAM_SIZE - 1)], lo = n->rdram[(from + 1) & (RDRAM_SIZE - 1)];
+			for (uint32_t q = 0; q < 4; ++q) {
+				uint32_t const to = ((offset + (uint32_t) texel * 4 + q) & 0x7FF) * 2;
+				r->tmem[to] = hi, r->tmem[to + 1] = lo;
+			}
+		}
+		return;
+	}
 	for (int at = 0; at < 0x800; ++at) {
 		int texel;
 		if (vs - ts == 2) {
