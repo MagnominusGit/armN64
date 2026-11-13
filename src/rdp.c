@@ -1750,43 +1750,6 @@ static int commandWords(int op) {
 	return op == 0x24 || op == 0x25 ? 2 : 1;
 }
 
-// FLE's RDP time for a primitive, from its shape alone: one or two clocks a pixel by cycle type, four
-// pixels a clock to fill or copy, and a fixed setup per triangle and texture rectangle; a triangle's
-// pixels are its area, half its height times its width at the middle corner.
-static uint64_t roughClocks(struct RDP* r, const uint64_t* w, int op) {
-	int perPixel = r->cycleType == 1 ? 2 : 1;
-	if (op >= 0x08 && op <= 0x0F) {
-		struct Edges e = edges(w);
-		double const height = (e.yl - e.yh) / 4.0;
-		double const width = fabs((e.xh + (double) e.dxh * (e.ym - e.yh) / 4.0 - e.xl) / 65536.0);
-		return height > 0 ? (uint64_t) (height * width / 2) * (uint64_t) perPixel + 20 : 20;
-	}
-	int x0, y0, x1, y1;
-	if (op == 0x24 || op == 0x25) {
-		int cx0, cy0;
-		rectBounds(r, w[0], &cx0, &cy0, &x0, &y0, &x1, &y1);
-	} else if (op == 0x36) {
-		int cx0, cy0;
-		rectBounds(r, w[0], &cx0, &cy0, &x0, &y0, &x1, &y1);
-	} else if (op == 0x30 || op == 0x33 || op == 0x34) {
-		// A texture load moves a 64-bit TMEM word a clock: a tile's texels, a block's, a palette's
-		// entries.
-		uint64_t c = w[0];
-		int sl = (c >> 44) & 0xFFF, tl = (c >> 32) & 0xFFF, sh = (c >> 12) & 0xFFF, th = c & 0xFFF;
-		uint64_t texels = op == 0x34 ? (uint64_t) ((sh >> 2) - (sl >> 2) + 1) * (uint64_t) ((th >> 2) - (tl >> 2) + 1)
-		                  : op == 0x33 ? (uint64_t) (sh - sl + 1) : (uint64_t) ((sh >> 2) - (sl >> 2) + 1);
-		uint64_t bytes = op == 0x30 ? texels * 2 : r->texSize ? texels << (r->texSize - 1) : texels / 2;
-		return (sh < sl || (op == 0x34 && th < tl)) ? 10 : bytes / 8 + 10;
-	} else {
-		return 0;
-	}
-	uint64_t pixels = x1 >= x0 && y1 >= y0 ? (uint64_t) (x1 - x0 + 1) * (y1 - y0 + 1) : 0;
-	if (op == 0x36) {
-		return r->cycleType == 3 ? pixels / (r->colorSize == 3 ? 2 : 4) : pixels * perPixel;
-	}
-	return (r->cycleType == 2 ? pixels / 4 : pixels * perPixel) + 10;
-}
-
 // The RDP's time from the costs measured on consoles (rdp_timing.h, with the model around them from
 // Nekokabu's ares, a1f969d: ares/n64/rdp/timing.cpp): every span by its mode, width and place in its
 // 64-byte RDRAM block, every primitive's setup, texture loads and syncs. The tables are for
@@ -1914,10 +1877,40 @@ static double timingCost(const struct N64* n, struct RDP* r, const uint64_t* w, 
 	return rdp_tm_state_cmd(n->dp.status & 1);
 }
 
+// FLE: timingCost with a primitive's rows all costing what its middle one does.
+static uint64_t roughClocks(const struct N64* n, struct RDP* r, const uint64_t* w, int op) {
+	enum rdp_tm_mode const mode = timingMode(r);
+	int x0 = 0, y = 0, pixels = 0, rows = 0;
+	if (op >= 0x08 && op <= 0x0F) {
+		struct Edges e = edges(w);
+		int first, end;
+		struct Span sp;
+		triangleRows(r, &e, &first, &end);
+		y = (first + end) / 2, rows = end - first;
+		if (rows > 0 && span(r, &e, y, &sp) && sp.x1 >= sp.x0) {
+			x0 = sp.x0, pixels = sp.x1 - sp.x0 + 1;
+		}
+	} else if (op == 0x24 || op == 0x25 || op == 0x36) {
+		int cx0, cy0, x1, y1;
+		rdpRectBounds(r, w[0], &cx0, &cy0, &x0, &y, &x1, &y1);
+		pixels = x1 >= x0 ? x1 - x0 + 1 : 0, rows = y1 >= y ? y1 - y + 1 : 0;
+		y = (y + y1) / 2;
+	} else {
+		double const cost = timingCost(n, r, w, op);
+		return cost > 0 ? (uint64_t) cost : 0;
+	}
+	double cost = pixels && rows ? spanCost(n, r, mode, x0, y, pixels) * rows : 0;
+	if (pixels && rows > 1 && r->cycleType < 2 && (r->zCompare || r->zUpdate)) {
+		r->zPixels += (uint64_t) pixels * (uint64_t) (rows - 1);
+	}
+	cost += rdp_tm_prim_overhead(mode, pixels ? pixels : 1) + (op >= 0x08 && op <= 0x0F && (op & 6) ? 3 : 0);
+	return cost > 0 ? (uint64_t) cost : 0;
+}
+
 // A command's RDP clocks: rough with FLE.
 static uint64_t commandClocks(const struct N64* n, struct RDP* r, const uint64_t* w, int op) {
 	if (n->fle) {
-		return roughClocks(r, w, op);
+		return roughClocks(n, r, w, op);
 	}
 	double const cost = timingCost(n, r, w, op) + r->clockPart;
 	uint64_t const clocks = cost > 0 ? (uint64_t) cost : 0;
