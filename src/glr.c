@@ -225,13 +225,14 @@ struct Glr {
 	GLint pushSource, pushScale;
 	// Drawing a triangle into the depth image (depthTriangle).
 	bool depthImage;
-	// The depth image (zWidth pixels a row at zAddr, zRows rows): what the RDP's rectangles, the CPU or
-	// a DMA wrote there since the GPU's depth took it (x0, y0, x1, y1 of zRect: Resident Evil 2's
-	// backgrounds) goes into the GPU's depth before the next draw. Its pages are marked for the writes to
-	// be seen (again once a picture, zMark). The program that writes it.
-	bool zForce, zMark;
-	uint32_t zAddr, zWidth;
-	int zRows, zRect[4];
+	// The depth image at zAddr, as last drawn (zWidth pixels a row, zRows rows; zBytes the most it has
+	// covered): what the RDP's rectangles, the CPU or a DMA wrote there since the GPU's depth took it
+	// (zLo to zHi, Resident Evil 2's backgrounds, which it writes at another width) goes into the GPU's
+	// depth before the next draw that reads or writes depth, at that draw's width. Its pages are marked
+	// for the writes to be seen (again once a picture, zMark). The program that writes it.
+	bool zPending, zMark;
+	uint32_t zAddr, zWidth, zBytes, zLo, zHi;
+	int zRows;
 	GLuint zProgram, zTexture;
 	GLint zSource, zParams;
 	// A program read COMBINED where it is the previous pixel's: from then on each primitive's last
@@ -2149,37 +2150,35 @@ static void depthUpload(struct N64* n, struct Glr* g, int x0, int y0, int x1, in
 	memset(&g->applied, 0xFF, sizeof(g->applied));
 }
 
-// Pixels x0, y0 to x1, y1 (not included) of the depth image are to go into the GPU's depth.
-static void depthWritten(struct Glr* g, int x0, int y0, int x1, int y1) {
-	x0 = x0 > 0 ? x0 : 0, y0 = y0 > 0 ? y0 : 0;
-	x1 = x1 < (int) g->zWidth ? x1 : (int) g->zWidth, y1 = y1 < g->zRows ? y1 : g->zRows;
-	if (x1 <= x0 || y1 <= y0) {
+// Bytes lo to hi of RDRAM, in the depth image, are to go into the GPU's depth.
+static void depthWritten(struct Glr* g, uint32_t lo, uint32_t hi) {
+	lo = lo > g->zAddr ? lo : g->zAddr, hi = hi < g->zAddr + g->zBytes ? hi : g->zAddr + g->zBytes;
+	if (hi <= lo) {
 		return;
 	}
-	if (!g->zForce) {
-		g->zRect[0] = x0, g->zRect[1] = y0, g->zRect[2] = x1, g->zRect[3] = y1;
-		g->zForce = true;
-		return;
-	}
-	g->zRect[0] = x0 < g->zRect[0] ? x0 : g->zRect[0], g->zRect[1] = y0 < g->zRect[1] ? y0 : g->zRect[1];
-	g->zRect[2] = x1 > g->zRect[2] ? x1 : g->zRect[2], g->zRect[3] = y1 > g->zRect[3] ? y1 : g->zRect[3];
+	g->zLo = g->zPending && g->zLo < lo ? g->zLo : lo;
+	g->zHi = g->zPending && g->zHi > hi ? g->zHi : hi;
+	g->zPending = true;
 }
 
-// Before a draw: a new depth image (or a taller one) goes into the GPU's depth whole, its pages are
-// marked, and what was written there since goes in.
-static void depthFromRdram(struct N64* n, struct Glr* g, struct RDP* r) {
+// Before a draw: a new depth image goes into the GPU's depth whole; its pages are marked; with depth
+// read or written, what was written there since goes in, at this draw's width.
+static void depthFromRdram(struct N64* n, struct Glr* g, struct RDP* r, bool depth) {
 	int const rows = (int) ((r->scissorY1 + 3) >> 2) < TARGET_ROWS ? (int) ((r->scissorY1 + 3) >> 2) : TARGET_ROWS;
 	if (!g->zProgram || !r->zAddr || !r->colorWidth || r->colorWidth > 1024 || rows <= 0) {
 		return;
 	}
-	if (g->zAddr != r->zAddr || g->zWidth != r->colorWidth || rows > g->zRows) {
-		g->zAddr = r->zAddr, g->zWidth = r->colorWidth, g->zRows = rows;
-		g->zForce = false, g->zMark = true;
-		depthWritten(g, 0, 0, (int) g->zWidth, g->zRows);
+	uint32_t const bytes = r->colorWidth * (uint32_t) rows * 2;
+	if (g->zAddr != r->zAddr || !g->zWidth) {
+		g->zAddr = r->zAddr, g->zBytes = bytes, g->zMark = true, g->zPending = false;
+		depthWritten(g, g->zAddr, g->zAddr + bytes);
+	} else if (bytes > g->zBytes) {
+		g->zBytes = bytes, g->zMark = true;
 	}
+	g->zWidth = r->colorWidth, g->zRows = rows;
 	if (g->zMark) {
 		g->zMark = false;
-		uint32_t const first = (g->zAddr & (RDRAM_SIZE - 1)) >> 12, last = ((g->zAddr + g->zWidth * (uint32_t) g->zRows * 2 - 1) & (RDRAM_SIZE - 1)) >> 12;
+		uint32_t const first = (g->zAddr & (RDRAM_SIZE - 1)) >> 12, last = ((g->zAddr + g->zBytes - 1) & (RDRAM_SIZE - 1)) >> 12;
 		for (uint32_t p = first;; p = (p + 1) & ((RDRAM_SIZE >> 12) - 1)) {
 			n->pageFlags[p] |= PAGE_RDP_WRITES;
 			if (p == last) {
@@ -2187,14 +2186,22 @@ static void depthFromRdram(struct N64* n, struct Glr* g, struct RDP* r) {
 			}
 		}
 	}
-	if (g->zForce) {
-		g->zForce = false;
-		depthUpload(n, g, g->zRect[0], g->zRect[1], g->zRect[2], g->zRect[3]);
+	if (!depth || !g->zPending) {
+		return;
 	}
+	g->zPending = false;
+	uint32_t const row = g->zWidth * 2, size = row * (uint32_t) g->zRows;
+	uint32_t const from = g->zLo - g->zAddr, to = g->zHi - g->zAddr < size ? g->zHi - g->zAddr : size;
+	if (from >= to) {
+		return;
+	}
+	int const y0 = (int) (from / row), y1 = (int) ((to - 1) / row) + 1;
+	bool const oneRow = y1 == y0 + 1;
+	depthUpload(n, g, oneRow ? (int) (from % row / 2) : 0, y0, oneRow ? (int) ((to - 1) % row / 2) + 1 : (int) g->zWidth, y1);
 }
 
 // A rectangle into the depth image (Resident Evil 2 copies its backgrounds' depth there): in RDRAM as
-// the RDP draws it, and into the GPU's depth before the next draw.
+// the RDP draws it, and into the GPU's depth before the next draw with depth.
 static void depthRectangle(struct N64* n, struct Glr* g, struct RDP* r, const uint64_t* w, int op) {
 	rdpDrawSoftware(n, r, w, op);
 	int x0, y0, x1, y1;
@@ -2205,8 +2212,10 @@ static void depthRectangle(struct N64* n, struct Glr* g, struct RDP* r, const ui
 		int cx0, cy0;
 		rdpRectBounds(r, w[0], &cx0, &cy0, &x0, &y0, &x1, &y1);
 	}
-	if (g->zAddr == r->zAddr && g->zWidth == r->colorWidth) {
-		depthWritten(g, x0, y0, x1 + 1, y1 + 1);
+	if (g->zAddr == r->zAddr && x1 >= x0 && y1 >= y0) {
+		uint32_t const row = r->colorWidth * 2;
+		uint32_t const lo = r->zAddr + (uint32_t) (y0 > 0 ? y0 : 0) * row + (uint32_t) (x0 > 0 ? x0 : 0) * 2;
+		depthWritten(g, lo, r->zAddr + (uint32_t) y1 * row + (uint32_t) (x1 + 1) * 2);
 	}
 }
 
@@ -2269,7 +2278,7 @@ static void draw(struct N64* n, struct RDP* r, const uint64_t* w, int op) {
 		return;
 	}
 	if (!(intoDepth && op == 0x36)) {
-		depthFromRdram(n, g, r);
+		depthFromRdram(n, g, r, (r->zCompare || r->zUpdate) && r->cycleType != 3);
 	}
 	// A triangle in fill mode: the RDP's own pixels, in the fill colour.
 	if (op >= 0x08 && op <= 0x0F && r->cycleType == 3) {
@@ -2413,14 +2422,9 @@ void glrDraw(struct N64* n, struct RDP* r, const uint64_t* w, int op) {
 // goes into the GPU's depth before the next draw.
 void glrWritten(struct N64* n, uint32_t addr, uint32_t len) {
 	struct Glr* g = n->glr;
-	uint32_t const row = g->zWidth * 2, size = row * (uint32_t) g->zRows;
-	if (!row || addr + len <= g->zAddr || addr >= g->zAddr + size) {
-		return;
+	if (g->zWidth && addr < g->zAddr + g->zBytes && addr + len > g->zAddr) {
+		depthWritten(g, addr, addr + len);
 	}
-	uint32_t const from = addr > g->zAddr ? addr - g->zAddr : 0, to = addr + len - g->zAddr < size ? addr + len - g->zAddr : size;
-	int const y0 = (int) (from / row), y1 = (int) ((to - 1) / row) + 1;
-	bool const oneRow = y1 == y0 + 1;
-	depthWritten(g, oneRow ? (int) (from % row / 2) : 0, y0, oneRow ? (int) ((to - 1) % row / 2) + 1 : (int) g->zWidth, y1);
 }
 
 bool glrFastEffects(struct N64* n) {
@@ -2807,7 +2811,7 @@ bool glrPrecompile(struct N64* n, double ms, int* done, int* total) {
 // them holds.
 void glrStateLoaded(struct Glr* g) {
 	memset(g->tileTexture, 0, sizeof(g->tileTexture));
-	g->zWidth = 0, g->zForce = false;
+	g->zWidth = 0, g->zPending = false;
 	g->queueRead = g->queueWrite;
 	g->fastValid = false;
 	memset(&g->applied, 0xFF, sizeof(g->applied));
