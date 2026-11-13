@@ -25,6 +25,7 @@
 #include <assert.h>
 #include <stddef.h>
 #include <stdint.h>
+#include <string.h>
 
 #include "common.h"
 #include "hle_internal.h"
@@ -176,15 +177,54 @@ static inline void dram_w32(struct hle_t* hle, uint32_t address, uint32_t value)
     dram_w16(hle, address + 2, (uint16_t)value);
 }
 
+/* armN64: whether a DMA of count bytes moves whole words: both ends aligned, DRAM not wrapping. */
+static inline int dma_words(const struct hle_t* hle, unsigned offset, uint32_t address, size_t count)
+{
+    uint32_t a = address & hle->dram_mask;
+    return !((offset | address | count) & 3) && count && (size_t)a + count - 1 <= hle->dram_mask;
+}
+
+static inline uint32_t dma_word(uint32_t v)
+{
+    return S8 ? __builtin_bswap32(v) : v;
+}
+
 /* armN64: DMA between DRAM and a buffer laid out as DMEM (host-order words), byte for byte. */
 static inline void dram_to_buffer(struct hle_t* hle, unsigned char* buffer, unsigned offset, uint32_t address, size_t count)
 {
+    if (dma_words(hle, offset, address, count)) {
+        const unsigned char* from = hle->dram + (address & hle->dram_mask);
+        for (size_t i = 0; i < count; i += 4) {
+            uint32_t v;
+            memcpy(&v, from + i, 4);
+            v = dma_word(v);
+            memcpy(buffer + offset + i, &v, 4);
+        }
+        return;
+    }
     for (size_t i = 0; i < count; ++i)
         buffer[(offset + i) ^ S8] = dram_r8(hle, address + (uint32_t)i);
 }
 
 static inline void buffer_to_dram(struct hle_t* hle, uint32_t address, const unsigned char* buffer, unsigned offset, size_t count)
 {
+    if (dma_words(hle, offset, address, count)) {
+        uint32_t a = address & hle->dram_mask;
+        if (a != hle->written_end) {
+            hle_written(hle);
+            hle->written_start = a;
+        }
+        hle->written_end = a + (uint32_t)count;
+        for (size_t i = 0; i < count; i += 4) {
+            uint32_t v;
+            memcpy(&v, buffer + offset + i, 4);
+            v = dma_word(v);
+            memcpy(hle->dram + a + i, &v, 4);
+        }
+        for (uint32_t p = a >> 12; p <= (a + (uint32_t)count - 1) >> 12; ++p)
+            hle->dram_dirty[p] = 0;
+        return;
+    }
     for (size_t i = 0; i < count; ++i)
         dram_w8(hle, address + (uint32_t)i, buffer[(offset + i) ^ S8]);
 }
