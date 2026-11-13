@@ -136,6 +136,8 @@ struct Target {
 	uint64_t used;
 	// Rows whose pages are flagged for rdpWait since the last sync.
 	int marked;
+	// The CPU read back what the GPU drew in its first rows (READ_BACK_ROWS).
+	bool cpuReads;
 };
 
 // What the fragment shader is made for.
@@ -1198,6 +1200,23 @@ static void markPages(struct N64* n, uint32_t addr, uint32_t len, bool wait) {
 	}
 }
 
+// The rows of a color image the CPU reads back that the RDP draws itself (readBack).
+enum { READ_BACK_ROWS = 8 };
+
+// A color image the CPU reads back what the GPU drew in, drawn into no further than its first rows.
+static bool readBack(struct Glr* g, const struct RDP* r) {
+	if ((r->scissorY1 + 3) >> 2 > READ_BACK_ROWS) {
+		return false;
+	}
+	for (int i = 0; i < TARGETS; ++i) {
+		struct Target* t = &g->target[i];
+		if (t->cpuReads && t->addr == r->colorAddr && t->width == r->colorWidth && t->size == r->colorSize) {
+			return true;
+		}
+	}
+	return false;
+}
+
 // RDRAM [addr, addr + len) changed under the targets (but keep): their rows there load from it again.
 static void forgetRows(struct Glr* g, uint32_t addr, uint32_t len, struct Target* keep) {
 	for (int i = 0; i < TARGETS; ++i) {
@@ -1274,6 +1293,7 @@ static struct Target* target(struct N64* n, struct Glr* g, uint32_t addr, uint32
 			t->unresolved = false;
 		}
 		t->addr = addr, t->width = width, t->size = size;
+		t->cpuReads = false;
 		t->loadedRows = 0;
 		t->dirtyFrom = t->dirtyTo = 0;
 	}
@@ -2313,9 +2333,10 @@ static void draw(struct N64* n, struct RDP* r, const uint64_t* w, int op) {
 		triangle(n, g, r, q);
 		return;
 	}
-	if (r->colorSize == 1) {
-		// 8-bit images (masks programs read back, Blast Corps', Conker's): the RDP's own pixels, after
-		// the GPU's rows there go back, and before targets there load them again.
+	if (r->colorSize == 1 || readBack(g, r)) {
+		// 8-bit images (masks programs read back, Blast Corps', Conker's), and the few rows of others
+		// the CPU reads back what was drawn in: the RDP's own pixels, after the GPU's rows there go
+		// back, and before targets there load them again.
 		uint32_t const lo = r->colorAddr, len = r->colorWidth * (uint32_t) ((r->scissorY1 + 3) >> 2);
 		if (n->rdpPending) {
 			glrSyncRange(n, lo, len);
@@ -2452,6 +2473,7 @@ void glrTouched(struct N64* n, uint32_t addr, uint32_t len, bool write) {
 		if (!t->texture || t->dirtyTo <= t->dirtyFrom || addr >= to || addr + len <= from) {
 			continue;
 		}
+		t->cpuReads |= !write && t->dirtyTo <= READ_BACK_ROWS;
 		glesUse(g->gles);
 		flushBatch(n, g);
 		g->fastValid = false;
