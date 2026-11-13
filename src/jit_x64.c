@@ -268,6 +268,178 @@ static void fpuTrivial(struct Emitter* e, bool dbl, bool mul, uint8_t** early, i
 	}
 }
 
+// A result in RAX (single, or double with dbl) stored as fpu_fast.c's setS and setD store it:
+// flushed to zero when subnormal with FCR31.FS set, and the host's default NaN made the VR4300's.
+static void fastResult(struct Emitter* e, bool dbl, int fd) {
+	xTestI(e, 4, CPU_AT(fcr31), 1u << 24);
+	uint8_t* keep = xJcc(e, CC_E, NULL);
+	if (dbl) {
+		xMovI64(e, RDX, 0x7FF0000000000000ull);
+		xTest(e, 8, R(RAX), RDX);
+		uint8_t* normal = xJcc(e, CC_NE, NULL);
+		xMovI64(e, RDX, 0x8000000000000000ull);
+		xAluRR(e, X_AND, 8, R(RAX), RDX);
+		patchHere(e, normal);
+		patchHere(e, keep);
+		xMovI64(e, RSI, 0x7FF7FFFFFFFFFFFFull);
+		xMovRR(e, 8, RCX, RAX);
+		xShiftI(e, X_SHL, 8, R(RCX), 1);
+		xMovI64(e, RDX, 0xFFF0000000000000ull);
+		xAluRR(e, X_CMP, 8, R(RCX), RDX);
+		xCmov(e, CC_E, 8, RAX, R(RSI));
+		xStore(e, 8, fprAt(fd), RAX);
+	} else {
+		xTestI(e, 4, R(RAX), 0x7F800000);
+		uint8_t* normal = xJcc(e, CC_NE, NULL);
+		xAluI(e, X_AND, 4, R(RAX), (int32_t) 0x80000000u);
+		patchHere(e, normal);
+		patchHere(e, keep);
+		xMovI(e, RSI, 0x7FBFFFFF);
+		xMovRR(e, 4, RCX, RAX);
+		xAluI(e, X_AND, 4, R(RCX), 0x7FFFFFFF);
+		xAluI(e, X_CMP, 4, R(RCX), 0x7FC00000);
+		xCmov(e, CC_E, 4, RAX, R(RSI));
+		xStore(e, 4, fprAt(fd), RAX);
+	}
+}
+
+// With HLE accuracy, the FPU instructions most code runs inline, as fpuExecuteFast runs them: the
+// moves, the four operations, square root, ABS, MOV, NEG and C.cond in S and D, and the conversions
+// between S, D and W. Only with even registers, the same in both FR modes; anything else goes
+// through fpuCall.
+static void fpuFast(struct Jit* j, uint32_t op) {
+	struct Emitter* e = &j->e;
+	int const fmt = (op >> 21) & 31, ft = (op >> 16) & 31, fs = (op >> 11) & 31, fd = (op >> 6) & 31, func = op & 0x3F;
+	bool const dbl = fmt == 17;
+	switch (fmt) {
+	case 0:
+	case 1:
+		if (fs & 1) {
+			break;
+		}
+		if (ft) {
+			if (fmt == 0) {
+				xLoad(e, 4, RAX, fprAt(fs));
+				xMovsxd(e, RAX, R(RAX));
+			} else {
+				xLoad(e, 8, RAX, fprAt(fs));
+			}
+			xStore(e, 8, gpr(ft), RAX);
+		}
+		return;
+	case 2:
+		if (ft) {
+			if (fs == 31) {
+				xLoad(e, 4, RAX, CPU_AT(fcr31));
+				xMovsxd(e, RAX, R(RAX));
+				xStore(e, 8, gpr(ft), RAX);
+			} else {
+				xStoreI(e, 8, gpr(ft), fs == 0 ? 0xA00 : 0);
+			}
+		}
+		return;
+	case 4:
+	case 5:
+		if (fs & 1) {
+			break;
+		}
+		xLoad(e, fmt == 4 ? 4 : 8, RAX, gpr(ft));
+		xStore(e, fmt == 4 ? 4 : 8, fprAt(fs), RAX);
+		return;
+	}
+	bool const known = ((fmt == 16 || fmt == 17) && (func <= 7 || func == 13 || func == (dbl ? 0x20 : 0x21) || func >= 0x30)) ||
+	                   (fmt == 20 && (func == 32 || func == 33));
+	if (!known || ((fs | ft | fd) & 1)) {
+		fpuCall(j, op);
+		return;
+	}
+	uint32_t const cycles = fpuCycles(fmt, func);
+	if (cycles) {
+		xAluI(e, X_ADD, 8, R(R13), (int32_t) cycles);
+	}
+	uint8_t const prefix = dbl ? 0xF2 : 0xF3;
+	int const width = dbl ? 8 : 4;
+	struct Opnd const out = M(RSP, -16);
+	if (func >= 0x30) {
+		// C.cond: less, equal and unordered as asked, into bit 23.
+		xAluRR(e, X_XOR, 4, R(RAX), RAX);
+		xAluRR(e, X_XOR, 4, R(RCX), RCX);
+		xAluRR(e, X_XOR, 4, R(RDX), RDX);
+		xSse(e, prefix, 0x10, 0, fprAt(fs), 4);
+		xSse(e, dbl ? 0x66 : 0, 0x2E, 0, fprAt(ft), 4);
+		xSetcc(e, CC_B, R(RAX));
+		xSetcc(e, CC_NP, R(RCX));
+		xSetcc(e, CC_E, R(RDX));
+		xAluRR(e, X_XOR, 4, R(RSI), RSI);
+		if (func & 4) {
+			xAluRR(e, X_AND, 4, R(RAX), RCX);
+			xAluRR(e, X_OR, 4, R(RSI), RAX);
+		}
+		if (func & 2) {
+			xAluRR(e, X_AND, 4, R(RDX), RCX);
+			xAluRR(e, X_OR, 4, R(RSI), RDX);
+		}
+		if (func & 1) {
+			xAluI(e, X_XOR, 4, R(RCX), 1);
+			xAluRR(e, X_OR, 4, R(RSI), RCX);
+		}
+		xShiftI(e, X_SHL, 4, R(RSI), 23);
+		xLoad(e, 4, RAX, CPU_AT(fcr31));
+		xAluI(e, X_AND, 4, R(RAX), (int32_t) ~(1u << 23));
+		xAluRR(e, X_OR, 4, R(RAX), RSI);
+		xStore(e, 4, CPU_AT(fcr31), RAX);
+		return;
+	}
+	if (fmt == 20) {
+		// CVT.S.W and CVT.D.W.
+		xSse(e, func == 32 ? 0xF3 : 0xF2, 0x2A, 0, fprAt(fs), 4);
+		xSse(e, func == 32 ? 0xF3 : 0xF2, 0x11, 0, out, 4);
+		xLoad(e, func == 32 ? 4 : 8, RAX, out);
+		fastResult(e, func == 33, fd);
+		return;
+	}
+	switch (func) {
+	case 5:
+	case 7:
+		xLoad(e, width, RAX, fprAt(fs));
+		if (dbl) {
+			xMovI64(e, RDX, func == 7 ? 0x8000000000000000ull : 0x7FFFFFFFFFFFFFFFull);
+			xAluRR(e, func == 7 ? X_XOR : X_AND, 8, R(RAX), RDX);
+		} else {
+			xAluI(e, func == 7 ? X_XOR : X_AND, 4, R(RAX), func == 7 ? (int32_t) 0x80000000u : 0x7FFFFFFF);
+		}
+		fastResult(e, dbl, fd);
+		return;
+	case 6:
+		xLoad(e, width, RAX, fprAt(fs));
+		xStore(e, width, fprAt(fd), RAX);
+		return;
+	case 13:
+		// TRUNC.W: out of range or NaN gives the most negative word, as toWord and the host do.
+		xSse(e, prefix, 0x2C, RAX, fprAt(fs), 4);
+		xStore(e, 4, fprAt(fd), RAX);
+		return;
+	case 0x20:
+	case 0x21:
+		// CVT.S.D and CVT.D.S.
+		xSse(e, prefix, 0x5A, 0, fprAt(fs), 4);
+		xSse(e, dbl ? 0xF3 : 0xF2, 0x11, 0, out, 4);
+		xLoad(e, dbl ? 4 : 8, RAX, out);
+		fastResult(e, !dbl, fd);
+		return;
+	}
+	static const uint8_t ops[5] = { 0x58, 0x5C, 0x59, 0x5E, 0x51 };
+	if (func == 4) {
+		xSse(e, prefix, 0x51, 0, fprAt(fs), 4);
+	} else {
+		xSse(e, prefix, 0x10, 0, fprAt(fs), 4);
+		xSse(e, prefix, ops[func], 0, fprAt(ft), 4);
+	}
+	xSse(e, prefix, 0x11, 0, out, 4);
+	xLoad(e, width, RAX, out);
+	fastResult(e, dbl, fd);
+}
+
 // MFC1, DMFC1, MTC1, DMTC1, MOV, NEG and ABS, the four operations and C.cond in S and D compiled
 // for operands and results fpu.c takes no exception path on (normal or zero, the host raising no
 // more than inexact, with inexact not enabled), and with the first operand's register the same in
@@ -703,7 +875,7 @@ static bool emitInline(struct Jit* j, uint32_t op, uint64_t pc, enum Kind* kind)
 		if (!j->fast) {
 			fpuInline(j, op);
 		} else {
-			fpuCall(j, op);
+			fpuFast(j, op);
 		}
 		return true;
 	case 0x20: case 0x21: case 0x23: case 0x24: case 0x25: case 0x27: case 0x37:
