@@ -387,7 +387,7 @@ static void piDma(struct N64* n, uint32_t len, bool toRdram) {
 	// Emulators that hacks were made on finish a DMA in a quarter cycle a byte (mle accuracy). The
 	// PI's timings count the RCP's cycles, so it overclocks with the RSP (the 6105 boot's RSP gives
 	// up waiting for the boot's DMA after so many of its own cycles: Donkey Kong 64).
-	n->pi.busyUntil = n->cycles + (n->compat ? len / 4 + 1 : rcp * 3 / 2);
+	n->pi.busyUntil = n->cycles + (n->compat && !n->hardwarePi ? len / 4 + 1 : rcp * 3 / 2);
 	n64Event(n, n->pi.busyUntil);
 	n->pi.status |= 1;
 }

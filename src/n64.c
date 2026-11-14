@@ -171,6 +171,7 @@ static void start(struct N64* n) {
 	cpuReset(n);
 	pifBoot(n);
 	n->eeprom16k = n->rom ? cartEeprom16k(n->rom) : false;
+	n->hardwarePi = n->rom && cartHardwarePi(n->rom);
 	memset(n->eeprom, 0xFF, sizeof(n->eeprom));
 	// 1, 1.5, 2, 2.5, 3 or 4 times the CPU's clock, once the boot is done.
 	const char* overclock = setting(n, "N64_OVERCLOCK");

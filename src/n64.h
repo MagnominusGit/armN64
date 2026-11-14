@@ -284,6 +284,8 @@ struct N64 {
 	bool pifJoybus, pifChallenged;
 	uint8_t eeprom[2048];
 	bool eeprom16k;
+	// The PI keeps its hardware timing in mle accuracy (carts.c).
+	bool hardwarePi;
 	// The cartridge's SRAM or FlashRAM (carts.c), whichever the game turns out to use. The flash's
 	// mode (FLASH_*), status, and the page buffer it programs from.
 	enum { SAVE_UNKNOWN, SAVE_SRAM, SAVE_FLASH } saveKind;
@@ -800,6 +802,7 @@ bool n64StateLoad(struct N64*, const void* data, size_t size, bool quick);
 
 // carts.c
 bool cartEeprom16k(const uint8_t* rom);
+bool cartHardwarePi(const uint8_t* rom);
 bool gbCartLoad(struct GbCart*, const uint8_t* rom, size_t size);
 void gbCartFree(struct GbCart*);
 uint8_t gbCartRead(struct GbCart*, uint16_t addr);

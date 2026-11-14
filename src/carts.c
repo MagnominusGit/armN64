@@ -71,6 +71,21 @@ bool cartEeprom16k(const uint8_t* rom) {
 	return false;
 }
 
+// Games that race their own cartridge DMA against a timer and so need the PI's hardware timing in
+// mle accuracy too (an EEPROM write's timer message is dropped when the loading DMA ends early).
+static const char gameIdsHardwarePi[][4] = {
+	"NIJ",
+};
+
+bool cartHardwarePi(const uint8_t* rom) {
+	for (size_t i = 0; i < sizeof(gameIdsHardwarePi) / sizeof(*gameIdsHardwarePi); ++i) {
+		if (!memcmp(rom + 0x3B, gameIdsHardwarePi[i], 3)) {
+			return true;
+		}
+	}
+	return false;
+}
+
 // The boot code's checksum over the first megabyte after the header (as the boot code works it out
 // for each lockout chip). False if the header has it already.
 bool cartBootChecksum(const uint8_t* rom, size_t size, int cic, uint8_t seedByte, uint32_t out[2]) {
