@@ -1162,6 +1162,44 @@ static inline __attribute__((always_inline)) void copyRect(struct N64* n, struct
 	bool const alphaTest = r->otherModes & 1, bytes = r->colorSize == 1 && tl->size == 1;
 	struct Color last = { 0 };
 	bool any = false;
+	// 16-bit texels point sampled into a 16-bit image: the texel's bits themselves, as sampleAs and
+	// writePixel would take them there, and its alpha bit the coverage.
+	if (kind == TK_RGBA16 && r->colorSize == 2 && !((r->otherModes >> 45) & 1)) {
+		bool const clampS = (tl->cmS & 2) || !tl->maskS, clampT = (tl->cmT & 2) || !tl->maskT;
+		uint16_t v = 0;
+		for (int y = y0; y <= y1; ++y) {
+			if (!ownsRow(r, y)) {
+				continue;
+			}
+			int const dy = y - cy0;
+			int const tt = texMask(texClamp(((t0 << 5) + (flip ? 0 : dy * dtdy)) >> 5, clampT, tl->tl, tl->th, tl->shiftT) >> 5, tl->maskT, tl->cmT & 1) & 0xFF;
+			uint32_t const row = (uint32_t) (r->colorAddr + (uint32_t) (y * (int) r->colorWidth) * 2);
+			for (int x = x0; x <= x1; ++x) {
+				int const dx = x - cx0;
+				int t = tt;
+				if (flip) {
+					t = texMask(texClamp(((t0 << 5) + dx * dtdy) >> 5, clampT, tl->tl, tl->th, tl->shiftT) >> 5, tl->maskT, tl->cmT & 1) & 0xFF;
+				}
+				int const s = texMask(texClamp(((s0 << 5) + (flip ? dy * dsdx : dx * dsdx)) >> 5, clampS, tl->sl, tl->sh, tl->shiftS) >> 5, tl->maskS, tl->cmS & 1);
+				uint32_t const at = ((uint32_t) tl->tmem * 8 + (uint32_t) (t * tl->line) * 8 + (uint32_t) s * 2) ^ (t & 1 ? 4 : 0);
+				v = (uint16_t) (r->tmem[at & 0xFFF] << 8 | r->tmem[(at + 1) & 0xFFF]);
+				any = true;
+				if (alphaTest && !(v & 1)) {
+					continue;
+				}
+				uint32_t const a = (row + (uint32_t) x * 2) & (RDRAM_SIZE - 2);
+				n->rdram[a] = (uint8_t) (v >> 8);
+				n->rdram[a + 1] = (uint8_t) v;
+				n->hidden[a >> 1] = v & 1 ? 3 : 0;
+			}
+		}
+		if (any) {
+			int const cr = (v >> 11) & 31, cg = (v >> 6) & 31, cb = (v >> 1) & 31;
+			r->pix = (struct Pixel) { 0 };
+			r->pix.tex0 = r->pix.tex1 = (struct Color) { cr << 3 | cr >> 2, cg << 3 | cg >> 2, cb << 3 | cb >> 2, v & 1 ? 255 : 0 };
+		}
+		return;
+	}
 	for (int y = y0; y <= y1; ++y) {
 		if (!ownsRow(r, y)) {
 			continue;
