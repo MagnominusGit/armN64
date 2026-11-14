@@ -2017,7 +2017,8 @@ static bool drawState(struct N64* n, struct Glr* g, struct RDP* r, bool textured
 	}
 	// No command but primitives since the last: the same state.
 	int primitive = textured | shaded << 1 | (depth != 0) << 2 | tile << 3 | persp << 6 | r->maxLevel << 7 | (depth == 2) << 10;
-	if (g->fastValid && g->stateSet && g->fastGen == r->stateGen && g->fastKey == primitive) {
+	if (g->fastValid && g->stateSet && g->fastGen == r->stateGen && g->fastKey == primitive &&
+	    (y1 < g->fastRows ? y1 : g->fastRows) <= g->state.target->loadedRows) {
 		return drawRows(n, g, r, g->fastRows, y0, y1);
 	}
 	struct DrawState s;
@@ -2031,7 +2032,8 @@ static bool drawState(struct N64* n, struct Glr* g, struct RDP* r, bool textured
 	if (!g->depthImage && g->stateSet && g->state.target && (g->state.target->addr != r->colorAddr || g->state.target->width != r->colorWidth)) {
 		flushBatch(n, g);
 	}
-	s.target = g->depthImage ? g->state.target : target(n, g, r->colorAddr, r->colorWidth, r->colorSize, rows);
+	// The image's rows down to the primitive's (a scissor can reach past the image, into the next).
+	s.target = g->depthImage ? g->state.target : target(n, g, r->colorAddr, r->colorWidth, r->colorSize, y1 < rows ? y1 : rows);
 	int cycleType = r->cycleType;
 	uint32_t modes = (uint32_t) cycleType | (r->alphaCompare ? MODE_ALPHA_COMPARE : 0) | (textured ? MODE_TEXTURED : 0) | (shaded ? MODE_SHADED : 0);
 	int lastCycle = cycleType == 1 ? 1 : 0;
