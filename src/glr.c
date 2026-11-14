@@ -2747,7 +2747,7 @@ void glrDraw(struct N64* n, struct RDP* r, const uint64_t* w, int op) {
 // RDRAM [addr, addr + len) about to be read or written by the CPU or a DMA: each target that drew
 // there gives its rows back, the others stay on the GPU; for a write, the rows there load again and
 // what of the depth image it covers goes into the GPU's depth before the next draw.
-void glrTouched(struct N64* n, uint32_t addr, uint32_t len, bool write) {
+static void touched(struct N64* n, uint32_t addr, uint32_t len, bool write, bool load) {
 	struct Glr* g = n->glr;
 	bool gave = false;
 	for (int i = 0; n->rdpPending && i < TARGETS; ++i) {
@@ -2757,10 +2757,10 @@ void glrTouched(struct N64* n, uint32_t addr, uint32_t len, bool write) {
 		if (t == g->own || !t->texture || t->dirtyTo <= t->dirtyFrom || addr >= to || addr + len <= from) {
 			continue;
 		}
-		t->cpuReads |= !write && t->dirtyTo <= READ_BACK_ROWS;
+		t->cpuReads |= !write && !load && t->dirtyTo <= READ_BACK_ROWS;
 		// FLE: a read takes what RDRAM has, the GPU's pixels a field late (glrField); the pages wait
 		// for writes only until it draws there again.
-		if (!write && n->fle) {
+		if (!write && !load && n->fle) {
 			int const rows = t->marked > t->dirtyTo ? t->marked : t->dirtyTo;
 			markPages(n, t->addr, (uint32_t) rows * row, false);
 			markWrites(n, t->addr, (uint32_t) rows * row);
@@ -2842,6 +2842,15 @@ void glrTouched(struct N64* n, uint32_t addr, uint32_t len, bool write) {
 			n->pageFlags[p] &= (uint8_t) ~PAGE_RDP_READS;
 		}
 	}
+}
+
+void glrTouched(struct N64* n, uint32_t addr, uint32_t len, bool write) {
+	touched(n, addr, len, write, false);
+}
+
+// A texture load from RDRAM [addr, addr + len): what the GPU drew there goes back, as for a read.
+void glrLoadFrom(struct N64* n, uint32_t addr, uint32_t len) {
+	touched(n, addr, len, false, true);
 }
 
 // RDRAM [addr, addr + len) about to be written by the CPU or a DMA: what of the depth image it covers

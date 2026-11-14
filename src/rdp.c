@@ -3920,7 +3920,7 @@ static void command(struct N64* n, struct RDP* r, const uint64_t* w, int op, int
 		uint32_t addr, len;
 		loadSource(r, w, op, &addr, &len);
 		if (glrDrew(n, addr, len)) {
-			glrSync(n);
+			glrLoadFrom(n, addr, len);
 		}
 	}
 	// The GL renderer draws; the RDP keeps the state (texture loads included) and the time.
