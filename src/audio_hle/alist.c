@@ -267,8 +267,6 @@ void alist_envmix_exp(
         const int32_t *rate,
         uint32_t address)
 {
-    size_t n = (aux) ? 4 : 2;
-
     const int16_t* const in = (int16_t*)(hle->alist_buffer + dmemi);
     int16_t* const dl = (int16_t*)(hle->alist_buffer + dmem_dl);
     int16_t* const dr = (int16_t*)(hle->alist_buffer + dmem_dr);
@@ -325,22 +323,17 @@ void alist_envmix_exp(
         }
 
         for (x = 0; x < 8; ++x) {
-            int16_t  gains[4];
-            int16_t* buffers[4];
             int16_t l_vol = ramp_step(&ramps[0]);
             int16_t r_vol = ramp_step(&ramps[1]);
+            int16_t sample = in[ptr^S];
 
-            buffers[0] = dl + (ptr^S);
-            buffers[1] = dr + (ptr^S);
-            buffers[2] = wl + (ptr^S);
-            buffers[3] = wr + (ptr^S);
-
-            gains[0] = clamp_s16((l_vol * dry + 0x4000) >> 15);
-            gains[1] = clamp_s16((r_vol * dry + 0x4000) >> 15);
-            gains[2] = clamp_s16((l_vol * wet + 0x4000) >> 15);
-            gains[3] = clamp_s16((r_vol * wet + 0x4000) >> 15);
-
-            alist_envmix_mix(n, buffers, gains, in[ptr^S]);
+            /* armN64: the mixes in turn, as alist_envmix_mix does them, the wet ones with aux only */
+            sample_mix(dl + (ptr^S), sample, clamp_s16((l_vol * dry + 0x4000) >> 15));
+            sample_mix(dr + (ptr^S), sample, clamp_s16((r_vol * dry + 0x4000) >> 15));
+            if (aux) {
+                sample_mix(wl + (ptr^S), sample, clamp_s16((l_vol * wet + 0x4000) >> 15));
+                sample_mix(wr + (ptr^S), sample, clamp_s16((r_vol * wet + 0x4000) >> 15));
+            }
             ++ptr;
         }
     }
