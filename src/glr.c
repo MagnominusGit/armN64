@@ -29,7 +29,7 @@ enum {
 	GL_STENCIL_TEST = 0x0B90, GL_EXTENSIONS = 0x1F03, GL_MAX_TEXTURE_SIZE = 0x0D33, GL_MAX_RENDERBUFFER_SIZE = 0x84E8, GL_STENCIL_BUFFER_BIT = 0x400, GL_KEEP = 0x1E00, GL_REPLACE = 0x1E01, GL_EQUAL = 0x202, GL_GEQUAL = 0x206,
 	GL_TEXTURE_MIN_FILTER = 0x2801, GL_TEXTURE_MAG_FILTER = 0x2800, GL_NEAREST = 0x2600, GL_TEXTURE_WRAP_S = 0x2802,
 	GL_TEXTURE_WRAP_T = 0x2803, GL_CLAMP_TO_EDGE = 0x812F, GL_REPEAT = 0x2901, GL_MIRRORED_REPEAT = 0x8370, GL_LINEAR = 0x2601, GL_TEXTURE0 = 0x84C0,
-	GL_ARRAY_BUFFER = 0x8892, GL_STREAM_DRAW = 0x88E0, GL_STREAM_READ = 0x88E1, GL_MAP_READ_BIT = 1, GL_TRIANGLES = 4, GL_MAP_WRITE_BIT = 2, GL_MAP_UNSYNCHRONIZED_BIT = 0x20,
+	GL_ARRAY_BUFFER = 0x8892, GL_STREAM_DRAW = 0x88E0, GL_FUNC_ADD = 0x8006, GL_MAX = 0x8008, GL_STREAM_READ = 0x88E1, GL_MAP_READ_BIT = 1, GL_TRIANGLES = 4, GL_MAP_WRITE_BIT = 2, GL_MAP_UNSYNCHRONIZED_BIT = 0x20,
 	GL_SCISSOR_TEST = 0x0C11, GL_DEPTH_TEST = 0x0B71, GL_BLEND = 0x0BE2, GL_POLYGON_OFFSET_FILL = 0x8037,
 	GL_DITHER = 0x0BD0, GL_COLOR_BUFFER_BIT = 0x4000, GL_DEPTH_BUFFER_BIT = 0x100,
 	GL_LESS = 0x201, GL_LEQUAL = 0x203, GL_ALWAYS = 0x207,
@@ -76,6 +76,7 @@ struct Gl {
 	void (*DepthMask)(GLboolean);
 	void (*BlendFunc)(GLenum, GLenum);
 	void (*BlendFuncSeparate)(GLenum, GLenum, GLenum, GLenum);
+	void (*BlendEquationSeparate)(GLenum, GLenum);
 	void (*BlendColor)(float, float, float, float);
 	void (*PolygonOffset)(float, float);
 	void (*StencilFunc)(GLenum, GLint, GLuint);
@@ -214,6 +215,9 @@ struct DrawState {
 	bool depthTest, depthWrite, decal, depthLess, blendOn, persp;
 	// Into the GPU's depth only (depthTriangle).
 	bool depthOnly;
+	// Coverage kept as it was (other modes' cvg_dst 3, not decals): the pixels are marked 1 in alpha,
+	// not drawn (markSaved), and go back keeping the coverage RDRAM has.
+	bool coverageSave;
 	// The image's pixels read (image read, or memory in the blender).
 	bool readsImage;
 	int blendB;
@@ -237,6 +241,9 @@ struct Glr {
 	int depthRows;
 	// A target's taller texture, for its rows to be copied in (grow).
 	GLuint growFramebuffer;
+	// The program marking the pixels a coverage-keeping batch covers (markSaved), and its uniforms.
+	GLuint markProgram;
+	GLint markSize, markPersp;
 	// The target giving rows back for a read while it keeps them (glrTouched): its own write to
 	// RDRAM leaves it as it is.
 	struct Target* own;
@@ -456,7 +463,7 @@ static bool loadGl(struct Glr* g) {
 	       GLFN(RenderbufferStorage) && GLFN(GenTextures) && GLFN(DeleteTextures) && GLFN(BindTexture) && GLFN(ActiveTexture) &&
 	       GLFN(TexImage2D) && GLFN(TexSubImage2D) && GLFN(TexParameteri) && GLFN(Viewport) && GLFN(Scissor) && GLFN(Enable) &&
 	       GLFN(Disable) && GLFN(ClearColor) && GLFN(ClearDepthf) && GLFN(Clear) && GLFN(DepthFunc) && GLFN(DepthMask) &&
-	       GLFN(BlendFunc) && GLFN(BlendFuncSeparate) && GLFN(BlendColor) && GLFN(PolygonOffset) && GLFN(StencilFunc) && GLFN(StencilOp) && GLFN(ColorMask) && GLFN(ClearStencil) && GLFN(GetString) && GLFN(GetIntegerv) && GLFN(ReadPixels) && GLFN(PixelStorei) && GLFN(CreateShader) &&
+	       GLFN(BlendFunc) && GLFN(BlendFuncSeparate) && GLFN(BlendEquationSeparate) && GLFN(BlendColor) && GLFN(PolygonOffset) && GLFN(StencilFunc) && GLFN(StencilOp) && GLFN(ColorMask) && GLFN(ClearStencil) && GLFN(GetString) && GLFN(GetIntegerv) && GLFN(ReadPixels) && GLFN(PixelStorei) && GLFN(CreateShader) &&
 	       GLFN(ShaderSource) && GLFN(CompileShader) && GLFN(GetShaderiv) && GLFN(GetShaderInfoLog) && GLFN(DeleteShader) &&
 	       GLFN(CreateProgram) && GLFN(AttachShader) && GLFN(LinkProgram) && GLFN(GetProgramiv) && GLFN(GetProgramInfoLog) &&
 	       GLFN(UseProgram) && GLFN(DeleteProgram) && GLFN(GetUniformLocation) && GLFN(Uniform1i) && GLFN(Uniform1f) &&
@@ -1488,14 +1495,16 @@ static void storePixels(struct N64* n, struct Target* t, int from, int to, const
 				continue;
 			}
 			int r = c & 255, gr = (c >> 8) & 255, b = (c >> 16) & 255;
+			// Alpha 1: drawn keeping coverage (markSaved), the coverage RDRAM has stays.
+			bool const kept = (c >> 24) == 1;
 			if (t->size == 3) {
 				uint8_t* p = &n->rdram[(t->addr + i * 4) & (RDRAM_SIZE - 4)];
-				p[0] = (uint8_t) r, p[1] = (uint8_t) gr, p[2] = (uint8_t) b, p[3] = 0xE0;
+				p[0] = (uint8_t) r, p[1] = (uint8_t) gr, p[2] = (uint8_t) b, p[3] = kept ? p[3] : 0xE0;
 			} else if (t->size == 2) {
 				uint32_t a = (t->addr + i * 2) & (RDRAM_SIZE - 2);
-				uint16_t v = (uint16_t) ((r >> 3) << 11 | (gr >> 3) << 6 | (b >> 3) << 1 | 1);
+				uint16_t v = (uint16_t) ((r >> 3) << 11 | (gr >> 3) << 6 | (b >> 3) << 1 | (kept ? n->rdram[a + 1] & 1 : 1));
 				n->rdram[a] = (uint8_t) (v >> 8), n->rdram[a + 1] = (uint8_t) v;
-				n->hidden[a >> 1] = 3;
+				n->hidden[a >> 1] = kept ? n->hidden[a >> 1] : 3;
 			} else {
 				n->rdram[(t->addr + i) & (RDRAM_SIZE - 1)] = (uint8_t) r;
 			}
@@ -1708,6 +1717,51 @@ static void colorOf(const struct Color* c, float* out) {
 	out[0] = c->r / 255.0f, out[1] = c->g / 255.0f, out[2] = c->b / 255.0f, out[3] = c->a / 255.0f;
 }
 
+// The batch just drawn (colors only) again, its pixels marked 1 in alpha where nothing drew them yet:
+// they go back to RDRAM keeping the coverage there.
+static void markSaved(struct Glr* g, const struct DrawState* s, GLint first) {
+	struct Gl* gl = &g->gl;
+	if (!g->markProgram) {
+		static const char fragment[] =
+			"#version 300 es\n"
+			"precision highp float;\n"
+			"out vec4 oColor;\n"
+			"void main() { oColor = vec4(0.0, 0.0, 0.0, 1.0 / 255.0); }\n";
+		GLuint const fs = compile(g, GL_FRAGMENT_SHADER, fragment);
+		GLint ok = 0;
+		if (fs) {
+			g->markProgram = gl->CreateProgram();
+			gl->AttachShader(g->markProgram, g->vertexShader);
+			gl->AttachShader(g->markProgram, fs);
+			gl->LinkProgram(g->markProgram);
+			gl->GetProgramiv(g->markProgram, GL_LINK_STATUS, &ok);
+			gl->DeleteShader(fs);
+		}
+		if (!ok) {
+			g->markProgram = 0;
+			return;
+		}
+		g->markSize = gl->GetUniformLocation(g->markProgram, "uSize");
+		g->markPersp = gl->GetUniformLocation(g->markProgram, "uPersp");
+	}
+	gl->UseProgram(g->markProgram);
+	gl->Uniform2f(g->markSize, (float) s->target->width, (float) TARGET_ROWS);
+	gl->Uniform1i(g->markPersp, s->persp);
+	gl->DepthMask(0);
+	if (s->depthTest) {
+		gl->DepthFunc(GL_LEQUAL);
+	}
+	gl->Enable(GL_BLEND);
+	gl->BlendEquationSeparate(GL_FUNC_ADD, GL_MAX);
+	gl->BlendFuncSeparate(GL_ZERO, GL_ONE, GL_ONE, GL_ONE);
+	gl->ColorMask(0, 0, 0, 1);
+	gl->DrawArrays(GL_TRIANGLES, first, g->batchCount);
+	gl->BlendEquationSeparate(GL_FUNC_ADD, GL_FUNC_ADD);
+	// Blending off, as the applied state's "unknown" (-1) also means for it.
+	gl->Disable(GL_BLEND);
+	memset(&g->applied, 0xFF, sizeof(g->applied));
+}
+
 static void flushBatch(struct N64* n, struct Glr* g) {
 	if (!g->batchCount || !g->stateSet) {
 		g->batchCount = 0;
@@ -1819,6 +1873,9 @@ static void flushBatch(struct N64* n, struct Glr* g) {
 		memcpy(to, g->batch, bytes);
 		gl->UnmapBuffer(GL_ARRAY_BUFFER);
 		GLint first = (GLint) (g->vertexOffset / (VERTEX_FLOATS * 4));
+		if (s->coverageSave) {
+			gl->ColorMask(1, 1, 1, 0);
+		}
 		if (s->decal) {
 			// The RDP's decal passes only within the depth slope either way (rdp.c, z mode 3): first
 			// the pixels no more than that in front marked, then those no more than that behind drawn.
@@ -1863,6 +1920,12 @@ static void flushBatch(struct N64* n, struct Glr* g) {
 			if (s->depthOnly) {
 				gl->ColorMask(1, 1, 1, 1);
 			}
+		}
+		if (s->coverageSave) {
+			markSaved(g, s, first);
+		}
+		if (s->coverageSave) {
+			gl->ColorMask(1, 1, 1, 1);
 		}
 		++n->stats.glBatches;
 		g->vertexOffset += bytes;
@@ -1991,6 +2054,7 @@ static bool drawState(struct N64* n, struct Glr* g, struct RDP* r, bool textured
 		s.memoryFirst = 0;
 	}
 	s.persp = persp;
+	s.coverageSave = ((r->otherModes >> 8) & 3) == 3 && !s.depthOnly && !s.decal;
 	s.scissor[0] = r->scissorX0 >> 2, s.scissor[1] = r->scissorY0 >> 2;
 	s.scissor[2] = (r->scissorX1 + 3) >> 2, s.scissor[3] = rows;
 	if (s.scissor[2] <= s.scissor[0] || s.scissor[3] <= s.scissor[1]) {
