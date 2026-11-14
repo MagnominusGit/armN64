@@ -5339,6 +5339,11 @@ bool hleGraphics(struct N64* n, bool dry) {
 	if (f == FAMILY_F3D && ucode == 0x7754FFF8u) {
 		f = FAMILY_F3DEX;
 	}
+	// Blast Corps' second microcode carries Fast3D's data but isn't Fast3D: its tasks hand it a block
+	// of addresses and counts, and it sends nothing to the RDP.
+	if (f == FAMILY_F3D && ucode == 0xE429B556u) {
+		f = FAMILY_NONE;
+	}
 	// Dark Rift's Turbo3D has no name either.
 	if (f == FAMILY_NONE && ucode == 0xA9DAF288u) {
 		f = FAMILY_TURBO3D;
