@@ -29,7 +29,7 @@ enum {
 	GL_STENCIL_TEST = 0x0B90, GL_EXTENSIONS = 0x1F03, GL_MAX_TEXTURE_SIZE = 0x0D33, GL_MAX_RENDERBUFFER_SIZE = 0x84E8, GL_STENCIL_BUFFER_BIT = 0x400, GL_KEEP = 0x1E00, GL_REPLACE = 0x1E01, GL_EQUAL = 0x202, GL_GEQUAL = 0x206,
 	GL_TEXTURE_MIN_FILTER = 0x2801, GL_TEXTURE_MAG_FILTER = 0x2800, GL_NEAREST = 0x2600, GL_TEXTURE_WRAP_S = 0x2802,
 	GL_TEXTURE_WRAP_T = 0x2803, GL_CLAMP_TO_EDGE = 0x812F, GL_REPEAT = 0x2901, GL_MIRRORED_REPEAT = 0x8370, GL_LINEAR = 0x2601, GL_TEXTURE0 = 0x84C0,
-	GL_ARRAY_BUFFER = 0x8892, GL_STREAM_DRAW = 0x88E0, GL_TRIANGLES = 4, GL_MAP_WRITE_BIT = 2, GL_MAP_UNSYNCHRONIZED_BIT = 0x20,
+	GL_ARRAY_BUFFER = 0x8892, GL_STREAM_DRAW = 0x88E0, GL_STREAM_READ = 0x88E1, GL_MAP_READ_BIT = 1, GL_TRIANGLES = 4, GL_MAP_WRITE_BIT = 2, GL_MAP_UNSYNCHRONIZED_BIT = 0x20,
 	GL_SCISSOR_TEST = 0x0C11, GL_DEPTH_TEST = 0x0B71, GL_BLEND = 0x0BE2, GL_POLYGON_OFFSET_FILL = 0x8037,
 	GL_DITHER = 0x0BD0, GL_COLOR_BUFFER_BIT = 0x4000, GL_DEPTH_BUFFER_BIT = 0x100,
 	GL_LESS = 0x201, GL_LEQUAL = 0x203, GL_ALWAYS = 0x207,
@@ -145,6 +145,11 @@ struct Target {
 	int height;
 	// Its pixels to an RDP pixel (scaleFor).
 	int scale;
+	// FLE: the CPU reads what the GPU drew a field late (glrField): read since the last field, and
+	// rows packFrom to packTo copied into pack at the last field, for RDRAM at the next.
+	bool readSince;
+	GLuint pack;
+	int packFrom, packTo;
 };
 
 // What the fragment shader is made for.
@@ -1172,6 +1177,7 @@ static void warm(struct Glr* g, struct Program* pr) {
 // ---- Color images
 
 static void writePixels(struct N64* n, struct Target* t, int from, int to);
+static void storePixels(struct N64* n, struct Target* t, int from, int to, const uint32_t* image);
 
 // The RDRAM pixels of rows from to to - 1, into the texture, with alpha 0: drawing sets it, and only
 // pixels with it go back.
@@ -1415,6 +1421,8 @@ static struct Target* target(struct N64* n, struct Glr* g, uint32_t addr, uint32
 		}
 		t->addr = addr, t->width = width, t->size = size;
 		t->cpuReads = false;
+		t->readSince = false;
+		t->packFrom = t->packTo = 0;
 		t->loadedRows = 0;
 		t->dirtyFrom = t->dirtyTo = 0;
 	} else if (height > t->height) {
@@ -1465,9 +1473,17 @@ static void writePixels(struct N64* n, struct Target* t, int from, int to) {
 	}
 	gl->ReadPixels(0, from, (GLsizei) t->width, to - from, GL_RGBA, GL_UNSIGNED_BYTE, g->image);
 	n->stats.glRows += (uint64_t) (to - from);
+	// Older pixels on their way back would undo these.
+	t->packFrom = t->packTo = 0;
+	storePixels(n, t, from, to, g->image);
+}
+
+// Rows from to to - 1 of what the GPU drew (image, bottom row first) into RDRAM, as the RDP would store
+// them (16-bit pixels fully covered).
+static void storePixels(struct N64* n, struct Target* t, int from, int to, const uint32_t* image) {
 	for (int y = from; y < to; ++y) {
 		for (uint32_t x = 0; x < t->width; ++x) {
-			uint32_t c = g->image[(y - from) * t->width + x], i = y * t->width + x;
+			uint32_t c = image[(y - from) * t->width + x], i = y * t->width + x;
 			if (!(c >> 24)) {
 				continue;
 			}
@@ -2606,6 +2622,17 @@ void glrTouched(struct N64* n, uint32_t addr, uint32_t len, bool write) {
 			continue;
 		}
 		t->cpuReads |= !write && t->dirtyTo <= READ_BACK_ROWS;
+		// FLE: a read takes what RDRAM has, the GPU's pixels a field late (glrField); the pages wait
+		// for writes only until it draws there again.
+		if (!write && n->fle) {
+			int const rows = t->marked > t->dirtyTo ? t->marked : t->dirtyTo;
+			markPages(n, t->addr, (uint32_t) rows * row, false);
+			markWrites(n, t->addr, (uint32_t) rows * row);
+			t->marked = 0;
+			t->readSince = true;
+			gave = true;
+			continue;
+		}
 		glesUse(g->gles);
 		flushBatch(n, g);
 		g->fastValid = false;
@@ -2659,6 +2686,14 @@ void glrTouched(struct N64* n, uint32_t addr, uint32_t len, bool write) {
 	if (write) {
 		forgetRows(g, addr, len, g->own);
 		glrWritten(n, addr, len);
+		// Older pixels on their way back would undo the write.
+		for (int i = 0; i < TARGETS; ++i) {
+			struct Target* t = &g->target[i];
+			uint32_t const row = t->width * (t->size == 3 ? 4 : t->size == 1 ? 1 : 2);
+			if (t != g->own && t->packTo > t->packFrom && addr < t->addr + (uint32_t) t->packTo * row && addr + len > t->addr + (uint32_t) t->packFrom * row) {
+				t->packFrom = t->packTo = 0;
+			}
+		}
 	}
 }
 
@@ -2702,6 +2737,59 @@ static void pictureStart(uint32_t offset, uint32_t stride, uint32_t bytes, int w
 // The framebuffer of the color image the VI shows from origin (width by rows pixels, stride pixels a
 // row, size 2 or 3), when the GPU drew some of those rows since its pixels last went back to RDRAM:
 // x and y of the picture's first pixel in it. 0 otherwise: RDRAM has the picture.
+// The pixels copied back at the last field into RDRAM (the GPU has had a field to copy them), and what
+// the targets the CPU read since drew copied back without waiting.
+void glrField(struct N64* n) {
+	struct Glr* g = n->glr;
+	struct Gl* gl = &g->gl;
+	glesUse(g->gles);
+	for (int i = 0; i < TARGETS; ++i) {
+		struct Target* t = &g->target[i];
+		if (!t->texture || !t->pack) {
+			continue;
+		}
+		if (t->packTo > t->packFrom) {
+			uint32_t const bytes = t->size == 3 ? 4 : t->size == 1 ? 1 : 2, start = t->addr + (uint32_t) t->packFrom * t->width * bytes;
+			gl->BindBuffer(GL_PIXEL_PACK_BUFFER, t->pack);
+			const uint32_t* image = gl->MapBufferRange(GL_PIXEL_PACK_BUFFER, 0, (GLsizeiptr) (t->packTo - t->packFrom) * t->width * 4, GL_MAP_READ_BIT);
+			if (image) {
+				g->own = t;
+				n64RdramWrite(n, start & (RDRAM_SIZE - 1), (uint32_t) (t->packTo - t->packFrom) * t->width * bytes);
+				g->own = NULL;
+				forgetRows(g, start, (uint32_t) (t->packTo - t->packFrom) * t->width * bytes, t);
+				// Copied out in one pass first: the mapping may be uncached.
+				memcpy(g->image, image, (size_t) (t->packTo - t->packFrom) * t->width * 4);
+				gl->UnmapBuffer(GL_PIXEL_PACK_BUFFER);
+				storePixels(n, t, t->packFrom, t->packTo, g->image);
+			}
+			gl->BindBuffer(GL_PIXEL_PACK_BUFFER, 0);
+			t->packFrom = t->packTo = 0;
+		}
+	}
+	for (int i = 0; i < TARGETS; ++i) {
+		struct Target* t = &g->target[i];
+		if (!t->texture || !t->readSince || t->dirtyTo <= t->dirtyFrom) {
+			continue;
+		}
+		t->readSince = false;
+		flushBatch(n, g);
+		if (!t->pack) {
+			gl->GenBuffers(1, &t->pack);
+		}
+		if (t->scale > 1) {
+			blitRows(g, t, t->dirtyFrom, t->dirtyTo, false);
+		} else {
+			resolve(g, t);
+			useFramebuffer(g, t->framebuffer);
+		}
+		gl->BindBuffer(GL_PIXEL_PACK_BUFFER, t->pack);
+		gl->BufferData(GL_PIXEL_PACK_BUFFER, (GLsizeiptr) (t->dirtyTo - t->dirtyFrom) * t->width * 4, NULL, GL_STREAM_READ);
+		gl->ReadPixels(0, t->dirtyFrom, (GLsizei) t->width, t->dirtyTo - t->dirtyFrom, GL_RGBA, GL_UNSIGNED_BYTE, 0);
+		gl->BindBuffer(GL_PIXEL_PACK_BUFFER, 0);
+		t->packFrom = t->dirtyFrom, t->packTo = t->dirtyTo;
+	}
+}
+
 unsigned glrPicture(struct N64* n, uint32_t origin, uint32_t stride, int size, int width, int rows, int* x, int* y) {
 	struct Glr* g = n->glr;
 	uint32_t const bytes = size == 3 ? 4 : 2;
@@ -3072,6 +3160,7 @@ void glrStateReplaced(struct Glr* g) {
 		g->target[i].dirtyFrom = g->target[i].dirtyTo = 0;
 		g->target[i].loadedRows = 0;
 		g->target[i].marked = 0;
+		g->target[i].packFrom = g->target[i].packTo = 0;
 	}
 }
 

@@ -418,6 +418,9 @@ void n64RunField(struct N64* n) {
 	aiUpdate(n);
 	n->nextVi += n->fieldCycles;
 	++n->fields;
+	if (n->glr && n->fle) {
+		glrField(n);
+	}
 }
 
 // One framebuffer row for the VI from column -3 (index 0): 8-bit channels, their 5-bit values
