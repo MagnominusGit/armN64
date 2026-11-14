@@ -575,7 +575,7 @@ static bool emitFpuFast(struct Jit* j, uint32_t op) {
 	int fmt = (op >> 21) & 31, func = op & 0x3F, ft = (op >> 16) & 31, fs = (op >> 11) & 31, fd = (op >> 6) & 31;
 	bool single = fmt == 16 && (func <= 3 || (func >= 5 && func <= 7) || func == 13 || func >= 0x30);
 	bool dbl = (fmt == 17 && (func <= 3 || (func >= 5 && func <= 7) || func == 0x20 || func >= 0x30)) || (fmt == 16 && func == 0x21);
-	if (!(fmt == 0 || fmt == 2 || fmt == 4 || single || dbl || (fmt == 20 && func == 32))) {
+	if (!(fmt == 0 || fmt == 2 || fmt == 4 || fmt == 6 || single || dbl || (fmt == 20 && func == 32))) {
 		return false;
 	}
 	needCop1(j, true);
@@ -600,6 +600,28 @@ static bool emitFpuFast(struct Jit* j, uint32_t op) {
 		return true;
 	case 4:
 		aStr(e, readReg(j, ft), CPU, fprOff(j, fs));
+		return true;
+	case 6:
+		// CTC1 to FCR31 (to the others it does nothing), and the host's rounding mode when it changes, as
+		// fpuHostRound sets it: FPCR's RMode for the mode is two bits of 0x9C.
+		if (fs == 31) {
+			int const s = readReg(j, ft);
+			aMovImm(e, 1, 0x0183FFFF);
+			aDp(e, A_AND, 0, s, 1, S_LSL, 0);
+			aStr(e, 0, CPU, CPU_OFF(fcr31));
+			aLogicImm(e, A_AND_IMM, 0, 0, 3);
+			aLdr(e, 1, CPU, CPU_OFF(hostRound));
+			aDp(e, A_SUBS, ZR, 0, 1, S_LSL, 0);
+			uint8_t* same = aBcond(e, C_EQ, NULL);
+			aStr(e, 0, CPU, CPU_OFF(hostRound));
+			aDp(e, A_ADD, 1, 0, 0, S_LSL, 0);
+			aMovImm(e, 2, 0x9C);
+			aDp(e, A_LSRV, 2, 2, 1, S_LSL, 0);
+			emit32(e, 0xD53B4403); // mrs x3, fpcr
+			aBfi(e, 3, 2, 22, 2);
+			emit32(e, 0xD51B4403); // msr fpcr, x3
+			patchHere(e, same);
+		}
 		return true;
 	case 20:
 		aLdr(e, 0, CPU, fprOff(j, fs));

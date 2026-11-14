@@ -328,6 +328,7 @@ void cpuReset(struct N64* n) {
 	memset(c->dcacheTag, 0xFF, sizeof(c->dcacheTag));
 	memset(c->icacheTag, 0xFF, sizeof(c->icacheTag));
 	memset(c->openRow, 0xFF, sizeof(c->openRow));
+	fpuHostRound(c, 0);
 	cpuTlbChanged(n);
 	c->cop0[CP0_STATUS] = 0x34000000;
 	c->cop0[CP0_CONFIG] = 0x7006E463;

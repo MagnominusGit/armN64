@@ -76,7 +76,24 @@ static void setD(struct N64* n, int r, double d) {
 	set64(n, r, (v & 0x7FFFFFFFFFFFFFFFull) == 0x7FF8000000000000ull ? 0x7FF7FFFFFFFFFFFFull : v);
 }
 
-static const int roundModes[4] = { FE_TONEAREST, FE_TOWARDZERO, FE_UPWARD, FE_DOWNWARD };
+// The host's rounding mode set to FCR31's mode (nearest, to zero, up, down): straight into MXCSR or
+// FPCR where the JITs set it too, so their arithmetic and conversions round the same way.
+void fpuHostRound(struct CPU* c, int mode) {
+	c->hostRound = mode;
+#if defined(__x86_64__)
+	__asm__ volatile("stmxcsr %0" : "=m"(c->mxcsr));
+	c->mxcsr = (c->mxcsr & ~0x6000u) | (uint32_t) ((4 - mode) & 3) << 13;
+	__asm__ volatile("ldmxcsr %0" : : "m"(c->mxcsr));
+#elif defined(__aarch64__)
+	uint64_t fpcr;
+	__asm__ volatile("mrs %0, fpcr" : "=r"(fpcr));
+	fpcr = (fpcr & ~(3ull << 22)) | (uint64_t) ((0x9C >> (mode * 2)) & 3) << 22;
+	__asm__ volatile("msr fpcr, %0" : : "r"(fpcr));
+#else
+	static const int roundModes[4] = { FE_TONEAREST, FE_TOWARDZERO, FE_UPWARD, FE_DOWNWARD };
+	fesetround(roundModes[mode]);
+#endif
+}
 
 static double roundWith(double v, int mode) {
 	switch (mode) {
@@ -147,11 +164,9 @@ void fpuExecuteFast(struct N64* n, uint32_t op) {
 	case 6:
 		if (FS == 31) {
 			// The host's rounding mode, set again only when it changes.
-			static _Thread_local int hostMode;
 			c->fcr31 = (uint32_t) c->gpr[FT] & 0x0183FFFF;
-			if ((int) (c->fcr31 & 3) != hostMode) {
-				hostMode = (int) (c->fcr31 & 3);
-				fesetround(roundModes[hostMode]);
+			if ((int) (c->fcr31 & 3) != c->hostRound) {
+				fpuHostRound(c, (int) (c->fcr31 & 3));
 			}
 		}
 		return;

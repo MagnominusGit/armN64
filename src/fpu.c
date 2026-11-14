@@ -267,7 +267,6 @@ static bool outputD(struct N64* n, double* d) {
 	return true;
 }
 
-static const int roundModes[4] = { FE_TONEAREST, FE_TOWARDZERO, FE_UPWARD, FE_DOWNWARD };
 
 // To an integral value: nearest (ties to even), toward zero, up, down.
 static double roundWith(double v, int mode) {
@@ -540,11 +539,9 @@ static bool early(struct N64* n, uint32_t op, int fmt, int func) {
 // unimplemented one, raises it.
 static void writeFcr31(struct N64* n, uint32_t v) {
 	struct CPU* c = &n->cpu;
-	static _Thread_local int hostMode = -1;
 	c->fcr31 = v & 0x0183FFFF;
-	if ((int) (c->fcr31 & 3) != hostMode) {
-		hostMode = (int) (c->fcr31 & 3);
-		fesetround(roundModes[hostMode]);
+	if ((int) (c->fcr31 & 3) != c->hostRound) {
+		fpuHostRound(c, (int) (c->fcr31 & 3));
 	}
 	if ((c->fcr31 >> 12 & c->fcr31 >> 7 & 0x1F) || (c->fcr31 & CAUSE_E)) {
 		// Cause.CE then names the coprocessor of the instruction after, when it is a coprocessor

@@ -145,6 +145,7 @@ bool n64StateLoad(struct N64* n, const void* data, size_t size, bool quick) {
 	n->saveDirty = true;
 	n->vpageFillCount = was->vpageFillCount;
 	free(was);
+	fpuHostRound(&n->cpu, (int) (n->cpu.fcr31 & 3));
 	if (!sameTlb) {
 		cpuTlbChanged(n);
 	}

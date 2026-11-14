@@ -390,6 +390,30 @@ static void fpuFast(struct Jit* j, uint32_t op) {
 		xLoad(e, fmt == 4 ? 4 : 8, RAX, gpr(ft));
 		xStore(e, fmt == 4 ? 4 : 8, fmt == 4 ? fprS(j, fs) : fprD(j, fs), RAX);
 		return;
+	case 6:
+		// CTC1 to FCR31 (to the others it does nothing), and the host's rounding mode when it changes, as
+		// fpuHostRound sets it: RC in MXCSR is 4 minus the mode, in two bits.
+		if (fs == 31) {
+			xLoad(e, 4, RAX, gpr(ft));
+			xAluI(e, X_AND, 4, R(RAX), 0x0183FFFF);
+			xStore(e, 4, CPU_AT(fcr31), RAX);
+			xAluI(e, X_AND, 4, R(RAX), 3);
+			xAluRM(e, X_CMP, 4, RAX, CPU_AT(hostRound));
+			uint8_t* same = xJcc(e, CC_E, NULL);
+			xStore(e, 4, CPU_AT(hostRound), RAX);
+			xMovI(e, RCX, 4);
+			xAluRR(e, X_SUB, 4, R(RCX), RAX);
+			xAluI(e, X_AND, 4, R(RCX), 3);
+			xShiftI(e, X_SHL, 4, R(RCX), 13);
+			xSse(e, 0, 0xAE, 3, CPU_AT(mxcsr), 4);
+			xLoad(e, 4, RDX, CPU_AT(mxcsr));
+			xAluI(e, X_AND, 4, R(RDX), (int32_t) ~0x6000u);
+			xAluRR(e, X_OR, 4, R(RDX), RCX);
+			xStore(e, 4, CPU_AT(mxcsr), RDX);
+			xSse(e, 0, 0xAE, 2, CPU_AT(mxcsr), 4);
+			patchHere(e, same);
+		}
+		return;
 	}
 	bool const known = ((fmt == 16 || fmt == 17) && (func <= 7 || func == 13 || func == (dbl ? 0x20 : 0x21) || func == 0x24 || func >= 0x30)) ||
 	                   (fmt == 20 && (func == 32 || func == 33));

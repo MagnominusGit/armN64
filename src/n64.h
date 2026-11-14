@@ -60,6 +60,9 @@ struct CPU {
 	// FPU registers as raw bits; how the 32 registers pair up depends on Status.FR.
 	uint64_t fpr[32];
 	uint32_t fcr31;
+	// The host's rounding mode as FCR31's (fpuHostRound), and room for MXCSR while the x86 JIT sets it.
+	int hostRound;
+	uint32_t mxcsr;
 	bool exception;
 	// The caches (cpu.c): tags, the line's physical address while it is valid, else DCACHE_NONE; the
 	// tags as CACHE reads them back; dirty D-cache lines; the lines' data, in RDRAM's byte order.
@@ -750,6 +753,7 @@ static inline void n64Event(struct N64* n, uint64_t at) {
 void fpuExecute(struct N64*, uint32_t op);
 void fpuClearCauses(struct N64*);
 void fpuExecuteFast(struct N64*, uint32_t op);
+void fpuHostRound(struct CPU*, int mode);
 bool fpuProbe(struct N64*, uint32_t op);
 uint32_t fpuCycles(int fmt, int func);
 
