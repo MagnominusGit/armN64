@@ -281,9 +281,9 @@ static void piWillWrite(struct N64* n, uint32_t dram, uint32_t len) {
 }
 
 // Cartridge to RDRAM goes through the RCP's 128-byte buffer, a block at a time, never crossing a
-// 2 KiB RDRAM page.
+// 2 KiB RDRAM page; with mle accuracy byte for byte, as on the emulators hacks were made on.
 static void piDmaToRdram(struct N64* n, uint32_t len) {
-	if (n->emulatorLike) {
+	if (n->compat) {
 		piWillWrite(n, n->pi.dramAddr, len);
 		for (uint32_t i = 0; i < len; ++i) {
 			piRdramByte(n, n->pi.dramAddr + i, cartByte(n, n->pi.cartAddr + i));
