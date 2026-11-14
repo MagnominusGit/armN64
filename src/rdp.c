@@ -1688,6 +1688,20 @@ static void loadTile(struct N64* n, struct RDP* r, uint64_t w, bool block) {
 			}
 			bytes = 0;
 		}
+		// 32-bit texels two at a time: red and green to the lower half, blue and alpha to the upper.
+		if (r->texSize == 3 && !r->tmemSource) {
+			for (uint32_t i = 0; i < bytes; i += 8, lineT += dxt) {
+				uint32_t const swap = (lineT >> 11) & 1 ? 4 : 0;
+				for (uint32_t k = 0; k < 8; k += 4) {
+					uint32_t const d = (t->tmem * 8 + (i + k) / 2) ^ swap, at = src + i + k;
+					r->tmem[d & 0xFFF] = n->rdram[at & (RDRAM_SIZE - 1)];
+					r->tmem[(d + 1) & 0xFFF] = n->rdram[(at + 1) & (RDRAM_SIZE - 1)];
+					r->tmem[(d + 0x800) & 0xFFF] = n->rdram[(at + 2) & (RDRAM_SIZE - 1)];
+					r->tmem[(d + 0x801) & 0xFFF] = n->rdram[(at + 3) & (RDRAM_SIZE - 1)];
+				}
+			}
+			bytes = 0;
+		}
 		for (uint32_t i = 0; i < bytes; i += 8) {
 			bool odd = (lineT >> 11) & 1;
 			if (plain && !r->tmemSource && ((src + i) & (RDRAM_SIZE - 1)) + 8 <= RDRAM_SIZE) {
@@ -1729,7 +1743,16 @@ static void loadTile(struct N64* n, struct RDP* r, uint64_t w, bool block) {
 		uint32_t row = r->texAddr + (uint32_t) (tt * r->texWidth) * (bpp ? bpp : 1);
 		uint32_t line = t->tmem * 8 + (tt - t0) * t->line * 8;
 		uint32_t swap = (tt - t0) & 1 ? 4 : 0;
-		if (r->texSize == 3) {
+		if (r->texSize == 3 && !r->tmemSource) {
+			for (int s = s0; s <= s1; ++s) {
+				const uint8_t* p = &n->rdram[(row + s * 4) & (RDRAM_SIZE - 4)];
+				uint32_t d = (line + (s - s0) * 2) ^ swap;
+				r->tmem[d & 0x7FF] = p[0];
+				r->tmem[(d + 1) & 0x7FF] = p[1];
+				r->tmem[0x800 | (d & 0x7FF)] = p[2];
+				r->tmem[0x800 | ((d + 1) & 0x7FF)] = p[3];
+			}
+		} else if (r->texSize == 3) {
 			for (int s = s0; s <= s1; ++s) {
 				uint32_t src = (row + s * 4) & (RDRAM_SIZE - 4);
 				uint32_t d = (line + (s - s0) * 2) ^ swap;
