@@ -2410,8 +2410,8 @@ static void depthWritten(struct Glr* g, uint32_t lo, uint32_t hi) {
 	g->zPending = true;
 }
 
-// Before a draw: a new depth image goes into the GPU's depth whole; its pages are marked; with depth
-// read or written, what was written there since goes in, at this draw's width.
+// Before a draw: a new depth image goes into the GPU's depth whole; its pages are marked for writes;
+// with depth read or written, what was written there since goes in, at this draw's width.
 static void depthFromRdram(struct N64* n, struct Glr* g, struct RDP* r, bool depth) {
 	int const rows = (int) ((r->scissorY1 + 3) >> 2) < TARGET_ROWS ? (int) ((r->scissorY1 + 3) >> 2) : TARGET_ROWS;
 	if (!g->zProgram || !r->zAddr || !r->colorWidth || r->colorWidth > 1024 || rows <= 0) {
@@ -2429,7 +2429,7 @@ static void depthFromRdram(struct N64* n, struct Glr* g, struct RDP* r, bool dep
 		g->zMark = false;
 		uint32_t const first = (g->zAddr & (RDRAM_SIZE - 1)) >> 12, last = ((g->zAddr + g->zBytes - 1) & (RDRAM_SIZE - 1)) >> 12;
 		for (uint32_t p = first;; p = (p + 1) & ((RDRAM_SIZE >> 12) - 1)) {
-			n->pageFlags[p] |= PAGE_RDP_WRITES;
+			n->pageFlags[p] |= PAGE_RDP_READS;
 			if (p == last) {
 				break;
 			}
@@ -2757,6 +2757,17 @@ void glrTouched(struct N64* n, uint32_t addr, uint32_t len, bool write) {
 			if (t != g->own && t->packTo > t->packFrom && addr < t->addr + (uint32_t) t->packTo * row && addr + len > t->addr + (uint32_t) t->packFrom * row) {
 				t->packFrom = t->packTo = 0;
 			}
+		}
+		// A page written that no target draws to and that holds no depth: the targets load its rows
+		// again when they need them, so the writes after this one go straight to RDRAM.
+		uint32_t const first = (addr & (RDRAM_SIZE - 1)) >> 12, last = ((addr + len - 1) & (RDRAM_SIZE - 1)) >> 12;
+		for (uint32_t p = first; !g->own && p <= last; ++p) {
+			uint32_t const at = p << 12;
+			if ((n->pageFlags[p] & PAGE_RDP) != PAGE_RDP_READS || (g->zWidth && at < g->zAddr + g->zBytes && at + 4096 > g->zAddr)) {
+				continue;
+			}
+			forgetRows(g, at, 4096, NULL);
+			n->pageFlags[p] &= (uint8_t) ~PAGE_RDP_READS;
 		}
 	}
 }
