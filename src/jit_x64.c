@@ -17,8 +17,27 @@ enum { ARENA_SIZE = 256 << 20, BLOCK_CODE_MAX = 32 << 10, SHARED_SIZE = 256 };
 #define CPU_AT(f) M(R12, (int32_t) offsetof(struct CPU, f))
 #define N64_AT(f) M(RBX, (int32_t) offsetof(struct N64, f))
 
-static struct Opnd gpr(int i) {
+// FLE keeps $sp in RBP; the C calls that can use it store it first and load it after.
+static bool pinSp;
+
+static struct Opnd gprMem(int i) {
 	return M(R12, (int32_t) (offsetof(struct CPU, gpr) + 8 * i));
+}
+
+static struct Opnd gpr(int i) {
+	return pinSp && i == 29 ? R(RBP) : gprMem(i);
+}
+
+static void storePinned(struct Emitter* e) {
+	if (pinSp) {
+		xStore(e, 8, gprMem(29), RBP);
+	}
+}
+
+static void loadPinned(struct Emitter* e) {
+	if (pinSp) {
+		xLoad(e, 8, RBP, gprMem(29));
+	}
 }
 
 static bool fits32(uint64_t v) {
@@ -131,6 +150,9 @@ struct Jit {
 	// Outside mle the D-cache holds the data cached accesses use; with HLE accuracy (fast)
 	// there are no caches.
 	bool cacheData, fast, plainCount;
+	// FLE (Fastest): cycles counted in runs, and no load interlocks, address checks or FPU result
+	// fix-ups.
+	bool fle;
 	int opCycles;
 };
 
@@ -193,10 +215,12 @@ static void fpuCall(struct Jit* j, uint32_t op) {
 	struct Emitter* e = &j->e;
 	int const rt = (op >> 16) & 31;
 	bool const probe = fpuProbed(op) && !j->fast;
+	storePinned(e);
 	xMovRR(e, 8, RDI, RBX);
 	xMovIKeepFlags(e, RSI, op);
 	xMovI64(e, RAX, (uint64_t) (uintptr_t) (j->fast ? (void*) fpuExecuteFast : probe ? (void*) fpuProbe : (void*) fpuExecute));
 	xCallR(e, RAX);
+	loadPinned(e);
 	if (probe) {
 		xTest(e, 1, R(RAX), RAX);
 		slowIf(j, CC_E);
@@ -269,8 +293,13 @@ static void fpuTrivial(struct Emitter* e, bool dbl, bool mul, uint8_t** early, i
 }
 
 // A result in RAX (single, or double with dbl) stored as fpu_fast.c's setS and setD store it:
-// flushed to zero when subnormal with FCR31.FS set, and the host's default NaN made the VR4300's.
-static void fastResult(struct Emitter* e, bool dbl, int fd) {
+// flushed to zero when subnormal with FCR31.FS set, and the host's default NaN made the VR4300's
+// (FLE: as it is).
+static void fastResult(struct Emitter* e, bool dbl, int fd, bool fle) {
+	if (fle) {
+		xStore(e, dbl ? 8 : 4, fprAt(fd), RAX);
+		return;
+	}
 	xTestI(e, 4, CPU_AT(fcr31), 1u << 24);
 	uint8_t* keep = xJcc(e, CC_E, NULL);
 	if (dbl) {
@@ -395,7 +424,7 @@ static void fpuFast(struct Jit* j, uint32_t op) {
 		xSse(e, func == 32 ? 0xF3 : 0xF2, 0x2A, 0, fprAt(fs), 4);
 		xSse(e, func == 32 ? 0xF3 : 0xF2, 0x11, 0, out, 4);
 		xLoad(e, func == 32 ? 4 : 8, RAX, out);
-		fastResult(e, func == 33, fd);
+		fastResult(e, func == 33, fd, j->fle);
 		return;
 	}
 	switch (func) {
@@ -408,7 +437,7 @@ static void fpuFast(struct Jit* j, uint32_t op) {
 		} else {
 			xAluI(e, func == 7 ? X_XOR : X_AND, 4, R(RAX), func == 7 ? (int32_t) 0x80000000u : 0x7FFFFFFF);
 		}
-		fastResult(e, dbl, fd);
+		fastResult(e, dbl, fd, j->fle);
 		return;
 	case 6:
 		xLoad(e, width, RAX, fprAt(fs));
@@ -425,7 +454,7 @@ static void fpuFast(struct Jit* j, uint32_t op) {
 		xSse(e, prefix, 0x5A, 0, fprAt(fs), 4);
 		xSse(e, dbl ? 0xF3 : 0xF2, 0x11, 0, out, 4);
 		xLoad(e, dbl ? 4 : 8, RAX, out);
-		fastResult(e, !dbl, fd);
+		fastResult(e, !dbl, fd, j->fle);
 		return;
 	}
 	static const uint8_t ops[5] = { 0x58, 0x5C, 0x59, 0x5E, 0x51 };
@@ -437,7 +466,7 @@ static void fpuFast(struct Jit* j, uint32_t op) {
 	}
 	xSse(e, prefix, 0x11, 0, out, 4);
 	xLoad(e, width, RAX, out);
-	fastResult(e, dbl, fd);
+	fastResult(e, dbl, fd, j->fle);
 }
 
 // MFC1, DMFC1, MTC1, DMTC1, MOV, NEG and ABS, the four operations and C.cond in S and D compiled
@@ -1040,10 +1069,12 @@ static void emitHelper(struct Jit* j, uint32_t op, uint64_t pc, uint32_t paddr, 
 	xStoreI(e, 1, CPU_AT(inDelay), delay);
 	xStoreI(e, 1, CPU_AT(nextInDelay), 0);
 	xStore(e, 8, N64_AT(cycles), R13);
+	storePinned(e);
 	xMovRR(e, 8, RDI, RBX);
 	xMovIKeepFlags(e, RSI, op);
 	xMovI64(e, RAX, (uint64_t) (uintptr_t) cpuJitStep);
 	xCallR(e, RAX);
+	loadPinned(e);
 	xLoad(e, 8, R13, N64_AT(cycles));
 	xLoad(e, 8, R14, N64_AT(jitLimit));
 	xTest(e, 1, R(RAX), RAX);
@@ -1133,9 +1164,11 @@ static void emitMemory(struct Jit* j, struct Slow* slow) {
 	if ((int16_t) op) {
 		xAluI(e, X_ADD, 8, R(RAX), (int16_t) op);
 	}
-	xMovsxd(e, RCX, R(RAX));
-	xAluRR(e, X_CMP, 8, R(RCX), RAX);
-	slow->site[slow->sites++] = xJcc(e, CC_NE, NULL);
+	if (!j->fle) {
+		xMovsxd(e, RCX, R(RAX));
+		xAluRR(e, X_CMP, 8, R(RCX), RAX);
+		slow->site[slow->sites++] = xJcc(e, CC_NE, NULL);
+	}
 	xMovRR(e, 4, R8, RAX);
 	// The physical page from vpages: one not looked up lands past RDRAM.
 	xMovRR(e, 4, RCX, RAX);
@@ -1170,7 +1203,7 @@ static void emitMemory(struct Jit* j, struct Slow* slow) {
 		// Aligned and in RDRAM.
 		xTestI(e, 4, R(RAX), ~(uint32_t) (RDRAM_SIZE - 1));
 		slow->site[slow->sites++] = xJcc(e, CC_NE, NULL);
-		if (size > 1) {
+		if (size > 1 && !j->fle) {
 			xTestI(e, 4, R(R8), (uint32_t) (size - 1));
 			slow->site[slow->sites++] = xJcc(e, CC_NE, NULL);
 		}
@@ -1377,8 +1410,19 @@ static uint8_t* arenaGet(struct N64* n) {
 		xLoad(&e, 8, R13, M(RBX, (int32_t) offsetof(struct N64, cycles)));
 		xLoad(&e, 8, R14, M(RBX, (int32_t) offsetof(struct N64, jitLimit)));
 		xLoad(&e, 8, R15, M(RBX, (int32_t) offsetof(struct N64, rdram)));
+		pinSp = n->fast && n->fle;
+		if (pinSp) {
+			xPush(&e, RBP);
+			xAluI(&e, X_SUB, 8, R(RSP), 8);
+			loadPinned(&e);
+		}
 		xJmpR(&e, RSI);
 		n->jitLeave = e.p;
+		if (pinSp) {
+			storePinned(&e);
+			xAluI(&e, X_ADD, 8, R(RSP), 8);
+			xPop(&e, RBP);
+		}
 		xStore(&e, 8, M(RBX, (int32_t) offsetof(struct N64, cycles)), R13);
 		xPop(&e, R15);
 		xPop(&e, R14);
@@ -1437,6 +1481,8 @@ void* jitCompile(struct N64* n, const uint32_t* ops, uint32_t count, uint32_t va
 	j->rdpThreads = n->rdpThreads > 0 || n->rdpGl;
 	j->rdpGl = n->rdpGl;
 	j->fast = n->fast;
+	j->fle = n->fast && n->fle;
+	pinSp = j->fle;
 	j->plainCount = n->countCycles == 2;
 	j->opCycles = (int) n->opCycles;
 	j->cacheData = !n->compat && !n->fast;
@@ -1449,6 +1495,7 @@ void* jitCompile(struct N64* n, const uint32_t* ops, uint32_t count, uint32_t va
 	uint32_t pollPass = blockPollPass(ops, count, vaddr, &reload);
 
 	bool delay = false;
+	int pending = 0;
 	for (uint32_t k = 0; k < count; ++k) {
 		uint32_t op = ops[k], p = paddr + k * 4;
 		uint64_t pc = sext32(vaddr + k * 4);
@@ -1477,12 +1524,21 @@ void* jitCompile(struct N64* n, const uint32_t* ops, uint32_t count, uint32_t va
 			if (lineStart && !branch && !j->fast) {
 				icacheCheck(e, (uint32_t) pc, p, false);
 			}
-			if (prevMark >= 0) {
-				j->extraCycles += cpuLoadStall(op, (uint8_t) prevMark);
+			if (j->fle) {
+				// No load interlocks; the cycles go in at branches and exits.
+				pending += j->opCycles + j->extraCycles;
+				if (last || delay || kind != PLAIN || j->interruptCheck || j->jumped || pending > 4000) {
+					xAluI(e, X_ADD, 8, R(R13), pending);
+					pending = 0;
+				}
 			} else {
-				loadStallCheck(e, op);
+				if (prevMark >= 0) {
+					j->extraCycles += cpuLoadStall(op, (uint8_t) prevMark);
+				} else {
+					loadStallCheck(e, op);
+				}
+				xAluI(e, X_ADD, 8, R(R13), j->opCycles + j->extraCycles);
 			}
-			xAluI(e, X_ADD, 8, R(R13), j->opCycles + j->extraCycles);
 			if (j->interruptCheck) {
 				// An interrupt now due is taken before the next instruction.
 				xTest(e, 4, R(RCX), RCX);
@@ -1608,12 +1664,14 @@ void* jitCompile(struct N64* n, const uint32_t* ops, uint32_t count, uint32_t va
 	for (int i = 0; i < j->exitCount; ++i) {
 		struct Exit* x = &j->exits[i];
 		patchHere(e, x->site);
-		if (x->stall < 0) {
-			loadStallCheck(e, ops[((uint32_t) x->pc - vaddr) >> 2]);
-		} else if (x->stall) {
-			xAluI(e, X_ADD, 8, R(R13), x->stall);
+		if (!j->fle) {
+			if (x->stall < 0) {
+				loadStallCheck(e, ops[((uint32_t) x->pc - vaddr) >> 2]);
+			} else if (x->stall) {
+				xAluI(e, X_ADD, 8, R(R13), x->stall);
+			}
+			xStoreI(e, 1, CPU_AT(loadMark), x->mark);
 		}
-		xStoreI(e, 1, CPU_AT(loadMark), x->mark);
 		storeConst(e, CPU_AT(curPc), x->pc);
 		xStoreI(e, 1, CPU_AT(inDelay), x->delay);
 		xStoreI(e, 1, CPU_AT(nextInDelay), x->kind != PLAIN && !x->skip);
