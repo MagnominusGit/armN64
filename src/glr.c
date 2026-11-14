@@ -2788,8 +2788,28 @@ void glrDraw(struct N64* n, struct RDP* r, const uint64_t* w, int op) {
 // RDRAM [addr, addr + len) about to be read or written by the CPU or a DMA: each target that drew
 // there gives its rows back, the others stay on the GPU; for a write, the rows there load again and
 // what of the depth image it covers goes into the GPU's depth before the next draw.
+// A write the depth image's pending bytes cover already, where no target has rows: nothing to do.
+static bool depthOnly(const struct Glr* g, uint32_t addr, uint32_t len) {
+	if (!g->zWidth || !g->zPending || addr < g->zLo || addr + len > g->zHi || g->own) {
+		return false;
+	}
+	for (int i = 0; i < TARGETS; ++i) {
+		const struct Target* t = &g->target[i];
+		uint32_t const row = t->width * (t->size == 3 ? 4 : t->size == 1 ? 1 : 2);
+		int rows = t->loadedRows > t->dirtyTo ? t->loadedRows : t->dirtyTo;
+		rows = rows > t->packTo ? rows : t->packTo;
+		if (t->texture && rows && addr < t->addr + (uint32_t) rows * row && addr + len > t->addr) {
+			return false;
+		}
+	}
+	return true;
+}
+
 static void touched(struct N64* n, uint32_t addr, uint32_t len, bool write, bool load) {
 	struct Glr* g = n->glr;
+	if (write && depthOnly(g, addr, len)) {
+		return;
+	}
 	bool gave = false;
 	for (int i = 0; n->rdpPending && i < TARGETS; ++i) {
 		struct Target* t = &g->target[i];
