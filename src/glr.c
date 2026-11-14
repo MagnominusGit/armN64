@@ -261,6 +261,8 @@ struct Glr {
 	// for the writes to be seen (again once a picture, zMark). The program that writes it.
 	bool zPending, zMark;
 	uint32_t zAddr, zWidth, zBytes, zLo, zHi;
+	// The depth images draws last read or wrote depth in: drawing into another is drawing color.
+	uint32_t zUsed[4];
 	int zRows;
 	GLuint zProgram, zTexture;
 	GLint zSource, zParams;
@@ -2587,13 +2589,50 @@ static bool fillRows(struct N64* n, struct Glr* g, struct RDP* r, const uint64_t
 	return true;
 }
 
+// A depth image read or written for the first time: what was drawn there as color goes back, and
+// the GPU's depth takes all of it.
+static void depthUsed(struct N64* n, struct Glr* g, struct RDP* r) {
+	for (int i = 0; i < 4; ++i) {
+		if (g->zUsed[i] == r->zAddr) {
+			return;
+		}
+	}
+	memmove(&g->zUsed[1], &g->zUsed[0], 3 * sizeof(g->zUsed[0]));
+	g->zUsed[0] = r->zAddr;
+	int const rows = (int) ((r->scissorY1 + 3) >> 2) < TARGET_ROWS ? (int) ((r->scissorY1 + 3) >> 2) : TARGET_ROWS;
+	uint32_t const len = r->colorWidth * (uint32_t) (rows > 0 ? rows : 0) * 2;
+	if (n->rdpPending) {
+		glrSyncRange(n, r->zAddr, len);
+	}
+	forgetRows(g, r->zAddr, len, NULL);
+	g->zWidth = 0;
+}
+
+static bool isDepth(const struct Glr* g, uint32_t addr) {
+	return addr && (g->zUsed[0] == addr || g->zUsed[1] == addr || g->zUsed[2] == addr || g->zUsed[3] == addr);
+}
+
+// Whether the GPU holds color drawn or loaded at addr.
+static bool colorAt(const struct Glr* g, uint32_t addr) {
+	for (int i = 0; i < TARGETS; ++i) {
+		const struct Target* t = &g->target[i];
+		if (t->texture && t->addr == addr && (t->loadedRows || t->dirtyTo > t->dirtyFrom)) {
+			return true;
+		}
+	}
+	return false;
+}
+
 static void draw(struct N64* n, struct RDP* r, const uint64_t* w, int op) {
 	struct Glr* g = n->glr;
 	glesUse(g->gles);
 	g->seq = r->seq;
 	uint64_t c = w[0];
 	const struct GlrCorners* q = op >= 0x08 && op <= 0x0F ? queued(g, w) : NULL;
-	bool const intoDepth = r->zAddr && r->colorAddr == r->zAddr && r->colorSize == 2;
+	if ((r->zCompare || r->zUpdate) && r->cycleType != 3 && r->zAddr) {
+		depthUsed(n, g, r);
+	}
+	bool const intoDepth = isDepth(g, r->zAddr) && r->colorAddr == r->zAddr && r->colorSize == 2;
 	if (intoDepth && (op == 0x24 || op == 0x25 || (op == 0x36 && r->cycleType != 3))) {
 		depthRectangle(n, g, r, w, op);
 		return;
@@ -2607,7 +2646,7 @@ static void draw(struct N64* n, struct RDP* r, const uint64_t* w, int op) {
 		rdpDrawSoftware(n, r, w, op);
 		return;
 	}
-	if (op >= 0x08 && op <= 0x0F && r->zAddr && r->colorAddr == r->zAddr && r->colorSize == 2) {
+	if (op >= 0x08 && op <= 0x0F && intoDepth) {
 		struct GlrCorners raw[4];
 		depthTriangle(n, g, r, w, op, q ? q : raw, q ? 1 : rawCorners(r, w, op, raw));
 		return;
@@ -2638,7 +2677,7 @@ static void draw(struct N64* n, struct RDP* r, const uint64_t* w, int op) {
 	}
 	if (op == 0x36) {
 		int x1 = (int) ((c >> 44) & 0xFFF), y1 = (int) ((c >> 32) & 0xFFF), x0 = (int) ((c >> 12) & 0xFFF), y0 = (int) (c & 0xFFF);
-		if (r->cycleType == 3 && r->colorAddr == r->zAddr) {
+		if (r->cycleType == 3 && r->colorAddr == r->zAddr && (isDepth(g, r->zAddr) || !colorAt(g, r->zAddr))) {
 			// The depth image cleared (the GPU's depth, shared by the color images).
 			flushBatch(n, g);
 			struct Gl* gl = &g->gl;
@@ -2739,7 +2778,7 @@ void glrDraw(struct N64* n, struct RDP* r, const uint64_t* w, int op) {
 	// keeps it already).
 	bool triangle = op >= 0x08 && op <= 0x0F;
 	if (n->glr->chained && (triangle || op == 0x24 || op == 0x25) && r->cycleType < 2 && r->colorSize != 1 &&
-	    !((triangle || op == 0x24 || op == 0x25) && r->zAddr && r->colorAddr == r->zAddr && r->colorSize == 2)) {
+	    !(isDepth(n->glr, r->zAddr) && r->colorAddr == r->zAddr && r->colorSize == 2)) {
 		rdpLastCombined(n, r, w, op);
 	}
 }
