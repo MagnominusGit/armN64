@@ -69,6 +69,32 @@ static void sample_mix(int16_t* dst, int16_t src, int16_t gain)
     *dst = clamp_s16(*dst + ((src * gain) >> 15));
 }
 
+/* armN64: eight samples mixed as sample_mix mixes them, in DMEM order (the compiler's vectors) */
+static void sample_mix8(int16_t* dst, const int16_t* src, const int16_t* gains)
+{
+    int16_t out[8];
+    int m;
+
+    for (m = 0; m < 8; ++m) {
+        int32_t v = dst[m] + ((src[m] * gains[m]) >> 15);
+        out[m] = (int16_t)(v < INT16_MIN ? INT16_MIN : v > INT16_MAX ? INT16_MAX : v);
+    }
+    memcpy(dst, out, sizeof(out));
+}
+
+/* armN64: eight samples added with saturation */
+static void sample_add8(int16_t* dst, const int16_t* src)
+{
+    int16_t out[8];
+    int m;
+
+    for (m = 0; m < 8; ++m) {
+        int32_t v = dst[m] + src[m];
+        out[m] = (int16_t)(v < INT16_MIN ? INT16_MIN : v > INT16_MAX ? INT16_MAX : v);
+    }
+    memcpy(dst, out, sizeof(out));
+}
+
 static void alist_envmix_mix(size_t n, int16_t** dst, const int16_t* gains, int16_t src)
 {
     size_t i;
@@ -322,20 +348,26 @@ void alist_envmix_exp(
             ramps[1].step = (exp_seq[1] - ramps[1].value) >> 3;
         }
 
+        /* armN64: the block's gains in turn, then its mixes, each in DMEM order (S only swaps samples
+         * within it), the wet ones with aux only */
+        int16_t samples[8], gains[4][8];
         for (x = 0; x < 8; ++x) {
             int16_t l_vol = ramp_step(&ramps[0]);
             int16_t r_vol = ramp_step(&ramps[1]);
-            int16_t sample = in[ptr^S];
 
-            /* armN64: the mixes in turn, as alist_envmix_mix does them, the wet ones with aux only */
-            sample_mix(dl + (ptr^S), sample, clamp_s16((l_vol * dry + 0x4000) >> 15));
-            sample_mix(dr + (ptr^S), sample, clamp_s16((r_vol * dry + 0x4000) >> 15));
-            if (aux) {
-                sample_mix(wl + (ptr^S), sample, clamp_s16((l_vol * wet + 0x4000) >> 15));
-                sample_mix(wr + (ptr^S), sample, clamp_s16((r_vol * wet + 0x4000) >> 15));
-            }
-            ++ptr;
+            gains[0][x^S] = clamp_s16((l_vol * dry + 0x4000) >> 15);
+            gains[1][x^S] = clamp_s16((r_vol * dry + 0x4000) >> 15);
+            gains[2][x^S] = clamp_s16((l_vol * wet + 0x4000) >> 15);
+            gains[3][x^S] = clamp_s16((r_vol * wet + 0x4000) >> 15);
         }
+        memcpy(samples, in + ptr, sizeof(samples));
+        sample_mix8(dl + ptr, samples, gains[0]);
+        sample_mix8(dr + ptr, samples, gains[1]);
+        if (aux) {
+            sample_mix8(wl + ptr, samples, gains[2]);
+            sample_mix8(wr + ptr, samples, gains[3]);
+        }
+        ptr += 8;
     }
 
     *(int16_t *)(save_buffer +  0) = wet;               /* 0-1 */
@@ -528,23 +560,30 @@ void alist_envmix_nead(
     if (swap_wet_LR)
         swap(&wl, &wr);
 
+    uint16_t e0 = env_values[0], e1 = env_values[1], e2 = env_values[2];
+    const uint32_t x0 = (uint32_t)(int32_t)xors[0], x1 = (uint32_t)(int32_t)xors[1];
+    const uint32_t x2 = (uint32_t)(int32_t)xors[2], x3 = (uint32_t)(int32_t)xors[3];
+
     while (count != 0) {
         size_t i;
+        int16_t s[8], l[8], r[8], l2[8], r2[8];
+        /* armN64: in DMEM order (S only swaps samples within the eight), the samples taken first
+         * and each mix in turn */
+        memcpy(s, in, sizeof(s));
         for(i = 0; i < 8; ++i) {
-            int16_t l  = (((int32_t)in[i^S] * (uint32_t)env_values[0]) >> 16) ^ xors[0];
-            int16_t r  = (((int32_t)in[i^S] * (uint32_t)env_values[1]) >> 16) ^ xors[1];
-            int16_t l2 = (((int32_t)l * (uint32_t)env_values[2]) >> 16) ^ xors[2];
-            int16_t r2 = (((int32_t)r * (uint32_t)env_values[2]) >> 16) ^ xors[3];
-
-            dl[i^S] = clamp_s16(dl[i^S] + l);
-            dr[i^S] = clamp_s16(dr[i^S] + r);
-            wl[i^S] = clamp_s16(wl[i^S] + l2);
-            wr[i^S] = clamp_s16(wr[i^S] + r2);
+            l[i]  = (int16_t)((((int32_t)s[i] * (uint32_t)e0) >> 16) ^ x0);
+            r[i]  = (int16_t)((((int32_t)s[i] * (uint32_t)e1) >> 16) ^ x1);
+            l2[i] = (int16_t)((((int32_t)l[i] * (uint32_t)e2) >> 16) ^ x2);
+            r2[i] = (int16_t)((((int32_t)r[i] * (uint32_t)e2) >> 16) ^ x3);
         }
+        sample_add8(dl, l);
+        sample_add8(dr, r);
+        sample_add8(wl, l2);
+        sample_add8(wr, r2);
 
-        env_values[0] += env_steps[0];
-        env_values[1] += env_steps[1];
-        env_values[2] += env_steps[2];
+        e0 += env_steps[0];
+        e1 += env_steps[1];
+        e2 += env_steps[2];
 
         dl += 8;
         dr += 8;
@@ -553,6 +592,10 @@ void alist_envmix_nead(
         in += 8;
         count -= 8;
     }
+
+    env_values[0] = e0;
+    env_values[1] = e1;
+    env_values[2] = e2;
 }
 
 
