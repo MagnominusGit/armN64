@@ -153,6 +153,8 @@ struct Jit {
 	// FLE (Fastest): cycles counted in runs, and no load interlocks, address checks or FPU result
 	// fix-ups.
 	bool fle;
+	// Status.FR as the block was compiled.
+	bool fr;
 	int opCycles;
 };
 
@@ -247,6 +249,20 @@ static struct Opnd fprAt(int r) {
 	return CPU_AT(fpr[r]);
 }
 
+// An FPU register as the block's Status.FR has it: with FR clear, an odd 32-bit register is the high
+// half of the even one below, and a 64-bit one is the even one.
+static struct Opnd fprS(const struct Jit* j, int r) {
+	return j->fr || !(r & 1) ? fprAt(r) : M(R12, (int32_t) (offsetof(struct CPU, fpr) + 8 * (r & ~1) + 4));
+}
+
+static struct Opnd fprD(const struct Jit* j, int r) {
+	return fprAt(j->fr ? r : r & ~1);
+}
+
+static struct Opnd fpr(const struct Jit* j, bool dbl, int r) {
+	return dbl ? fprD(j, r) : fprS(j, r);
+}
+
 // To bad when the value in RAX (single, or double with dbl) is denormal, infinite or NaN; ECX/RCX
 // keeps its exponent bits.
 static void fpuNormal(struct Emitter* e, bool dbl, uint8_t** bad) {
@@ -295,9 +311,9 @@ static void fpuTrivial(struct Emitter* e, bool dbl, bool mul, uint8_t** early, i
 // A result in RAX (single, or double with dbl) stored as fpu_fast.c's setS and setD store it:
 // flushed to zero when subnormal with FCR31.FS set, and the host's default NaN made the VR4300's
 // (FLE: as it is).
-static void fastResult(struct Emitter* e, bool dbl, int fd, bool fle) {
+static void fastResult(struct Emitter* e, bool dbl, struct Opnd dst, bool fle) {
 	if (fle) {
-		xStore(e, dbl ? 8 : 4, fprAt(fd), RAX);
+		xStore(e, dbl ? 8 : 4, dst, RAX);
 		return;
 	}
 	xTestI(e, 4, CPU_AT(fcr31), 1u << 24);
@@ -316,7 +332,7 @@ static void fastResult(struct Emitter* e, bool dbl, int fd, bool fle) {
 		xMovI64(e, RDX, 0xFFF0000000000000ull);
 		xAluRR(e, X_CMP, 8, R(RCX), RDX);
 		xCmov(e, CC_E, 8, RAX, R(RSI));
-		xStore(e, 8, fprAt(fd), RAX);
+		xStore(e, 8, dst, RAX);
 	} else {
 		xTestI(e, 4, R(RAX), 0x7F800000);
 		uint8_t* normal = xJcc(e, CC_NE, NULL);
@@ -328,30 +344,32 @@ static void fastResult(struct Emitter* e, bool dbl, int fd, bool fle) {
 		xAluI(e, X_AND, 4, R(RCX), 0x7FFFFFFF);
 		xAluI(e, X_CMP, 4, R(RCX), 0x7FC00000);
 		xCmov(e, CC_E, 4, RAX, R(RSI));
-		xStore(e, 4, fprAt(fd), RAX);
+		xStore(e, 4, dst, RAX);
 	}
 }
 
 // With HLE accuracy, the FPU instructions most code runs inline, as fpuExecuteFast runs them: the
 // moves, the four operations, square root, ABS, MOV, NEG and C.cond in S and D, and the conversions
-// between S, D and W. Only with even registers, the same in both FR modes; anything else goes
-// through fpuCall.
+// between S, D and W, for the Status.FR the block was compiled with; anything else goes through
+// fpuCall.
 static void fpuFast(struct Jit* j, uint32_t op) {
 	struct Emitter* e = &j->e;
 	int const fmt = (op >> 21) & 31, ft = (op >> 16) & 31, fs = (op >> 11) & 31, fd = (op >> 6) & 31, func = op & 0x3F;
 	bool const dbl = fmt == 17;
+	// An odd register means what Status.FR says: the block leaves when it isn't the one compiled for.
+	if ((fs | fd | (fmt >= 16 ? ft : 0)) & 1) {
+		xTestI(e, 4, M(R12, (int32_t) (offsetof(struct CPU, cop0) + 8 * CP0_STATUS)), 1u << 26);
+		slowIf(j, j->fr ? CC_E : CC_NE);
+	}
 	switch (fmt) {
 	case 0:
 	case 1:
-		if (fs & 1) {
-			break;
-		}
 		if (ft) {
 			if (fmt == 0) {
-				xLoad(e, 4, RAX, fprAt(fs));
+				xLoad(e, 4, RAX, fprS(j, fs));
 				xMovsxd(e, RAX, R(RAX));
 			} else {
-				xLoad(e, 8, RAX, fprAt(fs));
+				xLoad(e, 8, RAX, fprD(j, fs));
 			}
 			xStore(e, 8, gpr(ft), RAX);
 		}
@@ -369,16 +387,13 @@ static void fpuFast(struct Jit* j, uint32_t op) {
 		return;
 	case 4:
 	case 5:
-		if (fs & 1) {
-			break;
-		}
 		xLoad(e, fmt == 4 ? 4 : 8, RAX, gpr(ft));
-		xStore(e, fmt == 4 ? 4 : 8, fprAt(fs), RAX);
+		xStore(e, fmt == 4 ? 4 : 8, fmt == 4 ? fprS(j, fs) : fprD(j, fs), RAX);
 		return;
 	}
-	bool const known = ((fmt == 16 || fmt == 17) && (func <= 7 || func == 13 || func == (dbl ? 0x20 : 0x21) || func >= 0x30)) ||
+	bool const known = ((fmt == 16 || fmt == 17) && (func <= 7 || func == 13 || func == (dbl ? 0x20 : 0x21) || func == 0x24 || func >= 0x30)) ||
 	                   (fmt == 20 && (func == 32 || func == 33));
-	if (!known || ((fs | ft | fd) & 1)) {
+	if (!known) {
 		fpuCall(j, op);
 		return;
 	}
@@ -394,8 +409,8 @@ static void fpuFast(struct Jit* j, uint32_t op) {
 		xAluRR(e, X_XOR, 4, R(RAX), RAX);
 		xAluRR(e, X_XOR, 4, R(RCX), RCX);
 		xAluRR(e, X_XOR, 4, R(RDX), RDX);
-		xSse(e, prefix, 0x10, 0, fprAt(fs), 4);
-		xSse(e, dbl ? 0x66 : 0, 0x2E, 0, fprAt(ft), 4);
+		xSse(e, prefix, 0x10, 0, fpr(j, dbl, fs), 4);
+		xSse(e, dbl ? 0x66 : 0, 0x2E, 0, fpr(j, dbl, ft), 4);
 		xSetcc(e, CC_B, R(RAX));
 		xSetcc(e, CC_NP, R(RCX));
 		xSetcc(e, CC_E, R(RDX));
@@ -421,52 +436,57 @@ static void fpuFast(struct Jit* j, uint32_t op) {
 	}
 	if (fmt == 20) {
 		// CVT.S.W and CVT.D.W.
-		xSse(e, func == 32 ? 0xF3 : 0xF2, 0x2A, 0, fprAt(fs), 4);
+		xSse(e, func == 32 ? 0xF3 : 0xF2, 0x2A, 0, fprS(j, fs), 4);
 		xSse(e, func == 32 ? 0xF3 : 0xF2, 0x11, 0, out, 4);
 		xLoad(e, func == 32 ? 4 : 8, RAX, out);
-		fastResult(e, func == 33, fd, j->fle);
+		fastResult(e, func == 33, fpr(j, func == 33, fd), j->fle);
 		return;
 	}
 	switch (func) {
 	case 5:
 	case 7:
-		xLoad(e, width, RAX, fprAt(fs));
+		xLoad(e, width, RAX, fpr(j, dbl, fs));
 		if (dbl) {
 			xMovI64(e, RDX, func == 7 ? 0x8000000000000000ull : 0x7FFFFFFFFFFFFFFFull);
 			xAluRR(e, func == 7 ? X_XOR : X_AND, 8, R(RAX), RDX);
 		} else {
 			xAluI(e, func == 7 ? X_XOR : X_AND, 4, R(RAX), func == 7 ? (int32_t) 0x80000000u : 0x7FFFFFFF);
 		}
-		fastResult(e, dbl, fd, j->fle);
+		fastResult(e, dbl, fpr(j, dbl, fd), j->fle);
 		return;
 	case 6:
-		xLoad(e, width, RAX, fprAt(fs));
-		xStore(e, width, fprAt(fd), RAX);
+		xLoad(e, width, RAX, fpr(j, dbl, fs));
+		xStore(e, width, fpr(j, dbl, fd), RAX);
 		return;
 	case 13:
 		// TRUNC.W: out of range or NaN gives the most negative word, as toWord and the host do.
-		xSse(e, prefix, 0x2C, RAX, fprAt(fs), 4);
-		xStore(e, 4, fprAt(fd), RAX);
+		xSse(e, prefix, 0x2C, RAX, fpr(j, dbl, fs), 4);
+		xStore(e, 4, fprS(j, fd), RAX);
+		return;
+	case 0x24:
+		// CVT.W: rounded as FCR31 says, the host's rounding mode kept the same by CTC1.
+		xSse(e, prefix, 0x2D, RAX, fpr(j, dbl, fs), 4);
+		xStore(e, 4, fprS(j, fd), RAX);
 		return;
 	case 0x20:
 	case 0x21:
 		// CVT.S.D and CVT.D.S.
-		xSse(e, prefix, 0x5A, 0, fprAt(fs), 4);
+		xSse(e, prefix, 0x5A, 0, fpr(j, dbl, fs), 4);
 		xSse(e, dbl ? 0xF3 : 0xF2, 0x11, 0, out, 4);
 		xLoad(e, dbl ? 4 : 8, RAX, out);
-		fastResult(e, !dbl, fd, j->fle);
+		fastResult(e, !dbl, fpr(j, !dbl, fd), j->fle);
 		return;
 	}
 	static const uint8_t ops[5] = { 0x58, 0x5C, 0x59, 0x5E, 0x51 };
 	if (func == 4) {
-		xSse(e, prefix, 0x51, 0, fprAt(fs), 4);
+		xSse(e, prefix, 0x51, 0, fpr(j, dbl, fs), 4);
 	} else {
-		xSse(e, prefix, 0x10, 0, fprAt(fs), 4);
-		xSse(e, prefix, ops[func], 0, fprAt(ft), 4);
+		xSse(e, prefix, 0x10, 0, fpr(j, dbl, fs), 4);
+		xSse(e, prefix, ops[func], 0, fpr(j, dbl, ft), 4);
 	}
 	xSse(e, prefix, 0x11, 0, out, 4);
 	xLoad(e, width, RAX, out);
-	fastResult(e, dbl, fd, j->fle);
+	fastResult(e, dbl, fpr(j, dbl, fd), j->fle);
 }
 
 // MFC1, DMFC1, MTC1, DMTC1, MOV, NEG and ABS, the four operations and C.cond in S and D compiled
@@ -622,6 +642,17 @@ static void fpuInline(struct Jit* j, uint32_t op) {
 
 // MFC0 and DMFC0 of anything but Random and the registers that read the latch; MTC0 and DMTC0 of EPC
 // and ErrorEPC.
+// ecx = the interrupts due with Status in eax: none unless IE is set and EXL and ERL are clear.
+static void pendingInterrupts(struct Emitter* e) {
+	xLoad(e, 4, RCX, CPU_AT(cop0[CP0_CAUSE]));
+	xAluRR(e, X_AND, 4, R(RCX), RAX);
+	xAluI(e, X_AND, 4, R(RCX), 0xFF00);
+	xAluRR(e, X_XOR, 4, R(RDX), RDX);
+	xAluI(e, X_AND, 4, R(RAX), 7);
+	xAluI(e, X_CMP, 4, R(RAX), 1);
+	xCmov(e, CC_NE, 4, RCX, R(RDX));
+}
+
 static bool emitCop0(struct Jit* j, uint32_t op) {
 	struct Emitter* e = &j->e;
 	int rs = (op >> 21) & 31, rt = (op >> 16) & 31, rd = (op >> 11) & 31;
@@ -679,7 +710,27 @@ static bool emitCop0(struct Jit* j, uint32_t op) {
 	if (rs != 0x04 && rs != 0x05) {
 		return false;
 	}
-	// Status in C: a write may leave the mode compiled code runs in.
+	// Status: a write that changes the mode compiled code runs in (CU1, FR, RE, the address widths,
+	// KSU, ERL or EXL) goes to the interpreter; after one that doesn't, ecx holds the interrupts it
+	// leaves due.
+	if (rd == CP0_STATUS) {
+		xLoad(e, 4, RAX, gpr(rt));
+		xAluI(e, X_AND, 4, R(RAX), (int32_t) 0xFFF7FFFFu);
+		xLoad(e, 4, RCX, reg);
+		xAluRR(e, X_XOR, 4, R(RCX), RAX);
+		xTestI(e, 4, R(RCX), 1u << 29 | 1u << 26 | 1u << 25 | 0xFE);
+		slowIf(j, CC_NE);
+		xLoad(e, 8, RDX, gpr(rt));
+		xStore(e, 8, M(R12, (int32_t) (offsetof(struct CPU, cop0) + 8 * CP0_LATCH)), RDX);
+		xStore(e, 8, reg, RAX);
+		pendingInterrupts(e);
+		// One it leaves due is taken after the next instruction, as the interpreter has it.
+		xTest(e, 4, R(RCX), RCX);
+		xSetcc(e, CC_NE, CPU_AT(intHold));
+		j->interruptCheck = true;
+		return true;
+	}
+	// The others in C but EPC and ErrorEPC.
 	if (rd != CP0_EPC && rd != CP0_ERROREPC) {
 		return false;
 	}
@@ -779,6 +830,38 @@ static bool emitInline(struct Jit* j, uint32_t op, uint64_t pc, enum Kind* kind)
 			xMovsxd(e, RAX, R(RAX));
 			xStore(e, 8, CPU_AT(hi), RAX);
 			j->extraCycles = 4;
+			return true;
+		case 0x1A: case 0x1B:
+			// The quotient and remainder, sign-extended; a divisor of 0 goes to the interpreter. DIV
+			// takes the dividend's low word, and the divisor as 64 bits when its bits 63 and 31 agree
+			// (as the interpreter), else its low word.
+			if ((op & 0x3F) == 0x1A) {
+				xLoad(e, 4, RAX, gpr(rs));
+				xMovsxd(e, RAX, R(RAX));
+				xLoad(e, 8, RCX, gpr(rt));
+				xMovsxd(e, RDX, R(RCX));
+				xMovRR(e, 8, RSI, RCX);
+				xShiftI(e, X_SHL, 8, R(RSI), 32);
+				xAluRR(e, X_XOR, 8, R(RSI), RCX);
+				xCmov(e, CC_S, 8, RCX, R(RDX));
+				xTest(e, 8, R(RCX), RCX);
+				slowIf(j, CC_E);
+				xMovRR(e, 8, RDX, RAX);
+				xShiftI(e, X_SAR, 8, R(RDX), 63);
+				emitOp1(e, 8, 0xF7, 7, R(RCX));
+			} else {
+				xLoad(e, 4, RAX, gpr(rs));
+				xLoad(e, 4, RCX, gpr(rt));
+				xTest(e, 4, R(RCX), RCX);
+				slowIf(j, CC_E);
+				xAluRR(e, X_XOR, 4, R(RDX), RDX);
+				xDiv(e, 4, R(RCX));
+			}
+			xMovsxd(e, RAX, R(RAX));
+			xStore(e, 8, CPU_AT(lo), RAX);
+			xMovsxd(e, RDX, R(RDX));
+			xStore(e, 8, CPU_AT(hi), RDX);
+			j->extraCycles = 36;
 			return true;
 		case 0x20: case 0x22: case 0x2C: case 0x2E: {
 			// Overflow raises an exception, through the interpreter, before rd changes.
@@ -918,6 +1001,22 @@ static bool emitInline(struct Jit* j, uint32_t op, uint64_t pc, enum Kind* kind)
 			xAluI(e, X_ADD, 8, R(RAX), imm);
 			storeGpr(e, rt, RAX);
 		}
+		return true;
+	case 0x2F:
+		// CACHE on the D-cache: with HLE accuracy there are no caches, and an address in kseg0 or
+		// kseg1 raises nothing; another goes to the interpreter for its TLB exceptions. As after any
+		// instruction in C, an interrupt due is taken next.
+		if (!j->fast || ((op >> 16) & 3) != 1) {
+			return false;
+		}
+		xLoad(e, 8, RAX, gpr(rs));
+		xAluI(e, X_ADD, 8, R(RAX), imm);
+		xAluI(e, X_SUB, 8, R(RAX), INT32_MIN);
+		xAluI(e, X_CMP, 8, R(RAX), 0x40000000);
+		slowIf(j, CC_AE);
+		xLoad(e, 4, RAX, CPU_AT(cop0[CP0_STATUS]));
+		pendingInterrupts(e);
+		j->interruptCheck = true;
 		return true;
 	default:
 		return false;
@@ -1483,6 +1582,7 @@ void* jitCompile(struct N64* n, const uint32_t* ops, uint32_t count, uint32_t va
 	j->fast = n->fast;
 	j->fle = n->fast && n->fle;
 	pinSp = j->fle;
+	j->fr = n->cpu.cop0[CP0_STATUS] >> 26 & 1;
 	j->plainCount = n->countCycles == 2;
 	j->opCycles = (int) n->opCycles;
 	j->cacheData = !n->compat && !n->fast;
