@@ -746,11 +746,26 @@ static uint32_t randomIndex(struct N64* n) {
 	return 31 - (uint32_t) ((n->cycles) % (32 - wired));
 }
 
+// FLE: a loop polling Count until a time comes (a read soon after the last, at cycles) lets time pass
+// faster, a read costing up to 1024 cycles more (in stall), never past the next event; it finishes that
+// much later at most.
+void cpuCountPolled(struct N64* n, uint64_t cycles) {
+	enum { POLL_CYCLES = 1024 };
+	struct CPU* c = &n->cpu;
+	uint64_t const room = n->eventAt > cycles ? n->eventAt - cycles : 0;
+	uint32_t const skip = cycles - c->countReadEnd < COUNT_POLL_WITHIN ? (uint32_t) (room < POLL_CYCLES ? room : POLL_CYCLES) : 0;
+	c->stall += skip;
+	c->countReadEnd = cycles + skip;
+}
+
 static uint64_t cop0Read(struct N64* n, int r) {
 	// A loop polling Count, Cause or Random isn't idle: they change with nothing in memory changing.
 	n->idle.fatal |= r == CP0_COUNT || r == CP0_CAUSE || r == CP0_RANDOM;
 	switch (r) {
 	case CP0_COUNT:
+		if (n->fast && n->fle) {
+			cpuCountPolled(n, n->cycles);
+		}
 		return cpuCount(n);
 	case CP0_RANDOM:
 		return randomIndex(n);

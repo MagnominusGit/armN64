@@ -849,6 +849,8 @@ static bool emitFpuExact(struct Jit* j, uint32_t op) {
 
 // MFC0 and DMFC0 of anything but Random and the registers that read the latch; MTC0 and DMTC0 of EPC
 // and ErrorEPC.
+static void reloadPool(struct Emitter* e, const struct Cache* c);
+
 static bool emitCop0(struct Jit* j, uint32_t op) {
 	struct Emitter* e = &j->e;
 	int rs = (op >> 21) & 31, rt = (op >> 16) & 31, rd = (op >> 11) & 31;
@@ -900,6 +902,28 @@ static bool emitCop0(struct Jit* j, uint32_t op) {
 				}
 			}
 			commit(j, rt, d);
+			// FLE: a loop polling Count lets time pass faster (cpu.c); a read long after the last
+			// only notes when it was.
+			if (rd == CP0_COUNT && j->fle) {
+				aDp(e, A_SUB | W64, 0, LIMIT, LEFT, S_LSL, 0);
+				aLdrX(e, 1, CPU, CPU_OFF(countReadEnd));
+				aStrX(e, 0, CPU, CPU_OFF(countReadEnd));
+				aDp(e, A_SUB | W64, 1, 0, 1, S_LSL, 0);
+				aDpImm(e, A_SUBS_IMM | W64, ZR, 1, COUNT_POLL_WITHIN - 1);
+				uint8_t* late = aBcond(e, C_HI, NULL);
+				flushDirty(e, &j->cache);
+				aPush(e, 2, 3, 16);
+				aMovX(e, 0, N);
+				aDp(e, A_SUB | W64, 1, LIMIT, LEFT, S_LSL, 0);
+				aMovImm64(e, IP, (uint64_t) (uintptr_t) cpuCountPolled);
+				aBlr(e, IP);
+				aLdr(e, 1, CPU, CPU_OFF(stall));
+				aDp(e, A_SUB | W64, LEFT, LEFT, 1, S_LSL, 0);
+				aStr(e, ZR, CPU, CPU_OFF(stall));
+				aPop(e, 2, 3, 16);
+				reloadPool(e, &j->cache);
+				patchHere(e, late);
+			}
 		}
 		return true;
 	}

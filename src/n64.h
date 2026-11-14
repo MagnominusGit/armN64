@@ -71,6 +71,8 @@ struct CPU {
 	uint32_t stall;
 	// Count when the timer was last checked, so a Compare value passed during a stall still fires.
 	uint32_t lastCount;
+	// The cycle after FLE's last read of Count (cpu.c).
+	uint64_t countReadEnd;
 	// The D-cache line filled last (DCACHE_FILLING in its tag until an access waits for the rest of it)
 	// and the cycle it is all in, in the low bits of the cycle count.
 	uint32_t fillLine, fillReady;
@@ -597,6 +599,9 @@ uint32_t cpuDcacheMiss(struct N64*, uint32_t vaddr, uint32_t paddr, uint64_t now
 void cpuRdpWaitRead(struct N64*, uint32_t paddr, uint32_t len);
 void cpuRdpWaitWrite(struct N64*, uint32_t paddr, uint32_t len);
 uint32_t cpuIcacheMiss(struct N64*, uint32_t vaddr, uint32_t paddr);
+// FLE: a read of Count within so many cycles of the last is polling it (cpu.c).
+enum { COUNT_POLL_WITHIN = 4096 };
+void cpuCountPolled(struct N64*, uint64_t cycles);
 uint32_t cpuCacheOp(struct N64*, uint32_t op, uint32_t vaddr);
 bool cpuCodeCoherent(struct N64*, uint32_t vaddr, uint32_t paddr, uint32_t count);
 

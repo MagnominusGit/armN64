@@ -704,6 +704,25 @@ static bool emitCop0(struct Jit* j, uint32_t op) {
 				}
 			}
 			storeGpr(e, rt, RAX);
+			// FLE: a loop polling Count lets time pass faster (cpu.c); a read long after the last
+			// only notes when it was.
+			if (rd == CP0_COUNT && j->fle) {
+				xMovRR(e, 8, RAX, R13);
+				xAluRM(e, X_SUB, 8, RAX, CPU_AT(countReadEnd));
+				xStore(e, 8, CPU_AT(countReadEnd), R13);
+				xAluI(e, X_CMP, 8, R(RAX), COUNT_POLL_WITHIN);
+				uint8_t* late = xJcc(e, CC_AE, NULL);
+				storePinned(e);
+				xMovRR(e, 8, RDI, RBX);
+				xMovRR(e, 8, RSI, R13);
+				xMovI64(e, RAX, (uint64_t) (uintptr_t) cpuCountPolled);
+				xCallR(e, RAX);
+				loadPinned(e);
+				xLoad(e, 4, RAX, CPU_AT(stall));
+				xAluRR(e, X_ADD, 8, R(R13), RAX);
+				xStoreI(e, 4, CPU_AT(stall), 0);
+				patchHere(e, late);
+			}
 		}
 		return true;
 	}
