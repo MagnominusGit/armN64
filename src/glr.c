@@ -231,6 +231,8 @@ struct Glr {
 	// Each tile's texture as of a TMEM generation.
 	struct Texture* tileTexture[8];
 	uint32_t tileGen[8], tileTlut[8];
+	// Where the search for a texture's slot starts.
+	int textureHand;
 	struct Gl gl;
 	struct Target target[TARGETS];
 	GLuint depth, vertexArray, vertexBuffer, vertexShader;
@@ -1622,10 +1624,11 @@ static struct Texture* texture(struct N64* n, struct Glr* g, struct RDP* r, int 
 			return x;
 		}
 	}
-	// A new texture: in an unused slot or the one used longest ago, taken out of its bucket.
-	struct Texture* slot = &g->textures[0];
-	for (int i = 0; i < TEXTURES; ++i) {
-		struct Texture* x = &g->textures[i];
+	// A new texture: in an unused slot or the one used longest ago of the next 32 on, taken out of
+	// its bucket.
+	struct Texture* slot = &g->textures[g->textureHand];
+	for (int i = 0; i < 32; ++i) {
+		struct Texture* x = &g->textures[(g->textureHand + i) & (TEXTURES - 1)];
 		if (!x->texture || x->used < slot->used) {
 			slot = x;
 			if (!x->texture) {
@@ -1633,6 +1636,7 @@ static struct Texture* texture(struct N64* n, struct Glr* g, struct RDP* r, int 
 			}
 		}
 	}
+	g->textureHand = (int) (slot - g->textures + 1) & (TEXTURES - 1);
 	if (slot->texture) {
 		int self = (int) (slot - g->textures) + 1;
 		for (int* link = &g->textureBucket[slot->hash & (TEXTURE_BUCKETS - 1)]; *link; link = &g->textures[*link - 1].next) {

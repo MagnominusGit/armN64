@@ -445,6 +445,19 @@ static struct Color convert(const struct RDP* r, struct Color c);
 
 // One kind of texel at a time: the compiler makes a loop for each, without the kind's tests inside.
 static inline __attribute__((always_inline)) void tileImageKind(struct RDP* r, const struct Tile* t, int w, int h, bool converted, uint32_t* out, enum TexelKind kind) {
+	// 16-bit RGBA as texel() decodes it, a row's TMEM address and swap worked out once.
+	if (kind == TK_RGBA16 && !converted) {
+		for (int y = 0; y < h; ++y) {
+			uint32_t const base = (uint32_t) t->tmem * 8 + (uint32_t) (y * t->line) * 8, swap = y & 1 ? 4 : 0;
+			for (int x = 0; x < w; ++x) {
+				uint32_t const a = (base + (uint32_t) x * 2) ^ swap;
+				uint32_t const v = (uint32_t) r->tmem[a & 0xFFF] << 8 | r->tmem[(a + 1) & 0xFFF];
+				uint32_t const cr = (v >> 11) & 31, cg = (v >> 6) & 31, cb = (v >> 1) & 31;
+				out[y * w + x] = (cr << 3 | cr >> 2) | (cg << 3 | cg >> 2) << 8 | (cb << 3 | cb >> 2) << 16 | (v & 1 ? 0xFF000000u : 0);
+			}
+		}
+		return;
+	}
 	for (int y = 0; y < h; ++y) {
 		for (int x = 0; x < w; ++x) {
 			struct Color c = texel(r, t, x, y, kind);
