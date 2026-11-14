@@ -1193,6 +1193,18 @@ static void storePixels(struct N64* n, struct Target* t, int from, int to, const
 static void loadPixels(struct N64* n, struct Glr* g, struct Target* t, int from, int to) {
 	n->stats.glTargetRows += (uint64_t) (to - from);
 	uint32_t* out = g->image;
+	int const first = from;
+	// 16-bit pixels not wrapping past RDRAM's end: in one run.
+	uint32_t const start = t->addr + (uint32_t) from * t->width * 2, count = (uint32_t) (to - from) * t->width;
+	if (t->size == 2 && !(t->addr & 1) && start + count * 2 <= RDRAM_SIZE && start >= t->addr) {
+		const uint8_t* src = &n->rdram[start];
+		for (uint32_t k = 0; k < count; ++k) {
+			uint32_t const v = (uint32_t) src[2 * k] << 8 | src[2 * k + 1];
+			uint32_t const r = (v >> 11) & 31, gr = (v >> 6) & 31, b = (v >> 1) & 31;
+			out[k] = (r << 3 | r >> 2) | (gr << 3 | gr >> 2) << 8 | (b << 3 | b >> 2) << 16;
+		}
+		from = to;
+	}
 	for (int y = from; y < to; ++y) {
 		for (uint32_t x = 0; x < t->width; ++x) {
 			uint32_t i = y * t->width + x, c;
@@ -1208,9 +1220,10 @@ static void loadPixels(struct N64* n, struct Glr* g, struct Target* t, int from,
 				uint8_t v = n->rdram[(t->addr + i) & (RDRAM_SIZE - 1)];
 				c = v | (uint32_t) v << 8 | (uint32_t) v << 16;
 			}
-			out[(y - from) * t->width + x] = c;
+			out[(y - first) * t->width + x] = c;
 		}
 	}
+	from = first;
 	struct Gl* gl = &g->gl;
 	uploadTexture(g, t->scale > 1 ? g->native : t->texture);
 	gl->TexSubImage2D(GL_TEXTURE_2D, 0, 0, from, (GLsizei) t->width, to - from, GL_RGBA, GL_UNSIGNED_BYTE, out);
@@ -1490,6 +1503,23 @@ static void writePixels(struct N64* n, struct Target* t, int from, int to) {
 // Rows from to to - 1 of what the GPU drew (image, bottom row first) into RDRAM, as the RDP would store
 // them (16-bit pixels fully covered).
 static void storePixels(struct N64* n, struct Target* t, int from, int to, const uint32_t* image) {
+	// 16-bit pixels not wrapping past RDRAM's end: in one run.
+	uint32_t const start = t->addr + (uint32_t) from * t->width * 2, count = (uint32_t) (to - from) * t->width;
+	if (t->size == 2 && !(t->addr & 1) && start + count * 2 <= RDRAM_SIZE && start >= t->addr) {
+		uint8_t* dst = &n->rdram[start];
+		uint8_t* hidden = &n->hidden[start >> 1];
+		for (uint32_t k = 0; k < count; ++k) {
+			uint32_t const c = image[k];
+			if (!(c >> 24)) {
+				continue;
+			}
+			bool const kept = (c >> 24) == 1;
+			uint32_t const v = (c & 0xF8) << 8 | (c >> 5 & 0x7C0) | (c >> 18 & 0x3E) | (kept ? dst[2 * k + 1] & 1 : 1);
+			dst[2 * k] = (uint8_t) (v >> 8), dst[2 * k + 1] = (uint8_t) v;
+			hidden[k] = kept ? hidden[k] : 3;
+		}
+		return;
+	}
 	for (int y = from; y < to; ++y) {
 		for (uint32_t x = 0; x < t->width; ++x) {
 			uint32_t c = image[(y - from) * t->width + x], i = y * t->width + x;
