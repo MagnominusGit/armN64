@@ -2202,7 +2202,7 @@ static uint8_t* arenaGet(struct N64* n) {
 	loadN(&e, RAM, N64_OFF(rdram), 8);
 	loadN(&e, TLB, N64_OFF(vpages), 8);
 	aAddImmX(&e, PAGES, N, N64_OFF(pageFlags));
-	if (n->fle) {
+	if (n->fast && n->fle) {
 		loadPinned(&e);
 	} else {
 		aAddImmX(&e, DTAG, CPU, CPU_OFF(dcacheTag));
@@ -2210,7 +2210,7 @@ static uint8_t* arenaGet(struct N64* n) {
 	}
 	aBr(&e, 1);
 	n->jitLeave = e.p;
-	if (n->fle) {
+	if (n->fast && n->fle) {
 		storePinned(&e);
 	}
 	aDp(&e, A_SUB | W64, 0, LIMIT, LEFT, S_LSL, 0);

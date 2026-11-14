@@ -83,6 +83,9 @@ void n64Destroy(struct N64* n) {
 
 static void start(struct N64* n);
 
+// The fields from power-on that the CPU runs with the caches' timing at HLE accuracy.
+enum { CACHE_TIMED_FIELDS = 120 };
+
 // Cartridge images come big-endian (.z64), halfword-swapped (.v64) or word-swapped (.n64).
 bool n64LoadRom(struct N64* n, const uint8_t* data, size_t size) {
 	if (size < 0x1000) {
@@ -132,7 +135,9 @@ static void start(struct N64* n) {
 	n->opCycles = 1;
 	n->emulatorLike = n->accuracy != ACCURACY_LLE;
 	n->rspPlainTiming = n->accuracy != ACCURACY_LLE;
-	n->fast = n->accuracy == ACCURACY_HLE;
+	// n64RunField turns on the fast CPU after the first fields.
+	n->fast = false;
+	n->fields = 0;
 	const char* idleSkip = setting(n, "N64_IDLESKIP");
 	n->idle.enabled = n->accuracy == ACCURACY_HLE && !(idleSkip && idleSkip[0] == '0');
 	n->hleCheck = setting(n, "N64HLECHECK") != NULL;
@@ -322,13 +327,19 @@ void n64RunField(struct N64* n) {
 	if (n->stats.siDmas && (n->ocNum != n->ocWantNum || n->ocDen != n->ocWantDen)) {
 		overclock(n);
 	}
-	// Without the caches' timing, the boot up to the first SI DMA counts three cycles an instruction,
-	// about what its cache-bound loops take: a game that calls osContInit before starting its timers
-	// must find the half second from power-on already passed, as it does on hardware.
-	uint32_t const opCycles = n->emulatorLike && !n->stats.siDmas ? 3 : 1;
-	if (n->opCycles != opCycles) {
-		n->opCycles = opCycles;
+	// With HLE accuracy the CPU has the caches' timing for its first seconds all the same: a boot,
+	// and what a game's threads race the video and timer interrupts for early on, take as long as on
+	// hardware (osContInit called before the timers are set up, threads using a queue before it is
+	// made). Then it goes without.
+	bool const fast = n->accuracy == ACCURACY_HLE && n->fields >= CACHE_TIMED_FIELDS;
+	if (n->fast != fast) {
+		bool const keptData = !n->compat && !n->fast;
+		n->fast = fast;
+		cpuCachesFromState(n, keptData);
 		blocksFree(n);
+		jitFree(n);
+		n->vpageFillCount = VPAGE_FILLED + 1;
+		cpuTlbChanged(n);
 	}
 	uint64_t start = n->nextVi - n->fieldCycles, passed = start;
 	while (n->cycles < n->nextVi) {
