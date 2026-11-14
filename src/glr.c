@@ -1762,6 +1762,68 @@ static void markSaved(struct Glr* g, const struct DrawState* s, GLint first) {
 	memset(&g->applied, 0xFF, sizeof(g->applied));
 }
 
+// Whether a line through an edge of one of the two triangles (vertices in pixels) has them on its two
+// sides; triangles touching along it cover none of the same pixels (the pixels of a shared edge go to
+// one of them), nor does a triangle without area.
+static bool separated(const float* a, const float* b) {
+	const float* t[2] = { a, b };
+	for (int k = 0; k < 2; ++k) {
+		const float* p = t[k];
+		float const area = (p[VERTEX_FLOATS] - p[0]) * (p[2 * VERTEX_FLOATS + 1] - p[1]) - (p[VERTEX_FLOATS + 1] - p[1]) * (p[2 * VERTEX_FLOATS] - p[0]);
+		if (area == 0) {
+			return true;
+		}
+	}
+	for (int k = 0; k < 6; ++k) {
+		const float* p = t[k / 3];
+		const float* v0 = p + (k % 3) * VERTEX_FLOATS;
+		const float* v1 = p + (k % 3 + 1) % 3 * VERTEX_FLOATS;
+		float const nx = v0[1] - v1[1], ny = v1[0] - v0[0];
+		float lo[2], hi[2];
+		for (int j = 0; j < 2; ++j) {
+			for (int i = 0; i < 3; ++i) {
+				float const d = t[j][i * VERTEX_FLOATS] * nx + t[j][i * VERTEX_FLOATS + 1] * ny;
+				lo[j] = !i || d < lo[j] ? d : lo[j];
+				hi[j] = !i || d > hi[j] ? d : hi[j];
+			}
+		}
+		if (hi[0] <= lo[1] || hi[1] <= lo[0]) {
+			return true;
+		}
+	}
+	return false;
+}
+
+// The triangles of a batch drawn since the last barrier: where each starts and its bounds.
+struct Drawn {
+	int count;
+	int first[64];
+	float box[64][4];
+};
+
+// Whether the triangle at vertex i of the batch covers pixels of one drawn since the last barrier; if
+// not it joins them.
+static bool overlapsDrawn(const float* batch, struct Drawn* d, int i) {
+	const float* v = batch + i * VERTEX_FLOATS;
+	float box[4] = { v[0], v[1], v[0], v[1] };
+	for (int k = 1; k < 3; ++k) {
+		const float* p = v + k * VERTEX_FLOATS;
+		box[0] = p[0] < box[0] ? p[0] : box[0], box[1] = p[1] < box[1] ? p[1] : box[1];
+		box[2] = p[0] > box[2] ? p[0] : box[2], box[3] = p[1] > box[3] ? p[1] : box[3];
+	}
+	bool overlaps = d->count == 64;
+	for (int k = 0; k < d->count && !overlaps; ++k) {
+		const float* b = d->box[k];
+		overlaps = box[0] < b[2] && b[0] < box[2] && box[1] < b[3] && b[1] < box[3] && !separated(batch + d->first[k] * VERTEX_FLOATS, v);
+	}
+	if (overlaps) {
+		d->count = 0;
+	}
+	d->first[d->count] = i;
+	memcpy(d->box[d->count++], box, sizeof(box));
+	return overlaps;
+}
+
 static void flushBatch(struct N64* n, struct Glr* g) {
 	if (!g->batchCount || !g->stateSet) {
 		g->batchCount = 0;
@@ -1906,12 +1968,21 @@ static void flushBatch(struct N64* n, struct Glr* g) {
 			gl->DrawArrays(GL_TRIANGLES, first, g->batchCount);
 			gl->Disable(GL_STENCIL_TEST);
 		} else if (g->barrier && !s->depthOnly && s->readsImage) {
-			// What each triangle reads of the image is what those before it drew.
+			// What each triangle reads of the image is what those before it drew: triangles covering none
+			// of each other's pixels go in one draw, each pixel read only by the fragment that writes it.
 			useTexture(g, LEVELS + 1, s->target->texture);
-			for (int i = 0; i < g->batchCount; i += 3) {
-				gl->TextureBarrierNV();
-				gl->DrawArrays(GL_TRIANGLES, first + i, 3);
+			gl->TextureBarrierNV();
+			struct Drawn drawn = { 0 };
+			overlapsDrawn(g->batch, &drawn, 0);
+			int from = 0;
+			for (int i = 3; i < g->batchCount; i += 3) {
+				if (overlapsDrawn(g->batch, &drawn, i)) {
+					gl->DrawArrays(GL_TRIANGLES, first + from, i - from);
+					gl->TextureBarrierNV();
+					from = i;
+				}
 			}
+			gl->DrawArrays(GL_TRIANGLES, first + from, g->batchCount - from);
 		} else {
 			if (s->depthOnly) {
 				gl->ColorMask(0, 0, 0, 0);
