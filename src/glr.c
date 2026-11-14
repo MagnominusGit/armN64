@@ -2880,9 +2880,6 @@ static void pictureStart(uint32_t offset, uint32_t stride, uint32_t bytes, int w
 	}
 }
 
-// The framebuffer of the color image the VI shows from origin (width by rows pixels, stride pixels a
-// row, size 2 or 3), when the GPU drew some of those rows since its pixels last went back to RDRAM:
-// x and y of the picture's first pixel in it. 0 otherwise: RDRAM has the picture.
 // The pixels copied back at the last field into RDRAM (the GPU has had a field to copy them), and what
 // the targets the CPU read since drew copied back without waiting.
 void glrField(struct N64* n) {
@@ -2936,55 +2933,50 @@ void glrField(struct N64* n) {
 	}
 }
 
-unsigned glrPicture(struct N64* n, uint32_t origin, uint32_t stride, int size, int width, int rows, int* x, int* y) {
+// The framebuffer of the color image the VI shows from origin (width by rows pixels, stride pixels a
+// row, size 2 or 3), when the GPU drew some of those rows since its pixels last went back to RDRAM:
+// x and y of the picture's first pixel in it, and its rows (both fields of an interlaced picture). 0
+// otherwise: RDRAM has the picture.
+unsigned glrPicture(struct N64* n, uint32_t origin, uint32_t stride, int size, int width, int* rows, int* x, int* y) {
 	struct Glr* g = n->glr;
 	uint32_t const bytes = size == 3 ? 4 : 2;
-	for (int i = 0; i < TARGETS; ++i) {
-		struct Target* t = &g->target[i];
-		if (!t->texture || t->size != size || t->width != stride || t->dirtyTo <= t->dirtyFrom || origin < t->addr) {
-			continue;
+	for (int pass = 0; pass < 2; ++pass) {
+		for (int i = 0; i < TARGETS; ++i) {
+			struct Target* t = &g->target[i];
+			// A VI line every other row of the image: an interlaced field, shown with the other.
+			bool const laced = stride == t->width * 2;
+			if (!t->texture || t->size != size || (t->width != stride && !laced) || t->dirtyTo <= t->dirtyFrom || origin < t->addr) {
+				continue;
+			}
+			int col, row;
+			pictureStart(origin - t->addr, t->width, bytes, width, &col, &row);
+			int const count = laced ? *rows * 2 : *rows;
+			row = laced ? row & ~1 : row;
+			if (!pass ? row < t->dirtyFrom || row + count > t->dirtyTo : row + count > TARGET_ROWS || row >= t->dirtyTo || row + count <= t->dirtyFrom) {
+				continue;
+			}
+			glesUse(g->gles);
+			flushBatch(n, g);
+			// A target the GPU drew part of: the rows it didn't draw come from RDRAM (borders a game
+			// clears once, rows given back).
+			if (pass) {
+				if (row + count > t->height) {
+					grow(n, g, t, (row + count + 15) & ~15);
+				}
+				if (row < t->dirtyFrom) {
+					loadPixels(n, g, t, row, t->dirtyFrom);
+				}
+				if (row + count > t->dirtyTo) {
+					loadPixels(n, g, t, t->dirtyTo, row + count);
+				}
+			}
+			*x = col;
+			*y = row;
+			*rows = count;
+			resolve(g, t);
+			n->glrScale = t->scale;
+			return t->framebuffer;
 		}
-		int col, row;
-		pictureStart(origin - t->addr, stride, bytes, width, &col, &row);
-		if (row < t->dirtyFrom || row + rows > t->dirtyTo) {
-			continue;
-		}
-		glesUse(g->gles);
-		flushBatch(n, g);
-		*x = col;
-		*y = row;
-		resolve(g, t);
-		n->glrScale = t->scale;
-		return t->framebuffer;
-	}
-	// A target the GPU drew part of: the rows it didn't draw come from RDRAM (borders a game clears
-	// once, rows given back).
-	for (int i = 0; i < TARGETS; ++i) {
-		struct Target* t = &g->target[i];
-		if (!t->texture || t->size != size || t->width != stride || t->dirtyTo <= t->dirtyFrom || origin < t->addr) {
-			continue;
-		}
-		int col, row;
-		pictureStart(origin - t->addr, stride, bytes, width, &col, &row);
-		if (row + rows > TARGET_ROWS || row >= t->dirtyTo || row + rows <= t->dirtyFrom) {
-			continue;
-		}
-		glesUse(g->gles);
-		flushBatch(n, g);
-		if (row + rows > t->height) {
-			grow(n, g, t, (row + rows + 15) & ~15);
-		}
-		if (row < t->dirtyFrom) {
-			loadPixels(n, g, t, row, t->dirtyFrom);
-		}
-		if (row + rows > t->dirtyTo) {
-			loadPixels(n, g, t, t->dirtyTo, row + rows);
-		}
-		*x = col;
-		*y = row;
-		resolve(g, t);
-		n->glrScale = t->scale;
-		return t->framebuffer;
 	}
 	return 0;
 }
