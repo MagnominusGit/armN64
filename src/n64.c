@@ -332,9 +332,13 @@ void n64RunField(struct N64* n) {
 	// hardware (osContInit called before the timers are set up, threads using a queue before it is
 	// made). Then it goes without.
 	bool const fast = n->accuracy == ACCURACY_HLE && n->fields >= CACHE_TIMED_FIELDS;
-	if (n->fast != fast) {
+	// FLE's fast CPU takes two cycles an instruction, about the hardware's rate with its caches: what a
+	// game spins on while it waits costs half.
+	uint32_t const opCycles = fast && n->fle ? 2 : 1;
+	if (n->fast != fast || n->opCycles != opCycles) {
 		bool const keptData = !n->compat && !n->fast;
 		n->fast = fast;
+		n->opCycles = opCycles;
 		cpuCachesFromState(n, keptData);
 		blocksFree(n);
 		jitFree(n);
