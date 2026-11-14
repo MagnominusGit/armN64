@@ -1266,8 +1266,10 @@ static void spriteDraw(struct N64* n, struct Hle* h, int s0, int t0, int x, int 
 		emit(n, h, (uint64_t) 0x35 << 56 | (uint64_t) format << 53 | (uint64_t) loadSize << 51 | (uint64_t) line << 41 | (uint64_t) 7 << 24 | 2 << 18 | 2 << 8);
 		// 4-bit texels' columns as halves of the 8-bit ones (10.2), as the microcode gives them.
 		int sl = size ? loadS0 << 2 : s0 * 2, sh = size ? loadS1 << 2 : (s0 + width - 1) * 2;
-		emit(n, h, (uint64_t) 0x34 << 56 | (uint64_t) sl << 44 | (uint64_t) ((t0 + t) << 2) << 32 | (uint64_t) 7 << 24 | (uint64_t) sh << 12 |
-		           (uint64_t) ((t0 + t + rows - 1) << 2));
+		// Flipped upside down, the band on screen holds the image's rows from the bottom.
+		int const from = t0 + (h->spriteFlipT ? height - t - rows : t);
+		emit(n, h, (uint64_t) 0x34 << 56 | (uint64_t) sl << 44 | (uint64_t) (from << 2) << 32 | (uint64_t) 7 << 24 | (uint64_t) sh << 12 |
+		           (uint64_t) ((from + rows - 1) << 2));
 		emit(n, h, (uint64_t) 0x35 << 56 | (uint64_t) format << 53 | (uint64_t) size << 51 | (uint64_t) line << 41 | 2 << 18 | 2 << 8);
 		// The tile from the band's first texel (the loaded pair's first for 4-bit ones), as the
 		// microcode makes it.
