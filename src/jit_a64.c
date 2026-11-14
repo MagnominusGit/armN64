@@ -207,6 +207,9 @@ struct Jit {
 	struct Exit exits[3 * 64];
 	int exitCount;
 	struct Slow slows[64];
+	// A poll loop's block (pollSkip): its loads' addresses kept in CPU.pollAt each pass.
+	bool poll;
+	uint32_t pollBase;
 	int slowCount;
 	struct Miss misses[64];
 	int missCount;
@@ -1667,6 +1670,16 @@ static void emitMemory(struct Jit* j, struct Slow* slow) {
 			patchHere(e, kseg0);
 		}
 	}
+	if (j->poll && !isStore && (uint32_t) (slow->pc - j->pollBase) < 64) {
+		uint32_t const k = (uint32_t) (slow->pc - j->pollBase) / 4;
+		aStr(e, 6, CPU, CPU_OFF(pollAt) + 4 * k);
+		if (direct) {
+			aMovImm(e, 1, (uint32_t) at);
+			aStr(e, 1, CPU, CPU_OFF(pollVirt) + 4 * k);
+		} else {
+			aStr(e, 0, CPU, CPU_OFF(pollVirt) + 4 * k);
+		}
+	}
 	// Stores go slow on any flag (code, RDP) unless the page has only code that they miss; loads
 	// on pages the RDP may still be drawing to. With the D-cache's data only its fills and
 	// write-backs reach memory, in C.
@@ -2043,16 +2056,23 @@ static void pollSkip(struct Jit* j, const uint32_t* ops, uint32_t count, uint32_
 		if (op >> 26 < 0x20) {
 			continue;
 		}
-		int rs = (op >> 21) & 31, size = memSize(op);
-		if (rs) {
-			aLdr(e, 0, CPU, gprOff(rs));
-			aAddImm(e, 0, 0, (int16_t) op, 1);
+		int size = memSize(op);
+		if (j->poll) {
+			// Where the pass just made took it from (its base may be what an earlier load in it read).
+			aLdr(e, 6, CPU, CPU_OFF(pollAt) + 4 * k);
+			aLdr(e, 0, CPU, CPU_OFF(pollVirt) + 4 * k);
 		} else {
-			aMovImm(e, 0, (uint32_t) (int32_t) (int16_t) op);
+			int const rs = (op >> 21) & 31;
+			if (rs) {
+				aLdr(e, 0, CPU, gprOff(rs));
+				aAddImm(e, 0, 0, (int16_t) op, 1);
+			} else {
+				aMovImm(e, 0, (uint32_t) (int32_t) (int16_t) op);
+			}
+			aLsrImm(e, 1, 0, 12);
+			aLdst(e, L_LDR, 5, TLB, 1, L_UXTW | 0x1000);
+			aDp(e, A_ADD, 6, 0, 5, S_LSL, 0);
 		}
-		aLsrImm(e, 1, 0, 12);
-		aLdst(e, L_LDR, 5, TLB, 1, L_UXTW | 0x1000);
-		aDp(e, A_ADD, 6, 0, 5, S_LSL, 0);
 		if (j->rdpThreads) {
 			aLsrImm(e, 1, 6, 12);
 			aLdst(e, L_LDRB, 1, PAGES, 1, L_UXTW);
@@ -2418,6 +2438,17 @@ void* jitCompile(struct N64* n, const uint32_t* ops, uint32_t count, uint32_t va
 		storeByte(e, CPU_OFF(pollTried), 0);
 	}
 	uint8_t* again = e->p;
+	// FLE: its loads' addresses as each pass makes them (it counts no stalls, so a skipped pass costs
+	// what a pass made does whatever the loads depend on).
+	j->poll = pollPass != 0 && j->fle, j->pollBase = vaddr;
+	if (j->poll) {
+		aMovImm(e, 1, RDRAM_SIZE);
+		for (uint32_t k = 0; k < count; ++k) {
+			if (ops[k] >> 26 >= 0x20) {
+				aStr(e, 1, CPU, CPU_OFF(pollAt) + 4 * k);
+			}
+		}
+	}
 	// FLE: the cycles of the instructions since the last count.
 	int pending = 0;
 

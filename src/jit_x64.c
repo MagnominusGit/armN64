@@ -135,6 +135,9 @@ struct Jit {
 	int exitCount;
 	struct Slow slows[64];
 	int slowCount;
+	// A poll loop's block (pollSkip): its loads' addresses kept in CPU.pollAt from its start.
+	bool poll;
+	uint32_t pollBase;
 	struct Miss misses[64];
 	int missCount;
 	// Stores to pages with compiled code, which check that they miss its words.
@@ -1352,6 +1355,11 @@ static void emitMemory(struct Jit* j, struct Slow* slow) {
 	xShiftI(e, X_SHR, 4, R(RCX), 12);
 	xLoad(e, 8, RDX, N64_AT(vpages));
 	xAluRM(e, X_ADD, 4, RAX, MI(RDX, RCX, 4, isStore ? VPAGES * 4 : 0));
+	if (j->poll && !isStore && (uint32_t) (slow->pc - j->pollBase) < 64) {
+		uint32_t const k = (uint32_t) (slow->pc - j->pollBase) / 4;
+		xStore(e, 4, CPU_AT(pollAt[k]), RAX);
+		xStore(e, 4, CPU_AT(pollVirt[k]), R8);
+	}
 	// Stores go slow on any flag (code, RDP) unless the page has only code that they miss; loads
 	// on pages the RDP may still be drawing to. With the D-cache's data only its fills and
 	// write-backs reach memory, in C.
@@ -1502,13 +1510,19 @@ static void pollSkip(struct Jit* j, const uint32_t* ops, uint32_t count, uint32_
 			continue;
 		}
 		int size = memSize(op);
-		xLoad(e, 4, RAX, gpr((op >> 21) & 31));
-		xAluI(e, X_ADD, 4, R(RAX), (int16_t) op);
-		xMovRR(e, 4, R8, RAX);
-		xMovRR(e, 4, RCX, RAX);
-		xShiftI(e, X_SHR, 4, R(RCX), 12);
-		xLoad(e, 8, RDX, N64_AT(vpages));
-		xAluRM(e, X_ADD, 4, RAX, MI(RDX, RCX, 4, 0));
+		if (j->poll) {
+			// Where the pass just made took it from (its base may be what an earlier load in it read).
+			xLoad(e, 4, RAX, CPU_AT(pollAt[k]));
+			xLoad(e, 4, R8, CPU_AT(pollVirt[k]));
+		} else {
+			xLoad(e, 4, RAX, gpr((op >> 21) & 31));
+			xAluI(e, X_ADD, 4, R(RAX), (int16_t) op);
+			xMovRR(e, 4, R8, RAX);
+			xMovRR(e, 4, RCX, RAX);
+			xShiftI(e, X_SHR, 4, R(RCX), 12);
+			xLoad(e, 8, RDX, N64_AT(vpages));
+			xAluRM(e, X_ADD, 4, RAX, MI(RDX, RCX, 4, 0));
+		}
 		if (j->rdpThreads) {
 			xMovRR(e, 4, RCX, RAX);
 			xShiftI(e, X_SHR, 4, R(RCX), 12);
@@ -1677,6 +1691,14 @@ void* jitCompile(struct N64* n, const uint32_t* ops, uint32_t count, uint32_t va
 	}
 	int reload;
 	uint32_t pollPass = blockPollPass(ops, count, vaddr, &reload);
+	// FLE: its loads' addresses as each pass makes them (it counts no stalls, so a skipped pass costs
+	// what a pass made does whatever the loads depend on).
+	j->poll = pollPass != 0 && j->fle, j->pollBase = vaddr;
+	for (uint32_t k = 0; j->poll && k < count; ++k) {
+		if (ops[k] >> 26 >= 0x20) {
+			xStoreI(e, 4, CPU_AT(pollAt[k]), RDRAM_SIZE);
+		}
+	}
 
 	bool delay = false;
 	int pending = 0;

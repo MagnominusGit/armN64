@@ -63,6 +63,9 @@ struct CPU {
 	// The host's rounding mode as FCR31's (fpuHostRound), and room for MXCSR while the x86 JIT sets it.
 	int hostRound;
 	uint32_t mxcsr;
+	// A poll loop's loads in its last pass (by their place in the block): physical and virtual
+	// addresses, RDRAM_SIZE for one not made, for the JITs' pollSkip.
+	uint32_t pollAt[16], pollVirt[16];
 	bool exception;
 	// The caches (cpu.c): tags, the line's physical address while it is valid, else DCACHE_NONE; the
 	// tags as CACHE reads them back; dirty D-cache lines; the lines' data, in RDRAM's byte order.
