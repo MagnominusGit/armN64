@@ -70,14 +70,24 @@ static void sample_mix(int16_t* dst, int16_t src, int16_t gain)
 }
 
 /* armN64: eight samples mixed as sample_mix mixes them, in DMEM order (the compiler's vectors) */
+typedef int32_t v4si __attribute__((vector_size(16)));
+
 static void sample_mix8(int16_t* dst, const int16_t* src, const int16_t* gains)
 {
+    const v4si lo = { INT16_MIN, INT16_MIN, INT16_MIN, INT16_MIN }, hi = { INT16_MAX, INT16_MAX, INT16_MAX, INT16_MAX };
     int16_t out[8];
-    int m;
+    int h, m;
 
-    for (m = 0; m < 8; ++m) {
-        int32_t v = dst[m] + ((src[m] * gains[m]) >> 15);
-        out[m] = (int16_t)(v < INT16_MIN ? INT16_MIN : v > INT16_MAX ? INT16_MAX : v);
+    for (h = 0; h < 8; h += 4) {
+        v4si d = { dst[h], dst[h + 1], dst[h + 2], dst[h + 3] };
+        v4si s = { src[h], src[h + 1], src[h + 2], src[h + 3] };
+        v4si g = { gains[h], gains[h + 1], gains[h + 2], gains[h + 3] };
+        v4si v = d + ((s * g) >> 15);
+        v4si below = v < lo, above = v > hi;
+        v = (v & ~below) | (lo & below);
+        v = (v & ~above) | (hi & above);
+        for (m = 0; m < 4; ++m)
+            out[h + m] = (int16_t)v[m];
     }
     memcpy(dst, out, sizeof(out));
 }
@@ -505,7 +515,26 @@ void alist_envmix_lin(
     }
 
     count >>= 1;
-    for(k = 0; k < count; ++k) {
+    /* armN64: eight samples at a time, as alist_envmix_exp does them */
+    for (k = 0; k + 8 <= count; k += 8) {
+        int16_t samples[8], gains8[4][8];
+        size_t x;
+        for (x = 0; x < 8; ++x) {
+            int16_t l_vol = ramp_step(&ramps[0]);
+            int16_t r_vol = ramp_step(&ramps[1]);
+
+            gains8[0][x^S] = clamp_s16((l_vol * dry + 0x4000) >> 15);
+            gains8[1][x^S] = clamp_s16((r_vol * dry + 0x4000) >> 15);
+            gains8[2][x^S] = clamp_s16((l_vol * wet + 0x4000) >> 15);
+            gains8[3][x^S] = clamp_s16((r_vol * wet + 0x4000) >> 15);
+        }
+        memcpy(samples, in + k, sizeof(samples));
+        sample_mix8(dl + k, samples, gains8[0]);
+        sample_mix8(dr + k, samples, gains8[1]);
+        sample_mix8(wl + k, samples, gains8[2]);
+        sample_mix8(wr + k, samples, gains8[3]);
+    }
+    for(; k < count; ++k) {
         int16_t  gains[4];
         int16_t* buffers[4];
         int16_t l_vol = ramp_step(&ramps[0]);
