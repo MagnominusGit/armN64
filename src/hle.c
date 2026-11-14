@@ -4710,7 +4710,8 @@ static void runList(struct N64* n, struct Hle* h, uint32_t pc) {
 					h->spriteScaleX = (w1 >> 16) ? (w1 >> 16) / 1024.0f : 1, h->spriteScaleY = (w1 & 0xFFFF) ? (w1 & 0xFFFF) / 1024.0f : 1;
 					h->spriteFlipS = (w0 >> 8) & 0xFF, h->spriteFlipT = w0 & 0xFF;
 				} else {
-					cullOrEnd(h, (w0 & 0xFFFF) / (f3dex ? 2 : scale * 4), (w1 & 0xFFFF) / (f3dex ? 2 : scale * 4), &end);
+					// Fast3D's end is one past the last vertex, F3DEX's the last.
+					cullOrEnd(h, (w0 & 0xFFFF) / (f3dex ? 2 : scale * 4), (w1 & 0xFFFF) / (f3dex ? 2 : scale * 4) - !f3dex, &end);
 				}
 				break;
 			case 0xBF:
