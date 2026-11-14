@@ -232,6 +232,9 @@ struct Glr {
 	int depthRows;
 	// A target's taller texture, for its rows to be copied in (grow).
 	GLuint growFramebuffer;
+	// The target giving rows back for a read while it keeps them (glrTouched): its own write to
+	// RDRAM leaves it as it is.
+	struct Target* own;
 	// Multisampling (N64_GL_MSAA, with framebuffer fetch only): samples a pixel, the depth the targets'
 	// multisampled colors share, and the program that copies rows into one.
 	int samples;
@@ -1236,6 +1239,17 @@ static bool readBack(struct Glr* g, const struct RDP* r) {
 		}
 	}
 	return false;
+}
+
+// The pages of RDRAM [addr, addr + len): writes there wait for the GPU (rdpWaitFor), reads don't.
+static void markWrites(struct N64* n, uint32_t addr, uint32_t len) {
+	uint32_t const first = (addr & (RDRAM_SIZE - 1)) >> 12, last = ((addr + len - 1) & (RDRAM_SIZE - 1)) >> 12;
+	for (uint32_t p = first;; p = (p + 1) & ((RDRAM_SIZE >> 12) - 1)) {
+		n->pageFlags[p] |= PAGE_RDP_READS;
+		if (p == last) {
+			break;
+		}
+	}
 }
 
 // RDRAM [addr, addr + len) changed under the targets (but keep): their rows there load from it again.
@@ -2588,7 +2602,7 @@ void glrTouched(struct N64* n, uint32_t addr, uint32_t len, bool write) {
 		struct Target* t = &g->target[i];
 		uint32_t const row = t->width * (t->size == 3 ? 4 : t->size == 1 ? 1 : 2);
 		uint32_t const from = t->addr + (uint32_t) t->dirtyFrom * row, to = t->addr + (uint32_t) t->dirtyTo * row;
-		if (!t->texture || t->dirtyTo <= t->dirtyFrom || addr >= to || addr + len <= from) {
+		if (t == g->own || !t->texture || t->dirtyTo <= t->dirtyFrom || addr >= to || addr + len <= from) {
 			continue;
 		}
 		t->cpuReads |= !write && t->dirtyTo <= READ_BACK_ROWS;
@@ -2596,6 +2610,20 @@ void glrTouched(struct N64* n, uint32_t addr, uint32_t len, bool write) {
 		flushBatch(n, g);
 		g->fastValid = false;
 		++n->stats.glSyncs;
+		// A read: what the GPU drew goes back and the GPU keeps it; the pages wait for writes only,
+		// which load their rows again.
+		if (!write) {
+			int const drawnFrom = t->dirtyFrom, drawnTo = t->dirtyTo, rows = t->marked > t->dirtyTo ? t->marked : t->dirtyTo;
+			markPages(n, t->addr, (uint32_t) rows * row, false);
+			markWrites(n, t->addr, (uint32_t) rows * row);
+			t->dirtyFrom = t->dirtyTo = 0;
+			t->marked = 0;
+			g->own = t;
+			writePixels(n, t, drawnFrom, drawnTo);
+			g->own = NULL;
+			gave = true;
+			continue;
+		}
 		int const rows = t->marked > t->dirtyTo ? t->marked : t->dirtyTo;
 		markPages(n, t->addr, (uint32_t) rows * row, false);
 		// FLE: the whole rows a write replaces don't go back first (their hidden bits stay as they
@@ -2629,7 +2657,7 @@ void glrTouched(struct N64* n, uint32_t addr, uint32_t len, bool write) {
 		}
 	}
 	if (write) {
-		forgetRows(g, addr, len, NULL);
+		forgetRows(g, addr, len, g->own);
 		glrWritten(n, addr, len);
 	}
 }
