@@ -453,9 +453,13 @@ void cpuTlbChanged(struct N64* n) {
 		for (uint32_t page = 0; page < VPAGES; ++page) {
 			n->vpages[page] = n->vpages[VPAGES + page] = vpageUnknown(page);
 		}
-		// kseg0's RDRAM, which the TLB doesn't change.
+		// kseg0's RDRAM, which the TLB doesn't change; with FLE kseg1's too, uncached accesses costing
+		// nothing more.
 		for (uint32_t page = 0x80000; page < 0x80000 + (RDRAM_SIZE >> 12); ++page) {
 			n->vpages[page] = n->vpages[VPAGES + page] = 0x80000000u;
+		}
+		for (uint32_t page = 0xA0000; n->fast && n->fle && page < 0xA0000 + (RDRAM_SIZE >> 12); ++page) {
+			n->vpages[page] = n->vpages[VPAGES + page] = 0x60000000u;
 		}
 	} else {
 		for (uint32_t i = 0; i < n->vpageFillCount; ++i) {

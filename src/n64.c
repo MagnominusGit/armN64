@@ -161,6 +161,8 @@ static void start(struct N64* n) {
 		memset(n->rdram, 0, RDRAM_SIZE);
 	}
 	blocksFree(n);
+	// All of vpages again, kseg1's as the accuracy has it.
+	n->vpageFillCount = VPAGE_FILLED + 1;
 	cpuReset(n);
 	pifBoot(n);
 	n->eeprom16k = n->rom ? cartEeprom16k(n->rom) : false;
