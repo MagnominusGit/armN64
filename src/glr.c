@@ -143,6 +143,8 @@ struct Target {
 	// 16, TARGET_ROWS at most), as a tiled GPU loads and stores all of them for each pass. Drawing
 	// still maps TARGET_ROWS rows, the ones past it clipped.
 	int height;
+	// Its pixels to an RDP pixel (scaleFor).
+	int scale;
 };
 
 // What the fragment shader is made for.
@@ -161,13 +163,13 @@ struct ProgramKey {
 // A program's uniforms as last set.
 struct Uniforms {
 	float size[2], prim[4], env[4], fog[4], blend[4], primLod, primDepth, k[2], lastCombined[4];
-	int persp, tile[LEVELS][12], image[LEVELS][4];
+	int persp, scale, tile[LEVELS][12], image[LEVELS][4];
 };
 
 struct Program {
 	struct ProgramKey key;
 	GLuint program;
-	GLint size, persp, prim, env, fog, blend, primLod, primDepth, k, lastCombined, tile[LEVELS], image[LEVELS], texture[LEVELS], memory;
+	GLint size, persp, scale, prim, env, fog, blend, primLod, primDepth, k, lastCombined, tile[LEVELS], image[LEVELS], texture[LEVELS], memory;
 	struct Uniforms set;
 	bool uniformsSet;
 };
@@ -175,7 +177,7 @@ struct Program {
 // What GL is set to (-1: not known), so a batch changes only what differs.
 struct Applied {
 	GLuint framebuffer, program, texture[LEVELS + 2];
-	int unit, viewport, scissorOn, scissor[4], depth, depthMask, offset, blend;
+	int unit, viewport, scissorOn, scissor[4], scissorScale, depth, depthMask, offset, blend;
 	float blendConstant;
 };
 
@@ -254,9 +256,11 @@ struct Glr {
 	// RDRAM through a texture at its resolution.
 	int scale;
 	GLuint native, nativeFramebuffer;
-	// Seal Edges (N64_GL_SEAL): how far, in the RDP's pixels, opaque triangles reach past their edges
-	// to cover the cracks between them that show at higher scales.
+	// Seal Edges (N64_GL_SEAL): how far, in the target's pixels, opaque triangles reach past their
+	// edges to cover the cracks between them that show at higher scales.
 	float seal;
+	// The scale of the target drawn to, for the scissor.
+	int drawScale;
 	struct Program programs[PROGRAMS];
 	int programCount;
 	// The game's programs kept by their keys (glesCacheDirectory), made again as the renderer starts:
@@ -324,7 +328,7 @@ static void blitRows(struct Glr* g, struct Target* t, int from, int to, bool toT
 	if (!toTarget) {
 		resolve(g, t);
 	}
-	int const k = g->scale, w = (int) t->width;
+	int const k = t->scale, w = (int) t->width;
 	useScissor(g, false, 0, 0, 0, 0);
 	gl->BindFramebuffer(GL_READ_FRAMEBUFFER, toTarget ? g->nativeFramebuffer : t->framebuffer);
 	gl->BindFramebuffer(GL_DRAW_FRAMEBUFFER, toTarget ? t->framebuffer : g->nativeFramebuffer);
@@ -352,7 +356,7 @@ static void resolve(struct Glr* g, struct Target* t) {
 		return;
 	}
 	struct Gl* gl = &g->gl;
-	int const w = (int) t->width * g->scale, h = t->height * g->scale;
+	int const w = (int) t->width * t->scale, h = t->height * t->scale;
 	useScissor(g, false, 0, 0, 0, 0);
 	gl->BindFramebuffer(GL_READ_FRAMEBUFFER, t->msaaFramebuffer);
 	gl->BindFramebuffer(GL_DRAW_FRAMEBUFFER, t->framebuffer);
@@ -371,7 +375,7 @@ static void pushRows(struct Glr* g, struct Target* t, GLuint source, int from, i
 		return;
 	}
 	struct Gl* gl = &g->gl;
-	int const k = g->scale;
+	int const k = t->scale;
 	gl->BindFramebuffer(GL_FRAMEBUFFER, t->msaaFramebuffer);
 	gl->Viewport(0, 0, (GLsizei) t->width * k, TARGET_ROWS * k);
 	gl->Enable(GL_SCISSOR_TEST);
@@ -415,9 +419,9 @@ static void useScissor(struct Glr* g, bool on, int x, int y, int w, int h) {
 		on ? g->gl.Enable(GL_SCISSOR_TEST) : g->gl.Disable(GL_SCISSOR_TEST);
 		a->scissorOn = on;
 	}
-	if (on && (a->scissor[0] != x || a->scissor[1] != y || a->scissor[2] != w || a->scissor[3] != h)) {
-		g->gl.Scissor(x * g->scale, y * g->scale, w * g->scale, h * g->scale);
-		a->scissor[0] = x, a->scissor[1] = y, a->scissor[2] = w, a->scissor[3] = h;
+	if (on && (a->scissor[0] != x || a->scissor[1] != y || a->scissor[2] != w || a->scissor[3] != h || a->scissorScale != g->drawScale)) {
+		g->gl.Scissor(x * g->drawScale, y * g->drawScale, w * g->drawScale, h * g->drawScale);
+		a->scissor[0] = x, a->scissor[1] = y, a->scissor[2] = w, a->scissor[3] = h, a->scissorScale = g->drawScale;
 	}
 }
 
@@ -489,7 +493,7 @@ static const char fragmentHead[] =
 	"uniform vec4 uPrim, uEnv, uFog, uBlend, uLastCombined;\n"
 	"uniform float uPrimLod, uPrimDepth;\n"
 	"uniform vec2 uK;\n"
-	"uniform int uPersp;\n"
+	"uniform int uPersp, uScale;\n"
 	"uniform ivec4 uTile0[3], uTile1[3], uTile2[3], uTile3[3], uTile4[3], uTile5[3], uTile6[3], uTile7[3];\n"
 	"uniform ivec4 uImage0, uImage1, uImage2, uImage3, uImage4, uImage5, uImage6, uImage7;\n"
 	"uniform highp sampler2D uTex0, uTex1, uTex2, uTex3, uTex4, uTex5, uTex6, uTex7;\n"
@@ -817,13 +821,13 @@ static struct Program* program(struct Glr* g, struct ProgramKey key) {
 	// it is for (the combiner's channels 0-2, the dither 4).
 	snprintf(line, sizeof(line),
 	         "uint pixelNoise(uint tag) {\n"
-	         "	uvec2 p = uvec2(gl_FragCoord.xy) / %du;\n"
+	         "	uvec2 p = uvec2(gl_FragCoord.xy) / uint(uScale);\n"
 	         "	uint h = p.x * 0x9E3779B1u ^ p.y * 0x85EBCA77u ^ vSeq * 0xC2B2AE3Du ^ tag;\n"
 	         "	h ^= h >> 15;\n"
 	         "	h *= 0x2C1B3C6Du;\n"
 	         "	return h ^ (h >> 12);\n"
 	         "}\n"
-	         "vec3 noise() { return vec3(float((pixelNoise(0u) & 7u) << 6 | 32u) / 255.0); }\n", g->scale);
+	         "vec3 noise() { return vec3(float((pixelNoise(0u) & 7u) << 6 | 32u) / 255.0); }\n");
 	strcat(source, line);
 	// The level of detail picking the tiles: a texel from any of them (rdp.c levelOfDetail, with
 	// detail one further on).
@@ -935,11 +939,11 @@ static struct Program* program(struct Glr* g, struct ProgramKey key) {
 			int modeRgb = key.modes & MODE_NOISE ? 2 : key.modes & MODE_DITHER ? (key.modes & MODE_BAYER ? 1 : 0) : 3;
 			const char* matrix = modeRgb == 1 || modeRgb == 3 ? "int[16](0, 4, 1, 5, 4, 0, 5, 1, 3, 7, 2, 6, 7, 3, 6, 2)" : "int[16](0, 6, 1, 7, 4, 2, 5, 3, 3, 5, 2, 4, 7, 1, 6, 0)";
 			snprintf(line, sizeof(line),
-			         "	{ ivec2 ap = ivec2(gl_FragCoord.xy) / %d;\n"
+			         "	{ ivec2 ap = ivec2(gl_FragCoord.xy) / uScale;\n"
 			         "	int ad = %s;\n"
 			         "	combined.a = min(floor(combined.a * 255.0 + 0.5) + float(ad), 255.0) / 255.0;\n"
 			         "	shade.a = min(floor(shade.a * 255.0 + 0.5) + float(ad), 255.0) / 255.0; }\n",
-			         g->scale, key.alphaDither == 2 ? "int(pixelNoise(5u) & 7u)" : key.alphaDither == 1 ? "~%s[(ap.y & 3) * 4 + (ap.x & 3)] & 7" : "%s[(ap.y & 3) * 4 + (ap.x & 3)]");
+			         key.alphaDither == 2 ? "int(pixelNoise(5u) & 7u)" : key.alphaDither == 1 ? "~%s[(ap.y & 3) * 4 + (ap.x & 3)] & 7" : "%s[(ap.y & 3) * 4 + (ap.x & 3)]");
 			if (key.alphaDither < 2) {
 				char with[1024];
 				snprintf(with, sizeof(with), line, matrix);
@@ -969,9 +973,9 @@ static struct Program* program(struct Glr* g, struct ProgramKey key) {
 				snprintf(matrix, sizeof(matrix), "ivec3 ditherM = ivec3(%s[(px.y & 3) * 4 + (px.x & 3)])",
 				         key.modes & MODE_BAYER ? "int[16](0, 4, 1, 5, 4, 0, 5, 1, 3, 7, 2, 6, 7, 3, 6, 2)" : "int[16](0, 6, 1, 7, 4, 2, 5, 3, 3, 5, 2, 4, 7, 1, 6, 0)");
 			}
-			snprintf(line, sizeof(line), "	{ ivec2 px = ivec2(gl_FragCoord.xy) / %d;\n	%s;\n	ivec3 o = ivec3(floor(oColor.rgb * 255.0 + 0.5));\n"
+			snprintf(line, sizeof(line), "	{ ivec2 px = ivec2(gl_FragCoord.xy) / uScale;\n	%s;\n	ivec3 o = ivec3(floor(oColor.rgb * 255.0 + 0.5));\n"
 			         "	for (int i = 0; i < 3; ++i) if ((o[i] & 7) > ditherM[i]) o[i] = min((o[i] & 0xF8) + 8, 255);\n%s	oColor.rgb = vec3(o) / 255.0; }\n",
-			         g->scale, matrix, key.modes & MODE_IMAGE16 ? "	o = (o >> 3) << 3 | o >> 5;\n" : "");
+			         matrix, key.modes & MODE_IMAGE16 ? "	o = (o >> 3) << 3 | o >> 5;\n" : "");
 			strcat(source, line);
 		} else if (key.modes & MODE_IMAGE16) {
 			strcat(source, "	{ ivec3 o = ivec3(floor(oColor.rgb * 255.0 + 0.5));\n	o = (o >> 3) << 3 | o >> 5;\n	oColor.rgb = vec3(o) / 255.0; }\n");
@@ -1001,7 +1005,7 @@ static struct Program* program(struct Glr* g, struct ProgramKey key) {
 			snprintf(matrix, sizeof(matrix), "ivec3 ditherM = ivec3(%s[(px.y & 3) * 4 + (px.x & 3)])",
 			         key.modes & MODE_BAYER ? "int[16](0, 4, 1, 5, 4, 0, 5, 1, 3, 7, 2, 6, 7, 3, 6, 2)" : "int[16](0, 6, 1, 7, 4, 2, 5, 3, 3, 5, 2, 4, 7, 1, 6, 0)");
 		}
-		snprintf(line, sizeof(line), "	ivec2 px = ivec2(gl_FragCoord.xy) / %d;\n	%s;\n	bool dithered = %s;\n", g->scale, matrix,
+		snprintf(line, sizeof(line), "	ivec2 px = ivec2(gl_FragCoord.xy) / uScale;\n	%s;\n	bool dithered = %s;\n", matrix,
 		         key.modes & MODE_BLEND ? "false" : "true");
 		strcat(source, line);
 	}
@@ -1093,6 +1097,7 @@ compileFragment:;
 	pr->program = p;
 	pr->size = gl->GetUniformLocation(p, "uSize");
 	pr->persp = gl->GetUniformLocation(p, "uPersp");
+	pr->scale = gl->GetUniformLocation(p, "uScale");
 	pr->prim = gl->GetUniformLocation(p, "uPrim");
 	pr->env = gl->GetUniformLocation(p, "uEnv");
 	pr->fog = gl->GetUniformLocation(p, "uFog");
@@ -1189,15 +1194,21 @@ static void loadPixels(struct N64* n, struct Glr* g, struct Target* t, int from,
 		}
 	}
 	struct Gl* gl = &g->gl;
-	uploadTexture(g, g->scale > 1 ? g->native : t->texture);
+	uploadTexture(g, t->scale > 1 ? g->native : t->texture);
 	gl->TexSubImage2D(GL_TEXTURE_2D, 0, 0, from, (GLsizei) t->width, to - from, GL_RGBA, GL_UNSIGNED_BYTE, out);
-	if (g->scale > 1) {
+	if (t->scale > 1) {
 		blitRows(g, t, from, to, true);
 	}
-	pushRows(g, t, g->scale > 1 ? g->native : t->texture, from, to);
+	pushRows(g, t, t->scale > 1 ? g->native : t->texture, from, to);
 }
 
 static void flushBatch(struct N64* n, struct Glr* g);
+
+// A color image's scale: the Resolution's, or for one wider than 480 pixels (a high-resolution mode)
+// half of it rounded up, so the picture comes out about as large either way.
+static int scaleFor(const struct Glr* g, uint32_t width) {
+	return width > 480 ? (g->scale + 1) / 2 : g->scale;
+}
 
 // The pages of RDRAM [addr, addr + len) wait for the GPU (rdpWaitFor) or no longer do.
 static void markPages(struct N64* n, uint32_t addr, uint32_t len, bool wait) {
@@ -1244,29 +1255,28 @@ static void forgetRows(struct Glr* g, uint32_t addr, uint32_t len, struct Target
 static void allocate(struct Glr* g, struct Target* t, uint32_t width) {
 	struct Gl* gl = &g->gl;
 	uploadTexture(g, t->texture);
-	gl->TexImage2D(GL_TEXTURE_2D, 0, GL_RGBA8, (GLsizei) width * g->scale, t->height * g->scale, 0, GL_RGBA, GL_UNSIGNED_BYTE, NULL);
+	gl->TexImage2D(GL_TEXTURE_2D, 0, GL_RGBA8, (GLsizei) width * t->scale, t->height * t->scale, 0, GL_RGBA, GL_UNSIGNED_BYTE, NULL);
 	if (g->samples && t->msaa) {
 		gl->BindRenderbuffer(GL_RENDERBUFFER, t->msaa);
-		gl->RenderbufferStorageMultisample(GL_RENDERBUFFER, g->samples, GL_RGBA8, (GLsizei) width * g->scale, t->height * g->scale);
+		gl->RenderbufferStorageMultisample(GL_RENDERBUFFER, g->samples, GL_RGBA8, (GLsizei) width * t->scale, t->height * t->scale);
 		t->unresolved = false;
 	}
 }
 
-// The depth the targets share made at least width by rows, as a tiled GPU loads and stores all of it
-// for each pass: a larger one at the far plane, with what the smaller one held.
+// The depth the targets share made at least width by rows (the GPU's pixels), as a tiled GPU loads and
+// stores all of it for each pass: a larger one at the far plane, with what the smaller one held.
 static void depthSize(struct N64* n, struct Glr* g, uint32_t width, int rows) {
 	if (width <= g->depthWidth && rows <= g->depthRows) {
 		return;
 	}
 	struct Gl* gl = &g->gl;
-	int const k = g->scale;
 	flushBatch(n, g);
 	uint32_t const w = width > g->depthWidth ? width : g->depthWidth;
 	int const h = rows > g->depthRows ? rows : g->depthRows;
 	GLuint fresh, framebuffer;
 	gl->GenRenderbuffers(1, &fresh);
 	gl->BindRenderbuffer(GL_RENDERBUFFER, fresh);
-	gl->RenderbufferStorage(GL_RENDERBUFFER, GL_DEPTH24_STENCIL8, (GLsizei) w * k, h * k);
+	gl->RenderbufferStorage(GL_RENDERBUFFER, GL_DEPTH24_STENCIL8, (GLsizei) w, h);
 	gl->GenFramebuffers(1, &framebuffer);
 	gl->BindFramebuffer(GL_FRAMEBUFFER, framebuffer);
 	gl->FramebufferRenderbuffer(GL_FRAMEBUFFER, GL_DEPTH_STENCIL_ATTACHMENT, GL_RENDERBUFFER, fresh);
@@ -1276,8 +1286,8 @@ static void depthSize(struct N64* n, struct Glr* g, uint32_t width, int rows) {
 	gl->ClearStencil(0);
 	gl->Clear(GL_DEPTH_BUFFER_BIT | GL_STENCIL_BUFFER_BIT);
 	gl->BindFramebuffer(GL_READ_FRAMEBUFFER, g->depthFramebuffer);
-	gl->BlitFramebuffer(0, 0, (GLint) g->depthWidth * k, g->depthRows * k, 0, 0, (GLint) g->depthWidth * k, g->depthRows * k,
-	                    GL_DEPTH_BUFFER_BIT | GL_STENCIL_BUFFER_BIT, GL_NEAREST);
+	gl->BlitFramebuffer(0, 0, (GLint) g->depthWidth, g->depthRows, 0, 0, (GLint) g->depthWidth, g->depthRows, GL_DEPTH_BUFFER_BIT | GL_STENCIL_BUFFER_BIT,
+	                    GL_NEAREST);
 	gl->DeleteFramebuffers(1, &framebuffer);
 	gl->DeleteRenderbuffers(1, &g->depth);
 	g->depth = fresh, g->depthWidth = w, g->depthRows = h;
@@ -1299,7 +1309,7 @@ static void grow(struct N64* n, struct Glr* g, struct Target* t, int height) {
 	flushBatch(n, g);
 	resolve(g, t);
 	GLuint const old = t->texture;
-	int const w = (int) t->width * g->scale, h = t->height * g->scale;
+	int const w = (int) t->width * t->scale, h = t->height * t->scale;
 	gl->GenTextures(1, &t->texture);
 	t->height = height;
 	allocate(g, t, t->width);
@@ -1317,8 +1327,8 @@ static void grow(struct N64* n, struct Glr* g, struct Target* t, int height) {
 	gl->FramebufferTexture2D(GL_FRAMEBUFFER, GL_COLOR_ATTACHMENT0, GL_TEXTURE_2D, t->texture, 0);
 	gl->DeleteTextures(1, &old);
 	memset(&g->applied, 0xFF, sizeof(g->applied));
-	pushRows(g, t, t->texture, 0, h / g->scale);
-	depthSize(n, g, t->width, height);
+	pushRows(g, t, t->texture, 0, h / t->scale);
+	depthSize(n, g, t->width * (uint32_t) t->scale, height * t->scale);
 }
 
 // The target for a color image, its texture loaded from RDRAM (rows) when the GPU last gave its
@@ -1354,8 +1364,9 @@ static struct Target* target(struct N64* n, struct Glr* g, uint32_t addr, uint32
 			gl->GenFramebuffers(1, &t->framebuffer);
 		}
 		t->height = height;
+		t->scale = scaleFor(g, width);
 		allocate(g, t, width);
-		depthSize(n, g, width, height);
+		depthSize(n, g, width * (uint32_t) t->scale, height * t->scale);
 		gl->TexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_NEAREST);
 		gl->TexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_NEAREST);
 		useFramebuffer(g, t->framebuffer);
@@ -1382,7 +1393,7 @@ static struct Target* target(struct N64* n, struct Glr* g, uint32_t addr, uint32
 				gl->GenFramebuffers(1, &t->msaaFramebuffer);
 			}
 			gl->BindRenderbuffer(GL_RENDERBUFFER, t->msaa);
-			gl->RenderbufferStorageMultisample(GL_RENDERBUFFER, g->samples, GL_RGBA8, (GLsizei) width * g->scale, t->height * g->scale);
+			gl->RenderbufferStorageMultisample(GL_RENDERBUFFER, g->samples, GL_RGBA8, (GLsizei) width * t->scale, t->height * t->scale);
 			useFramebuffer(g, t->msaaFramebuffer);
 			gl->FramebufferRenderbuffer(GL_FRAMEBUFFER, GL_COLOR_ATTACHMENT0, GL_RENDERBUFFER, t->msaa);
 			gl->FramebufferRenderbuffer(GL_FRAMEBUFFER, GL_DEPTH_STENCIL_ATTACHMENT, GL_RENDERBUFFER, g->msaaDepth);
@@ -1432,7 +1443,7 @@ static void writePixels(struct N64* n, struct Target* t, int from, int to) {
 	// First, as it may give back another target's rows (through g->image).
 	n64RdramWrite(n, start & (RDRAM_SIZE - 1), (uint32_t) (to - from) * t->width * bytes);
 	forgetRows(g, start, (uint32_t) (to - from) * t->width * bytes, t);
-	if (g->scale > 1) {
+	if (t->scale > 1) {
 		blitRows(g, t, from, to, false);
 	} else {
 		resolve(g, t);
@@ -1677,10 +1688,11 @@ static void flushBatch(struct N64* n, struct Glr* g) {
 	struct Program* p = s->program;
 	struct Applied* a = &g->applied;
 	useFramebuffer(g, drawTo(g, s->target));
-	if (a->viewport != (int) s->target->width) {
-		gl->Viewport(0, 0, (GLsizei) s->target->width * g->scale, TARGET_ROWS * g->scale);
-		a->viewport = (int) s->target->width;
+	if (a->viewport != ((int) s->target->width << 4 | s->target->scale)) {
+		gl->Viewport(0, 0, (GLsizei) s->target->width * s->target->scale, TARGET_ROWS * s->target->scale);
+		a->viewport = (int) s->target->width << 4 | s->target->scale;
 	}
+	g->drawScale = s->target->scale;
 	useScissor(g, true, s->scissor[0], s->scissor[1], s->scissor[2] - s->scissor[0], s->scissor[3] - s->scissor[1]);
 	if (a->program != p->program) {
 		gl->UseProgram(p->program);
@@ -1696,6 +1708,10 @@ static void flushBatch(struct N64* n, struct Glr* g) {
 	if (u->persp != s->persp) {
 		gl->Uniform1i(p->persp, s->persp);
 		u->persp = s->persp;
+	}
+	if (u->scale != s->target->scale) {
+		gl->Uniform1i(p->scale, s->target->scale);
+		u->scale = s->target->scale;
 	}
 	uniform(g, p->prim, 4, s->prim, u->prim);
 	uniform(g, p->env, 4, s->env, u->env);
@@ -1736,7 +1752,7 @@ static void flushBatch(struct N64* n, struct Glr* g) {
 	if (a->offset != s->decal) {
 		if (s->decal) {
 			gl->Enable(GL_POLYGON_OFFSET_FILL);
-			gl->PolygonOffset((float) -g->scale, -1);
+			gl->PolygonOffset((float) -s->target->scale, -1);
 		} else {
 			gl->Disable(GL_POLYGON_OFFSET_FILL);
 		}
@@ -1790,14 +1806,14 @@ static void flushBatch(struct N64* n, struct Glr* g) {
 			gl->ColorMask(0, 0, 0, 0);
 			gl->DepthMask(0);
 			gl->DepthFunc(GL_GEQUAL);
-			gl->PolygonOffset((float) g->scale, 1);
+			gl->PolygonOffset((float) s->target->scale, 1);
 			gl->StencilFunc(GL_ALWAYS, g->stencilRef, 0xFF);
 			gl->StencilOp(GL_KEEP, GL_KEEP, GL_REPLACE);
 			gl->DrawArrays(GL_TRIANGLES, first, g->batchCount);
 			gl->ColorMask(1, 1, 1, 1);
 			gl->DepthMask(s->depthWrite);
 			gl->DepthFunc(GL_LEQUAL);
-			gl->PolygonOffset((float) -g->scale, -1);
+			gl->PolygonOffset((float) -s->target->scale, -1);
 			gl->StencilFunc(GL_EQUAL, g->stencilRef, 0xFF);
 			gl->StencilOp(GL_KEEP, GL_KEEP, GL_KEEP);
 			gl->DrawArrays(GL_TRIANGLES, first, g->batchCount);
@@ -2092,7 +2108,7 @@ static void triangle(struct N64* n, struct Glr* g, struct RDP* r, const struct G
 	bool const blends = r->cycleType < 2 && r->forceBlend && ((last[2] == 1) != (last[0] == 1));
 	if (g->seal > 0 && !blends) {
 		sealed = *q;
-		sealCorners(&sealed, g->seal);
+		sealCorners(&sealed, g->seal / (float) scaleFor(g, r->colorWidth));
 		q = &sealed;
 	}
 	uint32_t c = q->flags;
@@ -2249,14 +2265,14 @@ static void depthUpload(struct N64* n, struct Glr* g, int x0, int y0, int x1, in
 		return;
 	}
 	flushBatch(n, g);
-	depthSize(n, g, (uint32_t) x1, y1);
+	int const k = scaleFor(g, g->zWidth);
+	depthSize(n, g, (uint32_t) (x1 * k), y1 * k);
 	for (int y = 0; y < h; ++y) {
 		for (int x = 0; x < w; ++x) {
 			depth[y * w + x] = rdpDepthIn(n, g->zAddr, g->zWidth, x0 + x, y0 + y);
 		}
 	}
 	struct Gl* gl = &g->gl;
-	int const k = g->scale;
 	gl->ActiveTexture(GL_TEXTURE0);
 	if (!g->zTexture) {
 		gl->GenTextures(1, &g->zTexture);
@@ -2502,6 +2518,7 @@ static void draw(struct N64* n, struct RDP* r, const uint64_t* w, int op) {
 			if (sx1 <= sx0 || sy1 <= sy0) {
 				return;
 			}
+			g->drawScale = g->state.target->scale;
 			useScissor(g, true, sx0, sy0, sx1 - sx0, sy1 - sy0);
 			uint32_t f = r->fillColor;
 			if (r->colorSize == 3) {
@@ -2675,6 +2692,7 @@ unsigned glrPicture(struct N64* n, uint32_t origin, uint32_t stride, int size, i
 		*x = col;
 		*y = row;
 		resolve(g, t);
+		n->glrScale = t->scale;
 		return t->framebuffer;
 	}
 	// A target the GPU drew part of: the rows it didn't draw come from RDRAM (borders a game clears
@@ -2703,6 +2721,7 @@ unsigned glrPicture(struct N64* n, uint32_t origin, uint32_t stride, int size, i
 		*x = col;
 		*y = row;
 		resolve(g, t);
+		n->glrScale = t->scale;
 		return t->framebuffer;
 	}
 	return 0;
@@ -2714,12 +2733,13 @@ bool glrRead(struct N64* n, unsigned framebuffer, int x, int y, int w, int h, ui
 	if (!g) {
 		return false;
 	}
-	int const k = g->scale;
+	int k = g->scale;
 	glesUse(g->gles);
 	flushBatch(n, g);
 	for (int i = 0; i < TARGETS; ++i) {
 		if (g->target[i].texture && g->target[i].framebuffer == framebuffer) {
 			resolve(g, &g->target[i]);
+			k = g->target[i].scale;
 		}
 	}
 	useFramebuffer(g, framebuffer);
@@ -2842,8 +2862,8 @@ struct Glr* glrCreate(struct N64* n) {
 	}
 	n->glrScale = g->scale;
 	const char* seal = n->settings ? n->settings("N64_GL_SEAL") : getenv("N64_GL_SEAL");
-	g->seal = seal && *seal == '1' ? 0.5f / (float) g->scale : 0;
-	gl->RenderbufferStorage(GL_RENDERBUFFER, GL_DEPTH24_STENCIL8, 16 * g->scale, 16 * g->scale);
+	g->seal = seal && *seal == '1' ? 0.5f : 0;
+	gl->RenderbufferStorage(GL_RENDERBUFFER, GL_DEPTH24_STENCIL8, 16, 16);
 	g->depthWidth = 16, g->depthRows = 16;
 	gl->GenFramebuffers(1, &g->depthFramebuffer);
 	useFramebuffer(g, g->depthFramebuffer);

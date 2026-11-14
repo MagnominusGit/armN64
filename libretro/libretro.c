@@ -124,7 +124,7 @@ static struct retro_core_option_v2_definition optionDefinitions[] = {
 	  "GL: fastest, HD, not exact. CPU: exact, the choice on handhelds. GPU: exact, for desktop graphics cards, also HD. Applies on Restart.",
 	  NULL, "video", { { "gl", "GL (Fast, HD)" }, { "gpu", "GPU (Exact, HD)" }, { "cpu", "CPU (Exact, Native)" }, { NULL, NULL } }, "gl" },
 	{ "armn64_resolution", "Resolution", NULL,
-	  "GL and GPU drawing resolution. Auto fits the display with GL and is Native with GPU (exact only at Native). Applies on Restart.",
+	  "GL and GPU drawing resolution. Auto fits the display with GL and is Native with GPU (exact only at Native). GL draws high-resolution games at half. Applies on Restart.",
 	  NULL, "video", { { "auto", "Auto" }, { "1", "Native" }, { "2", "2x" }, { "3", "3x" }, { "4", "4x" }, { "5", "5x" }, { "6", "6x" }, { "7", "7x" }, { "8", "8x" }, { NULL, NULL } }, "2" },
 	{ "armn64_widescreen", "Widescreen", NULL,
 	  "16:9 and 16:10 draw more at the sides (Library graphics); things just off the 4:3 edges may be missing. Picture Only: for games' own wide modes.",

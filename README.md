@@ -99,7 +99,8 @@ GL, Resolution with GL or GPU, the custom crops with Crop Overscan Custom, and s
   GPU draw exactly as the console does at its own resolution: CPU on the processor (full speed on
   handhelds), GPU on the graphics chip (for desktop graphics cards; below full speed on handhelds).
   GPU can also draw higher (Resolution): close to exact, with the native picture kept for what
-  games read back.
+  games read back. GL draws a game's high-resolution images (wider than 480 pixels) at half the
+  Resolution, so 2x comes out about 640×480 either way.
 - **Widescreen.** 16:9 and 16:10 draw more of the scene at the sides with Library graphics; games may
   leave out things just off the 4:3 edges, and full-screen pictures stay stretched. Picture Only
   shows the picture that wide and changes nothing else, for games with their own wide modes.

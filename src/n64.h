@@ -441,7 +441,8 @@ struct N64 {
 	// makes them.
 	bool rdpGl;
 	struct Glr* glr;
-	// How many times the RDP's resolution the GL renderer draws at (N64_GL_SCALE).
+	// How many times the RDP's resolution the GL renderer drew the last picture at (N64_GL_SCALE, half
+	// that for a high-resolution image).
 	int glrScale;
 	struct FrameSkip skip;
 	// The last picture made, shown again for a skipped frame.
