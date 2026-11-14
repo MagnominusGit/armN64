@@ -2007,13 +2007,14 @@ static void flushBatch(struct N64* n, struct Glr* g) {
 // The state a primitive draws with, from the RDP's; the batch so far goes first when it differs.
 static bool drawRows(struct N64* n, struct Glr* g, struct RDP* r, int rows, int y0, int y1);
 
-static bool drawState(struct N64* n, struct Glr* g, struct RDP* r, bool textured, bool shaded, bool depth, int tile, bool persp,
+// depth: 0 none, 1 the primitive's depth or its corners', 2 the primitive's (rectangles).
+static bool drawState(struct N64* n, struct Glr* g, struct RDP* r, bool textured, bool shaded, int depth, int tile, bool persp,
                       int y0, int y1) {
 	if (r->colorSize < 1) {
 		return false;
 	}
 	// No command but primitives since the last: the same state.
-	int primitive = textured | shaded << 1 | depth << 2 | tile << 3 | persp << 6 | r->maxLevel << 7;
+	int primitive = textured | shaded << 1 | (depth != 0) << 2 | tile << 3 | persp << 6 | r->maxLevel << 7 | (depth == 2) << 10;
 	if (g->fastValid && g->stateSet && g->fastGen == r->stateGen && g->fastKey == primitive) {
 		return drawRows(n, g, r, g->fastRows, y0, y1);
 	}
@@ -2060,7 +2061,7 @@ static bool drawState(struct N64* n, struct Glr* g, struct RDP* r, bool textured
 	if (g->fetch && r->colorSize == 2) {
 		modes |= MODE_IMAGE16;
 	}
-	if (depth && r->zPrim && !g->depthImage) {
+	if (depth && (r->zPrim || depth == 2) && !g->depthImage) {
 		modes |= MODE_PRIM_DEPTH;
 	}
 	// Coverage times alpha, with antialiasing or with colour only where the coverage wraps (over a
@@ -2695,13 +2696,13 @@ static void draw(struct N64* n, struct RDP* r, const uint64_t* w, int op) {
 			gl->Clear(GL_COLOR_BUFFER_BIT);
 			return;
 		}
-		// Depth from the primitive's, as texture rectangles have it (Robot Poncots' dimmed scene
-		// behind its HUD).
-		if (!drawState(n, g, r, false, false, r->zAddr && r->zPrim, 0, false, y0 >> 2, (y1 >> 2) + 1)) {
+		// Rectangles have the primitive's depth whatever the depth source (Robot Poncots' dimmed scene
+		// behind its HUD, Mahjong Master's text kept in front of what is drawn after it).
+		if (!drawState(n, g, r, false, false, r->zAddr ? 2 : 0, 0, false, y0 >> 2, (y1 >> 2) + 1)) {
 			return;
 		}
 		static const float zero[2] = { 0, 0 };
-		rectangle(g, x0 / 4.0f, y0 / 4.0f, x1 / 4.0f, y1 / 4.0f, (float) (r->primZ >> 3) / 0x7FFF, zero, zero, false);
+		rectangle(g, x0 / 4.0f, y0 / 4.0f, x1 / 4.0f, y1 / 4.0f, (float) r->primZ / 0x3FFFF, zero, zero, false);
 		return;
 	}
 	// Texture rectangles: the pixels the RDP covers, and the texels at their corners (the shader
@@ -2726,10 +2727,10 @@ static void draw(struct N64* n, struct RDP* r, const uint64_t* w, int op) {
 	const float* along = flip ? ay : ax, * across = flip ? ax : ay;
 	float ss[2] = { s0 + along[0] * dsdx, s0 + along[1] * dsdx }, ts[2] = { t0 + across[0] * dtdy, t0 + across[1] * dtdy };
 	r->maxLevel = 0;
-	if (!drawState(n, g, r, true, false, r->zAddr && r->zPrim, tile, false, y0, y1 + 1)) {
+	if (!drawState(n, g, r, true, false, r->zAddr ? 2 : 0, tile, false, y0, y1 + 1)) {
 		return;
 	}
-	rectangle(g, (float) x0, (float) y0, (float) (x1 + 1), (float) (y1 + 1), (float) (r->primZ >> 3) / 0x7FFF, ss, ts, flip);
+	rectangle(g, (float) x0, (float) y0, (float) (x1 + 1), (float) (y1 + 1), (float) r->primZ / 0x3FFFF, ss, ts, flip);
 }
 
 void glrDraw(struct N64* n, struct RDP* r, const uint64_t* w, int op) {
