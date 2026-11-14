@@ -26,6 +26,11 @@ struct OptionChoice {
 // Gives the frontend the options. Returns true when it took them as definitions (version 2), false
 // when it took them as variables.
 bool optionsGive(retro_environment_t environment, struct retro_core_options_v2* options);
+// Once a frame, before the options are read: the values read since are kept until the frontend says
+// one changed (a core that never calls it asks the frontend every time).
+void optionsRefresh(retro_environment_t environment);
+// The kept values dropped (after the core sets an option itself).
+void optionsForget(void);
 // The option's value, NULL when the frontend has none.
 const char* optionValue(retro_environment_t environment, const char* key);
 bool optionIs(retro_environment_t environment, const char* key, const char* wanted);

@@ -38,9 +38,42 @@ bool optionsGive(retro_environment_t environment, struct retro_core_options_v2* 
 	return false;
 }
 
+// The values read since the frontend last changed an option, with optionsRefresh.
+static struct {
+	const char* key;
+	bool given;
+	char value[128];
+} kept[VARIABLES_MOST];
+static int keptCount;
+static bool keeping;
+
+void optionsRefresh(retro_environment_t environment) {
+	bool updated = false;
+	keeping = true;
+	if (!environment(RETRO_ENVIRONMENT_GET_VARIABLE_UPDATE, &updated) || updated) {
+		keptCount = 0;
+	}
+}
+
+void optionsForget(void) {
+	keptCount = 0;
+}
+
 const char* optionValue(retro_environment_t environment, const char* key) {
+	for (int i = 0; keeping && i < keptCount; ++i) {
+		if (kept[i].key == key || !strcmp(kept[i].key, key)) {
+			return kept[i].given ? kept[i].value : NULL;
+		}
+	}
 	struct retro_variable variable = { key, NULL };
-	return environment(RETRO_ENVIRONMENT_GET_VARIABLE, &variable) ? variable.value : NULL;
+	const char* value = environment(RETRO_ENVIRONMENT_GET_VARIABLE, &variable) ? variable.value : NULL;
+	if (!keeping || keptCount == VARIABLES_MOST || (value && strlen(value) >= sizeof(kept[0].value))) {
+		return value;
+	}
+	int const i = keptCount++;
+	kept[i].key = key, kept[i].given = value != NULL;
+	snprintf(kept[i].value, sizeof(kept[i].value), "%s", value ? value : "");
+	return value ? kept[i].value : NULL;
 }
 
 bool optionIs(retro_environment_t environment, const char* key, const char* wanted) {

@@ -1088,6 +1088,7 @@ static void swapHotkeys(void) {
 			bool const now = !optionIs(environment, "armn64_control_swap", swaps[i].value);
 			struct retro_variable set = { "armn64_control_swap", now ? swaps[i].value : "disabled" };
 			environment(RETRO_ENVIRONMENT_SET_VARIABLE, &set);
+			optionsForget();
 			notify(now ? swaps[i].message : "Control Swap: Off");
 		}
 		held[i] = down[i];
@@ -1316,6 +1317,7 @@ static bool pakManager(bool shared) {
 		if (asked) {
 			struct retro_variable closed = { "armn64_pak_manager", "closed" };
 			environment(RETRO_ENVIRONMENT_SET_VARIABLE, &closed);
+			optionsForget();
 		}
 		return false;
 	}
@@ -1332,6 +1334,7 @@ void retro_run(void) {
 	if (!machine) {
 		return;
 	}
+	optionsRefresh(environment);
 	if (!saveGiven) {
 		saveImport();
 		saveGiven = true;
