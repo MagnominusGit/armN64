@@ -292,6 +292,35 @@ static struct {
 } passBytes[256];
 static int passByteCount;
 
+// Where each of them is (index + 1), by address: entries of an older generation are empty.
+enum { PASS_HASH = 1024 };
+static struct {
+	uint32_t addr, gen;
+	int index;
+} passHash[PASS_HASH];
+static uint32_t passGen = 1;
+
+static void passReset(void) {
+	passByteCount = 0;
+	if (!++passGen) {
+		memset(passHash, 0, sizeof(passHash));
+		passGen = 1;
+	}
+}
+
+// The index of the byte at addr in passBytes, or -1; slot is where it would go.
+static int passFind(uint32_t addr, int* slot) {
+	uint32_t h = (addr * 0x9E3779B1u) >> 22;
+	while (passHash[h].gen == passGen) {
+		if (passHash[h].addr == addr) {
+			return passHash[h].index;
+		}
+		h = (h + 1) & (PASS_HASH - 1);
+	}
+	*slot = (int) h;
+	return -1;
+}
+
 static bool passStoredNew(const struct N64* n) {
 	for (int i = 0; i < passByteCount; ++i) {
 		if (n->rdram[passBytes[i].addr] != passBytes[i].was) {
@@ -310,8 +339,9 @@ void idleLoad(struct N64* n, uint32_t paddr, int size, uint64_t value) {
 		return;
 	}
 	// What the pass stored itself it reads back as it left it.
-	for (int i = 0; i < passByteCount && paddr < RDRAM_SIZE; ++i) {
-		if (passBytes[i].addr - paddr < (uint32_t) size) {
+	for (int k = 0; k < size && paddr < RDRAM_SIZE; ++k) {
+		int slot = 0;
+		if (passFind(paddr + (uint32_t) k, &slot) >= 0) {
 			return;
 		}
 	}
@@ -342,15 +372,13 @@ void idleStore(struct N64* n, uint32_t paddr, int size, uint64_t value) {
 		(void) value;
 		for (int k = 0; k < size; ++k) {
 			uint32_t const a = paddr + (uint32_t) k;
-			int i = 0;
-			while (i < passByteCount && passBytes[i].addr != a) {
-				++i;
-			}
-			if (i == passByteCount) {
+			int slot = 0;
+			if (passFind(a, &slot) < 0) {
 				if (passByteCount == (int) (sizeof(passBytes) / sizeof(passBytes[0]))) {
 					n->idle.changed = true;
 					return;
 				}
+				passHash[slot].addr = a, passHash[slot].gen = passGen, passHash[slot].index = passByteCount;
 				passBytes[passByteCount].addr = a;
 				passBytes[passByteCount++].was = n->rdram[a];
 			}
@@ -426,7 +454,7 @@ static bool idleRun(struct N64* n) {
 		// the slice's end or the timer's interrupt, whichever comes first.
 		if ((uint32_t) c->pc != d->pc || c->nextInDelay) {
 			// Back round to where the loop was traced (a slice ran the loop as it is).
-			d->tracing = true, d->fatal = false, d->loads = d->passLoads, passByteCount = 0;
+			d->tracing = true, d->fatal = false, d->loads = d->passLoads, passReset();
 			bool back = idleStepTo(n, d->pc, PASS_LIMIT);
 			d->tracing = false;
 			if (!back) {
@@ -456,9 +484,9 @@ static bool idleRun(struct N64* n) {
 	uint32_t pc = (uint32_t) c->pc;
 	struct IdleRegs before, after;
 	idleRegs(c, &before);
-	d->tracing = true, d->fatal = false, d->changed = false, passByteCount = 0;
+	d->tracing = true, d->fatal = false, d->changed = false, passReset();
 	bool once = idleStepBack(n, pc, &before, PASS_LIMIT);
-	d->changed = false, d->loads = 0, passByteCount = 0;
+	d->changed = false, d->loads = 0, passReset();
 	bool twice = once && idleStepBack(n, pc, &before, PASS_LIMIT);
 	d->changed |= passStoredNew(n);
 	idleRegs(c, &after);
