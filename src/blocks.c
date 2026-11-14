@@ -50,6 +50,16 @@ bool blockIsIdleLoop(const uint32_t* ops, uint32_t count, uint32_t vaddr) {
 	return count == 2 && (ops[0] == 0x1000FFFF || ops[0] == jumpSelf) && ops[1] == 0;
 }
 
+// Half of an idle loop over two blocks, "j there; nop" with "j here; nop" there: where it jumps to
+// (0 for none). The other half is checked as it runs.
+uint32_t blockIdlePair(const uint32_t* ops, uint32_t count, uint32_t vaddr) {
+	if (count != 2 || ops[0] >> 26 != 0x02 || ops[1]) {
+		return 0;
+	}
+	uint32_t const target = (vaddr & 0xF0000000) | (ops[0] & 0x03FFFFFF) << 2;
+	return target != vaddr && (target & 0xFF800000) == 0x80000000 && !(target & 7) ? target : 0;
+}
+
 // A loop counting while it waits, "b self; addiu r, r, imm" (or daddiu, or j self): only r changes,
 // by imm each time round. Its register (0 for none), and whether the add is a doubleword one.
 int blockCountLoop(const uint32_t* ops, uint32_t count, uint32_t vaddr, int32_t* imm, bool* dword) {
@@ -130,8 +140,10 @@ uint32_t blockPollPass(const uint32_t* ops, uint32_t count, uint32_t vaddr, int*
 		readFirst |= reads & ~written;
 		written |= writes;
 	}
-	// Each pass reads only what no pass changes, so all of them do the same.
-	if (!load || ((readFirst & written) & ~1ull)) {
+	// Each pass reads only what no pass changes, so all of them do the same (without loads, a branch on
+	// registers nothing changes: going round once, it goes round until an interrupt).
+	(void) load;
+	if ((readFirst & written) & ~1ull) {
 		*reload = 0;
 		return 0;
 	}

@@ -1409,6 +1409,32 @@ static void skipIdle(struct Emitter* e, uint32_t vaddr, uint32_t paddr, bool fas
 	}
 }
 
+// An idle loop over two blocks (blockIdlePair), with the fast CPU: while the other half still jumps
+// back, whole times round both until the next event.
+static void skipPair(struct Jit* j, uint32_t vaddr, uint32_t target) {
+	struct Emitter* e = &j->e;
+	uint8_t* skip[3];
+	int sites = 0;
+	uint32_t const back = 0x08000000 | ((vaddr >> 2) & 0x03FFFFFF);
+	aMovImm(e, 1, target & 0x7FFFFF);
+	aLdst(e, L_LDR, 0, RAM, 1, L_UXTW);
+	aMovImm(e, 2, __builtin_bswap32(back));
+	aDp(e, A_SUBS, ZR, 0, 2, S_LSL, 0);
+	skip[sites++] = aBcond(e, C_NE, NULL);
+	aMovImm(e, 1, (target & 0x7FFFFF) + 4);
+	aLdst(e, L_LDR, 0, RAM, 1, L_UXTW);
+	skip[sites++] = aCbnz(e, 0, NULL);
+	int const shift = j->opCycles == 4 ? 4 : j->opCycles == 2 ? 3 : 2;
+	aDpImm(e, A_SUBS_IMM | W64, ZR, LEFT, 1u << shift);
+	skip[sites++] = aBcond(e, C_LE, NULL);
+	aDpImm(e, A_SUB_IMM | W64, 0, LEFT, 1);
+	aLsrImmX(e, 0, 0, (unsigned) shift);
+	aDp(e, A_SUB | W64, LEFT, LEFT, 0, S_LSL, (unsigned) shift);
+	for (int i = 0; i < sites; ++i) {
+		patchHere(e, skip[i]);
+	}
+}
+
 // A count loop (blockCountLoop) run whole times round until the next event, as skipIdle runs the idle
 // loop: the cycles of each two instructions, and the register's add times as many (in its host
 // register when pinned, else in memory: nothing is cached at a block's start).
@@ -2460,6 +2486,10 @@ void* jitCompile(struct N64* n, const uint32_t* ops, uint32_t count, uint32_t va
 	int const countReg = blockCountLoop(ops, count, vaddr, &countImm, &countDword);
 	if (countReg) {
 		skipCount(j, vaddr, paddr, countReg, countImm, countDword);
+	}
+	uint32_t const pairTarget = j->fast ? blockIdlePair(ops, count, vaddr) : 0;
+	if (pairTarget) {
+		skipPair(j, vaddr, pairTarget);
 	}
 	// A conditional branch or jump at the end back to the start.
 	bool loopsBack = false;
