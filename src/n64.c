@@ -320,6 +320,14 @@ void n64RunField(struct N64* n) {
 	if (n->stats.siDmas && (n->ocNum != n->ocWantNum || n->ocDen != n->ocWantDen)) {
 		overclock(n);
 	}
+	// Without the caches' timing, the boot up to the first SI DMA counts three cycles an instruction,
+	// about what its cache-bound loops take: a game that calls osContInit before starting its timers
+	// must find the half second from power-on already passed, as it does on hardware.
+	uint32_t const opCycles = n->emulatorLike && !n->stats.siDmas ? 3 : 1;
+	if (n->opCycles != opCycles) {
+		n->opCycles = opCycles;
+		blocksFree(n);
+	}
 	uint64_t start = n->nextVi - n->fieldCycles, passed = start;
 	while (n->cycles < n->nextVi) {
 		uint64_t intrAt = viIntrAt(n, start);
