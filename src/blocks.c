@@ -259,11 +259,36 @@ static void jitRun(struct N64* n, void* code) {
 	}
 }
 
+// The bytes a pass stored to, with what they held before it: the pass stores nothing new when they
+// hold the same at its end (a thread's state made runnable and running again, say).
+static struct {
+	uint32_t addr;
+	uint8_t was;
+} passBytes[256];
+static int passByteCount;
+
+static bool passStoredNew(const struct N64* n) {
+	for (int i = 0; i < passByteCount; ++i) {
+		if (n->rdram[passBytes[i].addr] != passBytes[i].was) {
+			return true;
+		}
+	}
+	return false;
+}
+
+// A load in a pass: from RDRAM, or MI_INTR_MASK (a thread's switch saves it); the passes skipped
+// read the same as long as these do. Bytes the pass stored first don't count.
 void idleLoad(struct N64* n, uint32_t paddr, int size, uint64_t value) {
 	struct Idle* d = &n->idle;
-	if (paddr >= RDRAM_SIZE || d->loads == (int) (sizeof(d->load) / sizeof(d->load[0]))) {
+	if ((paddr >= RDRAM_SIZE && !(paddr == 0x0430000C && size == 4)) || d->loads == (int) (sizeof(d->load) / sizeof(d->load[0]))) {
 		d->fatal = true;
 		return;
+	}
+	// What the pass stored itself it reads back as it left it.
+	for (int i = 0; i < passByteCount && paddr < RDRAM_SIZE; ++i) {
+		if (passBytes[i].addr - paddr < (uint32_t) size) {
+			return;
+		}
 	}
 	d->load[d->loads++] = (struct IdleLoad) { paddr, size, value };
 }
@@ -276,11 +301,35 @@ static uint64_t rdramValue(const struct N64* n, uint32_t paddr, int size) {
 	return v;
 }
 
+// A store in a pass: to RDRAM, or to MI_INTR_MASK leaving the mask as it is (a thread dispatch
+// sets it to the thread's own mask each time).
 void idleStore(struct N64* n, uint32_t paddr, int size, uint64_t value) {
-	if (paddr >= RDRAM_SIZE) {
+	if (paddr == 0x0430000C && size == 4) {
+		uint32_t mask = n->miMask;
+		for (int line = 0; line < 6; ++line) {
+			mask = value & (1u << (line * 2)) ? mask & ~(1u << line) : mask;
+			mask = value & (2u << (line * 2)) ? mask | 1u << line : mask;
+		}
+		n->idle.fatal |= mask != n->miMask;
+	} else if (paddr >= RDRAM_SIZE) {
 		n->idle.fatal = true;
-	} else if (rdramValue(n, paddr, size) != (size == 8 ? value : value & ((1ull << (size * 8)) - 1))) {
-		n->idle.changed = true;
+	} else {
+		(void) value;
+		for (int k = 0; k < size; ++k) {
+			uint32_t const a = paddr + (uint32_t) k;
+			int i = 0;
+			while (i < passByteCount && passBytes[i].addr != a) {
+				++i;
+			}
+			if (i == passByteCount) {
+				if (passByteCount == (int) (sizeof(passBytes) / sizeof(passBytes[0]))) {
+					n->idle.changed = true;
+					return;
+				}
+				passBytes[passByteCount].addr = a;
+				passBytes[passByteCount++].was = n->rdram[a];
+			}
+		}
 	}
 }
 
@@ -307,9 +356,12 @@ struct IdleRegs {
 	uint32_t fcr31;
 };
 
+// The registers a pass is compared by: all but k0 and k1, the exception handlers' own (a pass that
+// yields leaves them as the dispatch did).
 static void idleRegs(const struct CPU* c, struct IdleRegs* out) {
 	memset(out, 0, sizeof(*out));
 	memcpy(out->gpr, c->gpr, sizeof(out->gpr));
+	out->gpr[26] = out->gpr[27] = 0;
 	memcpy(out->fpr, c->fpr, sizeof(out->fpr));
 	out->hi = c->hi, out->lo = c->lo, out->fcr31 = c->fcr31;
 }
@@ -343,13 +395,13 @@ static bool idleStepBack(struct N64* n, uint32_t pc, const struct IdleRegs* regs
 static bool idleRun(struct N64* n) {
 	struct Idle* d = &n->idle;
 	struct CPU* c = &n->cpu;
-	enum { PASS_LIMIT = 256 };
+	enum { PASS_LIMIT = 512 };
 	if (d->on) {
 		// The pass goes the same while no interrupt is due and its loads read what they did: on to
 		// the slice's end or the timer's interrupt, whichever comes first.
 		if ((uint32_t) c->pc != d->pc || c->nextInDelay) {
 			// Back round to where the loop was traced (a slice ran the loop as it is).
-			d->tracing = true, d->fatal = false, d->loads = d->passLoads;
+			d->tracing = true, d->fatal = false, d->loads = d->passLoads, passByteCount = 0;
 			bool back = idleStepTo(n, d->pc, PASS_LIMIT);
 			d->tracing = false;
 			if (!back) {
@@ -361,7 +413,7 @@ static bool idleRun(struct N64* n) {
 		// interrupts on its way round).
 		bool same = cpuJitReady(n) && n->jitLimit > n->cycles && !(c->cop0[CP0_CAUSE] & c->cop0[CP0_STATUS] & 0xFF00);
 		for (int i = 0; same && i < d->passLoads; ++i) {
-			same = rdramValue(n, d->load[i].addr, d->load[i].size) == d->load[i].value;
+			same = (d->load[i].addr == 0x0430000C ? n->miMask : rdramValue(n, d->load[i].addr, d->load[i].size)) == d->load[i].value;
 		}
 		if (!same) {
 			d->on = false;
@@ -379,10 +431,11 @@ static bool idleRun(struct N64* n) {
 	uint32_t pc = (uint32_t) c->pc;
 	struct IdleRegs before, after;
 	idleRegs(c, &before);
-	d->tracing = true, d->fatal = false, d->changed = false;
+	d->tracing = true, d->fatal = false, d->changed = false, passByteCount = 0;
 	bool once = idleStepBack(n, pc, &before, PASS_LIMIT);
-	d->changed = false, d->loads = 0;
+	d->changed = false, d->loads = 0, passByteCount = 0;
 	bool twice = once && idleStepBack(n, pc, &before, PASS_LIMIT);
+	d->changed |= passStoredNew(n);
 	idleRegs(c, &after);
 	d->tracing = false;
 	if (!twice || d->changed || d->loads > (int) (sizeof(d->load) / sizeof(d->load[0])) / 2 ||
@@ -396,8 +449,9 @@ static bool idleRun(struct N64* n) {
 	return false;
 }
 
-// At the end of a slice: where the CPU is, to see it staying in a small loop (with a call, two
-// places): the last slices ended in at most two 512-byte regions.
+// At the end of a slice: where the CPU is, to see it staying in a small loop (with calls, a few
+// places; a thread yielding to itself goes through the OS's switch): the last slices ended in at
+// most four 512-byte regions.
 static void idleWatch(struct N64* n) {
 	struct Idle* d = &n->idle;
 	enum { RECENT = sizeof(d->recent) / sizeof(d->recent[0]) };
@@ -408,12 +462,17 @@ static void idleWatch(struct N64* n) {
 		d->near = 0;
 		return;
 	}
-	uint32_t a = d->recent[0], b = a;
+	uint32_t seen[4];
+	int count = 0;
 	bool few = true;
-	for (int i = 1; i < RECENT && few; ++i) {
-		if (d->recent[i] != a) {
-			few = b == a || d->recent[i] == b;
-			b = d->recent[i];
+	for (int i = 0; i < RECENT && few; ++i) {
+		int k = 0;
+		while (k < count && seen[k] != d->recent[i]) {
+			++k;
+		}
+		if (k == count) {
+			few = count < 4;
+			seen[count < 4 ? count++ : 3] = d->recent[i];
 		}
 	}
 	d->near = few ? 4 : 0;

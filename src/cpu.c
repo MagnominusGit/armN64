@@ -747,8 +747,8 @@ static uint32_t randomIndex(struct N64* n) {
 }
 
 static uint64_t cop0Read(struct N64* n, int r) {
-	// A loop polling Count or Cause isn't idle: they change with nothing in memory changing.
-	n->idle.fatal = true;
+	// A loop polling Count, Cause or Random isn't idle: they change with nothing in memory changing.
+	n->idle.fatal |= r == CP0_COUNT || r == CP0_CAUSE || r == CP0_RANDOM;
 	switch (r) {
 	case CP0_COUNT:
 		return cpuCount(n);

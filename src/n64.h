@@ -511,7 +511,7 @@ struct N64 {
 			uint32_t addr;
 			int size;
 			uint64_t value;
-		} load[64];
+		} load[512];
 	} idle;
 };
 
