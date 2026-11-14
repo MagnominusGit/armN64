@@ -342,7 +342,8 @@ void cpuReset(struct N64* n) {
 // Count runs at half the hardware's clock (countCycles CPU cycles a tick), from the cycle countBase (a
 // write starts it on an edge, ares).
 uint32_t cpuCount(struct N64* n) {
-	return (uint32_t) ((n->cycles - n->cpu.countBase) / n->countCycles);
+	uint64_t const passed = n->cycles - n->cpu.countBase;
+	return (uint32_t) (n->countCycles == 2 ? passed >> 1 : passed / n->countCycles);
 }
 
 static bool cpuWide(const struct CPU* c);
@@ -1873,7 +1874,8 @@ bool cpuJitReady(struct N64* n) {
 		return false;
 	}
 	uint32_t delta = (uint32_t) c->cop0[CP0_COMPARE] - now;
-	n->jitFire = c->countBase + ((n->cycles - c->countBase) / n->countCycles + (delta ? delta : 1ull << 32)) * n->countCycles;
+	uint64_t const passed = n->cycles - c->countBase;
+	n->jitFire = c->countBase + ((n->countCycles == 2 ? passed >> 1 : passed / n->countCycles) + (delta ? delta : 1ull << 32)) * n->countCycles;
 	n->jitLimit = n->eventAt < n->jitFire ? n->eventAt : n->jitFire;
 	return true;
 }
