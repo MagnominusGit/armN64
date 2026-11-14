@@ -2581,7 +2581,23 @@ void glrTouched(struct N64* n, uint32_t addr, uint32_t len, bool write) {
 		++n->stats.glSyncs;
 		int const rows = t->marked > t->dirtyTo ? t->marked : t->dirtyTo;
 		markPages(n, t->addr, (uint32_t) rows * row, false);
-		writePixels(n, t, t->dirtyFrom, t->dirtyTo);
+		// FLE: the whole rows a write replaces don't go back first (their hidden bits stay as they
+		// were).
+		int keepFrom = t->dirtyTo, keepTo = t->dirtyTo;
+		if (write && n->fle && addr + len > t->addr) {
+			int const first = addr <= t->addr ? 0 : (int) ((addr - t->addr + row - 1) / row), end = (int) ((addr + len - t->addr) / row);
+			keepFrom = first > t->dirtyFrom ? first : t->dirtyFrom, keepTo = end < t->dirtyTo ? end : t->dirtyTo;
+		}
+		if (keepFrom < keepTo) {
+			if (t->dirtyFrom < keepFrom) {
+				writePixels(n, t, t->dirtyFrom, keepFrom);
+			}
+			if (keepTo < t->dirtyTo) {
+				writePixels(n, t, keepTo, t->dirtyTo);
+			}
+		} else {
+			writePixels(n, t, t->dirtyFrom, t->dirtyTo);
+		}
 		t->dirtyFrom = t->dirtyTo = 0;
 		// Its pages no longer wait, so RDRAM may change unseen before the GPU draws here again.
 		t->loadedRows = 0;
