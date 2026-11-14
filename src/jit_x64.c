@@ -1150,6 +1150,41 @@ static void skipIdle(struct Emitter* e, uint32_t vaddr, uint32_t paddr, bool fas
 	}
 }
 
+// A count loop (blockCountLoop) run whole times round until the next event, as skipIdle runs the idle
+// loop: the cycles of each two instructions, and the register's add times as many.
+static void skipCount(struct Emitter* e, uint32_t vaddr, uint32_t paddr, bool fast, int opCycles, int reg, int32_t imm, bool dword) {
+	uint8_t* skip[3];
+	int sites = 0;
+	int lines = fast ? 0 : (paddr + 4) & 31 ? 1 : 2;
+	for (int i = 0; i < lines; ++i) {
+		uint32_t v = vaddr + 4 * i, p = paddr + 4 * i;
+		struct Opnd tag = M(R12, (int32_t) (offsetof(struct CPU, icacheTag) + 4 * ((v >> 5) & 511)));
+		xAluI(e, X_CMP, 4, tag, (int32_t) (p & ~31u));
+		skip[sites++] = xJcc(e, CC_NE, NULL);
+	}
+	int const shift = opCycles == 4 ? 3 : opCycles == 2 ? 2 : 1;
+	xMovRR(e, 8, RAX, R14);
+	xAluRR(e, X_SUB, 8, R(RAX), R13);
+	xAluI(e, X_CMP, 8, R(RAX), 1 << shift);
+	skip[sites++] = xJcc(e, CC_LE, NULL);
+	xAluI(e, X_SUB, 8, R(RAX), 1);
+	xShiftI(e, X_SHR, 8, R(RAX), shift);
+	xMovRR(e, 8, RCX, RAX);
+	xShiftI(e, X_SHL, 8, R(RCX), shift);
+	xAluRR(e, X_ADD, 8, R(R13), RCX);
+	movConst(e, RDX, (uint64_t) (int64_t) imm);
+	xImul(e, 8, RAX, R(RDX));
+	xLoad(e, 8, RCX, gpr(reg));
+	xAluRR(e, X_ADD, 8, R(RCX), RAX);
+	if (!dword) {
+		xMovsxd(e, RCX, R(RCX));
+	}
+	xStore(e, 8, gpr(reg), RCX);
+	for (int i = 0; i < sites; ++i) {
+		patchHere(e, skip[i]);
+	}
+}
+
 static bool isBranchOp(uint32_t op) {
 	switch (op >> 26) {
 	case 0x00:
@@ -1633,6 +1668,12 @@ void* jitCompile(struct N64* n, const uint32_t* ops, uint32_t count, uint32_t va
 
 	if (blockIsIdleLoop(ops, count, vaddr)) {
 		skipIdle(e, vaddr, paddr, j->fast, j->opCycles);
+	}
+	int32_t countImm;
+	bool countDword;
+	int const countReg = blockCountLoop(ops, count, vaddr, &countImm, &countDword);
+	if (countReg) {
+		skipCount(e, vaddr, paddr, j->fast, j->opCycles, countReg, countImm, countDword);
 	}
 	int reload;
 	uint32_t pollPass = blockPollPass(ops, count, vaddr, &reload);

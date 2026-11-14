@@ -50,6 +50,19 @@ bool blockIsIdleLoop(const uint32_t* ops, uint32_t count, uint32_t vaddr) {
 	return count == 2 && (ops[0] == 0x1000FFFF || ops[0] == jumpSelf) && ops[1] == 0;
 }
 
+// A loop counting while it waits, "b self; addiu r, r, imm" (or daddiu, or j self): only r changes,
+// by imm each time round. Its register (0 for none), and whether the add is a doubleword one.
+int blockCountLoop(const uint32_t* ops, uint32_t count, uint32_t vaddr, int32_t* imm, bool* dword) {
+	uint32_t jumpSelf = 0x08000000 | ((vaddr >> 2) & 0x03FFFFFF);
+	if (count != 2 || (ops[0] != 0x1000FFFF && ops[0] != jumpSelf) || (ops[1] >> 26 != 0x09 && ops[1] >> 26 != 0x19)) {
+		return 0;
+	}
+	int const rs = (ops[1] >> 21) & 31, rt = (ops[1] >> 16) & 31;
+	*imm = (int16_t) ops[1];
+	*dword = ops[1] >> 26 == 0x19;
+	return rs == rt ? rt : 0;
+}
+
 // The registers an instruction of a poll loop reads and writes (bit 32 for none), or false for one
 // a poll loop can't have: anything but loads, ALU instructions that can't trap, and NOP.
 static bool pollOp(uint32_t op, uint64_t* reads, uint64_t* writes) {

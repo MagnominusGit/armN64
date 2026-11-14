@@ -641,6 +641,7 @@ void blocksFree(struct N64*);
 void perfMapAdd(const void* code, size_t size, const char* kind, uint32_t address);
 void blocksInvalidatePage(struct N64*, uint32_t page);
 bool blockIsIdleLoop(const uint32_t* ops, uint32_t count, uint32_t vaddr);
+int blockCountLoop(const uint32_t* ops, uint32_t count, uint32_t vaddr, int32_t* imm, bool* dword);
 void idleLoad(struct N64*, uint32_t paddr, int size, uint64_t value);
 void idleStore(struct N64*, uint32_t paddr, int size, uint64_t value);
 // The cycles one pass of a poll loop takes with its cache lines in, or 0 if the block isn't one: a
