@@ -414,7 +414,7 @@ static void siDma(struct N64* n, bool toPif) {
 	// the PI it overclocks with the RCP: Tetris 64 starts the next DMA after so much CPU work, and the
 	// SI refuses it while busy.
 	n->si.status |= 1;
-	n->si.busyUntil = n->cycles + (n->compat ? SI_DMA_CYCLES : rcp * 3 / 2);
+	n->si.busyUntil = n->cycles + (n->compat || n->quickSi ? SI_DMA_CYCLES : rcp * 3 / 2);
 	n64Event(n, n->si.busyUntil);
 }
 

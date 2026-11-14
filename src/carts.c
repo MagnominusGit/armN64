@@ -86,6 +86,21 @@ bool cartHardwarePi(const uint8_t* rom) {
 	return false;
 }
 
+// Games whose controller thread drops a request that comes while its SI transfer is still going, which
+// the CPU's and the graphics' timings in hle accuracy bring about: the SI takes the emulators' time there.
+static const char gameIdsQuickSi[][4] = {
+	"NFO",
+};
+
+bool cartQuickSi(const uint8_t* rom) {
+	for (size_t i = 0; i < sizeof(gameIdsQuickSi) / sizeof(*gameIdsQuickSi); ++i) {
+		if (!memcmp(rom + 0x3B, gameIdsQuickSi[i], 3)) {
+			return true;
+		}
+	}
+	return false;
+}
+
 // The boot code's checksum over the first megabyte after the header (as the boot code works it out
 // for each lockout chip). False if the header has it already.
 bool cartBootChecksum(const uint8_t* rom, size_t size, int cic, uint8_t seedByte, uint32_t out[2]) {
