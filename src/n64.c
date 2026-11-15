@@ -142,9 +142,10 @@ static void start(struct N64* n) {
 	n->idle.enabled = n->accuracy == ACCURACY_HLE && !(idleSkip && idleSkip[0] == '0');
 	n->hleCheck = setting(n, "N64HLECHECK") != NULL;
 	// The game's own graphics microcode on the RSP, or the built-in one (any accuracy); unset, the
-	// built-in one with HLE only.
+	// built-in one with HLE only. Some games keep their own below hle accuracy (carts.c).
 	const char* gfxRsp = setting(n, "N64_GFX_RSP");
 	n->gfxRsp = gfxRsp ? gfxRsp[0] == '1' : n->accuracy != ACCURACY_HLE;
+	n->gfxRsp |= n->accuracy != ACCURACY_HLE && n->rom && cartGfxRsp(n->rom);
 	const char* hleTiming = setting(n, "N64_HLE_TIMING");
 	n->hleShortTasks = hleTiming && !strcmp(hleTiming, "short");
 	if (setting(n, "N64ISVIEWER") && !n->isViewer) {

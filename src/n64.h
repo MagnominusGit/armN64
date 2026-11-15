@@ -818,6 +818,7 @@ bool n64StateLoad(struct N64*, const void* data, size_t size, bool quick);
 bool cartEeprom16k(const uint8_t* rom);
 bool cartHardwarePi(const uint8_t* rom);
 bool cartQuickSi(const uint8_t* rom);
+bool cartGfxRsp(const uint8_t* rom);
 bool gbCartLoad(struct GbCart*, const uint8_t* rom, size_t size);
 void gbCartFree(struct GbCart*);
 uint8_t gbCartRead(struct GbCart*, uint16_t addr);

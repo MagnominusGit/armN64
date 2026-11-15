@@ -101,6 +101,21 @@ bool cartQuickSi(const uint8_t* rom) {
 	return false;
 }
 
+// Games whose own graphics microcode keeps their timing races won in lle and mle accuracy, where the
+// built-in one finishes tasks sooner (the controller thread then waits for a read the SI refused).
+static const char gameIdsGfxRsp[][4] = {
+	"NFO",
+};
+
+bool cartGfxRsp(const uint8_t* rom) {
+	for (size_t i = 0; i < sizeof(gameIdsGfxRsp) / sizeof(*gameIdsGfxRsp); ++i) {
+		if (!memcmp(rom + 0x3B, gameIdsGfxRsp[i], 3)) {
+			return true;
+		}
+	}
+	return false;
+}
+
 // The boot code's checksum over the first megabyte after the header (as the boot code works it out
 // for each lockout chip). False if the header has it already.
 bool cartBootChecksum(const uint8_t* rom, size_t size, int cic, uint8_t seedByte, uint32_t out[2]) {
