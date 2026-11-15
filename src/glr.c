@@ -524,8 +524,7 @@ static const char fragmentHead[] =
 	"uniform float uPrimLod, uPrimDepth;\n"
 	"uniform vec2 uK;\n"
 	"uniform int uPersp, uScale;\n"
-	"uniform ivec4 uTile0[3], uTile1[3], uTile2[3], uTile3[3], uTile4[3], uTile5[3], uTile6[3], uTile7[3];\n"
-	"uniform ivec4 uImage0, uImage1, uImage2, uImage3, uImage4, uImage5, uImage6, uImage7;\n"
+	"uniform ivec4 uTile[24], uImage[8];\n"
 	"uniform highp sampler2D uTex0, uTex1, uTex2, uTex3, uTex4, uTex5, uTex6, uTex7;\n"
 	"out vec4 oColor;\n"
 	"vec3 e8(vec3 v) { return floor(v * 255.0 + 0.5); }\n"
@@ -538,32 +537,30 @@ static const char fragmentHead[] =
 	"float x9(float v) { v = floor(v * 255.0 + 0.5); return v - 512.0 * step(384.0, v); }\n"
 	"vec3 s9(vec3 v) { v = floor(v * 255.0 + 0.5); return v - 512.0 * step(256.0, v); }\n"
 	"float s9(float v) { v = floor(v * 255.0 + 0.5); return v - 512.0 * step(256.0, v); }\n"
-	// A texel and the one after it on an axis (the coordinate a whole texel on, as the filter takes
-	// it), and the fraction of the first.
-	"ivec2 wrapCoord(int c, int shift, int lo, int hi, int cm, int mask, out int frac) {\n"
-	"	int step = 32;\n"
-	"	if (shift < 11) {\n"
-	"		c >>= shift;\n"
-	"	} else {\n"
-	"		c <<= 16 - shift;\n"
-	"		step <<= 16 - shift;\n"
-	"	}\n"
+	// A texel and the one after it on each axis (the coordinate a whole texel on, as the filter takes
+	// it): s0, s1, t0, t1, and the fractions of the first; clamped as rdp.c does (below 0 to 0, else to
+	// at most the last, whatever that is). Both axes at once (c, shift, lo, hi, cm and mask hold each
+	// axis's), the choices made by multiplying, so that the compiler sees one piece of code.
+	"ivec4 wrapCoords(ivec2 c, ivec2 shift, ivec2 lo, ivec2 hi, ivec2 cm, ivec2 mask, out ivec2 frac) {\n"
+	"	ivec2 down = ivec2(lessThan(shift, ivec2(11))), up = (16 - shift) * (1 - down);\n"
+	"	c = (c >> (shift * down)) << up;\n"
+	"	ivec2 step = ivec2(32) << up;\n"
 	"	c -= lo << 3;\n"
-	"	ivec2 p = ivec2(c, c + step);\n"
-	"	if ((cm & 2) != 0 || mask == 0) p = clamp(p, 0, (hi - lo) << 3);\n"
-	"	frac = p.x & 31;\n"
-	"	ivec2 i = p >> 5;\n"
-	"	if (mask != 0) {\n"
-	"		if ((cm & 1) != 0) i ^= -((i >> mask) & 1);\n"
-	"		i &= (1 << mask) - 1;\n"
-	"	}\n"
-	"	return i;\n"
+	"	ivec4 p = ivec4(c.x, c.x + step.x, c.y, c.y + step.y);\n"
+	"	ivec4 limit = min(p, ((hi - lo) << 3).xxyy) * ivec4(greaterThanEqual(p, ivec4(0)));\n"
+	"	ivec4 m = mask.xxyy, has = ivec4(notEqual(m, ivec4(0)));\n"
+	"	ivec4 clampIt = max(ivec4(notEqual(cm.xxyy & 2, ivec4(0))), 1 - has);\n"
+	"	p += (limit - p) * clampIt;\n"
+	"	frac = p.xz & 31;\n"
+	"	ivec4 i = p >> 5;\n"
+	"	i ^= -((i >> m) & 1) * (ivec4(notEqual(cm.xxyy & 1, ivec4(0))) * has);\n"
+	"	return i + ((i & ((ivec4(1) << m) - 1)) - i) * has;\n"
 	"}\n"
 	// Rows past the image's period (TMEM wrapping) are the ones that many before: the remainder in
 	// float, one off at most, put right (the GPU has no integer divide).
-	"ivec2 rowWrap(ivec2 j, int period) {\n"
-	"	j -= ivec2(vec2(j) / float(period)) * period;\n"
-	"	return j + ivec2(lessThan(j, ivec2(0))) * period - ivec2(greaterThanEqual(j, ivec2(period))) * period;\n"
+	"ivec4 rowWrap(ivec4 j, int period) {\n"
+	"	j -= ivec4(vec4(j) / float(period)) * period;\n"
+	"	return j + ivec4(lessThan(j, ivec4(0))) * period - ivec4(greaterThanEqual(j, ivec4(period))) * period;\n"
 	"}\n"
 
 	// The RDP's divide (rdp.c texCoords): w's top 15 bits normalized, a table's reciprocal, the
@@ -618,34 +615,45 @@ static const char fragmentHead[] =
 	"ivec2 texCoordSimple() {\n"
 	"	return ivec2(clamp(floor(texCoordFloat() + 0.01), -65536.0, 65535.0));\n"
 	"}\n"
-	// A texel of the tile: a column past the fold is the row two on per fold, then rows wrap.
-	"vec4 tileTexel(sampler2D t, ivec4 image, int s, int tt) {\n"
+	// The tile's four texels by the filter (s0 t0, s1 t0, s0 t1, s1 t1) where the image has them: a
+	// column past the fold is the row two on per fold, then rows wrap. Worked out together, as one
+	// piece of code for the compiler however many texels the filter takes.
+	"void tileTexels(ivec4 image, ivec2 s, ivec2 tt, out ivec4 x, out ivec4 y) {\n"
+	"	ivec4 ss = s.xyxy, ts = tt.xxyy;\n"
 	"	if (image.z < 0) {\n"
-	"		int i = (tt * -image.z + s) & (image.w - 1);\n"
-	"		return texelFetch(t, ivec2(i & 63, (tt & 1) * (image.w >> 6) + (i >> 6)), 0);\n"
+	"		ivec4 i = (ts * -image.z + ss) & (image.w - 1);\n"
+	"		x = i & 63, y = (ts & 1) * (image.w >> 6) + (i >> 6);\n"
+	"		return;\n"
 	"	}\n"
 	"	if (image.z != 0) {\n"
-	"		int q = int(float(s) / float(image.z));\n"
-	"		q += int(s - q * image.z >= image.z) - int(s - q * image.z < 0);\n"
-	"		s -= q * image.z;\n"
-	"		tt += 2 * q;\n"
+	"		ivec4 q = ivec4(vec4(ss) / float(image.z));\n"
+	"		q += ivec4(greaterThanEqual(ss - q * image.z, ivec4(image.z))) - ivec4(lessThan(ss - q * image.z, ivec4(0)));\n"
+	"		ss -= q * image.z;\n"
+	"		ts += 2 * q;\n"
 	"	}\n"
-	"	if (image.w != 0) tt = rowWrap(ivec2(tt), image.w).x;\n"
-	"	return texelFetch(t, ivec2(s, tt), 0);\n"
+	"	if (image.w != 0) ts = rowWrap(ts, image.w);\n"
+	"	x = ss, y = ts;\n"
+	"}\n"
+	// The places of a tile's four texels around st and the fractions between them.
+	"void tileAddress(ivec4 a, ivec4 b, ivec4 c, ivec4 image, ivec2 st, out ivec4 x4, out ivec4 y4, out ivec2 f) {\n"
+	"	ivec4 w = wrapCoords(st, a.xy, a.zw, b.xy, b.zw, c.xy, f);\n"
+	"	tileTexels(image, clamp(w.xy, 0, image.x - 1), clamp(w.zw, 0, image.y - 1), x4, y4);\n"
+	"}\n"
+	// The RDP's filter over three of the four texels by the fractions (Texture Filtering Smooth: all
+	// four, as GPUs filter).
+	"vec4 tileFilter(vec4 c0, vec4 c1, vec4 c2, vec4 c3, ivec2 f) {\n"
+	"	float x = float(f.x) / 32.0, y = float(f.y) / 32.0;\n"
+	"	if (TEX_FILTER == 1) return mix(mix(c0, c1, x), mix(c2, c3, x), y);\n"
+	"	if (f.x + f.y < 32) return c0 + (c1 - c0) * x + (c2 - c0) * y;\n"
+	"	return c3 + (c2 - c3) * (1.0 - x) + (c1 - c3) * (1.0 - y);\n"
 	"}\n"
 	"vec4 sampleTile(sampler2D t, ivec4 a, ivec4 b, ivec4 c, ivec4 image, ivec2 st) {\n"
-	"	int fs, ft;\n"
-	"	ivec2 s = clamp(wrapCoord(st.x, a.x, a.z, b.x, b.z, c.x, fs), 0, image.x - 1);\n"
-	"	ivec2 tt = clamp(wrapCoord(st.y, a.y, a.w, b.y, b.w, c.y, ft), 0, image.y - 1);\n"
-	"	vec4 c0 = tileTexel(t, image, s.x, tt.x);\n"
+	"	ivec4 x4, y4;\n"
+	"	ivec2 f;\n"
+	"	tileAddress(a, b, c, image, st, x4, y4, f);\n"
+	"	vec4 c0 = texelFetch(t, ivec2(x4.x, y4.x), 0);\n"
 	"	if (c.z == 0 || TEX_FILTER == 2) return c0;\n"
-	"	vec4 c1 = tileTexel(t, image, s.y, tt.x), c2 = tileTexel(t, image, s.x, tt.y);\n"
-	"	float x = float(fs) / 32.0, y = float(ft) / 32.0;\n"
-	// Texture Filtering Smooth: four texels, as GPUs filter, instead of the RDP's three.
-	"	if (TEX_FILTER == 1) return mix(mix(c0, c1, x), mix(c2, tileTexel(t, image, s.y, tt.y), x), y);\n"
-	"	if (fs + ft < 32) return c0 + (c1 - c0) * x + (c2 - c0) * y;\n"
-	"	vec4 c3 = tileTexel(t, image, s.y, tt.y);\n"
-	"	return c3 + (c2 - c3) * (1.0 - x) + (c1 - c3) * (1.0 - y);\n"
+	"	return tileFilter(c0, texelFetch(t, ivec2(x4.y, y4.y), 0), texelFetch(t, ivec2(x4.z, y4.z), 0), texelFetch(t, ivec2(x4.w, y4.w), 0), f);\n"
 	"}\n"
 	// FLE: a tile the GPU's sampler wraps and filters (c.w set) sampled by it at the texel the RDP's
 	// coordinate falls on (half a texel on to filter as the RDP does); else as the RDP does.
@@ -863,15 +871,26 @@ static struct Program* program(struct Glr* g, struct ProgramKey key) {
 	// detail one further on).
 	int const levels = key.lod & 2 ? lodLevels((int) (key.lod >> 4) & 7, key.lod & 8) : 0;
 	if (levels) {
-		strcat(source, "vec4 sampleLevel(int k, ivec2 st) {\n");
+		// One sampling for every tile, its settings picked by number; only the texture it reads in turn
+		// (the GPU can't pick a sampler by a number worked out per pixel).
+		strcat(source, "vec4 levelTexel(int k, ivec2 p) {\n");
 		for (int k = 0; k < levels; ++k) {
-			char const* when = k + 1 == levels ? "" : k ? "if (k == %d) " : "if (k <= %d) ";
-			char test[32];
-			snprintf(test, sizeof(test), when, k);
-			snprintf(line, sizeof(line), "	%sreturn sampleTile(uTex%d, uTile%d[0], uTile%d[1], uTile%d[2], uImage%d, st);\n", test, k, k, k, k, k);
+			snprintf(line, sizeof(line), k + 1 == levels ? "	return texelFetch(uTex%d, p, 0);\n" : "	if (k == %d) return texelFetch(uTex%d, p, 0);\n", k, k);
 			strcat(source, line);
 		}
-		strcat(source, "}\n");
+		snprintf(line, sizeof(line),
+		         "}\n"
+		         "vec4 sampleLevel(int k, ivec2 st) {\n"
+		         "	k = clamp(k, 0, %d);\n"
+		         "	ivec4 c = uTile[3 * k + 2], x4, y4;\n"
+		         "	ivec2 f;\n"
+		         "	tileAddress(uTile[3 * k], uTile[3 * k + 1], c, uImage[k], st, x4, y4, f);\n"
+		         "	vec4 c0 = levelTexel(k, ivec2(x4.x, y4.x));\n"
+		         "	if (c.z == 0 || TEX_FILTER == 2) return c0;\n"
+		         "	return tileFilter(c0, levelTexel(k, ivec2(x4.y, y4.y)), levelTexel(k, ivec2(x4.z, y4.z)), levelTexel(k, ivec2(x4.w, y4.w)), f);\n"
+		         "}\n",
+		         levels - 1);
+		strcat(source, line);
 	}
 	strcat(source, readsCombined(key.combine, cycleType) ? "void main() {\n	vec4 combined = uLastCombined;\n" : "void main() {\n	vec4 combined = vec4(0.0);\n");
 	if (g->barrier) {
@@ -886,11 +905,11 @@ static struct Program* program(struct Glr* g, struct ProgramKey key) {
 			strcat(source, "	vec4 tex0, tex1;\n");
 		} else {
 			if (g->fle) {
-				strcat(source, "	vec4 tex0 = sampleFast(uTex0, uTile0[0], uTile0[1], uTile0[2], uImage0, stf, st);\n");
-				strcat(source, cycleType == 1 ? "	vec4 tex1 = sampleFast(uTex1, uTile1[0], uTile1[1], uTile1[2], uImage1, stf, st);\n" : "	vec4 tex1 = tex0;\n");
+				strcat(source, "	vec4 tex0 = sampleFast(uTex0, uTile[0], uTile[1], uTile[2], uImage[0], stf, st);\n");
+				strcat(source, cycleType == 1 ? "	vec4 tex1 = sampleFast(uTex1, uTile[3], uTile[4], uTile[5], uImage[1], stf, st);\n" : "	vec4 tex1 = tex0;\n");
 			} else {
-				strcat(source, "	vec4 tex0 = sampleTile(uTex0, uTile0[0], uTile0[1], uTile0[2], uImage0, st);\n");
-				strcat(source, cycleType == 1 ? "	vec4 tex1 = sampleTile(uTex1, uTile1[0], uTile1[1], uTile1[2], uImage1, st);\n" : "	vec4 tex1 = tex0;\n");
+				strcat(source, "	vec4 tex0 = sampleTile(uTex0, uTile[0], uTile[1], uTile[2], uImage[0], st);\n");
+				strcat(source, cycleType == 1 ? "	vec4 tex1 = sampleTile(uTex1, uTile[3], uTile[4], uTile[5], uImage[1], st);\n" : "	vec4 tex1 = tex0;\n");
 			}
 		}
 		if (key.lod & 1) {
@@ -1140,9 +1159,9 @@ compileFragment:;
 	g->applied.program = p;
 	for (int k = 0; k < LEVELS; ++k) {
 		char name[16];
-		snprintf(name, sizeof(name), "uTile%d", k);
+		snprintf(name, sizeof(name), "uTile[%d]", 3 * k);
 		pr->tile[k] = gl->GetUniformLocation(p, name);
-		snprintf(name, sizeof(name), "uImage%d", k);
+		snprintf(name, sizeof(name), "uImage[%d]", k);
 		pr->image[k] = gl->GetUniformLocation(p, name);
 		snprintf(name, sizeof(name), "uTex%d", k);
 		pr->texture[k] = gl->GetUniformLocation(p, name);
