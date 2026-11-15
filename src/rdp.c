@@ -445,6 +445,31 @@ static struct Color convert(const struct RDP* r, struct Color c);
 
 // One kind of texel at a time: the compiler makes a loop for each, without the kind's tests inside.
 static inline __attribute__((always_inline)) void tileImageKind(struct RDP* r, const struct Tile* t, int w, int h, bool converted, uint32_t* out, enum TexelKind kind) {
+	// Color-indexed texels through their palette's colors worked out once (texel() and tlutColor),
+	// a row's TMEM address and swap once.
+	if (!converted && (kind == TK_CI4 || kind == TK_CI4_IA || kind == TK_CI8 || kind == TK_CI8_IA)) {
+		bool const ia = kind == TK_CI4_IA || kind == TK_CI8_IA, four = kind == TK_CI4 || kind == TK_CI4_IA;
+		uint32_t palette[256];
+		int const count = four ? 16 : 256;
+		for (int i = 0; i < count; ++i) {
+			struct Color c = tlutColor(r, four ? t->palette << 4 | i : i, ia);
+			palette[i] = (uint32_t) c.r | (uint32_t) c.g << 8 | (uint32_t) c.b << 16 | (uint32_t) c.a << 24;
+		}
+		for (int y = 0; y < h; ++y) {
+			uint32_t const base = (uint32_t) t->tmem * 8 + (uint32_t) (y * t->line) * 8, swap = y & 1 ? 4 : 0;
+			for (int x = 0; x < w; ++x) {
+				int v;
+				if (four) {
+					uint8_t const b = r->tmem[((base + (uint32_t) (x >> 1)) ^ swap) & 0xFFF];
+					v = x & 1 ? b & 15 : b >> 4;
+				} else {
+					v = r->tmem[((base + (uint32_t) x) ^ swap) & 0xFFF];
+				}
+				out[y * w + x] = palette[v];
+			}
+		}
+		return;
+	}
 	// 16-bit RGBA as texel() decodes it, a row's TMEM address and swap worked out once.
 	if (kind == TK_RGBA16 && !converted) {
 		for (int y = 0; y < h; ++y) {
