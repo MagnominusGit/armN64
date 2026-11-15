@@ -57,6 +57,7 @@ GL, Resolution with GL or GPU, the custom crops with Crop Overscan Custom, and s
 | | Expansion Pak (applies on restart) | On, Off |
 | Video | Renderer (applies on restart) | GL (Fast, HD), GPU (Exact, HD), CPU (Exact, Native) |
 | | Resolution (GL and GPU; applies on restart) | 2x, Auto, Native, 3x to 8x |
+| | Resolution Scaling (GL) | Fixed (320x240), Internal |
 | | Widescreen | Off, 16:9, 16:10, 16:9 Picture Only, 16:10 Picture Only |
 | | Aspect Ratio | Fill 4:3, TV 4:3, Square Pixels |
 | | Crop Overscan | On, Off, Custom |
@@ -100,7 +101,8 @@ GL, Resolution with GL or GPU, the custom crops with Crop Overscan Custom, and s
   handhelds), GPU on the graphics chip (for desktop graphics cards; below full speed on handhelds).
   GPU can also draw higher (Resolution): close to exact, with the native picture kept for what
   games read back. GL draws a game's high-resolution images (wider than 480 pixels) at half the
-  Resolution, so 2x comes out about 640×480 either way.
+  Resolution, so 2x comes out about 640×480 either way; Resolution Scaling Internal draws them at the
+  full Resolution instead, sharper for up to four times the GPU work in those games.
 - **Widescreen.** 16:9 and 16:10 draw more of the scene at the sides with Library graphics; games may
   leave out things just off the 4:3 edges, and full-screen pictures stay stretched. Picture Only
   shows the picture that wide and changes nothing else, for games with their own wide modes.

@@ -283,6 +283,8 @@ struct Glr {
 	// Targets drawn at scale times the RDP's resolution (N64_GL_SCALE); their pixels go to and from
 	// RDRAM through a texture at its resolution.
 	int scale;
+	// High-resolution images at the full scale too (N64_GL_SCALING=internal).
+	bool internal;
 	GLuint native, nativeFramebuffer;
 	// The program laying a 16-bit image out again at another width (relayout), and its uniforms.
 	GLuint relayoutProgram;
@@ -1642,9 +1644,10 @@ static void loadPixels(struct N64* n, struct Glr* g, struct Target* t, int from,
 static void flushBatch(struct N64* n, struct Glr* g);
 
 // A color image's scale: the Resolution's, or for one wider than 480 pixels (a high-resolution mode)
-// half of it rounded up, so the picture comes out about as large either way.
+// half of it rounded up, so the picture comes out about as large either way, unless every image
+// takes the full scale.
 static int scaleFor(const struct Glr* g, uint32_t width) {
-	return width > 480 ? (g->scale + 1) / 2 : g->scale;
+	return width > 480 && !g->internal ? (g->scale + 1) / 2 : g->scale;
 }
 
 // The pages of RDRAM [addr, addr + len) wait for the GPU (rdpWaitFor) or no longer do.
@@ -3852,6 +3855,8 @@ struct Glr* glrCreate(struct N64* n) {
 		--g->scale;
 	}
 	n->glrScale = g->scale;
+	const char* scaling = n->settings ? n->settings("N64_GL_SCALING") : getenv("N64_GL_SCALING");
+	g->internal = scaling && !strcmp(scaling, "internal");
 	const char* seal = n->settings ? n->settings("N64_GL_SEAL") : getenv("N64_GL_SEAL");
 	g->seal = seal && *seal == '1' ? 0.5f : 0;
 	gl->RenderbufferStorage(GL_RENDERBUFFER, GL_DEPTH24_STENCIL8, 16, 16);

@@ -127,8 +127,11 @@ static struct retro_core_option_v2_definition optionDefinitions[] = {
 	  "GL: fastest, HD, not exact. CPU: exact, the choice on handhelds. GPU: exact, for desktop graphics cards, also HD.",
 	  NULL, "video", { { "gl", "GL (Fast, HD)" }, { "gpu", "GPU (Exact, HD)" }, { "cpu", "CPU (Exact, Native)" }, { NULL, NULL } }, "gl" },
 	{ "armn64_resolution", "Resolution", NULL,
-	  "GL and GPU drawing resolution. Auto fits the display with GL and is Native with GPU (exact only at Native). GL draws high-resolution games at half.",
+	  "GL and GPU drawing resolution. Auto fits the display with GL and is Native with GPU (exact only at Native). GL draws high-resolution games at half (Resolution Scaling).",
 	  NULL, "video", { { "auto", "Auto" }, { "1", "Native" }, { "2", "2x" }, { "3", "3x" }, { "4", "4x" }, { "5", "5x" }, { "6", "6x" }, { "7", "7x" }, { "8", "8x" }, { NULL, NULL } }, "2" },
+	{ "armn64_gl_scaling", "Resolution Scaling", NULL,
+	  "Fixed: Resolution counts from 320x240, so high-resolution games draw at half and every game comes out about as large. Internal: each game at the full Resolution of its own size, sharper in high-resolution games for up to four times the GPU work there. Auto stays Fixed.",
+	  NULL, "gl", { { "fixed", "Fixed (320x240)" }, { "internal", "Internal" }, { NULL, NULL } }, "fixed" },
 	{ "armn64_widescreen", "Widescreen", NULL,
 	  "16:9 and 16:10 draw more at the sides (Library graphics); things just off the 4:3 edges may be missing. Picture Only: for games' own wide modes.",
 	  NULL, "video", { { "disabled", "Off" }, { "16:9", "16:9" }, { "16:10", "16:10" }, { "16:9-picture", "16:9 Picture Only" }, { "16:10-picture", "16:10 Picture Only" }, { NULL, NULL } }, "disabled" },
@@ -289,6 +292,7 @@ static bool showOptions(void) {
 		bool shown;
 	} const options[] = {
 		{ "armn64_resolution", gl || gpu },
+		{ "armn64_gl_scaling", gl },
 		{ "armn64_crop_top", custom },
 		{ "armn64_crop_bottom", custom },
 		{ "armn64_crop_left", custom },
@@ -389,6 +393,10 @@ static const char* settings(const char* name) {
 	if (!strcmp(name, "N64_GL_SCALE")) {
 		scale[0] = (char) ('0' + glScale());
 		return scale;
+	}
+	if (!strcmp(name, "N64_GL_SCALING")) {
+		// Auto's scale fits the display counting from 320x240.
+		return optionIs(environment, "armn64_gl_scaling", "internal") && !optionIs(environment, "armn64_resolution", "auto") ? "internal" : "fixed";
 	}
 	// Compiled GPU programs in system/armN64/cache.
 	if (!strcmp(name, "N64_SHADER_CACHE")) {
@@ -1353,7 +1361,7 @@ static bool pakManager(bool shared) {
 
 // The settings the machine was made with that the game can take while it runs; and the Expansion
 // Pak's, which the game sizes its memory by as it boots.
-static const char* const madeWith[] = { "N64_ACCURACY", "N64_OVERCLOCK", "N64_GPU_SCALE", "N64_GL_SCALE", "N64_SLICE", "N64_RDP_GL",
+static const char* const madeWith[] = { "N64_ACCURACY", "N64_OVERCLOCK", "N64_GPU_SCALE", "N64_GL_SCALE", "N64_GL_SCALING", "N64_SLICE", "N64_RDP_GL",
 	                                    "N64_RDP_GPU", "N64_VI_GPU", "N64_GFX_RSP", "N64_HLE_TIMING", "N64_RSP_THREAD", "N64_GL_FB_EFFECTS",
 	                                    "N64_GL_MSAA", "N64_WIDESCREEN", "N64_GL_FILTER", "N64_GL_SEAL", "N64_GL_SHADERS", "N64_FRAMESKIP",
 	                                    "N64_RDP_THREADS" };
