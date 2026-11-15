@@ -279,6 +279,9 @@ static const char* overclock(void) {
 // changes; returns whether that changed which are shown.
 static bool showOptions(void) {
 	static bool shownSet, shown[24];
+	// The values as the menu has them now, not as read at the last frame (the game doesn't run while
+	// the menu is open).
+	optionsForget();
 	bool const hle = highLevel(), gl = !strcmp(renderer(), "gl"), gpu = !strcmp(renderer(), "gpu");
 	bool const custom = optionIs(environment, "armn64_crop_overscan", "custom");
 	struct {
