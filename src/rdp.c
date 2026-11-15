@@ -2003,8 +2003,8 @@ static double spanCost(const struct N64* n, struct RDP* r, enum rdp_tm_mode mode
 
 static double timingCost(const struct N64* n, struct RDP* r, const uint64_t* w, int op) {
 	uint64_t const c = w[0];
-	enum rdp_tm_mode const mode = timingMode(r);
 	if (op >= 0x08 && op <= 0x0F) {
+		enum rdp_tm_mode const mode = timingMode(r);
 		struct Edges e = edges(w);
 		double cost = 0;
 		int first, end, widest = 0;
@@ -2020,6 +2020,7 @@ static double timingCost(const struct N64* n, struct RDP* r, const uint64_t* w, 
 		return cost + rdp_tm_prim_overhead(mode, widest ? widest : 1) + (op & 6 ? 3 : 0);
 	}
 	if (op == 0x24 || op == 0x25 || op == 0x36) {
+		enum rdp_tm_mode const mode = timingMode(r);
 		int cx0, cy0, x0, y0, x1, y1;
 		rdpRectBounds(r, c, &cx0, &cy0, &x0, &y0, &x1, &y1);
 		double cost = 0;
@@ -2060,7 +2061,6 @@ static double timingCost(const struct N64* n, struct RDP* r, const uint64_t* w, 
 
 // FLE: timingCost with a primitive's rows all costing what its middle one does.
 static uint64_t roughClocks(const struct N64* n, struct RDP* r, const uint64_t* w, int op) {
-	enum rdp_tm_mode const mode = timingMode(r);
 	int x0 = 0, y = 0, pixels = 0, rows = 0;
 	if (op >= 0x08 && op <= 0x0F) {
 		struct Edges e = edges(w);
@@ -2080,6 +2080,7 @@ static uint64_t roughClocks(const struct N64* n, struct RDP* r, const uint64_t* 
 		double const cost = timingCost(n, r, w, op);
 		return cost > 0 ? (uint64_t) cost : 0;
 	}
+	enum rdp_tm_mode const mode = timingMode(r);
 	double cost = pixels && rows ? spanCost(n, r, mode, x0, y, pixels) * rows : 0;
 	if (pixels && rows > 1 && r->cycleType < 2 && (r->zCompare || r->zUpdate)) {
 		r->zPixels += (uint64_t) pixels * (uint64_t) (rows - 1);
@@ -3991,6 +3992,11 @@ static struct RDP* beginCommands(struct N64* n, uint64_t* begin) {
 static void rowsWritten(struct N64* n, uint32_t addr, int from, int to, uint32_t rowBytes) {
 	if (to > from && rowBytes) {
 		uint32_t first = addr + (uint32_t) from * rowBytes, last = addr + (uint32_t) to * rowBytes - 1;
+		uint32_t const p0 = (first & (RDRAM_SIZE - 1)) >> 12, p1 = (last & (RDRAM_SIZE - 1)) >> 12;
+		if (p0 <= p1 && p1 - p0 == (last >> 12) - (first >> 12)) {
+			memset(&n->dirtyPages[p0], 0, p1 - p0 + 1);
+			return;
+		}
 		for (uint32_t a = first & ~0xFFFu; a <= last; a += 0x1000) {
 			n->dirtyPages[(a & (RDRAM_SIZE - 1)) >> 12] = 0;
 		}
