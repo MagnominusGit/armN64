@@ -12,7 +12,14 @@
 // Registers: rbx = n, r12 = &n->cpu, r13 = n->cycles, r14 = the limit, r15 = RDRAM. A block that ends below the
 // limit goes on to the next through n->jitTable without returning to C.
 
+// The arena's first half has the shared code and the blocks' hot code (n->jitUsed), its second half
+// their cold code: slow paths, misses and the exits but the block's end. How much of the second half
+// is used is kept at the end of the shared code's space.
 enum { ARENA_SIZE = 256 << 20, BLOCK_CODE_MAX = 32 << 10, SHARED_SIZE = 256 };
+
+static uint64_t* coldUsed(struct N64* n) {
+	return (uint64_t*) (n->jitArena + SHARED_SIZE - 8);
+}
 
 #define CPU_AT(f) M(R12, (int32_t) offsetof(struct CPU, f))
 #define N64_AT(f) M(RBX, (int32_t) offsetof(struct N64, f))
@@ -1720,6 +1727,9 @@ static uint8_t* arenaGet(struct N64* n) {
 
 void jitReset(struct N64* n) {
 	n->jitUsed = SHARED_SIZE;
+	if (n->jitArena) {
+		*coldUsed(n) = 0;
+	}
 	++n->blockGen;
 }
 
@@ -1745,13 +1755,59 @@ void jitFree(struct N64* n) {
 
 const bool jitBranchesInside = false;
 
+// Leaving after an inline instruction: the state the interpreter would have after it.
+static void emitExit(struct Jit* j, const struct Exit* x, const uint32_t* ops, uint32_t count, uint32_t vaddr, uint32_t paddr,
+                     uint32_t pollPass, int reload) {
+	struct Emitter* e = &j->e;
+	if (x->site) {
+		patchHere(e, x->site);
+	}
+	if (!j->fle) {
+		if (x->stall < 0) {
+			loadStallCheck(e, ops[((uint32_t) x->pc - vaddr) >> 2]);
+		} else if (x->stall) {
+			xAluI(e, X_ADD, 8, R(R13), x->stall);
+		}
+		xStoreI(e, 1, CPU_AT(loadMark), x->mark);
+	}
+	storeConst(e, CPU_AT(curPc), x->pc);
+	xStoreI(e, 1, CPU_AT(inDelay), x->delay);
+	xStoreI(e, 1, CPU_AT(nextInDelay), x->kind != PLAIN && !x->skip);
+	if (x->jumped) {
+		xJmp(e, j->leave);
+		return;
+	}
+	if (x->skip) {
+		xAluI(e, X_ADD, 8, R(R13), 2 * j->opCycles);
+		storeConst(e, CPU_AT(pc), x->pc + 8);
+		storeConst(e, CPU_AT(nextPc), x->pc + 12);
+	} else if (x->delay) {
+		delayPrologue(e);
+	} else {
+		storeConst(e, CPU_AT(pc), x->pc + 4);
+		if (x->kind == PLAIN) {
+			storeConst(e, CPU_AT(nextPc), x->pc + 8);
+		}
+	}
+	if (x->last && !(x->kind != PLAIN && !x->skip)) {
+		xAluRR(e, X_CMP, 8, R(R13), R14);
+		xJcc(e, CC_AE, j->leave);
+		if (pollPass) {
+			pollSkip(j, ops, count, vaddr, paddr, pollPass * (uint32_t) j->opCycles, reload);
+		}
+		chain(j);
+	} else {
+		xJmp(e, j->leave);
+	}
+}
+
 // Code for count instructions at vaddr (cached, at paddr in RDRAM), or NULL when the arena is full.
 void* jitCompile(struct N64* n, const uint32_t* ops, uint32_t count, uint32_t vaddr, uint32_t paddr) {
 	uint8_t* arena = arenaGet(n);
 	if (n->jitUsed < SHARED_SIZE) {
 		n->jitUsed = SHARED_SIZE;
 	}
-	if (!arena || n->jitUsed + BLOCK_CODE_MAX > ARENA_SIZE) {
+	if (!arena || n->jitUsed + BLOCK_CODE_MAX > ARENA_SIZE / 2 || *coldUsed(n) + BLOCK_CODE_MAX > ARENA_SIZE / 2) {
 		return NULL;
 	}
 	static struct Jit jit;
@@ -1875,6 +1931,24 @@ void* jitCompile(struct N64* n, const uint32_t* ops, uint32_t count, uint32_t va
 		delay = branch;
 	}
 
+	// The block's end goes on straight after it (its jump there dropped); the rest is cold.
+	for (int i = 0; i < j->exitCount; ++i) {
+		struct Exit* x = &j->exits[i];
+		if (x->last) {
+			if (x->site + 4 == e->p) {
+				e->p -= 5;
+				x->site = NULL;
+			}
+			emitExit(j, x, ops, count, vaddr, paddr, pollPass, reload);
+		}
+	}
+	if (e->p > e->end) {
+		return NULL;
+	}
+	struct Emitter const hot = j->e;
+	uint8_t* const coldStart = arena + ARENA_SIZE / 2 + *coldUsed(n);
+	j->e = (struct Emitter) { coldStart, coldStart, coldStart + BLOCK_CODE_MAX };
+
 	// Stores to a page with code only: on unless they hit a word a block holds (n64HoldsCode), its
 	// bit in codeWords. An aligned store touches one word, or two for SD.
 	for (int i = 0; i < j->codeCheckCount; ++i) {
@@ -1984,52 +2058,17 @@ void* jitCompile(struct N64* n, const uint32_t* ops, uint32_t count, uint32_t va
 		}
 	}
 
-	// Leaving after an inline instruction: the state the interpreter would have after it.
 	for (int i = 0; i < j->exitCount; ++i) {
-		struct Exit* x = &j->exits[i];
-		patchHere(e, x->site);
-		if (!j->fle) {
-			if (x->stall < 0) {
-				loadStallCheck(e, ops[((uint32_t) x->pc - vaddr) >> 2]);
-			} else if (x->stall) {
-				xAluI(e, X_ADD, 8, R(R13), x->stall);
-			}
-			xStoreI(e, 1, CPU_AT(loadMark), x->mark);
-		}
-		storeConst(e, CPU_AT(curPc), x->pc);
-		xStoreI(e, 1, CPU_AT(inDelay), x->delay);
-		xStoreI(e, 1, CPU_AT(nextInDelay), x->kind != PLAIN && !x->skip);
-		if (x->jumped) {
-			xJmp(e, j->leave);
-			continue;
-		}
-		if (x->skip) {
-			xAluI(e, X_ADD, 8, R(R13), 2 * j->opCycles);
-			storeConst(e, CPU_AT(pc), x->pc + 8);
-			storeConst(e, CPU_AT(nextPc), x->pc + 12);
-		} else if (x->delay) {
-			delayPrologue(e);
-		} else {
-			storeConst(e, CPU_AT(pc), x->pc + 4);
-			if (x->kind == PLAIN) {
-				storeConst(e, CPU_AT(nextPc), x->pc + 8);
-			}
-		}
-		if (x->last && !(x->kind != PLAIN && !x->skip)) {
-			xAluRR(e, X_CMP, 8, R(R13), R14);
-			xJcc(e, CC_AE, j->leave);
-			if (pollPass) {
-				pollSkip(j, ops, count, vaddr, paddr, pollPass * (uint32_t) j->opCycles, reload);
-			}
-			chain(j);
-		} else {
-			xJmp(e, j->leave);
+		if (!j->exits[i].last) {
+			emitExit(j, &j->exits[i], ops, count, vaddr, paddr, pollPass, reload);
 		}
 	}
 
 	if (e->p > e->end) {
 		return NULL;
 	}
+	*coldUsed(n) += (size_t) (e->p - coldStart + 15) & ~(size_t) 15;
+	j->e = hot;
 	uint8_t* code = arena + n->jitUsed;
 	n->jitUsed += (size_t) (e->p - code + 15) & ~(size_t) 15;
 	return code;
