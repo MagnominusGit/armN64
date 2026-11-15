@@ -77,6 +77,7 @@ void n64Destroy(struct N64* n) {
 		free(n->vpages);
 		ddFree(n);
 		free(n->rom);
+		cheatCartFree(n);
 		free(n);
 	}
 }
@@ -170,6 +171,9 @@ static void start(struct N64* n) {
 	// All of vpages again, kseg1's as the accuracy has it.
 	n->vpageFillCount = VPAGE_FILLED + 1;
 	cpuReset(n);
+	if (n->cheat.flash) {
+		cheatCartReset(n);
+	}
 	pifBoot(n);
 	n->eeprom16k = n->rom ? cartEeprom16k(n->rom) : false;
 	n->hardwarePi = n->rom && cartHardwarePi(n->rom);

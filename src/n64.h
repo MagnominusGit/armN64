@@ -282,12 +282,29 @@ struct GbCart {
 	uint8_t rtc[5], rtcLatched[5];
 };
 
+// A cheat cartridge with the game on top of it (cheatcart.c): its flash chips' halfwords (NULL with
+// none), its logic chip's registers, the button, and each flash chip's command state.
+struct CheatCart {
+	uint8_t* flash;
+	uint8_t ioBase;
+	uint16_t direction, data;
+	bool blockA, blockC;
+	bool button;
+	uint8_t stage[2];
+	bool idMode[2], loading[2];
+	uint32_t page[2];
+	bool unprotected;
+	// The flash written since it was last kept.
+	bool dirty;
+};
+
 struct N64 {
 	uint8_t* rdram;
 	// RDRAM's hidden ninth bits, as the RDP keeps them: two coverage bits for each halfword.
 	uint8_t* hidden;
 	uint8_t* rom;
 	size_t romSize;
+	struct CheatCart cheat;
 	uint8_t pifRam[64];
 	// PIF RAM holds Joybus commands (not a CIC challenge), which run again when it is read.
 	bool pifJoybus, pifChallenged;
@@ -838,6 +855,13 @@ bool cartEeprom16k(const uint8_t* rom);
 bool cartHardwarePi(const uint8_t* rom);
 bool cartQuickSi(const uint8_t* rom);
 bool cartGfxRsp(const uint8_t* rom);
+
+// cheatcart.c
+bool cheatCartLoad(struct N64*, const uint8_t* data, size_t size);
+void cheatCartFree(struct N64*);
+void cheatCartReset(struct N64*);
+bool cheatCartRead16(struct N64*, uint32_t addr, uint16_t* v);
+bool cheatCartWrite16(struct N64*, uint32_t addr, uint16_t v);
 bool cartBootUntimed(const uint8_t* rom);
 bool gbCartLoad(struct GbCart*, const uint8_t* rom, size_t size);
 void gbCartFree(struct GbCart*);

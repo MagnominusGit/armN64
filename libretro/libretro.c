@@ -7,11 +7,13 @@
 
 #include "libretro.h"
 #include "options.h"
+#include "games.h"
 #include "paks.h"
 
 #include <dirent.h>
 #ifndef __ANDROID__
 #include <glob.h>
+#include <limits.h>
 #endif
 #include <math.h>
 #include <stdio.h>
@@ -62,6 +64,20 @@ static int16_t played[OUT_FRAMES * 2];
 static double audioPhase;
 static int16_t audioLast[2];
 static uint8_t saveMemory[SAVE_SIZE];
+// A cheat cartridge loaded (a GameShark or Action Replay, by its file's name): its ROM; its flash, which
+// the frontend keeps as the cartridge's save; the games beside it for Game on Top; and the game on top's
+// own save, kept by the core under the game's name as when it runs by itself, with what was last written.
+enum { CHEAT_FLASH_SIZE = 0x40000, CHEAT_GAMES = RETRO_NUM_CORE_OPTION_VALUES_MAX - 2 };
+static bool cheatCart;
+static uint8_t* cheatRom;
+static size_t cheatRomSize;
+static uint8_t cheatFlash[CHEAT_FLASH_SIZE];
+static bool cheatFlashReady;
+static struct ListedGame cheatGames[CHEAT_GAMES];
+static size_t cheatGameCount;
+static char topSavePath[2 * GAME_PATH + 8];
+static uint8_t topSaveWritten[SAVE_SIZE];
+static unsigned topSaveFrames;
 // The frontend's GL context for the GPU renderer, and what puts the picture in its framebuffer.
 static struct retro_hw_render_callback hw;
 static bool hwWanted, hwReady, viInContext;
@@ -123,6 +139,12 @@ static struct retro_core_option_v2_definition optionDefinitions[] = {
 	{ "armn64_expansion", "Expansion Pak", NULL,
 	  "The 4 MB memory add-on most later games use. Off: as without one, for games and hacks that need that. Takes effect when the game restarts.",
 	  NULL, "system", { { "enabled", "On" }, { "disabled", "Off" }, { NULL, NULL } }, "enabled" },
+	{ "armn64_cheat_game", "Game on Top", NULL,
+	  "The game plugged in on top of the cheat cartridge (a GameShark or Action Replay), from the games beside it, those played last first. Takes effect when the game restarts.",
+	  NULL, "system", { { "none", "None" }, { NULL, NULL } }, "none" },
+	{ "armn64_cheat_button", "Cheat Cartridge Button", NULL,
+	  "The controller button that presses the cheat cartridge's own button.",
+	  NULL, "input", { { "r3", "R3" }, { "l3", "L3" }, { "disabled", "Off" }, { NULL, NULL } }, "r3" },
 	{ "armn64_renderer", "Renderer", NULL,
 	  "GL: fastest, HD, not exact. CPU: exact, the choice on handhelds. GPU: exact, for desktop graphics cards, also HD.",
 	  NULL, "video", { { "gl", "GL (Fast, HD)" }, { "gpu", "GPU (Exact, HD)" }, { "cpu", "CPU (Exact, Native)" }, { NULL, NULL } }, "gl" },
@@ -281,7 +303,7 @@ static const char* overclock(void) {
 // Hides the options that do nothing with the others' values. The frontend calls it when an option
 // changes; returns whether that changed which are shown.
 static bool showOptions(void) {
-	static bool shownSet, shown[24];
+	static bool shownSet, shown[32];
 	// The values as the menu has them now, not as read at the last frame (the game doesn't run while
 	// the menu is open).
 	optionsForget();
@@ -312,6 +334,8 @@ static bool showOptions(void) {
 		{ "armn64_pak2_card", optionIs(environment, "armn64_pak2", "memory") || !optionValue(environment, "armn64_pak2") },
 		{ "armn64_pak3_card", optionIs(environment, "armn64_pak3", "memory") || !optionValue(environment, "armn64_pak3") },
 		{ "armn64_pak4_card", optionIs(environment, "armn64_pak4", "memory") || !optionValue(environment, "armn64_pak4") },
+		{ "armn64_cheat_game", cheatCart },
+		{ "armn64_cheat_button", cheatCart },
 	};
 	bool changed = false;
 	for (size_t i = 0; i < sizeof(options) / sizeof(options[0]); ++i) {
@@ -666,7 +690,20 @@ static struct N64* startMachine(void) {
 		return NULL;
 	}
 	n->settings = settings;
-	if (disk ? !n64LoadDisk(n, ipl, iplSize, game, gameSize) : !n64LoadRom(n, game, gameSize)) {
+	// A cheat cartridge goes in first, with its flash as last kept, the game on top of it (none: an
+	// empty cartridge).
+	static uint8_t empty[0x1000];
+	if (cheatCart && cheatRom && cheatCartLoad(n, cheatRom, cheatRomSize)) {
+		if (cheatFlashReady) {
+			memcpy(n->cheat.flash, cheatFlash, CHEAT_FLASH_SIZE);
+		} else {
+			memcpy(cheatFlash, n->cheat.flash, CHEAT_FLASH_SIZE);
+			cheatFlashReady = true;
+		}
+	}
+	const uint8_t* const rom = cheatCart && !game ? empty : game;
+	size_t const romSize = cheatCart && !game ? sizeof(empty) : gameSize;
+	if (disk ? !n64LoadDisk(n, ipl, iplSize, game, gameSize) : !n64LoadRom(n, rom, romSize)) {
 		n64Destroy(n);
 		return NULL;
 	}
@@ -929,6 +966,89 @@ static void describeInput(void) {
 
 static void rememberSettings(bool booted);
 
+// Game on Top's choices: None, then the games beside the cheat cartridge by file name.
+static void cheatGamesOffer(const char* cartPath) {
+	const char* saveDirectory = NULL;
+	environment(RETRO_ENVIRONMENT_GET_SAVE_DIRECTORY, &saveDirectory);
+	gamesFree(cheatGames, cheatGameCount);
+	cheatGameCount = gamesBeside(cartPath, saveDirectory, cheatGames, CHEAT_GAMES);
+	for (size_t i = 0; optionDefinitions[i].key; ++i) {
+		if (strcmp(optionDefinitions[i].key, "armn64_cheat_game")) {
+			continue;
+		}
+		struct retro_core_option_value* values = optionDefinitions[i].values;
+		size_t k = 0;
+		values[k++] = (struct retro_core_option_value) { "none", "None" };
+		for (size_t g = 0; g < cheatGameCount; ++g) {
+			const char* slash = strrchr(cheatGames[g].path, '/');
+			values[k++] = (struct retro_core_option_value) { slash ? slash + 1 : cheatGames[g].path, cheatGames[g].label };
+		}
+		values[k] = (struct retro_core_option_value) { NULL, NULL };
+	}
+	optionsGive(environment, &coreOptions);
+	optionsForget();
+}
+
+// The game Game on Top names, into game (NULL with none), and its own save, read into saveMemory.
+static void cheatTopLoad(void) {
+	free(game);
+	game = NULL;
+	gameSize = 0;
+	topSavePath[0] = '\0';
+	const char* const chosen = optionValue(environment, "armn64_cheat_game");
+	for (size_t g = 0; chosen && g < cheatGameCount; ++g) {
+		const char* slash = strrchr(cheatGames[g].path, '/');
+		if (strcmp(chosen, slash ? slash + 1 : cheatGames[g].path)) {
+			continue;
+		}
+		game = gameRead(cheatGames[g].path, &gameSize);
+		if (game && gameSize < 0x1000) {
+			free(game);
+			game = NULL;
+		}
+		const char* saveDirectory = NULL;
+		environment(RETRO_ENVIRONMENT_GET_SAVE_DIRECTORY, &saveDirectory);
+		char folder[GAME_PATH];
+		gameFile(cheatGames[g].path, folder, sizeof(folder));
+		char* cut = strrchr(folder, '/');
+		if (cut) {
+			*cut = '\0';
+		}
+		snprintf(topSavePath, sizeof(topSavePath), "%s/%s.srm", saveDirectory && *saveDirectory ? saveDirectory : folder, cheatGames[g].label);
+		break;
+	}
+	memset(saveMemory, 0, sizeof(saveMemory));
+	size_t size;
+	uint8_t* save = game ? readFile(topSavePath, &size) : NULL;
+	if (save && size == SAVE_SIZE) {
+		memcpy(saveMemory, save, SAVE_SIZE);
+	}
+	free(save);
+	memcpy(topSaveWritten, saveMemory, SAVE_SIZE);
+	topSaveFrames = 0;
+	if (!game) {
+		notify(chosen && strcmp(chosen, "none") ? "Game on Top can't be read: pick another, then Restart"
+		                                         : "No game on top of the cheat cartridge: pick one in Core Options > System > Game on Top, then Restart");
+	}
+}
+
+// The game on top's save written beside it when it changed.
+static void topSaveFlush(void) {
+	if (!cheatCart || !topSavePath[0] || !machine) {
+		return;
+	}
+	saveExport();
+	if (memcmp(saveMemory, topSaveWritten, SAVE_SIZE)) {
+		FILE* f = fopen(topSavePath, "wb");
+		if (f && fwrite(saveMemory, 1, SAVE_SIZE, f) == SAVE_SIZE) {
+			memcpy(topSaveWritten, saveMemory, SAVE_SIZE);
+		}
+		if (f) {
+			fclose(f);
+		}
+	}
+}
+
 bool retro_load_game(const struct retro_game_info* info) {
 	if (!info || !info->data || !info->size) {
 		return false;
@@ -973,6 +1093,16 @@ bool retro_load_game(const struct retro_game_info* info) {
 		}
 		snprintf(diskSavePath, sizeof(diskSavePath), "%s/%s.sav", saves, name);
 	}
+	// A cheat cartridge: the file loaded is its ROM, the game on top picked from the games beside it.
+	cheatCart = !disk && info->path && gameIsCheatCart(info->path);
+	if (cheatCart) {
+		cheatRom = game, cheatRomSize = gameSize;
+		game = NULL, gameSize = 0;
+		cheatFlashReady = false;
+		cheatGamesOffer(info->path);
+		cheatTopLoad();
+		showOptions();
+	}
 	const char* saveDir = NULL;
 	paksInit(environment(RETRO_ENVIRONMENT_GET_SAVE_DIRECTORY, &saveDir) ? saveDir : NULL);
 	machine = startMachine();
@@ -1007,6 +1137,12 @@ void retro_unload_game(void) {
 	if (machine) {
 		paksSync(machine);
 	}
+	topSaveFlush();
+	free(cheatRom);
+	cheatRom = NULL;
+	gamesFree(cheatGames, cheatGameCount);
+	cheatGameCount = 0;
+	cheatCart = cheatFlashReady = false;
 	diskSave();
 	transferPaksSave();
 	n64Destroy(machine);
@@ -1025,9 +1161,14 @@ void retro_reset(void) {
 	}
 	diskSave();
 	transferPaksSave();
+	topSaveFlush();
 	n64Destroy(machine);
 	glesYield();
 	chooseRenderer();
+	// Game on Top takes effect: the game picked now, with its own save.
+	if (cheatCart) {
+		cheatTopLoad();
+	}
 	machine = startMachine();
 	if (machine) {
 		saveImport();
@@ -1459,7 +1600,21 @@ void retro_run(void) {
 	applyOptions();
 	if (!saveGiven) {
 		saveImport();
+		// The cartridge's flash as the frontend kept it, given after the game loaded.
+		if (cheatCart && machine->cheat.flash) {
+			memcpy(machine->cheat.flash, cheatFlash, CHEAT_FLASH_SIZE);
+		}
 		saveGiven = true;
+	}
+	if (cheatCart && machine->cheat.flash) {
+		if (machine->cheat.dirty) {
+			memcpy(cheatFlash, machine->cheat.flash, CHEAT_FLASH_SIZE);
+			machine->cheat.dirty = false;
+		}
+		if (++topSaveFrames >= 600) {
+			topSaveFlush();
+			topSaveFrames = 0;
+		}
 	}
 	bool shared = hw.context_type != RETRO_HW_CONTEXT_NONE;
 	if (!shared) {
@@ -1485,6 +1640,12 @@ void retro_run(void) {
 		}
 	}
 	readPorts();
+	if (cheatCart && machine->cheat.flash) {
+		unsigned const button = optionIs(environment, "armn64_cheat_button", "l3") ? RETRO_DEVICE_ID_JOYPAD_L3
+		                        : optionIs(environment, "armn64_cheat_button", "disabled")   ? UINT_MAX
+		                                                                                     : RETRO_DEVICE_ID_JOYPAD_R3;
+		machine->cheat.button = button != UINT_MAX && inputState(0, RETRO_DEVICE_JOYPAD, 0, button);
+	}
 	if (machine->skip.automatic) {
 		// A longer audio buffer gives the skips time to catch up.
 		if (!latencySet) {
@@ -1597,7 +1758,7 @@ unsigned retro_get_region(void) {
 
 void* retro_get_memory_data(unsigned id) {
 	if (id == RETRO_MEMORY_SAVE_RAM) {
-		return saveMemory;
+		return cheatCart ? cheatFlash : saveMemory;
 	}
 	if (id == RETRO_MEMORY_SYSTEM_RAM && machine) {
 		if (!ramView && (ramView = malloc(RDRAM_SIZE))) {
@@ -1611,7 +1772,7 @@ void* retro_get_memory_data(unsigned id) {
 
 size_t retro_get_memory_size(unsigned id) {
 	if (id == RETRO_MEMORY_SAVE_RAM) {
-		return SAVE_SIZE;
+		return cheatCart ? CHEAT_FLASH_SIZE : SAVE_SIZE;
 	}
 	if (id == RETRO_MEMORY_SYSTEM_RAM && machine) {
 		return RDRAM_SIZE;

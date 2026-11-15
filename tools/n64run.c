@@ -238,6 +238,23 @@ int main(int argc, char** argv) {
 		}
 		free(changes);
 	}
+	// N64CHEATCART=path: a cheat cartridge's ROM, the game on top of it; N64CHEATFLASH=path its flash as
+	// kept (read before the run if there, written after it).
+	if (getenv("N64CHEATCART") && n) {
+		size_t cartSize;
+		uint8_t* cart = readFile(getenv("N64CHEATCART"), &cartSize);
+		if (!cart || !cheatCartLoad(n, cart, cartSize)) {
+			fprintf(stderr, "can't load the cheat cartridge %s\n", getenv("N64CHEATCART"));
+			return 1;
+		}
+		free(cart);
+		size_t flashSize;
+		uint8_t* flash = getenv("N64CHEATFLASH") ? readFile(getenv("N64CHEATFLASH"), &flashSize) : NULL;
+		if (flash && flashSize == 0x40000) {
+			memcpy(n->cheat.flash, flash, flashSize);
+		}
+		free(flash);
+	}
 	if (!data || !n || (!diskGame && !n64LoadRom(n, data, size)) || (diskGame && !iplPath)) {
 		fprintf(stderr, "can't load %s\n", argv[1]);
 		return 1;
@@ -374,6 +391,17 @@ int main(int argc, char** argv) {
 		rdpDumping = rdpDump && f >= rdpDumpFrom;
 		// N64CHEAT=code: a GameShark code (codes joined by "+") applied before each field.
 		static struct Cheats cheats;
+		// N64CHEATBUTTON="from-to,...": the cheat cartridge's button held over those fields.
+		if (n->cheat.flash) {
+			bool held = false;
+			for (const char* p = getenv("N64CHEATBUTTON"); p && *p; p = strchr(p, ',') ? strchr(p, ',') + 1 : NULL) {
+				int from, to;
+				if (sscanf(p, "%d-%d", &from, &to) == 2 && f >= from && f < to) {
+					held = true;
+				}
+			}
+			n->cheat.button = held;
+		}
 		if (f == 0 && getenv("N64CHEAT")) {
 			cheatsSet(&cheats, 0, true, getenv("N64CHEAT"));
 		}
@@ -561,6 +589,13 @@ int main(int argc, char** argv) {
 		free(image);
 	}
 	rdpWait(n);
+	if (n->cheat.flash && n->cheat.dirty && getenv("N64CHEATFLASH")) {
+		FILE* f = fopen(getenv("N64CHEATFLASH"), "wb");
+		if (f) {
+			fwrite(n->cheat.flash, 1, 0x40000, f);
+			fclose(f);
+		}
+	}
 	if (getenv("N64SAVEDUMP")) {
 		FILE* f = fopen(getenv("N64SAVEDUMP"), "wb");
 		for (size_t i = 0; f && i < sizeof(saves) / sizeof(*saves); ++i) {

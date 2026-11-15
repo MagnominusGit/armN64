@@ -31,7 +31,7 @@ else()
 	set(JIT_SOURCES src/jit_none.c)
 endif()
 
-add_library(n64 STATIC src/n64.c src/blocks.c ${JIT_SOURCES} src/cpu.c src/fpu.c src/fpu_fast.c src/bus.c src/pif.c src/rsp.c src/rsp_vu.c src/rspthread.c src/rdp.c src/hle.c src/gles.c src/glr.c src/carts.c src/gbcart.c src/dd.c src/state.c src/cheats.c
+add_library(n64 STATIC src/n64.c src/blocks.c ${JIT_SOURCES} src/cpu.c src/fpu.c src/fpu_fast.c src/bus.c src/pif.c src/rsp.c src/rsp_vu.c src/rspthread.c src/rdp.c src/hle.c src/gles.c src/glr.c src/carts.c src/cheatcart.c src/gbcart.c src/dd.c src/state.c src/cheats.c
 	src/audio_hle/audio_hle.c src/audio_hle/alist.c src/audio_hle/alist_audio.c src/audio_hle/alist_naudio.c src/audio_hle/alist_nead.c
 	src/audio_hle/audio.c src/audio_hle/memory.c src/audio_hle/mp3.c src/audio_hle/musyx.c src/audio_hle/re2.c src/audio_hle/hvqm.c)
 # The audio HLE stores words into halfword arrays through casts, as mupen64plus does.
@@ -68,9 +68,16 @@ add_custom_command(OUTPUT ${CMAKE_CURRENT_BINARY_DIR}/paks_font.inc
 set(PAKS_SOURCES libretro/paks.c ${CMAKE_CURRENT_BINARY_DIR}/paks_font.inc)
 set(PAKS_INCLUDES ${CMAKE_CURRENT_BINARY_DIR} ${CMAKE_CURRENT_SOURCE_DIR}/shared)
 
-add_library(armn64_libretro SHARED libretro/libretro.c shared/libretro/options.c ${PAKS_SOURCES})
+# Games on top of a cheat cartridge read out of a .zip too, where zlib is there.
+find_package(ZLIB QUIET)
+add_library(armn64_libretro SHARED libretro/libretro.c libretro/games.c shared/libretro/options.c ${PAKS_SOURCES})
 target_include_directories(armn64_libretro PRIVATE ${PAKS_INCLUDES} shared/libretro)
 target_link_libraries(armn64_libretro n64)
+if(ZLIB_FOUND)
+	set_source_files_properties(libretro/games.c PROPERTIES COMPILE_DEFINITIONS ARMN64_ZIP)
+	target_link_libraries(armn64_libretro ZLIB::ZLIB)
+	set(GAMES_ZLIB ZLIB::ZLIB)
+endif()
 set_target_properties(armn64_libretro PROPERTIES PREFIX "")
 target_link_options(armn64_libretro PRIVATE -Wl,--version-script=${CMAKE_CURRENT_SOURCE_DIR}/shared/libretro/link.T -Wl,--no-undefined)
 
@@ -80,5 +87,5 @@ option(ARMN64_APP "Build armn64, the standalone SDL2 app" OFF)
 if(ARMN64_APP)
 	add_subdirectory(armulators)
 	armulators_app(armn64-app DESCRIPTOR ${CMAKE_CURRENT_SOURCE_DIR}/app.cmake
-		SOURCES libretro/libretro.c ${PAKS_SOURCES} app/hooks.c INCLUDES ${CMAKE_CURRENT_SOURCE_DIR}/libretro ${PAKS_INCLUDES} LIBS n64)
+		SOURCES libretro/libretro.c libretro/games.c ${PAKS_SOURCES} app/hooks.c INCLUDES ${CMAKE_CURRENT_SOURCE_DIR}/libretro ${PAKS_INCLUDES} LIBS n64 ${GAMES_ZLIB})
 endif()

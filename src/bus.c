@@ -255,6 +255,10 @@ void aiUpdate(struct N64* n) {
 }
 
 static uint8_t cartByte(struct N64* n, uint32_t c) {
+	uint16_t h;
+	if (n->cheat.flash && c >= 0x10000000 && c < 0x1FC00000 && cheatCartRead16(n, c, &h)) {
+		return c & 1 ? (uint8_t) h : (uint8_t) (h >> 8);
+	}
 	if (c >= 0x10000000 && c - 0x10000000 < n->romSize) {
 		return n->rom[c - 0x10000000];
 	}
@@ -385,6 +389,8 @@ static void piDma(struct N64* n, uint32_t len, bool toRdram) {
 				cartSaveStore(n, c - 0x08000000, n->rdram[(dram + i) & (RDRAM_SIZE - 1)]);
 			} else if (c >= 0x05000000 && c < 0x06000000) {
 				ddWriteByte(n, c, n->rdram[(dram + i) & (RDRAM_SIZE - 1)]);
+			} else if (n->cheat.flash && c >= 0x10000000 && c < 0x1FC00000 && !(i & 1)) {
+				cheatCartWrite16(n, c, (uint16_t) (n->rdram[(dram + i) & (RDRAM_SIZE - 1)] << 8 | n->rdram[(dram + i + 1) & (RDRAM_SIZE - 1)]));
 			}
 		}
 		n->pi.dramAddr = dram + len;
@@ -485,6 +491,16 @@ uint32_t busRead32(struct N64* n, uint32_t addr) {
 		if (n->bootChecksumReads && (off == 0x10 || off == 0x14) && (n->bootChecksumReads & (off == 0x10 ? 1 : 2))) {
 			n->bootChecksumReads &= off == 0x10 ? 2 : 1;
 			return n->bootChecksum[off == 0x14];
+		}
+		if (n->cheat.flash) {
+			uint16_t half[2];
+			for (int k = 0; k < 2; ++k) {
+				uint32_t const at = (addr & ~3u) + 2u * (uint32_t) k, game = at - 0x10000000;
+				if (!cheatCartRead16(n, at, &half[k])) {
+					half[k] = game + 2 <= n->romSize ? (uint16_t) (n->rom[game] << 8 | n->rom[game + 1]) : 0;
+				}
+			}
+			return (uint32_t) half[0] << 16 | half[1];
 		}
 		return off + 4 <= n->romSize ? be32(&n->rom[off]) : 0;
 	}
@@ -857,6 +873,10 @@ void busWrite32(struct N64* n, uint32_t addr, uint32_t v) {
 		// While one write is on the bus, others are lost.
 		if (n->pi.romLatched && n->cycles < n->pi.romLatchUntil) {
 			return;
+		}
+		if (n->cheat.flash) {
+			cheatCartWrite16(n, addr & ~3u, (uint16_t) (v >> 16));
+			cheatCartWrite16(n, (addr & ~3u) + 2, (uint16_t) v);
 		}
 		n->pi.romLatch = v;
 		n->pi.romLatched = true;

@@ -31,7 +31,17 @@ void pifBoot(struct N64* n) {
 	struct CPU* c = &n->cpu;
 	// Without a cartridge, the 64DD's IPL ROM boots, its lockout chip known by the ROM's ID.
 	bool disk = n->romSize < 0x1000 && ddPresent(n);
-	const uint8_t* boot = disk ? n->dd.ipl : n->rom;
+	// With a cheat cartridge, the boot reads its header and program with the game's boot code between.
+	enum { VIEW = 0x101000 };
+	uint8_t* view = n->cheat.flash && !disk && n->romSize >= 0x1000 ? malloc(VIEW) : NULL;
+	for (uint32_t i = 0; view && i < VIEW; i += 2) {
+		uint16_t h;
+		if (!cheatCartRead16(n, 0x10000000 + i, &h)) {
+			h = i + 2 <= n->romSize ? (uint16_t) (n->rom[i] << 8 | n->rom[i + 1]) : 0;
+		}
+		view[i] = (uint8_t) (h >> 8), view[i + 1] = (uint8_t) h;
+	}
+	const uint8_t* boot = disk ? n->dd.ipl : view ? view : n->rom;
 	uint32_t crc = n->romSize >= 0x1000 ? crc32(n->rom + 0x40, 0x1000 - 0x40) : 0;
 	uint8_t seed = 0x3F;
 	n->cic = 6102;
@@ -47,11 +57,12 @@ void pifBoot(struct N64* n) {
 		seed = us ? 0xDE : 0xDD;
 	}
 	if (!boot) {
+		free(view);
 		return;
 	}
 	// Only for the standard boot codes: others check what they load their own way.
 	bool standard = n->cic >= 6101 && n->cic <= 7102 && n->cic != 8303;
-	n->bootChecksumReads = !disk && standard && cartBootChecksum(n->rom, n->romSize, n->cic, seed, n->bootChecksum) ? 3 : 0;
+	n->bootChecksumReads = !disk && standard && cartBootChecksum(view ? view : n->rom, view ? VIEW : n->romSize, n->cic, seed, n->bootChecksum) ? 3 : 0;
 	memcpy(n->sp.mem + 0x40, boot + 0x40, 0xFC0);
 	// The PIF leaves a short routine in IMEM, which the 6105 boot code relies on.
 	static const uint32_t imem[8] = {
@@ -72,7 +83,7 @@ void pifBoot(struct N64* n) {
 	// TV type from the cartridge's region (N64_TV=ntsc, pal or mpal picks the console's instead,
 	// for dumps whose header names another region): 0 PAL, 1 NTSC, 2 MPAL (Brazil).
 	const char* tv = getenv("N64_TV");
-	switch (tv && !strcmp(tv, "ntsc") ? 'E' : tv && !strcmp(tv, "pal") ? 'P' : tv && !strcmp(tv, "mpal") ? 'B' : boot[0x3E]) {
+	switch (tv && !strcmp(tv, "ntsc") ? 'E' : tv && !strcmp(tv, "pal") ? 'P' : tv && !strcmp(tv, "mpal") ? 'B' : view ? n->rom[0x3E] : boot[0x3E]) {
 	case 'D': case 'F': case 'H': case 'I': case 'L': case 'P': case 'S': case 'U': case 'W': case 'X': case 'Y':
 		c->gpr[20] = 0;
 		break;
@@ -128,6 +139,7 @@ void pifBoot(struct N64* n) {
 		c->pc = (uint64_t) (int64_t) (int32_t) entry;
 		c->nextPc = c->pc + 4;
 	}
+	free(view);
 }
 
 // The CRC a controller sends after a pak's 32 bytes (polynomial 0x85, as libultra checks it).

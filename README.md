@@ -30,6 +30,11 @@ first. Please report problems in Issues.
   holds the Game Boy ROM in `system/armN64/TransferPak1` (to `4`), with its save beside it.
 - GameShark cheats, RetroAchievements (with memory as mupen64plus-next lays it out, which the sets
   are made on), save states, rewind and run-ahead.
+- Cheat cartridges: a GameShark Pro or Action Replay Pro ROM (a file named for one) runs as the
+  cartridge itself, its menus and code lists, with a game plugged in on top (Game on Top). Its flash
+  is the cartridge's save; the game on top keeps its own save, as when it runs by itself. Version
+  3.x cartridges start games with the 6102 and 6105 lockout chips; games with the 6103 chip, and
+  version 2.0 cartridges, don't start yet.
 
 ## Controls
 
@@ -56,6 +61,7 @@ effect while the game runs, the Expansion Pak's when the game restarts.
 | | Overclock | Off, 1.5x, 2x, 2.5x, 3x, 4x |
 | | Frame Skip | Off, Auto, Every Other Frame |
 | | Expansion Pak (at the next restart) | On, Off |
+| | Game on Top (with a cheat cartridge; at the next restart) | None, the games beside the cartridge |
 | Video | Renderer | GL (Fast, HD), GPU (Exact, HD), CPU (Exact, Native) |
 | | Resolution (GL and GPU) | 2x, Auto, Native, 3x to 8x |
 | | Resolution Scaling (GL) | Fixed (320x240), Internal |
@@ -76,6 +82,7 @@ effect while the game runs, the Expansion Pak's when the game restarts.
 | | C Buttons on Face Buttons | R2 + Face Buttons, Off |
 | | Control Swap | Off, D-Pad / Left Stick, Both Sticks, Left / Right Stick |
 | | Control Swap Hotkeys | Start + D-Pad / R3, L3 + R3; Select + D-Pad / R3, L3 + R3; Off |
+| | Cheat Cartridge Button (with a cheat cartridge) | R3, L3, Off |
 | | Dual Controllers | Off, On |
 | | Controller Rumble | Off, On |
 | Controller Paks | Player 1 to 4 Pak | Controller Pak, Rumble Pak, Transfer Pak, None |
@@ -278,7 +285,8 @@ Code taken from other projects, each under its own license (see License):
 - **Inter** (The Inter Project Authors, OFL-1.1): the Controller Pak Manager's font, in `shared/`.
 
 Read for how the hardware behaves, without code taken: **Angrylion's RDP**, the **cxd4** RSP and
-**n64brew**. Test ROMs: Dillon's n64-tests, pdrome's timing ROM, Peter Lemon's suites, and homebrew
+**n64brew**; the cheat cartridges' logic chip from **RWeick's and Jhynjhiruu's LZ9FC17
+reconstruction** (REF1329-N64-Gameshark-Clone) and **Parasyte**'s register notes. Test ROMs: Dillon's n64-tests, pdrome's timing ROM, Peter Lemon's suites, and homebrew
 by rasky, meeq and others.
 
 ## AI assistance
