@@ -1011,7 +1011,9 @@ static void drawTriangle(struct N64* n, struct Hle* h, int i0, int i1, int i2) {
 				poly[cur ^ 1][out++] = *a;
 			}
 			if ((da >= 0) != (db >= 0) && out < 9) {
-				poly[cur ^ 1][out++] = lerp(a, b, da / (da - db));
+				// From the corner inside to the one outside, so that a triangle next to this one, going
+				// round their shared edge the other way, cuts it at the same point.
+				poly[cur ^ 1][out++] = da >= 0 ? lerp(a, b, da / (da - db)) : lerp(b, a, db / (db - da));
 				// A new corner's fog comes from its own depth, as the microcodes work it out.
 				if (h->geometry & GEOM_FOG) {
 					poly[cur ^ 1][out - 1].a = fogAlpha(h, &poly[cur ^ 1][out - 1]);
