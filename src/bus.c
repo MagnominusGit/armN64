@@ -32,6 +32,14 @@ static void spDma(struct N64* n, uint32_t lenReg, bool toRdram) {
 	uint32_t dram = n->sp.dramAddr & 0xFFFFF8;
 	for (uint32_t row = 0; row < count; ++row) {
 		spDmaPages(n, dram, len, toRdram);
+		if (!toRdram) {
+			for (uint32_t p = (dram & (RDRAM_SIZE - 1)) >> 12;; p = (p + 1) & ((RDRAM_SIZE >> 12) - 1)) {
+				n->pageFlags[p] |= PAGE_RSP_READS;
+				if (p == ((dram + len - 1) & (RDRAM_SIZE - 1)) >> 12) {
+					break;
+				}
+			}
+		}
 		if ((mem & 0xFFF) + len <= 0x1000 && (dram & 0xFFFFFF) + len <= RDRAM_SIZE) {
 			// The row wraps neither memory.
 			uint8_t* sp = &n->sp.mem[base | (mem & 0xFFF)];
@@ -143,6 +151,7 @@ static void spWriteStatus(struct N64* n, uint32_t v) {
 	}
 	if (v & 2) {
 		*s |= 1;
+		rspReadsForget(n);
 	}
 	if (v & 4) {
 		*s &= ~2u;

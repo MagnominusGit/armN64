@@ -285,6 +285,7 @@ static void storeBytes(struct N64* n, uint32_t addr, int size, uint32_t v) {
 static void halt(struct N64* n) {
 	audioCheckEnd(n);
 	n->sp.status |= 3;
+	rspReadsForget(n);
 	if (n->sp.status & 0x40) {
 		spInterrupt(n, true);
 	}

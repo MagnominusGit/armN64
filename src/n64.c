@@ -291,6 +291,15 @@ void rspCatchUp(struct N64* n) {
 	n->catchingUp = false;
 }
 
+// Before a CPU write the running RSP may read (rspSeesWrite): caught up when more than a few RSP cycles
+// behind, so a CPU writing such a page over and over doesn't run it in tiny steps.
+void rspCatchUpWrite(struct N64* n) {
+	enum { SLACK = 256 };
+	if (rspCycles(n) > n->rsp.clock + SLACK) {
+		rspCatchUp(n);
+	}
+}
+
 // When the beam reaches the V_INTR line in the field from start (never if the field is shorter).
 static uint64_t viIntrAt(struct N64* n, uint64_t start) {
 	uint32_t lines = (n->vi.reg[6] & 0x3FF) + 1, line = n->vi.reg[3] & 0x3FF;

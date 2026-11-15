@@ -1616,10 +1616,12 @@ static void markWritten(struct Emitter* e) {
 	aStrb(e, ZR, 2, N64_OFF(dirtyPages) - N64_OFF(pageFlags));
 }
 
-// cpuRdpWaitRead or cpuRdpWaitWrite for the physical address in w6 (w0 kept); the pool's
-// caller-saved registers are lost.
+// cpuRdpWaitRead or cpuRdpWaitWrite for the physical address in w6 (w0 kept), at the cycle the code
+// has reached (the RSP may catch up to it); the pool's caller-saved registers are lost.
 static void rdpWaitCall(struct Emitter* e, const void* f, int size) {
 	aPush(e, 0, 6, 16);
+	aDp(e, A_SUB | W64, 1, LIMIT, LEFT, S_LSL, 0);
+	storeN(e, 1, N64_OFF(cycles), 8);
 	aMovX(e, 0, N);
 	aMov(e, 1, 6);
 	aMovImm(e, 2, (uint32_t) size);
@@ -2686,11 +2688,11 @@ void* jitCompile(struct N64* n, const uint32_t* ops, uint32_t count, uint32_t va
 			flushDirty(e, &k->cache);
 			struct Cache clean = k->cache;
 			clean.dirty = 0;
-			// Past RDRAM, the interpreter. On a page the RDP draws to or reads, it waits for the RDP
-			// there in C first.
+			// Past RDRAM, the interpreter. On a page the RDP draws to or reads, or the running RSP's DMA read,
+			// it waits for them there in C first.
 			aLsrImm(e, 2, 6, 23);
 			slowSite(k->slow, aCbnz(e, 2, NULL), &clean);
-			aLogicImm(e, A_ANDS_IMM, ZR, 1, PAGE_RDP);
+			aLogicImm(e, A_ANDS_IMM, ZR, 1, PAGE_RDP | PAGE_RSP_READS);
 			uint8_t* noRdp = aBcond(e, C_EQ, NULL);
 			rdpWaitCall(e, (const void*) cpuRdpWaitWrite, k->size);
 			reloadPool(e, &k->cache);

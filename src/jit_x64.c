@@ -1393,8 +1393,10 @@ static void fprAddress(struct Emitter* e, int ft, int size) {
 // dataTiming's D-cache check. Anything else jumps to the slow path before any change: a page not
 // looked up, and a misaligned address, fail the tag check and leave from the miss path. eax is the
 // physical address and r8d the virtual one.
-// cpuRdpWaitRead or cpuRdpWaitWrite for the physical address in eax (the virtual one in r8 kept).
+// cpuRdpWaitRead or cpuRdpWaitWrite for the physical address in eax (the virtual one in r8 kept), at
+// the cycle the code has reached (the RSP may catch up to it).
 static void rdpWaitCall(struct Emitter* e, const void* f, int size) {
+	xStore(e, 8, N64_AT(cycles), R13);
 	xPush(e, RAX);
 	xPush(e, R8);
 	xMovRR(e, 8, RDI, RBX);
@@ -1954,11 +1956,11 @@ void* jitCompile(struct N64* n, const uint32_t* ops, uint32_t count, uint32_t va
 	for (int i = 0; i < j->codeCheckCount; ++i) {
 		struct Miss* k = &j->codeChecks[i];
 		patchHere(e, k->site);
-		// Past RDRAM, the interpreter. On a page the RDP draws to or reads, it waits for the RDP
-		// there in C first.
+		// Past RDRAM, the interpreter. On a page the RDP draws to or reads, or the running RSP's DMA read,
+		// it waits for them there in C first.
 		xTestI(e, 4, R(RAX), ~(uint32_t) (RDRAM_SIZE - 1));
 		k->slow->site[k->slow->sites++] = xJcc(e, CC_NE, NULL);
-		xTestI(e, 1, MI(RBX, RCX, 1, (int32_t) offsetof(struct N64, pageFlags)), PAGE_RDP);
+		xTestI(e, 1, MI(RBX, RCX, 1, (int32_t) offsetof(struct N64, pageFlags)), PAGE_RDP | PAGE_RSP_READS);
 		uint8_t* noRdp = xJcc(e, CC_E, NULL);
 		rdpWaitCall(e, (const void*) cpuRdpWaitWrite, k->size);
 		xMovRR(e, 4, RCX, RAX);

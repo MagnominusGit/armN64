@@ -221,8 +221,9 @@ enum { ACCURACY_LLE, ACCURACY_MLE, ACCURACY_HLE };
 // generators).
 enum { ICACHE_FILL = 44, DCACHE_FILL = 33, DCACHE_WRITEBACK = 40 };
 
-// Per 4 KB page of RDRAM: it holds compiled code, or RDP commands not yet drawn write or read it.
-enum { PAGE_CODE = 1, PAGE_RDP_WRITES = 2, PAGE_RDP_READS = 4, PAGE_RDP = 6 };
+// Per 4 KB page of RDRAM: it holds compiled code, or RDP commands not yet drawn write or read it, or the
+// running RSP's DMA has read it.
+enum { PAGE_CODE = 1, PAGE_RDP_WRITES = 2, PAGE_RDP_READS = 4, PAGE_RDP = 6, PAGE_RSP_READS = 8 };
 
 // Compiled RSP code for an IMEM address, good while rspCodeGen is unchanged.
 struct RspJitEntry {
@@ -688,12 +689,30 @@ static inline bool n64HoldsCode(struct N64* n, uint32_t p, uint32_t addr, uint32
 	return false;
 }
 
-// RDRAM [addr, addr + len) is about to be written: throws away blocks there, and waits for RDP
-// commands that draw there or read it.
+void rspCatchUpWrite(struct N64*);
+
+// A write to a page the running RSP's DMA has read: the RSP first runs to about now, so what it reads
+// before then is what was there (the CPU runs ahead of it by up to a slice).
+static inline void rspSeesWrite(struct N64* n, uint32_t page) {
+	if ((n->pageFlags[page] & PAGE_RSP_READS) && !(n->sp.status & 1)) {
+		rspCatchUpWrite(n);
+	}
+}
+
+// The RSP halted: its DMA reads no longer need the CPU's writes in order.
+static inline void rspReadsForget(struct N64* n) {
+	for (uint32_t p = 0; p < (RDRAM_SIZE >> 12); ++p) {
+		n->pageFlags[p] &= (uint8_t) ~PAGE_RSP_READS;
+	}
+}
+
+// RDRAM [addr, addr + len) is about to be written: throws away blocks there, waits for RDP commands
+// that draw there or read it, and has the RSP catch up to it where its DMA read.
 static inline void n64RdramWrite(struct N64* n, uint32_t addr, uint32_t len) {
 	uint32_t first = (addr & (RDRAM_SIZE - 1)) >> 12, last = ((addr + len - 1) & (RDRAM_SIZE - 1)) >> 12;
 	for (uint32_t p = first;; p = (p + 1) & ((RDRAM_SIZE >> 12) - 1)) {
 		n->dirtyPages[p] = 0;
+		rspSeesWrite(n, p);
 		if (n->pageFlags[p] & PAGE_RDP) {
 			rdpWaitFor(n, addr, len);
 		}

@@ -140,10 +140,13 @@ void cpuRdpWaitRead(struct N64* n, uint32_t paddr, uint32_t len) {
 	}
 }
 
-// And a store, as n64RdramWrite has it for the RDP.
+// And a store, as n64RdramWrite has it for the RDP and the RSP.
 void cpuRdpWaitWrite(struct N64* n, uint32_t paddr, uint32_t len) {
 	if (paddr < RDRAM_SIZE) {
-		rdpWaitFor(n, paddr, len);
+		if (n->pageFlags[paddr >> 12] & PAGE_RDP) {
+			rdpWaitFor(n, paddr, len);
+		}
+		rspSeesWrite(n, paddr >> 12);
 	}
 }
 
