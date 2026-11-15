@@ -401,8 +401,10 @@ static void piDma(struct N64* n, uint32_t len, bool toRdram) {
 	uint64_t rcp = piDmaCycles(n, cart, len);
 	// Emulators that hacks were made on finish a DMA in a quarter cycle a byte (mle accuracy). The
 	// PI's timings count the RCP's cycles, so it overclocks with the RSP (the 6105 boot's RSP gives
-	// up waiting for the boot's DMA after so many of its own cycles: Donkey Kong 64).
-	n->pi.busyUntil = n->cycles + (n->compat && !n->hardwarePi ? len / 4 + 1 : rcp * 3 / 2);
+	// up waiting for the boot's DMA after so many of its own cycles: Donkey Kong 64). A cheat
+	// cartridge's menu needs the hardware's time for its boot, up to its first SI DMA.
+	bool const hardware = n->hardwarePi || (n->cheat.flash && !n->stats.siDmas);
+	n->pi.busyUntil = n->cycles + (n->compat && !hardware ? len / 4 + 1 : rcp * 3 / 2);
 	n64Event(n, n->pi.busyUntil);
 	n->pi.status |= 1;
 }
@@ -441,7 +443,7 @@ static uint32_t viCurrent(struct N64* n) {
 	return (line % lines & ~1u) | field;
 }
 
-enum { RDRAM_INIT_CYCLES = 2000000 };
+enum { RDRAM_INIT_CYCLES = 9050000 };
 
 // SP memory and registers, DP and MI registers: what the RSP (and the RDP it drives) can change or see.
 // With the RSP on its own thread its interrupt reaches MI only as it is caught up: MI is the CPU's.
@@ -610,9 +612,9 @@ uint32_t busRead32(struct N64* n, uint32_t addr) {
 		uint32_t* r = reg(n->riReg, addr, 8);
 		// The RI comes up initialised (pifBoot), so the boot code skips the RDRAM set-up it does
 		// after a power-on: device numbering and current calibration of each chip. That takes
-		// about 20 ms (estimated from the 6102 boot code); it's spent here, at the boot code's first
-		// look at RI_SELECT. Games time their start from the Count the boot code zeroes just before
-		// (BattleTanx needs the time).
+		// about 97 ms (the 6102 boot code's in ares, which runs it); it's spent here, at the boot
+		// code's first look at RI_SELECT. Games time their start from the Count the boot code zeroes
+		// just before (BattleTanx and a cheat cartridge's menu need the time).
 		if ((addr & 0x1F) == 0x0C && n->coldBoot) {
 			n->coldBoot = false;
 			n->cpu.stall += RDRAM_INIT_CYCLES;

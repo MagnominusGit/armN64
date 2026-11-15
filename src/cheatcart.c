@@ -120,7 +120,9 @@ static int part(uint32_t a) {
 	if (rel >= 0x20000 && rel <= 0x2FFFFF) {
 		return PART_ZERO;
 	}
-	if (section == 3 || section == 9 || section == 0xB || section == 0xC || ((section == 0xE || section == 0xF) && !(a & 2))) {
+	// In sections E and F the flash is off for a word's second halfword, but the bus keeps the first's
+	// data, from the same flash address.
+	if (section == 3 || section == 9 || section == 0xB || section == 0xC || section == 0xE || section == 0xF) {
 		return PART_FLASH;
 	}
 	if (section == 4 && !((a >> 10) & 15)) {
@@ -274,7 +276,7 @@ bool cheatCartWrite16(struct N64* n, uint32_t a, uint16_t v) {
 		}
 		return true;
 	}
-	if (part(a) == PART_FLASH) {
+	if (part(a) == PART_FLASH && !((section == 0xE || section == 0xF) && (a & 2))) {
 		uint32_t const address = flashAddress(c, a);
 		if (c->loading[0] && (address & ~0x7Fu) != c->page[0] && c->page[0] != UINT32_MAX) {
 			pageLoadsEnd(c);

@@ -34,7 +34,7 @@ first. Please report problems in Issues.
   cartridge itself, its menus and code lists, with a game plugged in on top (Game on Top). Its flash
   is the cartridge's save; the game on top keeps its own save, as when it runs by itself. As on a
   real one, games with the 6103 lockout chip start only with their enabler (Must Be On) code turned
-  on in the cartridge's list. Version 2.0 cartridges don't start yet.
+  on in the cartridge's list.
 
 ## Controls
 
