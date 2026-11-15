@@ -286,8 +286,8 @@ struct Glr {
 	GLint gammaSource;
 	int gammaWidth, gammaHeight;
 	bool gammaTried;
-	// Seal Edges (N64_GL_SEAL): how far, in the target's pixels, opaque triangles reach past their
-	// edges to cover the cracks between them that show at higher scales.
+	// Seal Edges (N64_GL_SEAL): how far, in the RDP's pixels, opaque triangles reach past their lower
+	// and right edges to cover the cracks between them that the RDP's coverage fills (sealOutline).
 	float seal;
 	// The scale of the target drawn to, for the scissor.
 	int drawScale;
@@ -2302,7 +2302,7 @@ static bool drawState(struct N64* n, struct Glr* g, struct RDP* r, bool textured
 
 // A primitive's rows y0 to y1 - 1 in the state's target: they go back to RDRAM, their pages wait.
 static bool drawRows(struct N64* n, struct Glr* g, struct RDP* r, int rows, int y0, int y1) {
-	if (g->batchCount + 6 > BATCH_VERTICES) {
+	if (g->batchCount + 12 > BATCH_VERTICES) {
 		flushBatch(n, g);
 	}
 	if (g->state.depthOnly) {
@@ -2388,54 +2388,72 @@ void glrQueueClear(struct N64* n) {
 	}
 }
 
-// Corners moved out so each edge is d further out, and their values carried on from the triangle's
-// planes. A sharp corner's move is held to four times d.
-static void sealCorners(struct GlrCorners* q, float d) {
-	float (*v)[10] = q->v;
+// The triangle grown past its edges as the RDP's coverage reaches past them (its samples a quarter
+// line above a pixel's middle to a quarter below; so further down and right than up and left): an
+// edge facing down or right moves out d, one facing up or left stays. Its corners' values carried
+// on (planar), as up to six points around: a corner sharper than 60 degrees cut off, so that every
+// edge moves out its whole way (a single point there would move a long edge next to it by much
+// less). 0 when it can't.
+static int sealOutline(const struct GlrCorners* q, float d, float out[6][10]) {
+	const float (*v)[10] = q->v;
 	float const area = (v[1][0] - v[0][0]) * (v[2][1] - v[0][1]) - (v[2][0] - v[0][0]) * (v[1][1] - v[0][1]);
 	if (fabsf(area) < 1e-3f) {
-		return;
+		return 0;
 	}
 	// Each edge's outward normal, the edge from corner i to the next.
 	float nx[3], ny[3];
 	for (int i = 0; i < 3; ++i) {
 		float const ex = v[(i + 1) % 3][0] - v[i][0], ey = v[(i + 1) % 3][1] - v[i][1], len = sqrtf(ex * ex + ey * ey);
 		if (len < 1e-6f) {
-			return;
+			return 0;
 		}
 		nx[i] = (area > 0 ? ey : -ey) / len, ny[i] = (area > 0 ? -ex : ex) / len;
 	}
-	float out[3][10];
+	float o[3];
+	for (int i = 0; i < 3; ++i) {
+		o[i] = d * fminf(fmaxf(0.5f + 0.5f * (nx[i] + ny[i]), 0), 1);
+	}
+	int count = 0;
 	for (int i = 0; i < 3; ++i) {
 		int const p = (i + 2) % 3;
-		float const k = d / fmaxf(1 + nx[p] * nx[i] + ny[p] * ny[i], 0.125f);
-		float const x = v[i][0] + (nx[p] + nx[i]) * k, y = v[i][1] + (ny[p] + ny[i]) * k;
-		float const b1 = ((x - v[0][0]) * (v[2][1] - v[0][1]) - (v[2][0] - v[0][0]) * (y - v[0][1])) / area;
-		float const b2 = ((v[1][0] - v[0][0]) * (y - v[0][1]) - (x - v[0][0]) * (v[1][1] - v[0][1])) / area;
-		out[i][0] = x, out[i][1] = y;
-		for (int a = 2; a < 10; ++a) {
-			out[i][a] = v[0][a] + b1 * (v[1][a] - v[0][a]) + b2 * (v[2][a] - v[0][a]);
+		float const dot = nx[p] * nx[i] + ny[p] * ny[i], det = nx[p] * ny[i] - ny[p] * nx[i];
+		float at[2][2];
+		int points = 1;
+		if (dot >= -0.5f && fabsf(det) > 1e-3f) {
+			// Where the two moved edges meet.
+			at[0][0] = v[i][0] + (o[p] * ny[i] - o[i] * ny[p]) / det, at[0][1] = v[i][1] + (nx[p] * o[i] - nx[i] * o[p]) / det;
+		} else if (dot >= -0.5f) {
+			at[0][0] = v[i][0] + nx[i] * o[i], at[0][1] = v[i][1] + ny[i] * o[i];
+		} else {
+			at[0][0] = v[i][0] + nx[p] * o[p], at[0][1] = v[i][1] + ny[p] * o[p];
+			at[1][0] = v[i][0] + nx[i] * o[i], at[1][1] = v[i][1] + ny[i] * o[i];
+			points = 2;
 		}
-		out[i][2] = fminf(fmaxf(out[i][2], 0), 1);
-		out[i][3] = fmaxf(out[i][3], 1e-6f);
-		for (int a = 4; a < 8; ++a) {
-			out[i][a] = fminf(fmaxf(out[i][a], 0), 1);
+		for (int j = 0; j < points; ++j, ++count) {
+			float const x = at[j][0], y = at[j][1];
+			float const b1 = ((x - v[0][0]) * (v[2][1] - v[0][1]) - (v[2][0] - v[0][0]) * (y - v[0][1])) / area;
+			float const b2 = ((v[1][0] - v[0][0]) * (y - v[0][1]) - (x - v[0][0]) * (v[1][1] - v[0][1])) / area;
+			out[count][0] = x, out[count][1] = y;
+			for (int a = 2; a < 10; ++a) {
+				out[count][a] = v[0][a] + b1 * (v[1][a] - v[0][a]) + b2 * (v[2][a] - v[0][a]);
+			}
+			out[count][2] = fminf(fmaxf(out[count][2], 0), 1);
+			out[count][3] = fmaxf(out[count][3], 1e-6f);
+			for (int a = 4; a < 8; ++a) {
+				out[count][a] = fminf(fmaxf(out[count][a], 0), 1);
+			}
 		}
 	}
-	memcpy(v, out, sizeof(out));
+	return count;
 }
 
 // The HLE's triangle from its corners.
 static void triangle(struct N64* n, struct Glr* g, struct RDP* r, const struct GlrCorners* q) {
 	// Opaque ones sealed: one that blends with the image would show twice where they overlap.
-	struct GlrCorners sealed;
+	float outline[6][10];
 	const uint8_t* last = r->blendSel[r->cycleType == 1 ? 1 : 0];
 	bool const blends = r->cycleType < 2 && r->forceBlend && ((last[2] == 1) != (last[0] == 1));
-	if (g->seal > 0 && !blends) {
-		sealed = *q;
-		sealCorners(&sealed, g->seal / (float) scaleFor(g, r->colorWidth));
-		q = &sealed;
-	}
+	int const points = g->seal > 0 && !blends ? sealOutline(q, g->seal, outline) : 0;
 	uint32_t c = q->flags;
 	// Depth from the primitive's needs no depth per corner (NFL Quarterback Club 99's shadows).
 	bool z = (c & 1) || (r->zAddr && r->zPrim), tex = c & 2, shade = c & 4, persp = (c >> 16) & 1;
@@ -2446,10 +2464,12 @@ static void triangle(struct N64* n, struct Glr* g, struct RDP* r, const struct G
 	if (fixedTexel) {
 		tex = true, persp = false;
 	}
+	const float (*v)[10] = points ? (const float (*)[10]) outline : q->v;
+	int const count = points ? points : 3;
 	float top = 1e9f, bottom = -1e9f;
-	for (int k = 0; k < 3; ++k) {
-		top = q->v[k][1] < top ? q->v[k][1] : top;
-		bottom = q->v[k][1] > bottom ? q->v[k][1] : bottom;
+	for (int k = 0; k < count; ++k) {
+		top = v[k][1] < top ? v[k][1] : top;
+		bottom = v[k][1] > bottom ? v[k][1] : bottom;
 	}
 	r->maxLevel = (int) ((c >> 12) & 7);
 	if (!drawState(n, g, r, tex, shade, z, (c >> 8) & 7, persp, (int) floorf(top), (int) ceilf(bottom) + 1)) {
@@ -2458,8 +2478,13 @@ static void triangle(struct N64* n, struct Glr* g, struct RDP* r, const struct G
 	// 1/w scaled as the microcodes send it, the corners' largest a half (hle.c triangle).
 	float maxW = fmaxf(q->v[0][3], fmaxf(q->v[1][3], q->v[2][3]));
 	float k = maxW > 0 ? 0.5f / maxW : 0.5f;
-	for (int i = 0; i < 3; ++i) {
-		vertex(g, q->v[i][0], q->v[i][1], q->v[i][2], q->v[i][3] * k, &q->v[i][4], fixedTexel ? fixedSt : q->v[i][8], fixedTexel ? fixedSt : q->v[i][9]);
+	// A fan over the outline.
+	for (int t = 1; t + 1 < count; ++t) {
+		int const corner[3] = { 0, t, t + 1 };
+		for (int i = 0; i < 3; ++i) {
+			const float* c = v[corner[i]];
+			vertex(g, c[0], c[1], c[2], c[3] * k, &c[4], fixedTexel ? fixedSt : c[8], fixedTexel ? fixedSt : c[9]);
+		}
 	}
 }
 
