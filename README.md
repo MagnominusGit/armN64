@@ -47,16 +47,17 @@ first. Please report problems in Issues.
 ## Options
 
 The menu shows only the options that do something with the others' values: the GL Renderer's with
-GL, Resolution with GL or GPU, the custom crops with Crop Overscan Custom, and so on.
+GL, Resolution with GL or GPU, the custom crops with Crop Overscan Custom, and so on. Changes take
+effect while the game runs, the Expansion Pak's when the game restarts.
 
 | Category | Option | Values (default first) |
 | --- | --- | --- |
-| System | Accuracy (applies on restart) | Fast (HLE), Fastest (FLE), Balanced (MLE), Accurate (LLE) |
-| | Overclock (applies on restart) | Off, 1.5x, 2x, 2.5x, 3x, 4x |
-| | Frame Skip (applies on restart) | Off, Auto, Every Other Frame |
-| | Expansion Pak (applies on restart) | On, Off |
-| Video | Renderer (applies on restart) | GL (Fast, HD), GPU (Exact, HD), CPU (Exact, Native) |
-| | Resolution (GL and GPU; applies on restart) | 2x, Auto, Native, 3x to 8x |
+| System | Accuracy | Fast (HLE), Fastest (FLE), Balanced (MLE), Accurate (LLE) |
+| | Overclock | Off, 1.5x, 2x, 2.5x, 3x, 4x |
+| | Frame Skip | Off, Auto, Every Other Frame |
+| | Expansion Pak (at the next restart) | On, Off |
+| Video | Renderer | GL (Fast, HD), GPU (Exact, HD), CPU (Exact, Native) |
+| | Resolution (GL and GPU) | 2x, Auto, Native, 3x to 8x |
 | | Resolution Scaling (GL) | Fixed (320x240), Internal |
 | | Widescreen | Off, 16:9, 16:10, 16:9 Picture Only, 16:10 Picture Only |
 | | Aspect Ratio | Fill 4:3, TV 4:3, Square Pixels |
@@ -80,7 +81,7 @@ GL, Resolution with GL or GPU, the custom crops with Crop Overscan Custom, and s
 | Controller Paks | Player 1 to 4 Pak | Controller Pak, Rumble Pak, Transfer Pak, None |
 | | Player 1 to 4 Controller Pak (with a Controller Pak) | This Game's, Shared Pak 1 to 8 |
 | | Controller Pak Manager | Closed, Open |
-| Advanced | Graphics Microcode (applies on restart) | Library, Game's Own |
+| Advanced | Graphics Microcode | Library, Game's Own |
 | | Graphics Task Timing (with Library) | Console, Short |
 | | Threaded RSP (with Fast) | Off, On |
 | | Renderer Threads (with CPU) | Auto (up to 3), None, 1, 2, 3 |
