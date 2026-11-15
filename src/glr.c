@@ -275,6 +275,10 @@ struct Glr {
 	// RDRAM through a texture at its resolution.
 	int scale;
 	GLuint native, nativeFramebuffer;
+	// The program laying a 16-bit image out again at another width (relayout), and its uniforms.
+	GLuint relayoutProgram;
+	GLint relayoutSource, relayoutParams;
+	bool relayoutTried;
 	// Seal Edges (N64_GL_SEAL): how far, in the target's pixels, opaque triangles reach past their
 	// edges to cover the cracks between them that show at higher scales.
 	float seal;
@@ -1375,6 +1379,113 @@ static void grow(struct N64* n, struct Glr* g, struct Target* t, int height) {
 	depthSize(n, g, t->width * (uint32_t) t->scale, height * t->scale);
 }
 
+// A program drawing fragment over the whole framebuffer (as a strip of 4 vertices); 0 if it can't.
+static GLuint fullProgram(struct Glr* g, const char* fragment) {
+	static const char vertex[] =
+		"#version 300 es\n"
+		"void main() {\n"
+		"	vec2 p = vec2(float(gl_VertexID & 1), float(gl_VertexID >> 1));\n"
+		"	gl_Position = vec4(p * 2.0 - 1.0, 0.0, 1.0);\n"
+		"}\n";
+	struct Gl* gl = &g->gl;
+	GLuint vs = compile(g, GL_VERTEX_SHADER, vertex), fs = compile(g, GL_FRAGMENT_SHADER, fragment);
+	GLint ok = 0;
+	GLuint program = 0;
+	if (vs && fs) {
+		program = gl->CreateProgram();
+		gl->AttachShader(program, vs);
+		gl->AttachShader(program, fs);
+		gl->LinkProgram(program);
+		gl->GetProgramiv(program, GL_LINK_STATUS, &ok);
+	}
+	if (vs) {
+		gl->DeleteShader(vs);
+	}
+	if (fs) {
+		gl->DeleteShader(fs);
+	}
+	if (!ok && program) {
+		gl->DeleteProgram(program);
+	}
+	return ok ? program : 0;
+}
+
+static bool relayoutProgram(struct Glr* g) {
+	// A pixel of the image at the new width (uParams.y, scale uParams.w) is the one at the same
+	// address at the old (uParams.x, scale uParams.z), as writePixels takes it back to RDRAM and
+	// loadPixels brings it in again: 5 bits a component, its alpha (drawn or loaded) kept.
+	static const char fragment[] =
+		"#version 300 es\n"
+		"precision highp float;\n"
+		"precision highp int;\n"
+		"uniform highp sampler2D uSource;\n"
+		"uniform ivec4 uParams;\n"
+		"out vec4 color;\n"
+		"void main() {\n"
+		"	ivec2 p = ivec2(gl_FragCoord.xy) / uParams.w;\n"
+		"	int i = p.y * uParams.y + p.x;\n"
+		"	vec4 c = texelFetch(uSource, ivec2(i % uParams.x, i / uParams.x) * uParams.z + uParams.z / 2, 0);\n"
+		"	vec3 v = floor(floor(c.rgb * 255.0 + 0.5) / 8.0);\n"
+		"	color = vec4((v * 8.0 + floor(v / 4.0)) / 255.0, c.a);\n"
+		"}\n";
+	struct Gl* gl = &g->gl;
+	g->relayoutTried = true;
+	GLuint const program = fullProgram(g, fragment);
+	if (!program) {
+		return false;
+	}
+	g->relayoutProgram = program;
+	g->relayoutSource = gl->GetUniformLocation(program, "uSource");
+	g->relayoutParams = gl->GetUniformLocation(program, "uParams");
+	return true;
+}
+
+// A 16-bit color image the GPU drew in (o) used again at another width (t, drawing nothing yet)
+// whose rows at either width start and end at the same bytes: what o holds laid out in t on the
+// GPU, as giving o back and loading t would, t then drawing what o drew. False where it can't.
+static bool relayout(struct N64* n, struct Glr* g, struct Target* o, struct Target* t) {
+	uint32_t const bytes = (uint32_t) o->loadedRows * o->width;
+	if (o->addr != t->addr || o->size != 2 || t->size != 2 || o->width == t->width || g->samples || t->dirtyTo > t->dirtyFrom || o->loadedRows < o->dirtyTo ||
+	    o->packTo > o->packFrom || o->readSince ||
+	    bytes % t->width || ((uint32_t) o->dirtyFrom * o->width) % t->width || ((uint32_t) o->dirtyTo * o->width) % t->width ||
+	    bytes / t->width > TARGET_ROWS || (!g->relayoutProgram && (g->relayoutTried || !relayoutProgram(g)))) {
+		return false;
+	}
+	int const rows = (int) (bytes / t->width);
+	if (rows > t->height) {
+		grow(n, g, t, (rows + 15) & ~15);
+	}
+	resolve(g, o);
+	struct Gl* gl = &g->gl;
+	useFramebuffer(g, t->framebuffer);
+	gl->Viewport(0, 0, (GLsizei) t->width * t->scale, rows * t->scale);
+	useScissor(g, false, 0, 0, 0, 0);
+	gl->Disable(GL_DEPTH_TEST);
+	gl->Disable(GL_BLEND);
+	gl->Disable(GL_POLYGON_OFFSET_FILL);
+	gl->ColorMask(1, 1, 1, 1);
+	gl->UseProgram(g->relayoutProgram);
+	gl->ActiveTexture(GL_TEXTURE0);
+	gl->BindTexture(GL_TEXTURE_2D, o->texture);
+	gl->Uniform1i(g->relayoutSource, 0);
+	int const params[4] = { (int) o->width, (int) t->width, o->scale, t->scale };
+	gl->Uniform4iv(g->relayoutParams, 1, params);
+	gl->DrawArrays(5, 0, 4);
+	memset(&g->applied, 0xFF, sizeof(g->applied));
+	t->loadedRows = rows > t->loadedRows ? rows : t->loadedRows;
+	t->dirtyFrom = (int) ((uint32_t) o->dirtyFrom * o->width / t->width);
+	t->dirtyTo = (int) ((uint32_t) o->dirtyTo * o->width / t->width);
+	if (t->marked < t->dirtyTo) {
+		markPages(n, t->addr, (uint32_t) t->dirtyTo * t->width * 2, true);
+		t->marked = t->dirtyTo;
+	}
+	o->dirtyFrom = o->dirtyTo = 0;
+	o->loadedRows = 0;
+	o->marked = 0;
+	o->packFrom = o->packTo = 0;
+	return true;
+}
+
 // The target for a color image, its texture loaded from RDRAM (rows) when the GPU last gave its
 // pixels back.
 static struct Target* target(struct N64* n, struct Glr* g, uint32_t addr, uint32_t width, int size, int rows) {
@@ -1463,6 +1574,9 @@ static struct Target* target(struct N64* n, struct Glr* g, uint32_t addr, uint32
 			continue;
 		}
 		flushBatch(n, g);
+		if (relayout(n, g, o, t)) {
+			continue;
+		}
 		writePixels(n, o, o->dirtyFrom, o->dirtyTo);
 		o->dirtyFrom = o->dirtyTo = 0;
 		o->loadedRows = 0;
