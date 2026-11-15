@@ -47,6 +47,7 @@ enum { LEVELS = 8, TARGETS = 8, TARGET_ROWS = 480, PROGRAMS = 256, TEXTURES = 10
        VERTEX_BUFFER_BYTES = BATCH_VERTICES * VERTEX_FLOATS * 4 * 2 };
 
 struct Gl {
+	void (*MaxShaderCompilerThreadsKHR)(GLuint);
 	void (*GenFramebuffers)(GLsizei, GLuint*);
 	void (*BindFramebuffer)(GLenum, GLuint);
 	void (*BlitFramebuffer)(GLint, GLint, GLint, GLint, GLint, GLint, GLint, GLint, GLbitfield, GLenum);
@@ -169,15 +170,19 @@ struct ProgramKey {
 // A program's uniforms as last set.
 struct Uniforms {
 	float size[2], prim[4], env[4], fog[4], blend[4], primLod, primDepth, k[2], lastCombined[4];
-	int persp, scale, tile[LEVELS][12], image[LEVELS][4];
+	int persp, scale, tile[LEVELS][12], image[LEVELS][4], key[4], keyFlags[4];
 };
 
 struct Program {
 	struct ProgramKey key;
 	GLuint program;
-	GLint size, persp, scale, prim, env, fog, blend, primLod, primDepth, k, lastCombined, tile[LEVELS], image[LEVELS], texture[LEVELS], memory;
+	GLint size, persp, scale, prim, env, fog, blend, primLod, primDepth, k, lastCombined, tile[LEVELS], image[LEVELS], texture[LEVELS], memory, keyAt, keyFlagsAt;
 	struct Uniforms set;
 	bool uniformsSet;
+	// Linked in the background (GL_KHR_parallel_shader_compile) and not known to be done yet: its
+	// source, for its binary to be kept when it is.
+	bool pending;
+	char* source;
 };
 
 // What GL is set to (-1: not known), so a batch changes only what differs.
@@ -208,6 +213,8 @@ struct Texture {
 struct DrawState {
 	struct Target* target;
 	struct Program* program;
+	// The key the program for any key draws as (uKey, uKeyFlags), zero with a key's own program.
+	int anyKey[4], anyFlags[4];
 	struct Texture* texture[LEVELS];
 	int tile[LEVELS][12];
 	float prim[4], env[4], fog[4], blend[4], primLod, primDepth, k[2], lastCombined[4];
@@ -293,6 +300,10 @@ struct Glr {
 	int drawScale;
 	struct Program programs[PROGRAMS];
 	int programCount;
+	// The program for any key (anyBody), made when the GPU makes programs in the background: it draws
+	// while a key's own program is made, instead of the game waiting for it.
+	struct Program any;
+	bool anyMade;
 	// The game's programs kept by their keys (glesCacheDirectory), made again as the renderer starts:
 	// pending, with pendingDone of them made (all at once, or a few a frame through glrPrecompile).
 	char keysPath[4400];
@@ -832,11 +843,376 @@ static int lodLevels(int maxLevel, bool detail) {
 	return levels < LEVELS ? levels : LEVELS;
 }
 
+// What every program starts with: the declarations and helpers, the image's pixel to blend with
+// (framebuffer fetch or a copy) and rdp.c's noise: a hash of the pixel (at the RDP's resolution), the
+// primitive's number and what it is for (the combiner's channels 0-2, the dither 4).
+static void sourceHead(struct Glr* g, char* source, size_t size) {
+	if (g->fetch && !g->barrier) {
+		// The image's pixel in oColor before the shader writes it.
+		const char* out = strstr(fragmentHead, "out vec4 oColor;");
+		snprintf(source, size, "#version 300 es\n#extension GL_EXT_shader_framebuffer_fetch : require\n#define TEX_FILTER %d\n%.*sinout%s",
+		         g->filter, (int) (out - fragmentHead - strlen("#version 300 es\n")), fragmentHead + strlen("#version 300 es\n"), out + 3);
+	} else {
+		snprintf(source, size, "#version 300 es\n#define TEX_FILTER %d\n%s%s", g->filter, fragmentHead + strlen("#version 300 es\n"),
+		         g->barrier ? "uniform highp sampler2D uMemory;\n" : "");
+	}
+	strcat(source,
+	       "uint pixelNoise(uint tag) {\n"
+	       "	uvec2 p = uvec2(gl_FragCoord.xy) / uint(uScale);\n"
+	       "	uint h = p.x * 0x9E3779B1u ^ p.y * 0x85EBCA77u ^ vSeq * 0xC2B2AE3Du ^ tag;\n"
+	       "	h ^= h >> 15;\n"
+	       "	h *= 0x2C1B3C6Du;\n"
+	       "	return h ^ (h >> 12);\n"
+	       "}\n"
+	       "vec3 noise() { return vec3(float((pixelNoise(0u) & 7u) << 6 | 32u) / 255.0); }\n");
+}
+
+static void programUniforms(struct Glr* g, struct Program* pr);
+
+// A program compiled and linked without waiting for either (GL_KHR_parallel_shader_compile: the GPU's
+// threads make it; programDone tells when it is made). 0 if GL refused at once.
+static GLuint programLater(struct Glr* g, const char* source) {
+	struct Gl* gl = &g->gl;
+	GLuint const fs = gl->CreateShader(GL_FRAGMENT_SHADER);
+	gl->ShaderSource(fs, 1, &source, NULL);
+	gl->CompileShader(fs);
+	GLuint const p = gl->CreateProgram();
+	glesKeepable(g->gles, p);
+	gl->AttachShader(p, g->vertexShader);
+	gl->AttachShader(p, fs);
+	gl->LinkProgram(p);
+	gl->DeleteShader(fs);
+	return p;
+}
+
+// Whether a program linked in the background is made; made, it is kept as the others are (its binary
+// with the cache) or, failed, dropped (program 0).
+static bool programDone(struct Glr* g, struct Program* pr) {
+	struct Gl* gl = &g->gl;
+	GLint done = 0, ok = 0;
+	gl->GetProgramiv(pr->program, 0x91B1, &done);
+	if (!done) {
+		return false;
+	}
+	gl->GetProgramiv(pr->program, GL_LINK_STATUS, &ok);
+	if (ok) {
+		glesKeepProgram(g->gles, pr->program, vertexSource, pr->source);
+		programUniforms(g, pr);
+	} else {
+		char log[1024];
+		gl->GetProgramInfoLog(pr->program, sizeof(log), NULL, log);
+		fprintf(stderr, "GL renderer: program: %s\n", log);
+		gl->DeleteProgram(pr->program);
+		pr->program = 0;
+	}
+	free(pr->source);
+	pr->source = NULL;
+	pr->pending = false;
+	return true;
+}
+
+// Whether the program for any key is there to draw with.
+static bool anyReady(struct Glr* g) {
+	if (g->anyMade && g->any.pending && programDone(g, &g->any) && !g->any.program) {
+		g->anyMade = false;
+	}
+	return g->anyMade && !g->any.pending;
+}
+
+// The program for any key, which draws while a key's own program is made: the same code as program()
+// writes, its choices made from uKey (the combine mode's high and low words, the modes, the level of
+// detail) and uKeyFlags (whether the first cycle reads the last COMBINED, the alpha dither, the
+// alpha compare against noise) instead of written in.
+static const char anyBody[] =
+	"uniform ivec4 uKey, uKeyFlags;\n"
+	"vec4 combined, tex0, tex1, shade;\n"
+	"vec3 mem;\n"
+	"float lodFrac;\n"
+	"const int bayer[16] = int[16](0, 4, 1, 5, 4, 0, 5, 1, 3, 7, 2, 6, 7, 3, 6, 2);\n"
+	"const int magic[16] = int[16](0, 6, 1, 7, 4, 2, 5, 3, 3, 5, 2, 4, 7, 1, 6, 0);\n"
+	"vec4 levelTexel(int k, ivec2 p) {\n"
+	"	if (k == 0) return texelFetch(uTex0, p, 0);\n"
+	"	if (k == 1) return texelFetch(uTex1, p, 0);\n"
+	"	if (k == 2) return texelFetch(uTex2, p, 0);\n"
+	"	if (k == 3) return texelFetch(uTex3, p, 0);\n"
+	"	if (k == 4) return texelFetch(uTex4, p, 0);\n"
+	"	if (k == 5) return texelFetch(uTex5, p, 0);\n"
+	"	if (k == 6) return texelFetch(uTex6, p, 0);\n"
+	"	return texelFetch(uTex7, p, 0);\n"
+	"}\n"
+	"vec4 sampleLevel(int k, int levels, ivec2 st) {\n"
+	"	k = clamp(k, 0, levels - 1);\n"
+	"	ivec4 c = uTile[3 * k + 2], x4, y4;\n"
+	"	ivec2 f;\n"
+	"	tileAddress(uTile[3 * k], uTile[3 * k + 1], c, uImage[k], st, x4, y4, f);\n"
+	"	vec4 c0 = levelTexel(k, ivec2(x4.x, y4.x));\n"
+	"	if (c.z == 0 || TEX_FILTER == 2) return c0;\n"
+	"	return tileFilter(c0, levelTexel(k, ivec2(x4.y, y4.y)), levelTexel(k, ivec2(x4.z, y4.z)), levelTexel(k, ivec2(x4.w, y4.w)), f);\n"
+	"}\n"
+	// rgbInput, alphaInput and input8.
+	"vec3 rgbIn(int which, int sel) {\n"
+	"	if (sel == 0) return combined.rgb;\n"
+	"	if (sel == 1) return tex0.rgb;\n"
+	"	if (sel == 2) return tex1.rgb;\n"
+	"	if (sel == 3) return uPrim.rgb;\n"
+	"	if (sel == 4) return shade.rgb;\n"
+	"	if (sel == 5) return uEnv.rgb;\n"
+	"	if (which == 2) {\n"
+	"		if (sel == 7) return vec3(combined.a);\n"
+	"		if (sel == 8) return vec3(tex0.a);\n"
+	"		if (sel == 9) return vec3(tex1.a);\n"
+	"		if (sel == 10) return vec3(uPrim.a);\n"
+	"		if (sel == 11) return vec3(shade.a);\n"
+	"		if (sel == 12) return vec3(uEnv.a);\n"
+	"		if (sel == 13) return vec3(lodFrac);\n"
+	"		if (sel == 14) return vec3(uPrimLod);\n"
+	"		if (sel == 15) return vec3(uK.y);\n"
+	"		return vec3(0.0);\n"
+	"	}\n"
+	"	if (which == 0 && sel == 7) return noise();\n"
+	"	if (which == 1 && sel == 7) return vec3(uK.x);\n"
+	"	return (which == 0 || which == 3) && sel == 6 ? vec3(1.0) : vec3(0.0);\n"
+	"}\n"
+	"float alphaIn(int sel, bool multiplier) {\n"
+	"	if (sel == 0) return multiplier ? lodFrac : combined.a;\n"
+	"	if (sel == 1) return tex0.a;\n"
+	"	if (sel == 2) return tex1.a;\n"
+	"	if (sel == 3) return uPrim.a;\n"
+	"	if (sel == 4) return shade.a;\n"
+	"	if (sel == 5) return uEnv.a;\n"
+	"	return sel == 6 ? (multiplier ? uPrimLod : 1.0) : 0.0;\n"
+	"}\n"
+	"vec3 rgb8(int which, int sel, bool afterFirst) {\n"
+	"	if ((which == 0 || which == 3) && sel == 6) return vec3(256.0);\n"
+	"	vec3 v = rgbIn(which, sel);\n"
+	"	if (afterFirst && (sel == 0 || (which == 2 && sel == 7))) return which == 2 ? s9(v) : x9(v);\n"
+	"	return e8(v);\n"
+	"}\n"
+	"float alpha8(int sel, bool multiplier, bool afterFirst) {\n"
+	"	if (sel == 6 && !multiplier) return 256.0;\n"
+	"	float v = alphaIn(sel, multiplier);\n"
+	"	if (afterFirst && sel == 0 && !multiplier) return x9(v);\n"
+	"	return e8(v);\n"
+	"}\n"
+	// cycleSource.
+	"void cycle(int which, bool first, bool afterFirst) {\n"
+	"	uint hi = uint(uKey.x), lo = uint(uKey.y);\n"
+	"	int a = int(which != 0 ? (hi >> 5) & 15u : (hi >> 20) & 15u), m = int(which != 0 ? hi & 31u : (hi >> 15) & 31u);\n"
+	"	int b = int(which != 0 ? (lo >> 24) & 15u : (lo >> 28) & 15u), d = int(which != 0 ? (lo >> 6) & 7u : (lo >> 15) & 7u);\n"
+	"	int aa = int(which != 0 ? (lo >> 21) & 7u : (hi >> 12) & 7u), ab = int(which != 0 ? (lo >> 3) & 7u : (lo >> 12) & 7u);\n"
+	"	int am = int(which != 0 ? (lo >> 18) & 7u : (hi >> 9) & 7u), ad = int(which != 0 ? lo & 7u : (lo >> 9) & 7u);\n"
+	"#if SIMPLE\n"
+	"	combined = clamp(vec4((rgbIn(0, a) - rgbIn(1, b)) * rgbIn(2, m), (alphaIn(aa, false) - alphaIn(ab, false)) * alphaIn(am, true)) +\n"
+	"	                 vec4(rgbIn(3, d), alphaIn(ad, false)), 0.0, 1.0);\n"
+	"#else\n"
+	"	vec4 t = vec4((rgb8(0, a, afterFirst) - rgb8(1, b, afterFirst)) * rgb8(2, m, afterFirst), (alpha8(aa, false, afterFirst) - alpha8(ab, false, afterFirst)) *\n"
+	"	              alpha8(am, true, afterFirst)) + vec4(rgb8(3, d, afterFirst), alpha8(ad, false, afterFirst)) * 256.0 + 128.0;\n"
+	"	combined = first ? mod(floor(t / 256.0), 512.0) / 255.0 : clamp9(floor(t / 256.0)) / 255.0;\n"
+	"#endif\n"
+	"}\n"
+	// The blender's inputs, factors and formulas (blendColorInput ... fetchBlend).
+	"vec3 blendColorIn(int sel) { sel &= 3; return sel < 2 ? combined.rgb : sel == 2 ? uBlend.rgb : uFog.rgb; }\n"
+	"float blendAlphaIn(int sel) { sel &= 3; return sel == 0 ? combined.a : sel == 1 ? uFog.a : sel == 2 ? shade.a : 0.0; }\n"
+	"vec3 fetchColorIn(int sel) { sel &= 3; return sel == 0 ? combined.rgb : sel == 1 ? mem : sel == 2 ? uBlend.rgb : uFog.rgb; }\n"
+	"void blendFactors(int sel, float keep, out float blendA8, out float fa, out float fb1, out float reject, out float blendA, out float blendB) {\n"
+	"	blendA8 = floor(blendAlphaIn(sel >> 2) * keep * 255.0 + 0.5);\n"
+	"	fa = floor(blendA8 / 8.0);\n"
+	"	int b = (sel >> 6) & 3;\n"
+	"	fb1 = b == 0 ? floor((255.0 - blendA8) / 8.0) + 1.0 : b == 3 ? 1.0 : 32.0;\n"
+	"	reject = ((sel >> 2) & 3) == 0 && b == 0 ? (blendA8 >= 255.0 ? 1.0 : 0.0) : 0.0;\n"
+	"	blendA = mix(fa / 32.0, 1.0, reject), blendB = mix(fb1 / 32.0, 0.0, reject);\n"
+	"}\n"
+	"void blendFormula(int sel) {\n"
+	"	float blendA8, fa, fb1, reject, blendA, blendB;\n"
+	"	blendFactors(sel, 1.0, blendA8, fa, fb1, reject, blendA, blendB);\n"
+	"	combined.rgb = mix(clamp(floor((e8(blendColorIn(sel)) * fa + e8(blendColorIn(sel >> 4)) * fb1) / 32.0), 0.0, 255.0) / 255.0, blendColorIn(sel), reject);\n"
+	"}\n"
+	"void fetchBlend(int sel, bool last) {\n"
+	"	float a8 = floor(clamp(blendAlphaIn(sel >> 2), 0.0, 1.0) * 255.0 + 0.5), fa = floor(a8 / 8.0);\n"
+	"	int b = (sel >> 6) & 3;\n"
+	"	if (b == 1) fa -= mod(floor(a8 / 8.0), 4.0);\n"
+	"	float fb1 = b == 0 ? floor((255.0 - a8) / 8.0) + 1.0 : b == 3 ? 1.0 : 32.0;\n"
+	"	vec3 o = mod(floor((e8(fetchColorIn(sel)) * fa + e8(fetchColorIn(sel >> 4)) * fb1) / 32.0), 256.0) / 255.0;\n"
+	"	combined.rgb = last && ((sel >> 2) & 3) == 0 && b == 0 && a8 >= 255.0 ? combined.rgb : o;\n"
+	"}\n"
+	// The dither's matrix value for each channel, or three bits of noise for each.
+	"ivec3 ditherMatrix(uint modes) {\n"
+	"	if ((modes & 0x80000000u) != 0u) {\n"
+	"		uint h = pixelNoise(4u);\n"
+	"		return ivec3(uvec3(h, h >> 3, h >> 6) & 7u);\n"
+	"	}\n"
+	"	ivec2 px = ivec2(gl_FragCoord.xy) / uScale;\n"
+	"	int i = (px.y & 3) * 4 + (px.x & 3);\n"
+	"	return ivec3((modes & 64u) != 0u ? bayer[i] : magic[i]);\n"
+	"}\n"
+	"vec3 dither(vec3 rgb, ivec3 m, bool image16) {\n"
+	"	ivec3 o = ivec3(floor(rgb * 255.0 + 0.5));\n"
+	"	for (int i = 0; i < 3; ++i) if ((o[i] & 7) > m[i]) o[i] = min((o[i] & 0xF8) + 8, 255);\n"
+	"	if (image16) o = (o >> 3) << 3 | o >> 5;\n"
+	"	return vec3(o) / 255.0;\n"
+	"}\n"
+	"void main() {\n"
+	"	uint modes = uint(uKey.z), lod = uint(uKey.w);\n"
+	"	int cycleType = int(modes & 3u), first = int((modes >> 8) & 255u), last = int((modes >> 16) & 255u);\n"
+	"	bool simple = SIMPLE != 0, ditherOn = (modes & 32u) != 0u && !simple, image16 = (modes & 128u) != 0u;\n"
+	"	combined = uKeyFlags.x != 0 ? uLastCombined : vec4(0.0);\n"
+	"#if BARRIER\n"
+	"	oColor = texelFetch(uMemory, ivec2(gl_FragCoord.xy), 0);\n"
+	"#endif\n"
+	"	shade = (modes & 16u) != 0u ? vShade : vec4(0.0);\n"
+	"	lodFrac = 0.0;\n"
+	"	tex0 = vec4(0.0), tex1 = vec4(0.0);\n"
+	"	if ((modes & 8u) != 0u) {\n"
+	"#if FLE\n"
+	"		vec2 stf = texCoordFloat();\n"
+	"		ivec2 st = ivec2(clamp(floor(stf + 0.01), -65536.0, 65535.0));\n"
+	"#elif SIMPLE\n"
+	"		ivec2 st = texCoordSimple();\n"
+	"#else\n"
+	"		ivec2 st = texCoord();\n"
+	"#endif\n"
+	"		int maxLevel = int(lod >> 4) & 7, minLevel = int(lod >> 8) & 31;\n"
+	"		bool sharpen = (lod & 4u) != 0u, detail = (lod & 8u) != 0u;\n"
+	"		int levels = (lod & 2u) != 0u ? min(maxLevel + (detail ? 2 : 1), 8) : 0;\n"
+	"		if (levels == 0) {\n"
+	"#if FLE\n"
+	"			tex0 = sampleFast(uTex0, uTile[0], uTile[1], uTile[2], uImage[0], stf, st);\n"
+	"			tex1 = cycleType == 1 ? sampleFast(uTex1, uTile[3], uTile[4], uTile[5], uImage[1], stf, st) : tex0;\n"
+	"#else\n"
+	"			tex0 = sampleTile(uTex0, uTile[0], uTile[1], uTile[2], uImage[0], st);\n"
+	"			tex1 = cycleType == 1 ? sampleTile(uTex1, uTile[3], uTile[4], uTile[5], uImage[1], st) : tex0;\n"
+	"#endif\n"
+	"		}\n"
+	"		if ((lod & 1u) != 0u) {\n"
+	"			vec2 fst = vec2(st);\n"
+	"			int l = int(max(max(abs(dFdx(fst.x)), abs(dFdx(fst.y))), max(abs(dFdy(fst.x)), abs(dFdy(fst.y)))));\n"
+	"			l = l >= 0x4000 ? (l & 0x3FFF) | 0x4000 : l;\n"
+	"			bool magnify = l < 32;\n"
+	"			int level = 0;\n"
+	"			for (int v = (l >> 5) & 0xFF; !magnify && v > 1; v >>= 1) ++level;\n"
+	"			bool distant = (l & 0x4000) != 0 || maxLevel == 0 || (!magnify && ((l & 0x6000) != 0 || level >= maxLevel));\n"
+	"			int near = !sharpen && !detail ? (distant ? 0xFF : 0) : sharpen ? (max(l, minLevel) << 3) | 0x100 : max(l, minLevel) << 3;\n"
+	"			int far = !sharpen && !detail ? (distant ? 0xFF : ((l << 3) >> level) & 0xFF) : ((l << 3) >> level) & 0xFF;\n"
+	"			int frac = (l & 0x4000) != 0 ? 0xFF : magnify ? near : far;\n"
+	"			lodFrac = float((frac & 0x100) != 0 ? (frac & 0x1FF) - 0x200 : frac) / 255.0;\n"
+	"			if (levels != 0) {\n"
+	"				int t1, t2;\n"
+	"				if (detail) {\n"
+	"					int at = distant ? maxLevel : level;\n"
+	"					t1 = at + (magnify ? 0 : 1), t2 = at + (!distant && !magnify ? 2 : 1);\n"
+	"				} else {\n"
+	"					t1 = distant ? maxLevel : level, t2 = distant || (!sharpen && magnify) ? t1 : t1 + 1;\n"
+	"				}\n"
+	"				tex0 = sampleLevel(t1, levels, st);\n"
+	"				tex1 = sampleLevel(t2, levels, st);\n"
+	"			}\n"
+	"		}\n"
+	"	}\n"
+	"	if (cycleType == 2) {\n"
+	"		combined = tex0;\n"
+	"	} else {\n"
+	"		if (cycleType == 1) {\n"
+	"			cycle(0, true, false);\n"
+	"			vec4 swapped = tex0;\n"
+	"			tex0 = tex1;\n"
+	"			tex1 = swapped;\n"
+	"		}\n"
+	"		cycle(1, false, cycleType == 1);\n"
+	"	}\n"
+	"	if ((modes & 0x4000000u) != 0u && combined.a < 0.125) discard;\n"
+	"	if ((modes & 0x8000000u) != 0u) combined.a = 1.0;\n"
+	"	if ((modes & 4u) != 0u) {\n"
+	"		if (cycleType == 2 ? combined.a == 0.0 : uKeyFlags.z != 0 ? combined.a * 255.0 < float(pixelNoise(6u) & 255u) : combined.a < uBlend.a) discard;\n"
+	"	}\n"
+	"	gl_FragDepth = (modes & 0x2000000u) != 0u ? uPrimDepth : gl_FragCoord.z;\n"
+	"#if FETCH\n"
+	"	if (cycleType < 2) {\n"
+	"		if (uKeyFlags.y != 3 && !simple) {\n"
+	"			ivec2 ap = ivec2(gl_FragCoord.xy) / uScale;\n"
+	"			int rgbMode = (modes & 0x80000000u) != 0u ? 2 : (modes & 32u) != 0u ? ((modes & 64u) != 0u ? 1 : 0) : 3;\n"
+	"			int i = (ap.y & 3) * 4 + (ap.x & 3), mv = rgbMode == 1 || rgbMode == 3 ? bayer[i] : magic[i];\n"
+	"			int ad = uKeyFlags.y == 2 ? int(pixelNoise(5u) & 7u) : uKeyFlags.y == 1 ? ~mv & 7 : mv;\n"
+	"			combined.a = min(floor(combined.a * 255.0 + 0.5) + float(ad), 255.0) / 255.0;\n"
+	"			shade.a = min(floor(shade.a * 255.0 + 0.5) + float(ad), 255.0) / 255.0;\n"
+	"		}\n"
+	"		mem = image16 ? vec3((ivec3(floor(oColor.rgb * 255.0 + 0.5)) >> 3) << 3) / 255.0 : oColor.rgb;\n"
+	"		if (cycleType == 1) fetchBlend(first, false);\n"
+	"		if ((modes & (0x1000000u | 0x10000000u | 0x20000000u)) != 0u) fetchBlend(last, true);\n"
+	"		else combined.rgb = fetchColorIn(last);\n"
+	"		oColor = vec4(combined.rgb, 1.0);\n"
+	"		if (ditherOn) oColor.rgb = dither(oColor.rgb, ditherMatrix(modes), image16);\n"
+	"		else if (image16) { ivec3 o = ivec3(floor(oColor.rgb * 255.0 + 0.5)); o = (o >> 3) << 3 | o >> 5; oColor.rgb = vec3(o) / 255.0; }\n"
+	"		return;\n"
+	"	}\n"
+	"#endif\n"
+	"	float memoryKeep = 1.0;\n"
+	"	if (cycleType == 1 && ((first >> 4) & 3) == 1 && ((first >> 6) & 3) == 0) {\n"
+	"		memoryKeep = blendAlphaIn(first >> 2);\n"
+	"		combined.rgb = blendColorIn(first);\n"
+	"	} else if (cycleType == 1) {\n"
+	"		blendFormula(first);\n"
+	"	}\n"
+	"	bool dithered = (modes & 0x1000000u) == 0u;\n"
+	"	if (cycleType < 2) {\n"
+	"		float blendA8, fa, fb1, reject, blendA, blendB;\n"
+	"		if ((modes & 0x10000000u) != 0u) {\n"
+	"			blendFormula(last);\n"
+	"			oColor = vec4(combined.rgb, blendAlphaIn(last >> 2));\n"
+	"		} else if ((modes & 0x20000000u) != 0u) {\n"
+	"			blendFactors(last, 1.0, blendA8, fa, fb1, reject, blendA, blendB);\n"
+	"			oColor = vec4(blendColorIn(last >> 4) * blendB, (modes & 0x40000000u) != 0u ? 1.0 : blendA);\n"
+	"		} else if ((modes & 0x1000000u) != 0u) {\n"
+	"			blendFactors(last, memoryKeep, blendA8, fa, fb1, reject, blendA, blendB);\n"
+	"			oColor = vec4(blendColorIn(last) * blendA - (1.0 - reject) * 0.49 / 255.0, mix(blendA8 / 255.0, 1.0, reject));\n"
+	"			int keep = (last >> 6) & 3;\n"
+	"			if (keep == 3) dithered = true;\n"
+	"			if (keep == 0) dithered = reject == 1.0;\n"
+	"		} else {\n"
+	"			oColor = vec4(blendColorIn(last), blendAlphaIn(last >> 2) * memoryKeep);\n"
+	"		}\n"
+	"	} else {\n"
+	"		oColor = combined;\n"
+	"	}\n"
+	"	if (ditherOn && dithered) oColor.rgb = dither(oColor.rgb, ditherMatrix(modes), image16);\n"
+	"	if ((modes & 0x1000000u) == 0u && (modes & (0x20000000u | 0x40000000u)) != 0x20000000u) oColor.a = 1.0;\n"
+	"}\n";
+
+// The program for any key started (its binary from the cache, or made in the background).
+static void startAny(struct Glr* g) {
+	static char source[65536];
+	sourceHead(g, source, sizeof(source));
+	char defines[128];
+	snprintf(defines, sizeof(defines), "#define SIMPLE %d\n#define FLE %d\n#define FETCH %d\n#define BARRIER %d\n", g->simple, g->fle, g->fetch, g->barrier);
+	strcat(source, defines);
+	strcat(source, anyBody);
+	GLuint p = glesCachedProgram(g->gles, vertexSource, source);
+	if (p) {
+		g->any.program = p, g->anyMade = true;
+		programUniforms(g, &g->any);
+		return;
+	}
+	p = programLater(g, source);
+	// Made already, this long one: the GPU makes programs as they're linked or first drawn (V3D), not
+	// in the background, and this one would only add its own making to the game's.
+	GLint done = 0;
+	g->gl.GetProgramiv(p, 0x91B1, &done);
+	if (!p || done) {
+		g->gl.DeleteProgram(p);
+		return;
+	}
+	g->any.program = p, g->any.pending = true, g->any.source = strdup(source), g->anyMade = true;
+}
+
 static struct Program* program(struct Glr* g, struct ProgramKey key) {
 	for (int i = 0; i < g->programCount; ++i) {
 		if (g->programs[i].key.combine == key.combine && g->programs[i].key.modes == key.modes && g->programs[i].key.lod == key.lod &&
 		    g->programs[i].key.alphaDither == key.alphaDither && g->programs[i].key.compareNoise == key.compareNoise) {
-			return &g->programs[i];
+			struct Program* pr = &g->programs[i];
+			// Still being made: the program for any key draws meanwhile.
+			if (pr->pending && !programDone(g, pr)) {
+				return &g->any;
+			}
+			return pr->program ? pr : NULL;
 		}
 	}
 	if (g->programCount == PROGRAMS) {
@@ -846,27 +1222,7 @@ static struct Program* program(struct Glr* g, struct ProgramKey key) {
 	static char source[65536];
 	char line[1024];
 	int cycleType = key.modes & MODE_CYCLE;
-	if (g->fetch && !g->barrier) {
-		// The image's pixel in oColor before the shader writes it.
-		const char* out = strstr(fragmentHead, "out vec4 oColor;");
-		snprintf(source, sizeof(source), "#version 300 es\n#extension GL_EXT_shader_framebuffer_fetch : require\n#define TEX_FILTER %d\n%.*sinout%s",
-		         g->filter, (int) (out - fragmentHead - strlen("#version 300 es\n")), fragmentHead + strlen("#version 300 es\n"), out + 3);
-	} else {
-		snprintf(source, sizeof(source), "#version 300 es\n#define TEX_FILTER %d\n%s%s", g->filter, fragmentHead + strlen("#version 300 es\n"),
-		         g->barrier ? "uniform highp sampler2D uMemory;\n" : "");
-	}
-	// rdp.c's noise: a hash of the pixel (at the RDP's resolution), the primitive's number and what
-	// it is for (the combiner's channels 0-2, the dither 4).
-	snprintf(line, sizeof(line),
-	         "uint pixelNoise(uint tag) {\n"
-	         "	uvec2 p = uvec2(gl_FragCoord.xy) / uint(uScale);\n"
-	         "	uint h = p.x * 0x9E3779B1u ^ p.y * 0x85EBCA77u ^ vSeq * 0xC2B2AE3Du ^ tag;\n"
-	         "	h ^= h >> 15;\n"
-	         "	h *= 0x2C1B3C6Du;\n"
-	         "	return h ^ (h >> 12);\n"
-	         "}\n"
-	         "vec3 noise() { return vec3(float((pixelNoise(0u) & 7u) << 6 | 32u) / 255.0); }\n");
-	strcat(source, line);
+	sourceHead(g, source, sizeof(source));
 	// The level of detail picking the tiles: a texel from any of them (rdp.c levelOfDetail, with
 	// detail one further on).
 	int const levels = key.lod & 2 ? lodLevels((int) (key.lod >> 4) & 7, key.lod & 8) : 0;
@@ -1112,7 +1468,11 @@ static struct Program* program(struct Glr* g, struct ProgramKey key) {
 	strcat(source, "}\n");
 compileFragment:;
 	GLuint p = glesCachedProgram(g->gles, vertexSource, source);
-	if (!p) {
+	// While the game runs, a program not made before is made in the background.
+	bool const background = !p && !g->preloading && anyReady(g);
+	if (background) {
+		p = programLater(g, source);
+	} else if (!p) {
 		GLuint fs = compile(g, GL_FRAGMENT_SHADER, source);
 		if (!fs) {
 			return NULL;
@@ -1144,6 +1504,19 @@ compileFragment:;
 	struct Program* pr = &g->programs[g->programCount++];
 	pr->key = key;
 	pr->program = p;
+	if (background) {
+		pr->pending = true;
+		pr->source = strdup(source);
+		return &g->any;
+	}
+	programUniforms(g, pr);
+	return pr;
+}
+
+// A linked program's uniforms found, its samplers' units set.
+static void programUniforms(struct Glr* g, struct Program* pr) {
+	struct Gl* gl = &g->gl;
+	GLuint const p = pr->program;
 	pr->size = gl->GetUniformLocation(p, "uSize");
 	pr->persp = gl->GetUniformLocation(p, "uPersp");
 	pr->scale = gl->GetUniformLocation(p, "uScale");
@@ -1169,7 +1542,8 @@ compileFragment:;
 	}
 	pr->memory = gl->GetUniformLocation(p, "uMemory");
 	gl->Uniform1i(pr->memory, LEVELS + 1);
-	return pr;
+	pr->keyAt = gl->GetUniformLocation(p, "uKey");
+	pr->keyFlagsAt = gl->GetUniformLocation(p, "uKeyFlags");
 }
 
 // A program drawn once (a triangle with no area, into a pixel nobody sees): drivers that compile a
@@ -2043,6 +2417,14 @@ static void flushBatch(struct N64* n, struct Glr* g) {
 	uniform(g, p->primDepth, 1, &s->primDepth, &u->primDepth);
 	uniform(g, p->k, 2, s->k, u->k);
 	uniform(g, p->lastCombined, 4, s->lastCombined, u->lastCombined);
+	if (p == &g->any && memcmp(u->key, s->anyKey, sizeof(u->key))) {
+		gl->Uniform4iv(p->keyAt, 1, s->anyKey);
+		memcpy(u->key, s->anyKey, sizeof(u->key));
+	}
+	if (p == &g->any && memcmp(u->keyFlags, s->anyFlags, sizeof(u->keyFlags))) {
+		gl->Uniform4iv(p->keyFlagsAt, 1, s->anyFlags);
+		memcpy(u->keyFlags, s->anyFlags, sizeof(u->keyFlags));
+	}
 	for (int k = 0; k < LEVELS; ++k) {
 		if (s->texture[k]) {
 			useTexture(g, k, s->texture[k]->texture);
@@ -2264,6 +2646,12 @@ static bool drawState(struct N64* n, struct Glr* g, struct RDP* r, bool textured
 	s.program = program(g, key);
 	if (!s.program) {
 		return false;
+	}
+	if (s.program == &g->any) {
+		int const k[4] = { (int) (uint32_t) (key.combine >> 32), (int) (uint32_t) key.combine, (int) key.modes, (int) key.lod };
+		int const f[4] = { readsCombined(key.combine, cycleType), (int) key.alphaDither, key.compareNoise, 0 };
+		memcpy(s.anyKey, k, sizeof(k));
+		memcpy(s.anyFlags, f, sizeof(f));
 	}
 	if (textured) {
 		int const levels = lodTiles ? lodLevels(r->maxLevel, (m >> 50) & 1) : cycleType == 1 ? 2 : 1;
@@ -3560,6 +3948,17 @@ struct Glr* glrCreate(struct N64* n) {
 	g->simple = g->fle || (shaders && !strcmp(shaders, "fast"));
 	const char* filter = n->settings ? n->settings("N64_GL_FILTER") : getenv("N64_GL_FILTER");
 	g->filter = filter && !strcmp(filter, "smooth") ? 1 : filter && !strcmp(filter, "sharp") ? 2 : 0;
+	// The program for any key, made in the background where the GPU makes programs so.
+	const char* background = n->settings ? n->settings("N64_GL_BACKGROUND") : NULL;
+	background = background ? background : getenv("N64_GL_BACKGROUND");
+	if (extensions && (strstr(extensions, "GL_KHR_parallel_shader_compile") || strstr(extensions, "GL_ARB_parallel_shader_compile")) &&
+	    !(background && *background == '0')) {
+		*(void**) &gl->MaxShaderCompilerThreadsKHR = glesProc(g->gles, "glMaxShaderCompilerThreadsKHR");
+		if (gl->MaxShaderCompilerThreadsKHR) {
+			gl->MaxShaderCompilerThreadsKHR(0xFFFFFFFFu);
+		}
+		startAny(g);
+	}
 	// The programs the game used before, made now rather than at the draws that first need them.
 	const char* precompile = n->settings ? n->settings("N64_GL_PRECOMPILE") : getenv("N64_GL_PRECOMPILE");
 	bool const preload = !(precompile && *precompile == '0'), stepped = precompile && *precompile == '2';
@@ -3664,6 +4063,10 @@ void glrDestroy(struct Glr* g) {
 		return;
 	}
 	glesDestroy(g->gles);
+	for (int i = 0; i < g->programCount; ++i) {
+		free(g->programs[i].source);
+	}
+	free(g->any.source);
 	free(g->pending);
 	free(g->batch);
 	free(g->image);
