@@ -1781,7 +1781,26 @@ static void loadTile(struct N64* n, struct RDP* r, uint64_t w, bool block) {
 		uint32_t row = r->texAddr + (uint32_t) (tt * r->texWidth) * (bpp ? bpp : 1);
 		uint32_t line = t->tmem * 8 + (tt - t0) * t->line * 8;
 		uint32_t swap = (tt - t0) & 1 ? 4 : 0;
-		if (r->texSize == 3 && !r->tmemSource) {
+		if (r->texSize == 3 && !r->tmemSource && s1 >= s0 && (line & 7) == 0 && line + (uint32_t) (s1 - s0 + 1) * 2 <= 0x800 &&
+		    ((row + s0 * 4) & (RDRAM_SIZE - 4)) + (uint32_t) (s1 - s0 + 1) * 4 <= RDRAM_SIZE) {
+			// Two texels a word: their red and green to the lower half, blue and alpha to the upper.
+			const uint8_t* p = &n->rdram[(row + s0 * 4) & (RDRAM_SIZE - 4)];
+			int const count = s1 - s0 + 1;
+			int k = 0;
+			for (; k + 2 <= count; k += 2) {
+				uint32_t a, b;
+				memcpy(&a, p + k * 4, 4);
+				memcpy(&b, p + k * 4 + 4, 4);
+				uint32_t const lo = (a & 0xFFFF) | b << 16, hi = a >> 16 | (b & 0xFFFF0000u), d = (line + (uint32_t) k * 2) ^ swap;
+				memcpy(&r->tmem[d], &lo, 4);
+				memcpy(&r->tmem[0x800 | d], &hi, 4);
+			}
+			if (k < count) {
+				uint32_t const d = (line + (uint32_t) k * 2) ^ swap;
+				r->tmem[d] = p[k * 4], r->tmem[d + 1] = p[k * 4 + 1];
+				r->tmem[0x800 | d] = p[k * 4 + 2], r->tmem[0x800 | (d + 1)] = p[k * 4 + 3];
+			}
+		} else if (r->texSize == 3 && !r->tmemSource) {
 			for (int s = s0; s <= s1; ++s) {
 				const uint8_t* p = &n->rdram[(row + s * 4) & (RDRAM_SIZE - 4)];
 				uint32_t d = (line + (s - s0) * 2) ^ swap;
