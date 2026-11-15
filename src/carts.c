@@ -116,6 +116,22 @@ bool cartGfxRsp(const uint8_t* rom) {
 	return false;
 }
 
+// Images, by the two CRCs at 0x10 in the header, that boot only with the fast CPU from power-on: made
+// on emulators, they hang with the caches' timing (in lle too).
+static const uint64_t bootUntimed[] = {
+	0x01CE221E1457165Aull, // Sunshine 64 (hack)
+};
+
+bool cartBootUntimed(const uint8_t* rom) {
+	uint64_t id = (uint64_t) be32(rom + 0x10) << 32 | be32(rom + 0x14);
+	for (size_t i = 0; i < sizeof(bootUntimed) / sizeof(*bootUntimed); ++i) {
+		if (bootUntimed[i] == id) {
+			return true;
+		}
+	}
+	return false;
+}
+
 // The boot code's checksum over the first megabyte after the header (as the boot code works it out
 // for each lockout chip). False if the header has it already.
 bool cartBootChecksum(const uint8_t* rom, size_t size, int cic, uint8_t seedByte, uint32_t out[2]) {

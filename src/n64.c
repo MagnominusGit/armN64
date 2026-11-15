@@ -334,7 +334,7 @@ void n64RunField(struct N64* n) {
 	// and what a game's threads race the video and timer interrupts for early on, take as long as on
 	// hardware (osContInit called before the timers are set up, threads using a queue before it is
 	// made). Then it goes without.
-	bool const fast = n->accuracy == ACCURACY_HLE && n->fields >= CACHE_TIMED_FIELDS;
+	bool const fast = n->accuracy == ACCURACY_HLE && (n->fields >= CACHE_TIMED_FIELDS || (n->rom && cartBootUntimed(n->rom)));
 	// The fast CPU takes two cycles an instruction, about the hardware's rate with its caches: what a
 	// game spins on while it waits costs half, and games racing the CPU find it no faster than theirs.
 	uint32_t const opCycles = fast ? 2 : 1;

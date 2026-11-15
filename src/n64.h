@@ -819,6 +819,7 @@ bool cartEeprom16k(const uint8_t* rom);
 bool cartHardwarePi(const uint8_t* rom);
 bool cartQuickSi(const uint8_t* rom);
 bool cartGfxRsp(const uint8_t* rom);
+bool cartBootUntimed(const uint8_t* rom);
 bool gbCartLoad(struct GbCart*, const uint8_t* rom, size_t size);
 void gbCartFree(struct GbCart*);
 uint8_t gbCartRead(struct GbCart*, uint16_t addr);
