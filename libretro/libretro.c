@@ -65,6 +65,9 @@ static uint8_t saveMemory[SAVE_SIZE];
 // The frontend's GL context for the GPU renderer, and what puts the picture in its framebuffer.
 static struct retro_hw_render_callback hw;
 static bool hwWanted, hwReady, viInContext;
+// Whether the frontend gave its GL context, and without it whether the core may make its own.
+static bool contextGiven, ownContext;
+
 static struct {
 	void (*GenTextures)(int, unsigned*);
 	void (*DeleteTextures)(int, const unsigned*);
@@ -109,22 +112,22 @@ static struct retro_core_option_v2_category optionCategories[] = {
 // the options that do nothing with the others' values.
 static struct retro_core_option_v2_definition optionDefinitions[] = {
 	{ "armn64_accuracy", "Accuracy", NULL,
-	  "Fastest and Fast put speed first; Balanced runs each game's own audio code; Accurate is cycle-exact. Applies on Restart.",
+	  "Fastest and Fast put speed first; Balanced runs each game's own audio code; Accurate is cycle-exact.",
 	  NULL, "system", { { "fle", "Fastest (FLE)" }, { "hle", "Fast (HLE)" }, { "mle", "Balanced (MLE)" }, { "lle", "Accurate (LLE)" }, { NULL, NULL } }, "hle" },
 	{ "armn64_overclock", "Overclock", NULL,
-	  "A faster CPU, RSP and RDP for less slowdown and shorter loading. Applies on Restart.",
+	  "A faster CPU, RSP and RDP for less slowdown and shorter loading.",
 	  NULL, "system", { { "1", "Off" }, { "1.5", "1.5x" }, { "2", "2x" }, { "2.5", "2.5x" }, { "3", "3x" }, { "4", "4x" }, { NULL, NULL } }, "1" },
 	{ "armn64_frameskip", "Frame Skip", NULL,
-	  "Skips drawing frames for full speed on slow devices. Auto: only when it falls behind. Applies on Restart.",
+	  "Skips drawing frames for full speed on slow devices. Auto: only when it falls behind.",
 	  NULL, "system", { { "disabled", "Off" }, { "auto", "Auto" }, { "enabled", "Every Other Frame" }, { NULL, NULL } }, "disabled" },
 	{ "armn64_expansion", "Expansion Pak", NULL,
-	  "The 4 MB memory add-on most later games use. Off: as without one, for games and hacks that need that. Applies on Restart.",
+	  "The 4 MB memory add-on most later games use. Off: as without one, for games and hacks that need that. Takes effect when the game restarts.",
 	  NULL, "system", { { "enabled", "On" }, { "disabled", "Off" }, { NULL, NULL } }, "enabled" },
 	{ "armn64_renderer", "Renderer", NULL,
-	  "GL: fastest, HD, not exact. CPU: exact, the choice on handhelds. GPU: exact, for desktop graphics cards, also HD. Applies on Restart.",
+	  "GL: fastest, HD, not exact. CPU: exact, the choice on handhelds. GPU: exact, for desktop graphics cards, also HD.",
 	  NULL, "video", { { "gl", "GL (Fast, HD)" }, { "gpu", "GPU (Exact, HD)" }, { "cpu", "CPU (Exact, Native)" }, { NULL, NULL } }, "gl" },
 	{ "armn64_resolution", "Resolution", NULL,
-	  "GL and GPU drawing resolution. Auto fits the display with GL and is Native with GPU (exact only at Native). GL draws high-resolution games at half. Applies on Restart.",
+	  "GL and GPU drawing resolution. Auto fits the display with GL and is Native with GPU (exact only at Native). GL draws high-resolution games at half.",
 	  NULL, "video", { { "auto", "Auto" }, { "1", "Native" }, { "2", "2x" }, { "3", "3x" }, { "4", "4x" }, { "5", "5x" }, { "6", "6x" }, { "7", "7x" }, { "8", "8x" }, { NULL, NULL } }, "2" },
 	{ "armn64_widescreen", "Widescreen", NULL,
 	  "16:9 and 16:10 draw more at the sides (Library graphics); things just off the 4:3 edges may be missing. Picture Only: for games' own wide modes.",
@@ -147,16 +150,16 @@ static struct retro_core_option_v2_definition optionDefinitions[] = {
 	  "The console's antialiasing and dither filters, as a TV showed them. Auto: on with Balanced and Accurate.",
 	  NULL, "video", { { "auto", "Auto" }, { "on", "On" }, { "off", "Off" }, { NULL, NULL } }, "auto" },
 	{ "armn64_gl_filter", "Texture Filtering", NULL,
-	  "Console: the N64's own three-texel filter. Smooth: four texels, softer. Sharp: unfiltered, square texels. Applies on Restart.",
+	  "Console: the N64's own three-texel filter. Smooth: four texels, softer. Sharp: unfiltered, square texels.",
 	  NULL, "gl", { { "console", "Console" }, { "smooth", "Smooth" }, { "sharp", "Sharp" }, { NULL, NULL } }, "console" },
 	{ "armn64_gl_msaa", "Anti-Aliasing", NULL,
-	  "Smooths edges and closes hairline gaps between triangles. Costs GPU time. Applies on Restart.",
+	  "Smooths edges and closes hairline gaps between triangles. Costs GPU time.",
 	  NULL, "gl", { { "off", "Off" }, { "2", "2x" }, { "4", "4x" }, { "8", "8x" }, { NULL, NULL } }, "off" },
 	{ "armn64_gl_seal", "Seal Edges", NULL,
-	  "Opaque triangles reach half a pixel further, closing cracks the background shows through. Applies on Restart.",
+	  "Opaque triangles reach half a pixel further, closing cracks the background shows through.",
 	  NULL, "gl", { { "disabled", "Off" }, { "enabled", "On" }, { NULL, NULL } }, "disabled" },
 	{ "armn64_gl_shaders", "Shader Accuracy", NULL,
-	  "Fast: simpler shaders for weak GPUs; colors and textures can differ slightly from the console. Applies on Restart.",
+	  "Fast: simpler shaders for weak GPUs; colors and textures can differ slightly from the console.",
 	  NULL, "gl", { { "accurate", "Accurate" }, { "fast", "Fast" }, { NULL, NULL } }, "accurate" },
 	{ "armn64_gl_fb_effects", "Framebuffer Effects", NULL,
 	  "Fast: effects drawn from the picture (blurs, screen copies) use the last one in memory. Faster on some devices; may lag or glitch.",
@@ -219,16 +222,16 @@ static struct retro_core_option_v2_definition optionDefinitions[] = {
 	  "Open pauses the game to copy, delete, export, import and format the paks' notes. B closes it.",
 	  NULL, "paks", { { "closed", "Closed" }, { "open", "Open" }, { NULL, NULL } }, "closed" },
 	{ "armn64_gfx_rsp", "Graphics Microcode", NULL,
-	  "Library: the core's own copy of the graphics code, fast. Game's Own: the game's code on the RSP, exact but slower. Applies on Restart.",
+	  "Library: the core's own copy of the graphics code, fast. Game's Own: the game's code on the RSP, exact but slower.",
 	  NULL, "advanced", { { "library", "Library" }, { "rsp", "Game's Own" }, { NULL, NULL } }, "library" },
 	{ "armn64_hle_timing", "Graphics Task Timing", NULL,
-	  "With Library graphics. Short: graphics tasks finish sooner; some games then draw more frames than on a console. Applies on Restart.",
+	  "With Library graphics. Short: graphics tasks finish sooner; some games then draw more frames than on a console.",
 	  NULL, "advanced", { { "console", "Console" }, { "short", "Short" }, { NULL, NULL } }, "console" },
 	{ "armn64_rsp_thread", "Threaded RSP", NULL,
-	  "With Fast. Runs the RSP on a core of its own: faster for some games. Applies on Restart.",
+	  "With Fast. Runs the RSP on a core of its own: faster for some games.",
 	  NULL, "advanced", { { "disabled", "Off" }, { "enabled", "On" }, { NULL, NULL } }, "disabled" },
 	{ "armn64_rdp_threads", "Renderer Threads", NULL,
-	  "With the CPU renderer. Cores drawing beside the emulation; Auto takes up to 3. Applies on Restart.",
+	  "With the CPU renderer. Cores drawing beside the emulation; Auto takes up to 3.",
 	  NULL, "advanced", { { "auto", "Auto" }, { "0", "None" }, { "1", "1" }, { "2", "2" }, { "3", "3" }, { NULL, NULL } }, "auto" },
 	{ NULL, NULL, NULL, NULL, NULL, NULL, { { NULL, NULL } }, NULL },
 };
@@ -258,6 +261,13 @@ static const char* renderer(void) {
 		return value;
 	}
 	return "gl";
+}
+
+// The GPU renderers by the option, in the frontend's GL context if it has one, else in the core's own
+// (beside a Vulkan frontend, say). With the renderer threads, the VI's filters use the GL context.
+static void chooseRenderer(void) {
+	hwWanted = strcmp(renderer(), "cpu") != 0 && (contextGiven || ownContext);
+	viInContext = contextGiven && strcmp(renderer(), "cpu") == 0;
 }
 
 static const char* overclock(void) {
@@ -349,6 +359,11 @@ static int glScale(void) {
 	return display;
 }
 
+// The Expansion Pak's setting the game booted with, and whether the machine is being made again for
+// other options (applyOptions), when it keeps it.
+static char madeExpansion[16];
+static bool expansionTold, rebuilding;
+
 // The emulator's settings, from the core's options; the recompilers are always on.
 static const char* settings(const char* name) {
 	static char threads[4], scale[2];
@@ -356,7 +371,8 @@ static const char* settings(const char* name) {
 		return accuracy();
 	}
 	if (!strcmp(name, "N64_EXPANSION")) {
-		return optionIs(environment, "armn64_expansion", "disabled") ? "0" : "1";
+		// A machine made again for other options keeps the memory the game booted with.
+		return rebuilding ? madeExpansion : optionIs(environment, "armn64_expansion", "disabled") ? "0" : "1";
 	}
 	if (!strcmp(name, "N64_OVERCLOCK")) {
 		return overclock();
@@ -900,6 +916,8 @@ static void describeInput(void) {
 	environment(RETRO_ENVIRONMENT_SET_CONTROLLER_INFO, (void*) ports);
 }
 
+static void rememberSettings(bool booted);
+
 bool retro_load_game(const struct retro_game_info* info) {
 	if (!info || !info->data || !info->size) {
 		return false;
@@ -912,18 +930,15 @@ bool retro_load_game(const struct retro_game_info* info) {
 	if (!game) {
 		return false;
 	}
-	// The GPU renderers, in the frontend's GL context if it has one, else in the core's own (beside a
-	// Vulkan frontend, say). With the renderer threads, the VI's filters use the GL context.
 	showOptions();
-	hwWanted = strcmp(renderer(), "cpu") != 0;
-	bool context = askHardwareContext();
-	viInContext = context && !hwWanted;
-	if (hwWanted && !context) {
+	contextGiven = askHardwareContext();
+	if (!contextGiven) {
 		unsigned preferred = RETRO_HW_CONTEXT_NONE;
 		environment(RETRO_ENVIRONMENT_GET_PREFERRED_HW_RENDER, &preferred);
-		hwWanted = preferred == RETRO_HW_CONTEXT_VULKAN || preferred == RETRO_HW_CONTEXT_NONE;
+		ownContext = preferred == RETRO_HW_CONTEXT_VULKAN || preferred == RETRO_HW_CONTEXT_NONE;
 		hw.context_type = RETRO_HW_CONTEXT_NONE;
 	}
+	chooseRenderer();
 	memcpy(game, info->data, info->size);
 	gameSize = info->size;
 	size_t length = info->path ? strlen(info->path) : 0;
@@ -955,6 +970,7 @@ bool retro_load_game(const struct retro_game_info* info) {
 		return false;
 	}
 	pal = machine->fieldCycles == hwCycles(machine, CPU_HZ / 50);
+	rememberSettings(true);
 	saveExport();
 	saveGiven = false;
 	toldRsp = false;
@@ -1000,9 +1016,11 @@ void retro_reset(void) {
 	transferPaksSave();
 	n64Destroy(machine);
 	glesYield();
+	chooseRenderer();
 	machine = startMachine();
 	if (machine) {
 		saveImport();
+		rememberSettings(true);
 	}
 }
 
@@ -1330,11 +1348,104 @@ static bool pakManager(bool shared) {
 	return true;
 }
 
+// The settings the machine was made with that the game can take while it runs; and the Expansion
+// Pak's, which the game sizes its memory by as it boots.
+static const char* const madeWith[] = { "N64_ACCURACY", "N64_OVERCLOCK", "N64_GPU_SCALE", "N64_GL_SCALE", "N64_SLICE", "N64_RDP_GL",
+	                                    "N64_RDP_GPU", "N64_VI_GPU", "N64_GFX_RSP", "N64_HLE_TIMING", "N64_RSP_THREAD", "N64_GL_FB_EFFECTS",
+	                                    "N64_GL_MSAA", "N64_WIDESCREEN", "N64_GL_FILTER", "N64_GL_SEAL", "N64_GL_SHADERS", "N64_FRAMESKIP",
+	                                    "N64_RDP_THREADS" };
+static char madeValues[sizeof(madeWith) / sizeof(*madeWith)][16];
+
+// booted: the Expansion Pak's too, for a machine that boots.
+static void rememberSettings(bool booted) {
+	for (size_t i = 0; i < sizeof(madeWith) / sizeof(*madeWith); ++i) {
+		const char* value = settings(madeWith[i]);
+		snprintf(madeValues[i], sizeof(madeValues[i]), "%s", value ? value : "");
+	}
+	if (booted) {
+		const char* value = settings("N64_EXPANSION");
+		snprintf(madeExpansion, sizeof(madeExpansion), "%s", value ? value : "");
+		expansionTold = false;
+	}
+}
+
+static bool settingsChanged(void) {
+	for (size_t i = 0; i < sizeof(madeWith) / sizeof(*madeWith); ++i) {
+		const char* value = settings(madeWith[i]);
+		if (strcmp(madeValues[i], value ? value : "")) {
+			return true;
+		}
+	}
+	return false;
+}
+
+// Options changed while the game runs: the machine made again with them, from a state of the one
+// that ran (states load across accuracies and renderers), so the game goes on where it was. The
+// Expansion Pak waits for a Restart.
+static void applyOptions(void) {
+	const char* expansion = optionIs(environment, "armn64_expansion", "disabled") ? "0" : "1";
+	if (!expansionTold && strcmp(madeExpansion, expansion)) {
+		notify("Expansion Pak: takes effect when the game restarts");
+		expansionTold = true;
+	}
+	// The renderer's settings by the option as it is now.
+	chooseRenderer();
+	if (!settingsChanged()) {
+		return;
+	}
+	bool const own = hw.context_type == RETRO_HW_CONTEXT_NONE;
+	size_t const size = n64StateSize();
+	void* state = malloc(size);
+	if (own) {
+		glesResume();
+	}
+	bool const saved = state && n64StateSave(machine, state, size, false);
+	if (own) {
+		glesYield();
+	}
+	if (!saved) {
+		free(state);
+		notify("These options take effect when the game restarts");
+		rememberSettings(false);
+		return;
+	}
+	paksSync(machine);
+	diskSave();
+	transferPaksSave();
+	n64Destroy(machine);
+	glesYield();
+	rebuilding = true;
+	machine = startMachine();
+	rebuilding = false;
+	if (!machine) {
+		free(state);
+		logMessage(RETRO_LOG_ERROR, "the game couldn't be started again with the new options");
+		return;
+	}
+	if (own) {
+		glesResume();
+	}
+	bool const loaded = n64StateLoad(machine, state, size, false);
+	if (own) {
+		glesYield();
+	}
+	free(state);
+	if (!loaded) {
+		logMessage(RETRO_LOG_WARN, "the game started again with the new options, from the beginning");
+		saveImport();
+	}
+	struct retro_audio_buffer_status_callback bufferStatus = { audioBufferStatus };
+	audioBehind = latencySet = false;
+	environment(RETRO_ENVIRONMENT_SET_AUDIO_BUFFER_STATUS_CALLBACK, machine->skip.automatic ? &bufferStatus : NULL);
+	rememberSettings(false);
+}
+
 void retro_run(void) {
 	if (!machine) {
 		return;
 	}
 	optionsRefresh(environment);
+	applyOptions();
 	if (!saveGiven) {
 		saveImport();
 		saveGiven = true;
