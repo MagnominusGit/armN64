@@ -173,6 +173,14 @@ void blocksInvalidatePage(struct N64* n, uint32_t page) {
 	}
 	n->pageFlags[page] &= ~PAGE_CODE;
 	memset(&n->codeWords[page << 7], 0, 128);
+	// A block on the page before with its last word here.
+	struct Block** before = page ? n->blockPage[page - 1] : NULL;
+	for (int i = PAGE_WORDS - BLOCK_MAX; before && i < PAGE_WORDS; ++i) {
+		if (before[i] && i + (int) before[i]->count > PAGE_WORDS) {
+			dropBlock(n, before[i]);
+			before[i] = NULL;
+		}
+	}
 	++n->codeGen;
 }
 
@@ -232,6 +240,11 @@ static struct Block* compile(struct N64* n, uint32_t vaddr, uint32_t paddr) {
 		b->ops[count++] = op;
 		a += 4;
 		if (!(a & 0xFFF)) {
+			// A branch in the page's last word takes its delay slot from the next page, where kseg0
+			// has it in RDRAM.
+			if (isBranch(op) && (vaddr & 0xC0000000) == 0x80000000 && a < RDRAM_SIZE && count < BLOCK_MAX) {
+				b->ops[count++] = be32(&n->rdram[a]);
+			}
 			break;
 		}
 		if (delay) {
@@ -579,6 +592,7 @@ void blocksRun(struct N64* n) {
 			}
 			t[(paddr >> 2) & (PAGE_WORDS - 1)] = b;
 			n->pageFlags[page] |= PAGE_CODE;
+			n->pageFlags[(paddr + 4 * (b->count - 1)) >> 12] |= PAGE_CODE;
 			for (uint32_t w = paddr >> 2; w < (paddr >> 2) + b->count; ++w) {
 				n->codeWords[w >> 3] |= (uint8_t) (1 << (w & 7));
 			}
