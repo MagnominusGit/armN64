@@ -3406,6 +3406,18 @@ static bool depthOnly(const struct Glr* g, uint32_t addr, uint32_t len) {
 	return true;
 }
 
+// Whether a target has drawn rows in the page at at.
+static bool pageDrawn(const struct Glr* g, uint32_t at) {
+	for (int i = 0; i < TARGETS; ++i) {
+		const struct Target* t = &g->target[i];
+		uint32_t const row = t->width * (t->size == 3 ? 4 : t->size == 1 ? 1 : 2);
+		if (t->texture && t->dirtyTo > t->dirtyFrom && at < t->addr + (uint32_t) t->dirtyTo * row && at + 4096 > t->addr + (uint32_t) t->dirtyFrom * row) {
+			return true;
+		}
+	}
+	return false;
+}
+
 static void touched(struct N64* n, uint32_t addr, uint32_t len, bool write, bool load) {
 	struct Glr* g = n->glr;
 	if (write && depthOnly(g, addr, len)) {
@@ -3493,11 +3505,14 @@ static void touched(struct N64* n, uint32_t addr, uint32_t len, bool write, bool
 			}
 		}
 		// A page written that no target draws to and that holds no depth: the targets load its rows
-		// again when they need them, so the writes after this one go straight to RDRAM.
+		// again when they need them, so the writes after this one go straight to RDRAM. Not one with
+		// rows a target drew (FLE leaves those waiting for writes only once the CPU reads them): its
+		// writes keep coming here, where only the bytes written load again (forgetting the page
+		// would load the image's every row again, a field late, at its next draw).
 		uint32_t const first = (addr & (RDRAM_SIZE - 1)) >> 12, last = ((addr + len - 1) & (RDRAM_SIZE - 1)) >> 12;
 		for (uint32_t p = first; !g->own && p <= last; ++p) {
 			uint32_t const at = p << 12;
-			if ((n->pageFlags[p] & PAGE_RDP) != PAGE_RDP_READS || (g->zWidth && at < g->zAddr + g->zBytes && at + 4096 > g->zAddr)) {
+			if ((n->pageFlags[p] & PAGE_RDP) != PAGE_RDP_READS || (g->zWidth && at < g->zAddr + g->zBytes && at + 4096 > g->zAddr) || pageDrawn(g, at)) {
 				continue;
 			}
 			forgetRows(g, at, 4096, NULL);
