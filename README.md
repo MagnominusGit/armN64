@@ -32,9 +32,9 @@ first. Please report problems in Issues.
   are made on), save states, rewind and run-ahead.
 - Cheat cartridges: a GameShark Pro or Action Replay Pro ROM (a file named for one) runs as the
   cartridge itself, its menus and code lists, with a game plugged in on top (Game on Top). Its flash
-  is the cartridge's save; the game on top keeps its own save, as when it runs by itself. Version
-  3.x cartridges start games with the 6102 and 6105 lockout chips; games with the 6103 chip, and
-  version 2.0 cartridges, don't start yet.
+  is the cartridge's save; the game on top keeps its own save, as when it runs by itself. As on a
+  real one, games with the 6103 lockout chip start only with their enabler (Must Be On) code turned
+  on in the cartridge's list. Version 2.0 cartridges don't start yet.
 
 ## Controls
 
