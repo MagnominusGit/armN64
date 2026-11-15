@@ -117,6 +117,8 @@ struct Miss {
 	int size;
 	// A load that, with the GL renderer, waits for the GPU's pages when the line comes in.
 	bool glLoad;
+	// A store (its vpages entry is the one for writes).
+	bool store;
 };
 
 struct Jit {
@@ -144,6 +146,9 @@ struct Jit {
 	int32_t value[32];
 	struct Miss misses[64];
 	int missCount;
+	// Fast CPU accesses outside kseg0's RDRAM, through vpages in the cold code.
+	struct Miss mapped[64];
+	int mappedCount;
 
 	// Stores to pages with compiled code, which check that they miss its words.
 	struct Miss codeChecks[64];
@@ -1427,23 +1432,17 @@ static void emitMemory(struct Jit* j, struct Slow* slow) {
 	}
 	xMovRR(e, 4, R8, RAX);
 	if (j->fast) {
-		// kseg0's RDRAM (and aligned, but with FLE) in one test; anything else through vpages, which
-		// must give RDRAM.
+		// kseg0's RDRAM (and aligned, but with FLE) in one test; anything else through vpages in the
+		// cold code.
 		xAluI(e, X_XOR, 4, R(RAX), (int32_t) 0x80000000u);
 		xTestI(e, 4, R(RAX), ~(uint32_t) (RDRAM_SIZE - 1) | (j->fle ? 0 : (uint32_t) (size - 1)));
-		uint8_t* kseg0 = xJcc(e, CC_E, NULL);
-		xMovRR(e, 4, RAX, R8);
-		xMovRR(e, 4, RCX, RAX);
-		xShiftI(e, X_SHR, 4, R(RCX), 12);
-		xLoad(e, 8, RDX, N64_AT(vpages));
-		xAluRM(e, X_ADD, 4, RAX, MI(RDX, RCX, 4, isStore ? VPAGES * 4 : 0));
-		xTestI(e, 4, R(RAX), ~(uint32_t) (RDRAM_SIZE - 1));
-		slow->site[slow->sites++] = xJcc(e, CC_NE, NULL);
-		if (size > 1 && !j->fle) {
-			xTestI(e, 4, R(R8), (uint32_t) (size - 1));
-			slow->site[slow->sites++] = xJcc(e, CC_NE, NULL);
-		}
-		patchHere(e, kseg0);
+		struct Miss* v = &j->mapped[j->mappedCount++];
+		v->site = xJcc(e, CC_NE, NULL);
+		v->resume = e->p;
+		v->slow = slow;
+		v->size = size;
+		v->store = isStore;
+		slow->keep = true;
 	} else {
 		// The physical page from vpages: one not looked up lands past RDRAM.
 		xMovRR(e, 4, RCX, RAX);
@@ -1758,7 +1757,7 @@ void* jitCompile(struct N64* n, const uint32_t* ops, uint32_t count, uint32_t va
 	static struct Jit jit;
 	struct Jit* j = &jit;
 	j->e = (struct Emitter) { arena + n->jitUsed, arena + n->jitUsed, arena + n->jitUsed + BLOCK_CODE_MAX };
-	j->exitCount = j->slowCount = j->missCount = j->codeCheckCount = j->rdpWaitCount = 0;
+	j->exitCount = j->slowCount = j->missCount = j->codeCheckCount = j->rdpWaitCount = j->mappedCount = 0;
 	j->leave = n->jitLeave;
 	j->rdpThreads = n->rdpThreads > 0 || n->rdpGl;
 	j->rdpGl = n->rdpGl;
@@ -1808,7 +1807,7 @@ void* jitCompile(struct N64* n, const uint32_t* ops, uint32_t count, uint32_t va
 		bool lineStart = k == 0 || !(p & 31);
 		enum Kind kind;
 		uint8_t* mark = e->p;
-		int exits = j->exitCount, misses = j->missCount, codeChecks = j->codeCheckCount;
+		int exits = j->exitCount, misses = j->missCount, codeChecks = j->codeCheckCount, mapped = j->mappedCount;
 		bool branch = isBranchOp(op);
 		struct Slow* slow = &j->slows[j->slowCount];
 		int const prevMark = k ? cpuLoadMark(ops[k - 1]) : -1;
@@ -1871,6 +1870,7 @@ void* jitCompile(struct N64* n, const uint32_t* ops, uint32_t count, uint32_t va
 		j->exitCount = exits;
 		j->missCount = misses;
 		j->codeCheckCount = codeChecks;
+		j->mappedCount = mapped;
 		emitHelper(j, op, pc, p, delay, lineStart, last, prevMark, slow->nextStall);
 		delay = branch;
 	}
@@ -1911,6 +1911,25 @@ void* jitCompile(struct N64* n, const uint32_t* ops, uint32_t count, uint32_t va
 		patchHere(e, w->site);
 		rdpWaitCall(e, (const void*) cpuRdpWaitRead, w->size);
 		xJmp(e, w->resume);
+	}
+
+	// Fast CPU accesses outside kseg0's RDRAM: the physical address from vpages, which must be RDRAM
+	// (and, but with FLE, aligned).
+	for (int i = 0; i < j->mappedCount; ++i) {
+		struct Miss* v = &j->mapped[i];
+		patchHere(e, v->site);
+		xMovRR(e, 4, RAX, R8);
+		xMovRR(e, 4, RCX, RAX);
+		xShiftI(e, X_SHR, 4, R(RCX), 12);
+		xLoad(e, 8, RDX, N64_AT(vpages));
+		xAluRM(e, X_ADD, 4, RAX, MI(RDX, RCX, 4, v->store ? VPAGES * 4 : 0));
+		xTestI(e, 4, R(RAX), ~(uint32_t) (RDRAM_SIZE - 1));
+		v->slow->site[v->slow->sites++] = xJcc(e, CC_NE, NULL);
+		if (v->size > 1 && !j->fle) {
+			xTestI(e, 4, R(R8), (uint32_t) (v->size - 1));
+			v->slow->site[v->slow->sites++] = xJcc(e, CC_NE, NULL);
+		}
+		xJmp(e, v->resume);
 	}
 
 	// D-cache misses, filled (and a dirty line written back) in C. A misaligned address, one past
