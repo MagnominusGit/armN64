@@ -138,8 +138,13 @@ struct Jit {
 	// A poll loop's block (pollSkip): its loads' addresses kept in CPU.pollAt from its start.
 	bool poll;
 	uint32_t pollBase;
+	// Guest registers holding a 32-bit value known as the block runs (bit per register; r0 always),
+	// and their values: what lui, addiu and ori made of known ones.
+	uint32_t known;
+	int32_t value[32];
 	struct Miss misses[64];
 	int missCount;
+
 	// Stores to pages with compiled code, which check that they miss its words.
 	struct Miss codeChecks[64];
 	int codeCheckCount;
@@ -1212,6 +1217,45 @@ static void skipCount(struct Emitter* e, uint32_t vaddr, uint32_t paddr, bool fa
 	}
 }
 
+// The known registers after op: what it makes of known ones, and none it writes otherwise (all of
+// them after an instruction not decoded here).
+static void trackConst(struct Jit* j, uint32_t op) {
+	int const rs = (op >> 21) & 31, rt = (op >> 16) & 31, rd = (op >> 11) & 31, code = op >> 26;
+	uint32_t const imm = op & 0xFFFF;
+	uint32_t written = 0;
+	switch (code) {
+	case 0x00:
+		written = 1u << rd;
+		break;
+	case 0x01:
+	case 0x03:
+		written = 1u << 31;
+		break;
+	case 0x02: case 0x04: case 0x05: case 0x06: case 0x07: case 0x14: case 0x15: case 0x16: case 0x17:
+	case 0x28: case 0x29: case 0x2A: case 0x2B: case 0x2C: case 0x2D: case 0x2E: case 0x2F: case 0x3F:
+	case 0x31: case 0x35: case 0x39: case 0x3D:
+		break;
+	case 0x09: case 0x0D: case 0x0F: {
+		bool const from = code == 0x0F || (j->known >> rs & 1);
+		int32_t const v = code == 0x0F ? (int32_t) (imm << 16) : code == 0x09 ? (int32_t) ((uint32_t) j->value[rs] + (uint32_t) (int16_t) imm) : (int32_t) ((uint32_t) j->value[rs] | imm);
+		if (rt) {
+			j->known = from ? j->known | 1u << rt : j->known & ~(1u << rt);
+			j->value[rt] = v;
+		}
+		return;
+	}
+	case 0x08: case 0x0A: case 0x0B: case 0x0C: case 0x0E: case 0x10: case 0x11: case 0x12: case 0x18: case 0x19:
+	case 0x1A: case 0x1B: case 0x20: case 0x21: case 0x22: case 0x23: case 0x24: case 0x25: case 0x26: case 0x27:
+	case 0x30: case 0x34: case 0x37: case 0x38: case 0x3C:
+		written = 1u << rt;
+		break;
+	default:
+		written = ~1u;
+		break;
+	}
+	j->known &= ~written | 1u;
+}
+
 static bool isBranchOp(uint32_t op) {
 	switch (op >> 26) {
 	case 0x00:
@@ -1362,6 +1406,14 @@ static void emitMemory(struct Jit* j, struct Slow* slow) {
 		needCop1(j);
 	}
 
+	// With the fast CPU, an address known now (a constant base) that is kseg0's RDRAM, aligned, needs
+	// no checks.
+	uint32_t const at = (uint32_t) j->value[rs] + (uint32_t) (int16_t) op;
+	bool const direct = j->fast && (j->known >> rs & 1) && (at ^ 0x80000000u) < RDRAM_SIZE && !(at & (uint32_t) (size - 1));
+	if (direct) {
+		xMovI(e, R8, at);
+		xMovI(e, RAX, at ^ 0x80000000u);
+	} else {
 	// The address in 64 bits, which the interpreter takes when it isn't a 32-bit one sign-extended (an
 	// address error); the low 32 bits from here on.
 	xLoad(e, 8, RAX, gpr(rs));
@@ -1374,11 +1426,32 @@ static void emitMemory(struct Jit* j, struct Slow* slow) {
 		slow->site[slow->sites++] = xJcc(e, CC_NE, NULL);
 	}
 	xMovRR(e, 4, R8, RAX);
-	// The physical page from vpages: one not looked up lands past RDRAM.
-	xMovRR(e, 4, RCX, RAX);
-	xShiftI(e, X_SHR, 4, R(RCX), 12);
-	xLoad(e, 8, RDX, N64_AT(vpages));
-	xAluRM(e, X_ADD, 4, RAX, MI(RDX, RCX, 4, isStore ? VPAGES * 4 : 0));
+	if (j->fast) {
+		// kseg0's RDRAM (and aligned, but with FLE) in one test; anything else through vpages, which
+		// must give RDRAM.
+		xAluI(e, X_XOR, 4, R(RAX), (int32_t) 0x80000000u);
+		xTestI(e, 4, R(RAX), ~(uint32_t) (RDRAM_SIZE - 1) | (j->fle ? 0 : (uint32_t) (size - 1)));
+		uint8_t* kseg0 = xJcc(e, CC_E, NULL);
+		xMovRR(e, 4, RAX, R8);
+		xMovRR(e, 4, RCX, RAX);
+		xShiftI(e, X_SHR, 4, R(RCX), 12);
+		xLoad(e, 8, RDX, N64_AT(vpages));
+		xAluRM(e, X_ADD, 4, RAX, MI(RDX, RCX, 4, isStore ? VPAGES * 4 : 0));
+		xTestI(e, 4, R(RAX), ~(uint32_t) (RDRAM_SIZE - 1));
+		slow->site[slow->sites++] = xJcc(e, CC_NE, NULL);
+		if (size > 1 && !j->fle) {
+			xTestI(e, 4, R(R8), (uint32_t) (size - 1));
+			slow->site[slow->sites++] = xJcc(e, CC_NE, NULL);
+		}
+		patchHere(e, kseg0);
+	} else {
+		// The physical page from vpages: one not looked up lands past RDRAM.
+		xMovRR(e, 4, RCX, RAX);
+		xShiftI(e, X_SHR, 4, R(RCX), 12);
+		xLoad(e, 8, RDX, N64_AT(vpages));
+		xAluRM(e, X_ADD, 4, RAX, MI(RDX, RCX, 4, isStore ? VPAGES * 4 : 0));
+	}
+	}
 	if (j->poll && !isStore && (uint32_t) (slow->pc - j->pollBase) < 64) {
 		uint32_t const k = (uint32_t) (slow->pc - j->pollBase) / 4;
 		xStore(e, 4, CPU_AT(pollAt[k]), RAX);
@@ -1409,13 +1482,7 @@ static void emitMemory(struct Jit* j, struct Slow* slow) {
 	}
 
 	if (j->fast) {
-		// Aligned and in RDRAM.
-		xTestI(e, 4, R(RAX), ~(uint32_t) (RDRAM_SIZE - 1));
-		slow->site[slow->sites++] = xJcc(e, CC_NE, NULL);
-		if (size > 1 && !j->fle) {
-			xTestI(e, 4, R(R8), (uint32_t) (size - 1));
-			slow->site[slow->sites++] = xJcc(e, CC_NE, NULL);
-		}
+		// Aligned and in RDRAM: tested on the way here.
 	} else {
 	// The line index from the virtual address; a hit when its tag is this physical line and the
 	// address is aligned.
@@ -1730,9 +1797,13 @@ void* jitCompile(struct N64* n, const uint32_t* ops, uint32_t count, uint32_t va
 
 	bool delay = false;
 	int pending = 0;
+	j->known = 1, j->value[0] = 0;
 	for (uint32_t k = 0; k < count; ++k) {
 		uint32_t op = ops[k], p = paddr + k * 4;
 		uint64_t pc = sext32(vaddr + k * 4);
+		if (k) {
+			trackConst(j, ops[k - 1]);
+		}
 		bool last = k + 1 == count;
 		bool lineStart = k == 0 || !(p & 31);
 		enum Kind kind;
