@@ -279,6 +279,11 @@ struct Glr {
 	GLuint relayoutProgram;
 	GLint relayoutSource, relayoutParams;
 	bool relayoutTried;
+	// The VI's gamma on a picture: its program, and the texture it draws into.
+	GLuint gammaProgram, gammaTexture, gammaFramebuffer;
+	GLint gammaSource;
+	int gammaWidth, gammaHeight;
+	bool gammaTried;
 	// Seal Edges (N64_GL_SEAL): how far, in the target's pixels, opaque triangles reach past their
 	// edges to cover the cracks between them that show at higher scales.
 	float seal;
@@ -3088,6 +3093,55 @@ bool glrDrew(struct N64* n, uint32_t addr, uint32_t len) {
 	return false;
 }
 
+// The VI's gamma on what a target holds (each channel the square root, as viGamma has it), in a
+// texture as large: its framebuffer, or 0 where it can't.
+static GLuint gammaPicture(struct Glr* g, struct Target* t) {
+	static const char fragment[] =
+		"#version 300 es\n"
+		"precision highp float;\n"
+		"uniform highp sampler2D uSource;\n"
+		"out vec4 color;\n"
+		"void main() {\n"
+		"	vec3 v = floor(texelFetch(uSource, ivec2(gl_FragCoord.xy), 0).rgb * 255.0 + 0.5);\n"
+		"	color = vec4(min(floor(sqrt(v * 256.0) + 0.001), 255.0) / 255.0, 1.0);\n"
+		"}\n";
+	struct Gl* gl = &g->gl;
+	if (!g->gammaProgram) {
+		if (g->gammaTried || !(g->gammaProgram = fullProgram(g, fragment))) {
+			g->gammaTried = true;
+			return 0;
+		}
+		g->gammaSource = gl->GetUniformLocation(g->gammaProgram, "uSource");
+		gl->GenTextures(1, &g->gammaTexture);
+		gl->GenFramebuffers(1, &g->gammaFramebuffer);
+	}
+	int const w = (int) t->width * t->scale, h = t->height * t->scale;
+	if (w > g->gammaWidth || h > g->gammaHeight) {
+		g->gammaWidth = w > g->gammaWidth ? w : g->gammaWidth;
+		g->gammaHeight = h > g->gammaHeight ? h : g->gammaHeight;
+		uploadTexture(g, g->gammaTexture);
+		gl->TexImage2D(GL_TEXTURE_2D, 0, GL_RGBA8, g->gammaWidth, g->gammaHeight, 0, GL_RGBA, GL_UNSIGNED_BYTE, NULL);
+		gl->TexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_NEAREST);
+		gl->TexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_NEAREST);
+		useFramebuffer(g, g->gammaFramebuffer);
+		gl->FramebufferTexture2D(GL_FRAMEBUFFER, GL_COLOR_ATTACHMENT0, GL_TEXTURE_2D, g->gammaTexture, 0);
+	}
+	useFramebuffer(g, g->gammaFramebuffer);
+	gl->Viewport(0, 0, w, h);
+	useScissor(g, false, 0, 0, 0, 0);
+	gl->Disable(GL_DEPTH_TEST);
+	gl->Disable(GL_BLEND);
+	gl->Disable(GL_POLYGON_OFFSET_FILL);
+	gl->ColorMask(1, 1, 1, 1);
+	gl->UseProgram(g->gammaProgram);
+	gl->ActiveTexture(GL_TEXTURE0);
+	gl->BindTexture(GL_TEXTURE_2D, t->texture);
+	gl->Uniform1i(g->gammaSource, 0);
+	gl->DrawArrays(5, 0, 4);
+	memset(&g->applied, 0xFF, sizeof(g->applied));
+	return g->gammaFramebuffer;
+}
+
 // Where in a target the VI's picture starts, from origin's offset there. A picture that starts near a
 // row's end and runs past it starts left of the next row (an origin a few pixels before a row).
 static void pictureStart(uint32_t offset, uint32_t stride, uint32_t bytes, int width, int* x, int* y) {
@@ -3156,7 +3210,7 @@ void glrField(struct N64* n) {
 // row, size 2 or 3), when the GPU drew some of those rows since its pixels last went back to RDRAM:
 // x and y of the picture's first pixel in it, and its rows (both fields of an interlaced picture). 0
 // otherwise: RDRAM has the picture.
-unsigned glrPicture(struct N64* n, uint32_t origin, uint32_t stride, int size, int width, int* rows, int* x, int* y) {
+unsigned glrPicture(struct N64* n, uint32_t origin, uint32_t stride, int size, int width, bool gamma, int* rows, int* x, int* y) {
 	struct Glr* g = n->glr;
 	uint32_t const bytes = size == 3 ? 4 : 2;
 	for (int pass = 0; pass < 2; ++pass) {
@@ -3194,7 +3248,8 @@ unsigned glrPicture(struct N64* n, uint32_t origin, uint32_t stride, int size, i
 			*rows = count;
 			resolve(g, t);
 			n->glrScale = t->scale;
-			return t->framebuffer;
+			GLuint const shown = gamma ? gammaPicture(g, t) : 0;
+			return shown ? shown : t->framebuffer;
 		}
 	}
 	return 0;

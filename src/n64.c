@@ -727,16 +727,16 @@ unsigned n64PictureBuffer(struct N64* n) {
 	return n->pictureGles && n->pictureRgba ? glesBuffer(n->pictureGles, n->pictureBinding) : 0;
 }
 
-// With the GL renderer, the VI's picture straight from the GPU when it drew it last (no VI filters,
-// as HLE puts speed first): the framebuffer and the picture's first pixel there. False when RDRAM
-// has the picture.
+// With the GL renderer, the VI's picture straight from the GPU when it drew it last (its gamma but no
+// VI filters, as HLE puts speed first): the framebuffer and the picture's first pixel there. False
+// when RDRAM has the picture.
 bool n64GlPicture(struct N64* n, unsigned* framebuffer, int* x, int* y, int* width, int* height) {
 	struct ViSetup s;
 	if (!n->glr || !viSetup(n, &s)) {
 		return false;
 	}
 	int rows = s.h;
-	*framebuffer = glrPicture(n, s.origin, s.stride, s.wide ? 3 : 2, s.w, &rows, x, y);
+	*framebuffer = glrPicture(n, s.origin, s.stride, s.wide ? 3 : 2, s.w, s.gammaOn, &rows, x, y);
 	*width = s.w;
 	*height = rows;
 	return *framebuffer != 0;

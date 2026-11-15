@@ -143,7 +143,7 @@ void glrWritten(struct N64*, uint32_t addr, uint32_t len);
 void glrTouched(struct N64*, uint32_t addr, uint32_t len, bool write);
 // FLE, once a field: the GPU's pixels the CPU read copied back to RDRAM a field late, without waiting.
 void glrField(struct N64*);
-unsigned glrPicture(struct N64*, uint32_t origin, uint32_t stride, int size, int width, int* rows, int* x, int* y);
+unsigned glrPicture(struct N64*, uint32_t origin, uint32_t stride, int size, int width, bool gamma, int* rows, int* x, int* y);
 // The RDP's own drawing of a primitive, into RDRAM.
 void rdpDrawSoftware(struct N64*, struct RDP*, const uint64_t* w, int op);
 // Whether the combiner reads a texel in either cycle: a triangle without texture coefficients still
