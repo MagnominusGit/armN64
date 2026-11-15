@@ -263,8 +263,10 @@ struct Glr {
 	// for the writes to be seen (again once a picture, zMark). The program that writes it.
 	bool zPending, zMark;
 	uint32_t zAddr, zWidth, zBytes, zLo, zHi;
-	// The depth images draws last read or wrote depth in: drawing into another is drawing color.
-	uint32_t zUsed[4];
+	// The depth images draws last read or wrote depth in, the width they did at and the field they
+	// last did: drawing into another is drawing color.
+	uint32_t zUsed[4], zUsedWidth[4];
+	uint64_t zUsedField[4];
 	int zRows;
 	GLuint zProgram, zTexture;
 	GLint zSource, zParams;
@@ -2749,11 +2751,16 @@ static bool fillRows(struct N64* n, struct Glr* g, struct RDP* r, const uint64_t
 static void depthUsed(struct N64* n, struct Glr* g, struct RDP* r) {
 	for (int i = 0; i < 4; ++i) {
 		if (g->zUsed[i] == r->zAddr) {
+			g->zUsedField[i] = n->fields;
 			return;
 		}
 	}
 	memmove(&g->zUsed[1], &g->zUsed[0], 3 * sizeof(g->zUsed[0]));
+	memmove(&g->zUsedWidth[1], &g->zUsedWidth[0], 3 * sizeof(g->zUsedWidth[0]));
+	memmove(&g->zUsedField[1], &g->zUsedField[0], 3 * sizeof(g->zUsedField[0]));
 	g->zUsed[0] = r->zAddr;
+	g->zUsedWidth[0] = r->colorWidth;
+	g->zUsedField[0] = n->fields;
 	int const rows = (int) ((r->scissorY1 + 3) >> 2) < TARGET_ROWS ? (int) ((r->scissorY1 + 3) >> 2) : TARGET_ROWS;
 	uint32_t const len = r->colorWidth * (uint32_t) (rows > 0 ? rows : 0) * 2;
 	if (n->rdpPending) {
@@ -2784,6 +2791,15 @@ static void draw(struct N64* n, struct RDP* r, const uint64_t* w, int op) {
 	g->seq = r->seq;
 	uint64_t c = w[0];
 	const struct GlrCorners* q = op >= 0x08 && op <= 0x0F ? queued(g, w) : NULL;
+	// A depth image no draw has used for a few fields drawn at another width (a high-resolution
+	// picture where the depth image was): a color image now, until depth is used there again.
+	if (r->colorAddr == r->zAddr && r->cycleType != 3) {
+		for (int i = 0; i < 4; ++i) {
+			if (g->zUsed[i] == r->zAddr && g->zUsedWidth[i] != r->colorWidth && n->fields - g->zUsedField[i] > 2) {
+				g->zUsed[i] = 0;
+			}
+		}
+	}
 	if ((r->zCompare || r->zUpdate) && r->cycleType != 3 && r->zAddr) {
 		depthUsed(n, g, r);
 	}
