@@ -122,6 +122,7 @@ static void spWriteStatus(struct N64* n, uint32_t v) {
 			n64Event(n, n->sp.hleDoneAt);
 			n->stats.gfxHle += graphics;
 		} else {
+			hleRspTask(n);
 			if (n->accuracy == ACCURACY_MLE && graphics) {
 				n->sp.gfxSince = n->cycles;
 				memcpy(n->sp.gfxTask, &n->sp.mem[0xFC0], sizeof(n->sp.gfxTask));

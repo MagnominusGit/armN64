@@ -40,7 +40,7 @@ struct ScreenVertex {
 };
 
 struct Hle {
-	// The display list of the last task drawn here, for a yielded copy of it.
+	// Unused, kept for the save states' layout.
 	uint32_t doneList;
 	// The task's output buffer (FIFO microcodes), when it has one in RDRAM.
 	uint32_t fifoStart, fifoEnd;
@@ -191,6 +191,8 @@ struct Hle {
 	// A graphics task drawn here that yielded: its time left, for when the scheduler starts it again.
 	bool yielding;
 	uint64_t yieldLeft;
+	// The display list of the last graphics task the RSP ran: a yielded copy of it goes back to the RSP.
+	uint32_t rspList;
 	// The share of the last drawn task's triangles sent to the RDP, for the time of a skipped frame's.
 	float sentShare;
 	int taskTriangles, taskSent;
@@ -5260,6 +5262,12 @@ void hleSignalled(struct N64* n) {
 	}
 }
 
+void hleRspTask(struct N64* n) {
+	if (n->hle && be32(&n->sp.mem[0xFC0]) == 1) {
+		n->hle->rspList = be32(&n->sp.mem[0xFF0]) & 0xFFFFFF;
+	}
+}
+
 // The status bits a task run here ends with: yielded (signal 1) or done (signal 2), halted at a break.
 uint32_t hleTaskEnd(struct N64* n) {
 	if (n->hle && n->hle->yielding) {
@@ -5345,11 +5353,11 @@ bool hleGraphics(struct N64* n, bool dry) {
 			return false;
 		}
 	}
-	// A yielded task started again: one run here drew all of it, so it is done (its data is the
-	// yield buffer, which the microcode would restore itself from).
+	// A yielded task started again (its data is the yield buffer, which the microcode restores itself
+	// from): one the RSP ran goes back to it; one run here drew all of it at its start, so it is done.
 	uint32_t list = be32(task + 0x30) & 0xFFFFFF;
 	if (be32(task + 4) & 1) {
-		if (n->hle && n->hle->doneList == list && !dry) {
+		if (n->hle && n->hle->rspList != list && !dry) {
 			n->sp.hleDoneAt = n->cycles + (n->hle->yieldLeft ? n->hle->yieldLeft : 4096);
 			n->hle->yieldLeft = 0;
 			return true;
@@ -5518,14 +5526,15 @@ bool hleGraphics(struct N64* n, bool dry) {
 	if (h->rejectedNow) {
 		// The RSP runs this task from the start (what the list made so far goes).
 		h->count = 0;
-		h->doneList = 0;
 		if (n->rdpGl) {
 			glrQueueClear(n);
 		}
 		return false;
 	}
 	finishTask(n, h);
-	h->doneList = dry ? h->doneList : list;
+	if (!dry && h->rspList == list) {
+		h->rspList = 0;
+	}
 	// Through without a FIFO or waits: the next tasks of this microcode may run on the RSP's thread.
 	bool const plain = f == FAMILY_F3D || f == FAMILY_F3DEX || f == FAMILY_F3DEX2 || f == FAMILY_F3DPD || f == FAMILY_S2DEX || f == FAMILY_S2DEX2;
 	if (!dry && n->rspThread && !rspThreadOn() && plain && !h->waiting && !h->stalled) {

@@ -837,6 +837,8 @@ void glrForget(struct N64*);
 // whether it can go on.
 bool hleWaiting(struct N64*);
 uint32_t hleTaskEnd(struct N64*);
+// A graphics task goes to the RSP.
+void hleRspTask(struct N64*);
 void hleResume(struct N64*);
 // The CPU changed an SP signal: a task waiting on one goes on.
 void hleSignalled(struct N64*);
