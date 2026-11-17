@@ -150,7 +150,7 @@ static struct retro_core_option_v2_definition optionDefinitions[] = {
 	  NULL, "video", { { "gl", "GL (Fast, HD)" }, { "gpu", "GPU (Exact, HD)" }, { "cpu", "CPU (Exact, Native)" }, { NULL, NULL } }, "gl" },
 	{ "armn64_resolution", "Resolution", NULL,
 	  "GL and GPU drawing resolution. Auto fits the display with GL and is Native with GPU (exact only at Native). GL draws high-resolution games at half (Resolution Scaling).",
-	  NULL, "video", { { "auto", "Auto" }, { "1", "Native" }, { "2", "2x" }, { "3", "3x" }, { "4", "4x" }, { "5", "5x" }, { "6", "6x" }, { "7", "7x" }, { "8", "8x" }, { NULL, NULL } }, "2" },
+	  NULL, "video", { { "auto", "Auto" }, { "1", "Native" }, { "2", "2x" }, { "3", "3x" }, { "4", "4x" }, { "5", "5x" }, { "6", "6x" }, { "7", "7x" }, { "8", "8x" }, { NULL, NULL } }, "1" },
 	{ "armn64_gl_scaling", "Resolution Scaling", NULL,
 	  "Fixed: Resolution counts from 320x240, so high-resolution games draw at half and every game comes out about as large. Internal: each game at the full Resolution of its own size, sharper in high-resolution games for up to four times the GPU work there. Auto stays Fixed.",
 	  NULL, "gl", { { "fixed", "Fixed (320x240)" }, { "internal", "Internal" }, { NULL, NULL } }, "fixed" },

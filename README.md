@@ -63,7 +63,7 @@ effect while the game runs, the Expansion Pak's when the game restarts.
 | | Expansion Pak (at the next restart) | On, Off |
 | | Game on Top (with a cheat cartridge; at the next restart) | None, the games beside the cartridge |
 | Video | Renderer | GL (Fast, HD), GPU (Exact, HD), CPU (Exact, Native) |
-| | Resolution (GL and GPU) | 2x, Auto, Native, 3x to 8x |
+| | Resolution (GL and GPU) | Native, Auto, 2x to 8x |
 | | Resolution Scaling (GL) | Fixed (320x240), Internal |
 | | Widescreen | Off, 16:9, 16:10, 16:9 Picture Only, 16:10 Picture Only |
 | | Aspect Ratio | Fill 4:3, TV 4:3, Square Pixels |
