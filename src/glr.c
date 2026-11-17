@@ -2503,11 +2503,17 @@ static void flushBatch(struct N64* n, struct Glr* g) {
 			// The RDP's decal passes only within the depth slope either way (rdp.c, z mode 3): first
 			// the pixels no more than that in front marked, then those no more than that behind drawn.
 			if (++g->stencilRef > 255) {
-				// All of the stencil, through the depth's framebuffer (a target's may have fewer rows).
+				// All of the stencil, through the depth's framebuffer (a target's may have fewer rows), in two
+				// halves: Mali's driver clears the depth too when a stencil clear covers the whole buffer.
 				useFramebuffer(g, g->samples ? g->msaaDepthFramebuffer : g->depthFramebuffer);
-				useScissor(g, false, 0, 0, 0, 0);
+				int const half = g->depthRows / 2;
+				gl->Enable(GL_SCISSOR_TEST);
 				gl->ClearStencil(0);
+				gl->Scissor(0, 0, (GLsizei) g->depthWidth, half);
 				gl->Clear(GL_STENCIL_BUFFER_BIT);
+				gl->Scissor(0, half, (GLsizei) g->depthWidth, g->depthRows - half);
+				gl->Clear(GL_STENCIL_BUFFER_BIT);
+				g->applied.scissorOn = g->applied.scissorScale = -1;
 				useFramebuffer(g, drawTo(g, s->target));
 				useScissor(g, true, s->scissor[0], s->scissor[1], s->scissor[2] - s->scissor[0], s->scissor[3] - s->scissor[1]);
 				g->stencilRef = 1;
