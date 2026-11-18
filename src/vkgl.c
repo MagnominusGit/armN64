@@ -58,7 +58,7 @@ enum {
 };
 
 enum { SUBS = 3, UNITS = 12, SAMPLERS = 16, MEMBERS = 64, ATTRIBS = 8, UBO_BYTES = 4 << 20, STAGE_BYTES = 16 << 20, SETS = 4096 };
-enum { LOCATION_ELEMENTS = 1024, SAMPLER_LOCATION = MEMBERS * LOCATION_ELEMENTS, SUBMIT_DRAWS = 256, SET_CACHE = 2048 };
+enum { LOCATION_ELEMENTS = 1024, SAMPLER_LOCATION = MEMBERS * LOCATION_ELEMENTS, SUBMIT_DRAWS = 256, SUBMIT_BARRIERS = 64, SET_CACHE = 2048 };
 // Images up to 256 KB share 2 MB allocations, in power-of-two pieces from 4 KB.
 enum { SLAB_MIN = 12, SLAB_MAX = 18, SLAB_BYTES = 2 << 20 };
 
@@ -328,7 +328,10 @@ static struct Vkgl {
 	bool barrierNeeded;
 	// Draws since the last submission: the queue gets them a few hundred at a time, as GL's drivers
 	// do, so the GPU works while the next are made.
-	int pendingDraws;
+	int pendingDraws, pendingBarriers;
+	// Broadcom's V3D starts a job at each barrier within a pass, with memory of its own until the
+	// submission is done: 4 GB in a few thousand.
+	bool barrierJobs;
 	// The frontend's pictures, one for each of its frames in flight, and the framebuffer for them.
 	struct Img picture[4];
 	int pictureIndex;
@@ -568,7 +571,7 @@ static void passEnd(void) {
 // The draws so far to the queue when there are enough of them, at the start of something that takes
 // room in the turn's buffers (never in the middle: what it took would go with the turn before).
 static void submitDue(void) {
-	if (V.pendingDraws >= SUBMIT_DRAWS && (!V.passOpen || V.passFbo != V.st.drawFbo)) {
+	if ((V.pendingDraws >= SUBMIT_DRAWS && (!V.passOpen || V.passFbo != V.st.drawFbo)) || (V.barrierJobs && V.pendingBarriers >= SUBMIT_BARRIERS)) {
 		submit(false);
 	}
 }
@@ -650,7 +653,7 @@ static void submit(bool wait) {
 			V.frontend.lockQueue(V.frontend.handle);
 		}
 		vkQueueSubmit(V.queue, 1, &info, s->fence);
-		V.pendingDraws = 0;
+		V.pendingDraws = V.pendingBarriers = 0;
 		if (V.external && V.frontend.unlockQueue) {
 			V.frontend.unlockQueue(V.frontend.handle);
 		}
@@ -986,6 +989,7 @@ bool vkglCreate(const struct VkglFrontend* frontend, char* error, size_t errorSi
 	VkPhysicalDeviceProperties p;
 	vkGetPhysicalDeviceProperties(V.gpu, &p);
 	V.limits = p.limits;
+	V.barrierJobs = p.vendorID == 0x14e4;
 	snprintf(V.renderer, sizeof(V.renderer), "%s (Vulkan %u.%u)", p.deviceName, VK_VERSION_MAJOR(p.apiVersion), VK_VERSION_MINOR(p.apiVersion));
 	vkGetPhysicalDeviceMemoryProperties(V.gpu, &V.memory);
 	VkFormatProperties fp;
@@ -2196,6 +2200,7 @@ static void glClear_(GLbitfield mask) {
 		VkMemoryBarrier m = { VK_STRUCTURE_TYPE_MEMORY_BARRIER, NULL, VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT, VK_ACCESS_INPUT_ATTACHMENT_READ_BIT };
 		vkCmdPipelineBarrier(V.sub[V.current].cb, VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT, VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT,
 		                     VK_DEPENDENCY_BY_REGION_BIT, 1, &m, 0, NULL, 0, NULL);
+		++V.pendingBarriers;
 	}
 }
 
@@ -2951,6 +2956,7 @@ static void glTextureBarrierNV_(void) {
 		VkMemoryBarrier m = { VK_STRUCTURE_TYPE_MEMORY_BARRIER, NULL, VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT, VK_ACCESS_INPUT_ATTACHMENT_READ_BIT };
 		vkCmdPipelineBarrier(V.sub[V.current].cb, VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT, VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT,
 		                     VK_DEPENDENCY_BY_REGION_BIT, 1, &m, 0, NULL, 0, NULL);
+		++V.pendingBarriers;
 	}
 }
 
