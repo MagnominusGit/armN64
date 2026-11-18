@@ -6,6 +6,7 @@
 #include "gles.h"
 
 #include <dlfcn.h>
+#include <fenv.h>
 #include <pthread.h>
 #include <stdatomic.h>
 #include <unistd.h>
@@ -1839,7 +1840,11 @@ static bool linkProgram(struct Prog* p) {
 	uint32_t* fCode = NULL;
 	char path[4300] = "";
 	if (vText && fText && glesCacheDirectory()[0]) {
+		// Version 2: compiled in the default rounding mode (one compiled in a game's, before, isn't used).
 		uint64_t h = 0xCBF29CE484222325ull;
+		for (const char* c = "2"; *c; ++c) {
+			h = (h ^ (uint8_t) *c) * 0x100000001B3ull;
+		}
 		for (const char* c = vText; *c; ++c) {
 			h = (h ^ (uint8_t) *c) * 0x100000001B3ull;
 		}
@@ -1850,8 +1855,14 @@ static bool linkProgram(struct Prog* p) {
 		cachedSpirv(path, &vCode, &vWords, &fCode, &fWords);
 	}
 	if (!vCode) {
+		// Compilers fold constants in the host's rounding mode, which the CPU's emulation leaves at
+		// the game's (fpuHostRound): to nearest meanwhile.
+		fenv_t env;
+		fegetenv(&env);
+		fesetround(FE_TONEAREST);
 		vCode = vText ? spirv(vText, true, &vWords, &p->log) : NULL;
 		fCode = vCode && fText ? spirv(fText, false, &fWords, &p->log) : NULL;
+		fesetenv(&env);
 		if (vCode && fCode && path[0]) {
 			keepSpirv(path, vCode, vWords, fCode, fWords);
 		}
@@ -2019,7 +2030,12 @@ static VkPipeline pipeline(const struct PipeKey* k, struct Prog* p) {
 	VkGraphicsPipelineCreateInfo info = { VK_STRUCTURE_TYPE_GRAPHICS_PIPELINE_CREATE_INFO, NULL, 0, 2, stages, &vi, &ia, NULL, &vp, &rs, &ms, &ds, &cb,
 		                                  &dy, p->layout, k->pass, 0, VK_NULL_HANDLE, -1 };
 	VkPipeline pipe;
-	if (vkCreateGraphicsPipelines(V.device, V.pipelineCache, 1, &info, NULL, &pipe) != VK_SUCCESS) {
+	fenv_t env;
+	fegetenv(&env);
+	fesetround(FE_TONEAREST);
+	VkResult const made = vkCreateGraphicsPipelines(V.device, V.pipelineCache, 1, &info, NULL, &pipe);
+	fesetenv(&env);
+	if (made != VK_SUCCESS) {
 		return VK_NULL_HANDLE;
 	}
 	if (V.pipeCount == V.pipeCapacity) {
