@@ -101,6 +101,8 @@ struct Img {
 	// Its memory a piece of 1 << piece bytes of slab - 1 at offset, or with slab 0 its own.
 	int slab, piece;
 	VkDeviceSize offset;
+	// The turns whose command buffer used it, and whose uploads ahead of it wrote it.
+	uint64_t used, early;
 };
 
 struct Slab {
@@ -207,9 +209,10 @@ struct Garbage {
 
 struct Sub {
 	VkCommandPool pool;
-	VkCommandBuffer cb;
+	// early: uploads to images cb hasn't used, run before it (outside its render passes).
+	VkCommandBuffer cb, early;
 	VkFence fence;
-	bool recording, submitted;
+	bool recording, earlyRecording, submitted;
 	uint64_t serial;
 	VkDescriptorPool sets;
 	struct Buf ubo, stage;
@@ -458,6 +461,7 @@ static bool imageMake(struct Img* img, VkFormat format, int width, int height) {
 	}
 	struct Piece piece;
 	img->slab = 0, img->piece = size, img->offset = 0;
+	img->used = img->early = 0;
 	if (size <= SLAB_MAX && pieceTake(size, (uint32_t) type, &piece)) {
 		img->memory = V.slabs[piece.slab].memory;
 		img->slab = piece.slab + 1, img->offset = piece.offset;
@@ -534,7 +538,9 @@ static VkCommandBuffer cmd(void) {
 static void barrier(VkCommandBuffer cb) {
 	VkMemoryBarrier m = { VK_STRUCTURE_TYPE_MEMORY_BARRIER, NULL, VK_ACCESS_MEMORY_WRITE_BIT, VK_ACCESS_MEMORY_READ_BIT | VK_ACCESS_MEMORY_WRITE_BIT };
 	vkCmdPipelineBarrier(cb, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, 0, 1, &m, 0, NULL, 0, NULL);
-	V.barrierNeeded = false;
+	if (cb == V.sub[V.current].cb) {
+		V.barrierNeeded = false;
+	}
 }
 
 static void submit(bool wait);
@@ -568,6 +574,29 @@ static VkCommandBuffer transfer(void) {
 	return cb;
 }
 
+static void touch(struct Img* img) {
+	img->used = V.sub[V.current].serial;
+}
+
+// The command buffer for a copy into img: the one run ahead of this turn's when it hasn't used img
+// (so a render pass goes on), else transfer's.
+static VkCommandBuffer transferTo(struct Img* img) {
+	struct Sub* s = &V.sub[V.current];
+	if (img->used == s->serial) {
+		return transfer();
+	}
+	if (!s->earlyRecording) {
+		VkCommandBufferBeginInfo begin = { VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO, NULL, VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT, NULL };
+		vkBeginCommandBuffer(s->early, &begin);
+		s->earlyRecording = true;
+		barrier(s->early);
+	} else if (img->early == s->serial) {
+		barrier(s->early);
+	}
+	img->early = s->serial;
+	return s->early;
+}
+
 static void layoutTo(VkCommandBuffer cb, struct Img* img, VkImageLayout to) {
 	if (img->layout == to) {
 		return;
@@ -593,11 +622,20 @@ static void subWait(struct Sub* s) {
 static void submit(bool wait) {
 	passEnd();
 	struct Sub* s = &V.sub[V.current];
-	if (s->recording) {
+	if (s->recording || s->earlyRecording) {
+		// The early buffer first; the turn's first command waits for it (its barrier).
+		cmd();
+		if (V.barrierNeeded) {
+			barrier(s->cb);
+		}
 		VkMemoryBarrier host = { VK_STRUCTURE_TYPE_MEMORY_BARRIER, NULL, VK_ACCESS_MEMORY_WRITE_BIT, VK_ACCESS_HOST_READ_BIT };
 		vkCmdPipelineBarrier(s->cb, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, VK_PIPELINE_STAGE_HOST_BIT, 0, 1, &host, 0, NULL, 0, NULL);
 		vkEndCommandBuffer(s->cb);
-		VkSubmitInfo info = { VK_STRUCTURE_TYPE_SUBMIT_INFO, NULL, 0, NULL, NULL, 1, &s->cb, 0, NULL };
+		VkCommandBuffer const buffers[2] = { s->early, s->cb };
+		if (s->earlyRecording) {
+			vkEndCommandBuffer(s->early);
+		}
+		VkSubmitInfo info = { VK_STRUCTURE_TYPE_SUBMIT_INFO, NULL, 0, NULL, NULL, s->earlyRecording ? 2 : 1, s->earlyRecording ? buffers : &s->cb, 0, NULL };
 		if (V.external && V.frontend.lockQueue) {
 			V.frontend.lockQueue(V.frontend.handle);
 		}
@@ -606,7 +644,7 @@ static void submit(bool wait) {
 		if (V.external && V.frontend.unlockQueue) {
 			V.frontend.unlockQueue(V.frontend.handle);
 		}
-		s->recording = false;
+		s->recording = s->earlyRecording = false;
 		s->submitted = true;
 		// The queue doesn't order one submission's work after the last's: the next turn's first
 		// command waits on it.
@@ -686,7 +724,7 @@ static void imageFree(struct Img* img) {
 // zero: Vulkan's memory comes with what it last held, GL's drivers give it cleared, and pixels the
 // renderer reads back before drawing them must be the same each run.
 static void imageReady(struct Img* img) {
-	VkCommandBuffer cb = transfer();
+	VkCommandBuffer cb = transferTo(img);
 	layoutTo(cb, img, VK_IMAGE_LAYOUT_GENERAL);
 	VkImageSubresourceRange const all = { img->aspect, 0, 1, 0, 1 };
 	if (img->aspect & VK_IMAGE_ASPECT_COLOR_BIT) {
@@ -850,6 +888,7 @@ bool vkglCreate(const struct VkglFrontend* frontend, char* error, size_t errorSi
 		}
 		VkCommandBufferAllocateInfo cb = { VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO, NULL, s->pool, VK_COMMAND_BUFFER_LEVEL_PRIMARY, 1 };
 		vkAllocateCommandBuffers(V.device, &cb, &s->cb);
+		vkAllocateCommandBuffers(V.device, &cb, &s->early);
 	}
 	V.sub[0].serial = V.serial = 1;
 	V.st = (struct State) { .depthFunc = 0x201, .depthMask = true, .blendSrc = { 1, 1 }, .blendDst = { 0, 0 }, .blendEq = { 0x8006, 0x8006 },
@@ -1092,9 +1131,11 @@ static bool passBegin(void) {
 		barrier(cb);
 	}
 	if (color) {
+		touch(color);
 		layoutTo(cb, color, VK_IMAGE_LAYOUT_GENERAL);
 	}
 	if (depth) {
+		touch(depth);
 		layoutTo(cb, depth, VK_IMAGE_LAYOUT_GENERAL);
 	}
 	int w = color ? color->width : depth->width, h = color ? color->height : depth->height;
@@ -1814,6 +1855,7 @@ static bool bindings(struct Prog* p, VkDescriptorSet* set, uint32_t* offset) {
 		GLuint const t = i == p->input && isTarget ? 0 : V.st.texture[unit];
 		struct Tex* tex = t && t < (GLuint) V.texCount && V.tex[t].used && V.tex[t].img.image ? &V.tex[t] : NULL;
 		struct Img* img = tex ? &tex->img : dummyImage();
+		touch(img);
 		images[i] = (VkDescriptorImageInfo) { tex ? sampler(tex->filter[0], tex->wrap[0], tex->wrap[1], tex->filter[1]) : sampler(GL_NEAREST, 0, 0, GL_NEAREST),
 			                                  img->view, VK_IMAGE_LAYOUT_GENERAL };
 		writes[n++] = (VkWriteDescriptorSet) { VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, NULL, *set, (uint32_t) (1 + i), 0, 1,
@@ -2006,7 +2048,7 @@ static void upload(struct Img* img, int x, int y, int w, int h, const void* data
 			src = temp.buffer, at = 0;
 		}
 	}
-	VkCommandBuffer cb = transfer();
+	VkCommandBuffer cb = transferTo(img);
 	layoutTo(cb, img, VK_IMAGE_LAYOUT_GENERAL);
 	VkBufferImageCopy region = { at, 0, 0, { VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1 }, { x, y, 0 }, { (uint32_t) w, (uint32_t) h, 1 } };
 	vkCmdCopyBufferToImage(cb, src, img->image, VK_IMAGE_LAYOUT_GENERAL, 1, &region);
@@ -2124,7 +2166,9 @@ static void glTexImage2D_(GLenum target, GLint level, GLint internal, GLsizei w,
 	VkFormat const f = internal == GL_R32F ? VK_FORMAT_R32_SFLOAT : VK_FORMAT_R8G8B8A8_UNORM;
 	struct Buf* unpack = V.st.unpackBuffer && V.st.unpackBuffer < (GLuint) V.bufCount ? &V.buf[V.st.unpackBuffer] : NULL;
 	if (!t->img.image || t->img.format != f || t->img.width != w || t->img.height != h) {
-		passEnd();
+		if (V.passOpen && fboColor(fboGet(V.passFbo)) == &t->img) {
+			passEnd();
+		}
 		imageFree(&t->img);
 		if (!imageMake(&t->img, f, w, h)) {
 			return;
@@ -2768,6 +2812,7 @@ static void glReadPixels_(GLint x, GLint y, GLsizei w, GLsizei h, GLenum format,
 		}
 	}
 	VkCommandBuffer cb = transfer();
+	touch(img);
 	layoutTo(cb, img, VK_IMAGE_LAYOUT_GENERAL);
 	VkBufferImageCopy region = { pack ? (VkDeviceSize) (uintptr_t) out : 0, 0, 0, { VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1 }, { x, y, 0 },
 		                         { (uint32_t) w, (uint32_t) h, 1 } };
@@ -2791,6 +2836,7 @@ static void glBlitFramebuffer_(GLint sx0, GLint sy0, GLint sx1, GLint sy1, GLint
 		struct Img* dst = fboColor(d);
 		if (src && dst) {
 			VkCommandBuffer cb = transfer();
+			touch(src), touch(dst);
 			layoutTo(cb, src, VK_IMAGE_LAYOUT_GENERAL);
 			layoutTo(cb, dst, VK_IMAGE_LAYOUT_GENERAL);
 			VkImageBlit blit = { { VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1 }, { { sx0, sy0, 0 }, { sx1, sy1, 1 } }, { VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1 },
@@ -2805,6 +2851,7 @@ static void glBlitFramebuffer_(GLint sx0, GLint sy0, GLint sx1, GLint sy1, GLint
 		int const w = sx1 - sx0, h = sy1 - sy0;
 		if (src && dst && w > 0 && h > 0 && w == dx1 - dx0 && h == dy1 - dy0) {
 			VkCommandBuffer cb = transfer();
+			touch(src), touch(dst);
 			VkImageCopy copy = { { src->aspect, 0, 0, 1 }, { sx0, sy0, 0 }, { dst->aspect, 0, 0, 1 }, { dx0, dy0, 0 }, { (uint32_t) w, (uint32_t) h, 1 } };
 			vkCmdCopyImage(cb, src->image, VK_IMAGE_LAYOUT_GENERAL, dst->image, VK_IMAGE_LAYOUT_GENERAL, 1, &copy);
 		}
@@ -2848,6 +2895,7 @@ bool vkglPicture(VkImage* image, VkImageView* view, VkImageLayout* layout, VkIma
 		return false;
 	}
 	VkCommandBuffer cb = transfer();
+	touch(img);
 	layoutTo(cb, img, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL);
 	submit(false);
 	*image = img->image, *view = img->view, *layout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
