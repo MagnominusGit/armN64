@@ -56,6 +56,8 @@ enum {
 
 enum { SUBS = 3, UNITS = 12, SAMPLERS = 16, MEMBERS = 64, ATTRIBS = 8, UBO_BYTES = 4 << 20, STAGE_BYTES = 16 << 20, SETS = 4096 };
 enum { LOCATION_ELEMENTS = 1024, SAMPLER_LOCATION = MEMBERS * LOCATION_ELEMENTS, SUBMIT_DRAWS = 256 };
+// Images up to 256 KB share 2 MB allocations, in power-of-two pieces from 4 KB.
+enum { SLAB_MIN = 12, SLAB_MAX = 18, SLAB_BYTES = 2 << 20 };
 
 // ---- Vulkan's functions
 
@@ -96,6 +98,19 @@ struct Img {
 	VkImageAspectFlags aspect;
 	int width, height;
 	VkImageLayout layout;
+	// Its memory a piece of 1 << piece bytes of slab - 1 at offset, or with slab 0 its own.
+	int slab, piece;
+	VkDeviceSize offset;
+};
+
+struct Slab {
+	VkDeviceMemory memory;
+	uint32_t type;
+};
+
+struct Piece {
+	int slab;
+	VkDeviceSize offset;
 };
 
 struct Tex {
@@ -201,6 +216,9 @@ struct Sub {
 	size_t uboUsed, stageUsed;
 	struct Garbage* garbage;
 	int garbageCount, garbageCapacity;
+	// Images given up during the turn, destroyed once it's done.
+	struct Img* retired;
+	int retiredCount, retiredCapacity;
 };
 
 struct RenderPass {
@@ -265,6 +283,10 @@ static struct Vkgl {
 	int passCount;
 	struct FbCache* fbs;
 	int fbCount, fbCapacity;
+	struct Slab* slabs;
+	int slabCount, slabCapacity;
+	struct Piece* pieces[SLAB_MAX - SLAB_MIN + 1];
+	int pieceCount[SLAB_MAX - SLAB_MIN + 1], pieceCapacity[SLAB_MAX - SLAB_MIN + 1];
 	VkSampler samplers[2][3][3][2];
 	struct State st;
 	// The render pass open, on that framebuffer, and what the command buffer has set in it.
@@ -353,6 +375,65 @@ static void bufferFree(struct Buf* b) {
 	b->buffer = VK_NULL_HANDLE, b->memory = VK_NULL_HANDLE, b->map = NULL, b->size = 0;
 }
 
+static bool piecePut(int size, int slab, VkDeviceSize offset) {
+	int const k = size - SLAB_MIN;
+	if (V.pieceCount[k] == V.pieceCapacity[k]) {
+		int const n = V.pieceCapacity[k] ? V.pieceCapacity[k] * 2 : SLAB_BYTES >> size;
+		struct Piece* more = realloc(V.pieces[k], (size_t) n * sizeof(*more));
+		if (!more) {
+			return false;
+		}
+		V.pieces[k] = more, V.pieceCapacity[k] = n;
+	}
+	V.pieces[k][V.pieceCount[k]++] = (struct Piece) { slab, offset };
+	return true;
+}
+
+// A piece of 1 << size bytes of memory type, a new slab cut up for it if there's none.
+static bool pieceTake(int size, uint32_t type, struct Piece* out) {
+	int const k = size - SLAB_MIN;
+	for (int i = V.pieceCount[k] - 1; i >= 0; --i) {
+		if (V.slabs[V.pieces[k][i].slab].type == type) {
+			*out = V.pieces[k][i];
+			V.pieces[k][i] = V.pieces[k][--V.pieceCount[k]];
+			return true;
+		}
+	}
+	if (V.slabCount == V.slabCapacity) {
+		int const n = V.slabCapacity ? V.slabCapacity * 2 : 16;
+		struct Slab* more = realloc(V.slabs, (size_t) n * sizeof(*more));
+		if (!more) {
+			return false;
+		}
+		V.slabs = more, V.slabCapacity = n;
+	}
+	VkMemoryAllocateInfo alloc = { VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO, NULL, SLAB_BYTES, type };
+	VkDeviceMemory memory;
+	if (vkAllocateMemory(V.device, &alloc, NULL, &memory) != VK_SUCCESS) {
+		return false;
+	}
+	int const slab = V.slabCount++;
+	V.slabs[slab] = (struct Slab) { memory, type };
+	for (VkDeviceSize at = SLAB_BYTES; at > 1u << size;) {
+		at -= 1u << size;
+		piecePut(size, slab, at);
+	}
+	*out = (struct Piece) { slab, 0 };
+	return true;
+}
+
+static void imageDestroy(struct Img* img) {
+	if (img->view) {
+		vkDestroyImageView(V.device, img->view, NULL);
+	}
+	vkDestroyImage(V.device, img->image, NULL);
+	if (img->slab) {
+		piecePut(img->piece, img->slab - 1, img->offset);
+	} else {
+		vkFreeMemory(V.device, img->memory, NULL);
+	}
+}
+
 static bool imageMake(struct Img* img, VkFormat format, int width, int height) {
 	bool const depth = format == V.depthFormat;
 	VkImageUsageFlags usage = VK_IMAGE_USAGE_TRANSFER_SRC_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT |
@@ -369,31 +450,43 @@ static bool imageMake(struct Img* img, VkFormat format, int width, int height) {
 	}
 	VkMemoryRequirements req;
 	vkGetImageMemoryRequirements(V.device, img->image, &req);
-	int const type = memoryType(req.memoryTypeBits, VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT, 0);
-	VkMemoryAllocateInfo alloc = { VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO, NULL, req.size, (uint32_t) (type < 0 ? memoryType(req.memoryTypeBits, 0, 0) : type) };
-	if (vkAllocateMemory(V.device, &alloc, NULL, &img->memory) != VK_SUCCESS) {
-		vkDestroyImage(V.device, img->image, NULL);
-		img->image = VK_NULL_HANDLE;
-		return false;
+	int type = memoryType(req.memoryTypeBits, VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT, 0);
+	type = type < 0 ? memoryType(req.memoryTypeBits, 0, 0) : type;
+	int size = SLAB_MIN;
+	while ((VkDeviceSize) 1 << size < req.size || (VkDeviceSize) 1 << size < req.alignment) {
+		++size;
 	}
-	vkBindImageMemory(V.device, img->image, img->memory, 0);
+	struct Piece piece;
+	img->slab = 0, img->piece = size, img->offset = 0;
+	if (size <= SLAB_MAX && pieceTake(size, (uint32_t) type, &piece)) {
+		img->memory = V.slabs[piece.slab].memory;
+		img->slab = piece.slab + 1, img->offset = piece.offset;
+	} else {
+		VkMemoryAllocateInfo alloc = { VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO, NULL, req.size, (uint32_t) type };
+		if (vkAllocateMemory(V.device, &alloc, NULL, &img->memory) != VK_SUCCESS) {
+			vkDestroyImage(V.device, img->image, NULL);
+			img->image = VK_NULL_HANDLE;
+			return false;
+		}
+	}
+	vkBindImageMemory(V.device, img->image, img->memory, img->offset);
 	img->aspect = depth ? VK_IMAGE_ASPECT_DEPTH_BIT | VK_IMAGE_ASPECT_STENCIL_BIT : VK_IMAGE_ASPECT_COLOR_BIT;
 	VkImageViewCreateInfo view = { VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO, NULL, 0, img->image, VK_IMAGE_VIEW_TYPE_2D, format,
 		                           { VK_COMPONENT_SWIZZLE_IDENTITY, VK_COMPONENT_SWIZZLE_IDENTITY, VK_COMPONENT_SWIZZLE_IDENTITY, VK_COMPONENT_SWIZZLE_IDENTITY },
 		                           { img->aspect, 0, 1, 0, 1 } };
+	img->format = format, img->width = width, img->height = height, img->layout = VK_IMAGE_LAYOUT_UNDEFINED;
 	if (vkCreateImageView(V.device, &view, NULL, &img->view) != VK_SUCCESS) {
-		vkDestroyImage(V.device, img->image, NULL);
-		vkFreeMemory(V.device, img->memory, NULL);
+		img->view = VK_NULL_HANDLE;
+		imageDestroy(img);
 		img->image = VK_NULL_HANDLE;
 		return false;
 	}
-	img->format = format, img->width = width, img->height = height, img->layout = VK_IMAGE_LAYOUT_UNDEFINED;
 	return true;
 }
 
 // ---- Submission
 
-enum { GARBAGE_BUFFER, GARBAGE_IMAGE, GARBAGE_FRAMEBUFFER, GARBAGE_PIPELINE, GARBAGE_VIEW };
+enum { GARBAGE_BUFFER, GARBAGE_FRAMEBUFFER, GARBAGE_PIPELINE };
 
 static void garbage(int kind, uint64_t a, uint64_t b) {
 	struct Sub* s = &V.sub[V.current];
@@ -414,16 +507,15 @@ static void collect(struct Sub* s) {
 		if (g->kind == GARBAGE_BUFFER) {
 			vkDestroyBuffer(V.device, (VkBuffer) (uintptr_t) g->a, NULL);
 			vkFreeMemory(V.device, (VkDeviceMemory) (uintptr_t) g->b, NULL);
-		} else if (g->kind == GARBAGE_IMAGE) {
-			vkDestroyImage(V.device, (VkImage) (uintptr_t) g->a, NULL);
-			vkFreeMemory(V.device, (VkDeviceMemory) (uintptr_t) g->b, NULL);
 		} else if (g->kind == GARBAGE_FRAMEBUFFER) {
 			vkDestroyFramebuffer(V.device, (VkFramebuffer) (uintptr_t) g->a, NULL);
-		} else if (g->kind == GARBAGE_VIEW) {
-			vkDestroyImageView(V.device, (VkImageView) (uintptr_t) g->a, NULL);
 		}
 	}
 	s->garbageCount = 0;
+	for (int i = 0; i < s->retiredCount; ++i) {
+		imageDestroy(&s->retired[i]);
+	}
+	s->retiredCount = 0;
 }
 
 static void imageFree(struct Img* img);
@@ -576,8 +668,17 @@ static void imageFree(struct Img* img) {
 			V.fbs[i--] = V.fbs[--V.fbCount];
 		}
 	}
-	garbage(GARBAGE_VIEW, (uint64_t) (uintptr_t) img->view, 0);
-	garbage(GARBAGE_IMAGE, (uint64_t) (uintptr_t) img->image, (uint64_t) (uintptr_t) img->memory);
+	struct Sub* s = &V.sub[V.current];
+	if (s->retiredCount == s->retiredCapacity) {
+		int const n = s->retiredCapacity ? s->retiredCapacity * 2 : 64;
+		struct Img* more = realloc(s->retired, (size_t) n * sizeof(*more));
+		if (!more) {
+			memset(img, 0, sizeof(*img));
+			return;
+		}
+		s->retired = more, s->retiredCapacity = n;
+	}
+	s->retired[s->retiredCount++] = *img;
 	memset(img, 0, sizeof(*img));
 }
 
@@ -849,6 +950,8 @@ static void freeAll(void) {
 			collect(s);
 			free(s->garbage);
 			s->garbage = NULL, s->garbageCount = s->garbageCapacity = 0;
+			free(s->retired);
+			s->retired = NULL, s->retiredCount = s->retiredCapacity = 0;
 			bufferFree(&s->ubo);
 			bufferFree(&s->stage);
 			if (s->sets) {
@@ -860,6 +963,15 @@ static void freeAll(void) {
 			if (s->pool) {
 				vkDestroyCommandPool(V.device, s->pool, NULL);
 			}
+		}
+		for (int i = 0; i < V.slabCount; ++i) {
+			vkFreeMemory(V.device, V.slabs[i].memory, NULL);
+		}
+		free(V.slabs);
+		V.slabs = NULL, V.slabCount = V.slabCapacity = 0;
+		for (int k = 0; k <= SLAB_MAX - SLAB_MIN; ++k) {
+			free(V.pieces[k]);
+			V.pieces[k] = NULL, V.pieceCount[k] = V.pieceCapacity[k] = 0;
 		}
 		if (V.pipelineCache) {
 			keepPipelines();
@@ -2010,16 +2122,18 @@ static void glTexImage2D_(GLenum target, GLint level, GLint internal, GLsizei w,
 		return;
 	}
 	VkFormat const f = internal == GL_R32F ? VK_FORMAT_R32_SFLOAT : VK_FORMAT_R8G8B8A8_UNORM;
+	struct Buf* unpack = V.st.unpackBuffer && V.st.unpackBuffer < (GLuint) V.bufCount ? &V.buf[V.st.unpackBuffer] : NULL;
 	if (!t->img.image || t->img.format != f || t->img.width != w || t->img.height != h) {
 		passEnd();
 		imageFree(&t->img);
 		if (!imageMake(&t->img, f, w, h)) {
 			return;
 		}
-		imageReady(&t->img);
+		if (!data && !unpack) {
+			imageReady(&t->img);
+		}
 		++texVersion;
 	}
-	struct Buf* unpack = V.st.unpackBuffer && V.st.unpackBuffer < (GLuint) V.bufCount ? &V.buf[V.st.unpackBuffer] : NULL;
 	if (data || unpack) {
 		upload(&t->img, 0, 0, w, h, data, (size_t) w * (size_t) h * 4, unpack ? unpack->buffer : VK_NULL_HANDLE, (VkDeviceSize) (uintptr_t) data);
 	}
