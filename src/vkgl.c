@@ -21,8 +21,9 @@
 // in the general layout, with a full barrier between a render pass and a copy and around each copy.
 // Work goes to the queue in turns of three; what GL would have done at once (a read of pixels or of
 // a mapped buffer) submits and waits. The image's own pixel (GL_NV_texture_barrier, the renderer's
-// sampler uMemory) is read as an input attachment, a by-region barrier between the draws that need
-// what the one before wrote. Rows are as GL keeps them: a framebuffer's row 0 is GL's y = 0,
+// sampler uMemory, when the image drawn to is the texture bound to it) is read as an input
+// attachment, a by-region barrier between the draws that need what the one before wrote; with another
+// texture bound, uMemory samples that, as GL does. Rows are as GL keeps them: a framebuffer's row 0 is GL's y = 0,
 // the bottom, which is the first row in memory for both, so nothing is flipped.
 
 typedef unsigned GLenum;
@@ -166,8 +167,9 @@ struct Prog {
 	char sampler[SAMPLERS][48];
 	int unit[SAMPLERS];
 	int samplers;
-	// The sampler read as the image's own pixel (uMemory), or -1.
-	int input;
+	// The sampler read as the image's own pixel (uMemory), or -1, and the block's member saying
+	// whether the texture bound to it is the image drawn to (then read as the input attachment).
+	int input, target;
 	VkImageView setInput;
 	uint32_t inputs;
 	// The set and uniform offset its last draw used, for the next one that changes neither.
@@ -1255,7 +1257,10 @@ static char* translate(const struct Prog* p, const char* source, bool vertex, ch
 					}
 					char decl[160];
 					if (k == p->input) {
-						snprintf(decl, sizeof(decl), "layout(input_attachment_index = 0, set = 0, binding = %d) uniform highp subpassInput %s;\n", 1 + k, names[i]);
+						snprintf(decl, sizeof(decl),
+						         "layout(set = 0, binding = %d) uniform highp sampler2D %s;\n"
+						         "layout(input_attachment_index = 0, set = 0, binding = %d) uniform highp subpassInput vkglMemory;\n",
+						         1 + k, names[i], 1 + p->samplers);
 					} else {
 						snprintf(decl, sizeof(decl), "layout(set = 0, binding = %d) uniform highp %s %s;\n", 1 + k, type, names[i]);
 					}
@@ -1295,9 +1300,11 @@ static char* translate(const struct Prog* p, const char* source, bool vertex, ch
 			*inputs |= 1u << atoi(q + strcspn(q, "=") + 1);
 		}
 		// The rest as it is, with Vulkan's names.
-		for (char* v = strstr(buf, "texelFetch(uMemory, ivec2(gl_FragCoord.xy), 0)"); v && p->input >= 0; v = strstr(v + 1, "texelFetch(uMemory, ivec2(gl_FragCoord.xy), 0)")) {
+		static const char fetch[] = "texelFetch(uMemory, ivec2(gl_FragCoord.xy), 0)";
+		static const char either[] = "(vkglTarget != 0 ? subpassLoad(vkglMemory) : texelFetch(uMemory, ivec2(gl_FragCoord.xy), 0))";
+		for (char* v = strstr(buf, fetch); v && p->input >= 0; v = strstr(v + strlen(either), fetch)) {
 			char rest[2048];
-			snprintf(rest, sizeof(rest), "subpassLoad(uMemory)%s", v + strlen("texelFetch(uMemory, ivec2(gl_FragCoord.xy), 0)"));
+			snprintf(rest, sizeof(rest), "%s%s", either, v + strlen(fetch));
 			snprintf(v, sizeof(buf) - (size_t) (v - buf), "%s", rest);
 		}
 		for (char* v = strstr(buf, "gl_VertexID"); v; v = strstr(v + 1, "gl_VertexID")) {
@@ -1420,9 +1427,14 @@ static bool linkProgram(struct Prog* p) {
 	int varyingCount = 0;
 	gather(p, vs, varyings, &varyingCount);
 	gather(p, fs, NULL, NULL);
-	p->input = -1;
+	p->input = p->target = -1;
 	for (int i = 0; i < p->samplers; ++i) {
 		p->input = !strcmp(p->sampler[i], "uMemory") ? i : p->input;
+	}
+	if (p->input >= 0 && p->members < MEMBERS) {
+		struct Member* m = &p->member[p->target = p->members++];
+		*m = (struct Member) { "vkglTarget", "int", p->blockSize, 4, 0, true };
+		p->blockSize += 16;
 	}
 	p->inputs = 0;
 	char* vText = translate(p, vs, true, varyings, varyingCount, &p->inputs);
@@ -1464,13 +1476,15 @@ static bool linkProgram(struct Prog* p) {
 	bool ok = vkCreateShaderModule(V.device, &vm, NULL, &p->vertex) == VK_SUCCESS && vkCreateShaderModule(V.device, &fm, NULL, &p->fragment) == VK_SUCCESS;
 	free(vCode);
 	free(fCode);
-	VkDescriptorSetLayoutBinding bindings[1 + SAMPLERS];
+	VkDescriptorSetLayoutBinding bindings[2 + SAMPLERS];
 	uint32_t n = 0;
 	bindings[n++] = (VkDescriptorSetLayoutBinding) { 0, VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER_DYNAMIC, 1, VK_SHADER_STAGE_VERTEX_BIT | VK_SHADER_STAGE_FRAGMENT_BIT, NULL };
 	for (int i = 0; i < p->samplers; ++i) {
-		bool const input = i == p->input;
-		bindings[n++] = (VkDescriptorSetLayoutBinding) { (uint32_t) (1 + i), input ? VK_DESCRIPTOR_TYPE_INPUT_ATTACHMENT : VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, 1,
-			                                             input ? VK_SHADER_STAGE_FRAGMENT_BIT : VK_SHADER_STAGE_VERTEX_BIT | VK_SHADER_STAGE_FRAGMENT_BIT, NULL };
+		bindings[n++] = (VkDescriptorSetLayoutBinding) { (uint32_t) (1 + i), VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, 1,
+			                                             VK_SHADER_STAGE_VERTEX_BIT | VK_SHADER_STAGE_FRAGMENT_BIT, NULL };
+	}
+	if (p->input >= 0) {
+		bindings[n++] = (VkDescriptorSetLayoutBinding) { (uint32_t) (1 + p->samplers), VK_DESCRIPTOR_TYPE_INPUT_ATTACHMENT, 1, VK_SHADER_STAGE_FRAGMENT_BIT, NULL };
 	}
 	VkDescriptorSetLayoutCreateInfo sl = { VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO, NULL, 0, n, bindings };
 	ok = ok && vkCreateDescriptorSetLayout(V.device, &sl, NULL, &p->setLayout) == VK_SUCCESS;
@@ -1644,6 +1658,15 @@ static struct Img* dummyImage(void);
 // holds changed. False when the turn moved on while taking room (then try again).
 static bool bindings(struct Prog* p, VkDescriptorSet* set, uint32_t* offset) {
 	uint64_t const serial = V.sub[V.current].serial;
+	// uMemory reads the image drawn to (the input attachment) when that's the texture bound to it.
+	struct Fbo* drawing = fboGet(V.st.drawFbo);
+	struct Img* own = drawing ? fboColor(drawing) : NULL;
+	GLuint const memory = p->input >= 0 ? V.st.texture[p->unit[p->input] >= 0 && p->unit[p->input] < UNITS ? p->unit[p->input] : 0] : 0;
+	int32_t const isTarget = p->input >= 0 && own && drawing && !drawing->colorIsRb && memory && memory == drawing->color;
+	if (p->target >= 0 && memcmp(p->shadow + p->member[p->target].offset, &isTarget, 4)) {
+		memcpy(p->shadow + p->member[p->target].offset, &isTarget, 4);
+		p->shadowDirty = true;
+	}
 	if (p->shadowDirty || p->uboSerial != serial) {
 		size_t const at = ringTake(true, (size_t) p->blockSize ? (size_t) p->blockSize : 16, V.limits.minUniformBufferOffsetAlignment);
 		if (at == SIZE_MAX || V.sub[V.current].serial != serial) {
@@ -1653,8 +1676,6 @@ static bool bindings(struct Prog* p, VkDescriptorSet* set, uint32_t* offset) {
 		p->uboOffset = (uint32_t) at, p->uboSerial = serial, p->shadowDirty = false;
 	}
 	*offset = p->uboOffset;
-	struct Fbo* drawing = fboGet(V.st.drawFbo);
-	struct Img* own = drawing ? fboColor(drawing) : NULL;
 	VkImageView const inputView = p->input >= 0 && own ? own->view : VK_NULL_HANDLE;
 	if (p->set && p->setSerial == serial && p->setVersion == texVersion && p->setInput == inputView) {
 		*set = p->set;
@@ -1666,19 +1687,19 @@ static bool bindings(struct Prog* p, VkDescriptorSet* set, uint32_t* offset) {
 		return false;
 	}
 	VkDescriptorBufferInfo ubo = { V.sub[V.current].ubo.buffer, 0, (VkDeviceSize) (p->blockSize ? p->blockSize : 16) };
-	VkDescriptorImageInfo images[SAMPLERS];
-	VkWriteDescriptorSet writes[1 + SAMPLERS];
+	VkDescriptorImageInfo images[SAMPLERS + 1];
+	VkWriteDescriptorSet writes[2 + SAMPLERS];
 	uint32_t n = 0;
 	writes[n++] = (VkWriteDescriptorSet) { VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, NULL, *set, 0, 0, 1, VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER_DYNAMIC, NULL, &ubo, NULL };
+	if (p->input >= 0) {
+		images[p->samplers] = (VkDescriptorImageInfo) { VK_NULL_HANDLE, inputView ? inputView : dummyImage()->view, VK_IMAGE_LAYOUT_GENERAL };
+		writes[n++] = (VkWriteDescriptorSet) { VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, NULL, *set, (uint32_t) (1 + p->samplers), 0, 1,
+			                                   VK_DESCRIPTOR_TYPE_INPUT_ATTACHMENT, &images[p->samplers], NULL, NULL };
+	}
 	for (int i = 0; i < p->samplers; ++i) {
-		if (i == p->input) {
-			images[i] = (VkDescriptorImageInfo) { VK_NULL_HANDLE, inputView ? inputView : dummyImage()->view, VK_IMAGE_LAYOUT_GENERAL };
-			writes[n++] = (VkWriteDescriptorSet) { VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, NULL, *set, (uint32_t) (1 + i), 0, 1,
-				                                   VK_DESCRIPTOR_TYPE_INPUT_ATTACHMENT, &images[i], NULL, NULL };
-			continue;
-		}
 		int const unit = p->unit[i] >= 0 && p->unit[i] < UNITS ? p->unit[i] : 0;
-		GLuint const t = V.st.texture[unit];
+		// The image drawn to isn't sampled as well (it is the input attachment then).
+		GLuint const t = i == p->input && isTarget ? 0 : V.st.texture[unit];
 		struct Tex* tex = t && t < (GLuint) V.texCount && V.tex[t].used && V.tex[t].img.image ? &V.tex[t] : NULL;
 		struct Img* img = tex ? &tex->img : dummyImage();
 		images[i] = (VkDescriptorImageInfo) { tex ? sampler(tex->filter[0], tex->wrap[0], tex->wrap[1], tex->filter[1]) : sampler(GL_NEAREST, 0, 0, GL_NEAREST),
@@ -1840,6 +1861,12 @@ static void glClear_(GLbitfield mask) {
 	}
 	VkClearRect rect = { { { x0, y0 }, { (uint32_t) (x1 - x0), (uint32_t) (y1 - y0) } }, 0, 1 };
 	vkCmdClearAttachments(V.sub[V.current].cb, n, att, 1, &rect);
+	// A draw reading its own pixels next reads the cleared ones (GL's clears are done before).
+	if (mask & GL_COLOR_BUFFER_BIT) {
+		VkMemoryBarrier m = { VK_STRUCTURE_TYPE_MEMORY_BARRIER, NULL, VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT, VK_ACCESS_INPUT_ATTACHMENT_READ_BIT };
+		vkCmdPipelineBarrier(V.sub[V.current].cb, VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT, VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT,
+		                     VK_DEPENDENCY_BY_REGION_BIT, 1, &m, 0, NULL, 0, NULL);
+	}
 }
 
 // ---- Copies
