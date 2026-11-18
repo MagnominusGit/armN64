@@ -1205,6 +1205,10 @@ const char* vkglRenderer(void) {
 	return V.renderer;
 }
 
+bool vkglOrdered(void) {
+	return V.ordered;
+}
+
 // ---- Render passes, framebuffers and samplers
 
 static VkRenderPass renderPass(VkFormat color, VkFormat depth) {

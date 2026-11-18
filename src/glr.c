@@ -3951,7 +3951,9 @@ struct Glr* glrCreate(struct N64* n) {
 	}
 	g->fetch = found && !(fetch && *fetch == '0');
 	*(void**) &gl->TextureBarrierNV = glesProc(g->gles, "glTextureBarrierNV");
-	if (!g->fetch && !(fetch && *fetch == '0') && extensions && strstr(extensions, "GL_NV_texture_barrier") && gl->TextureBarrierNV) {
+	// FLE blends without reading the image where reading it takes barriers.
+	if (!g->fetch && !(fetch && *fetch == '0') && extensions && strstr(extensions, "GL_NV_texture_barrier") && gl->TextureBarrierNV &&
+	    (!n->fle || glesOrderedReads(g->gles))) {
 		g->fetch = g->barrier = true;
 	}
 	fprintf(stderr, "GL renderer on %s%s\n", glesRenderer(g->gles), g->barrier ? " (blending in the shader, texture barriers)" : g->fetch ? " (blending in the shader)" : "");

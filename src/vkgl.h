@@ -49,6 +49,8 @@ bool vkglActive(void);
 // A GL function by name ("glDrawArrays"), or NULL.
 void* vkglProc(const char* name);
 const char* vkglRenderer(void);
+// Whether draws read their own pixels in rasterization order, with no barriers.
+bool vkglOrdered(void);
 
 // The framebuffer name the frontend's picture is drawn to (with a blit), width by height pixels; then
 // vkglPicture submits the work and gives the image to pass to the frontend, in layout.

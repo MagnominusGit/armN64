@@ -511,6 +511,15 @@ struct Gles* glesCreateContext(char* error, size_t errorSize) {
 	return g;
 }
 
+bool glesOrderedReads(struct Gles* g) {
+#ifdef ARMN64_VULKAN
+	return g->vulkan && vkglOrdered();
+#else
+	(void) g;
+	return false;
+#endif
+}
+
 void* glesProc(struct Gles* g, const char* name) {
 #ifdef ARMN64_VULKAN
 	if (g->vulkan) {

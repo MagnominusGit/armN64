@@ -27,6 +27,8 @@ void glesResume(void);
 void glesFrontend(void* (*getProc)(const char* name));
 void glesDestroy(struct Gles*);
 const char* glesRenderer(struct Gles*);
+// Whether a texture barrier costs nothing: draws read their own pixels in order anyway.
+bool glesOrderedReads(struct Gles*);
 // Where compiled programs are kept, by their source and the driver (none: "" or NULL).
 void glesCacheDir(const char* dir);
 const char* glesCacheDirectory(void);
