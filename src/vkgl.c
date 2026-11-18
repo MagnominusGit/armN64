@@ -58,7 +58,7 @@ enum {
 };
 
 enum { SUBS = 3, UNITS = 12, SAMPLERS = 16, MEMBERS = 64, ATTRIBS = 8, UBO_BYTES = 4 << 20, STAGE_BYTES = 16 << 20, SETS = 4096 };
-enum { LOCATION_ELEMENTS = 1024, SAMPLER_LOCATION = MEMBERS * LOCATION_ELEMENTS, SUBMIT_DRAWS = 256, SUBMIT_BARRIERS = 64, SET_CACHE = 2048 };
+enum { LOCATION_ELEMENTS = 1024, SAMPLER_LOCATION = MEMBERS * LOCATION_ELEMENTS, SUBMIT_BARRIERS = 64, SET_CACHE = 2048 };
 // Images up to 256 KB share 2 MB allocations, in power-of-two pieces from 4 KB.
 enum { SLAB_MIN = 12, SLAB_MAX = 18, SLAB_BYTES = 2 << 20 };
 
@@ -328,8 +328,8 @@ static struct Vkgl {
 	VkPipeline lastPipe;
 	int pipeHash[4096];
 	bool barrierNeeded;
-	// Draws since the last submission: the queue gets them a few hundred at a time, as GL's drivers
-	// do, so the GPU works while the next are made.
+	// Draws since the last submission: the queue gets each render pass once it ends, as GL's drivers
+	// do, so the GPU works while the next are made (a tiling GPU draws a pass only then).
 	int pendingDraws, pendingBarriers;
 	// Broadcom's V3D starts a job at each barrier within a pass, with memory of its own until the
 	// submission is done: 4 GB in a few thousand.
@@ -570,10 +570,10 @@ static void passEnd(void) {
 	}
 }
 
-// The draws so far to the queue when there are enough of them, at the start of something that takes
-// room in the turn's buffers (never in the middle: what it took would go with the turn before).
+// The draws so far to the queue when their render pass has ended, at the start of something that
+// takes room in the turn's buffers (never in the middle: what it took would go with the turn before).
 static void submitDue(void) {
-	if ((V.pendingDraws >= SUBMIT_DRAWS && (!V.passOpen || V.passFbo != V.st.drawFbo)) || (V.barrierJobs && V.pendingBarriers >= SUBMIT_BARRIERS)) {
+	if ((V.pendingDraws && (!V.passOpen || V.passFbo != V.st.drawFbo)) || (V.barrierJobs && V.pendingBarriers >= SUBMIT_BARRIERS)) {
 		submit(false);
 	}
 }
