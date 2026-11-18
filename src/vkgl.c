@@ -771,7 +771,6 @@ static bool loadInstance(PFN_vkGetInstanceProcAddr get) {
 // when gpu can: extension and features (order chained on it), for the device's create info.
 struct Ordering {
 	const char* extension;
-	VkPhysicalDeviceFeatures2 features;
 	VkPhysicalDeviceRasterizationOrderAttachmentAccessFeaturesEXT order;
 };
 
@@ -780,14 +779,16 @@ static VkDevice orderedDevice;
 static bool ordering(VkInstance instance, PFN_vkGetInstanceProcAddr get, VkPhysicalDevice gpu, struct Ordering* o) {
 	PFN_vkGetPhysicalDeviceProperties properties = (PFN_vkGetPhysicalDeviceProperties) get(instance, "vkGetPhysicalDeviceProperties");
 	PFN_vkEnumerateDeviceExtensionProperties extensions = (PFN_vkEnumerateDeviceExtensionProperties) get(instance, "vkEnumerateDeviceExtensionProperties");
-	PFN_vkGetPhysicalDeviceFeatures2 features = (PFN_vkGetPhysicalDeviceFeatures2) get(instance, "vkGetPhysicalDeviceFeatures2");
-	if (!properties || !extensions || !features) {
+	if (!properties || !extensions) {
 		return false;
 	}
+	// A Vulkan 1.0 GPU's features through VK_KHR_get_physical_device_properties2 (some Adrenos).
 	VkPhysicalDeviceProperties p;
 	properties(gpu, &p);
+	PFN_vkGetPhysicalDeviceFeatures2 features =
+	    (PFN_vkGetPhysicalDeviceFeatures2) get(instance, p.apiVersion >= VK_API_VERSION_1_1 ? "vkGetPhysicalDeviceFeatures2" : "vkGetPhysicalDeviceFeatures2KHR");
 	uint32_t n = 0;
-	if (p.apiVersion < VK_API_VERSION_1_1 || extensions(gpu, NULL, &n, NULL) != VK_SUCCESS) {
+	if (!features || extensions(gpu, NULL, &n, NULL) != VK_SUCCESS) {
 		return false;
 	}
 	VkExtensionProperties* list = calloc(n ? n : 1, sizeof(*list));
@@ -809,9 +810,9 @@ static bool ordering(VkInstance instance, PFN_vkGetInstanceProcAddr get, VkPhysi
 	}
 	o->order = (VkPhysicalDeviceRasterizationOrderAttachmentAccessFeaturesEXT) { VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_RASTERIZATION_ORDER_ATTACHMENT_ACCESS_FEATURES_EXT,
 		                                                                         NULL, VK_FALSE, VK_FALSE, VK_FALSE };
-	o->features = (VkPhysicalDeviceFeatures2) { VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FEATURES_2, &o->order, { 0 } };
-	features(gpu, &o->features);
-	memset(&o->features.features, 0, sizeof(o->features.features));
+	VkPhysicalDeviceFeatures2 all = { VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FEATURES_2, &o->order, { 0 } };
+	features(gpu, &all);
+	o->order.pNext = NULL;
 	o->order.rasterizationOrderDepthAttachmentAccess = o->order.rasterizationOrderStencilAttachmentAccess = VK_FALSE;
 	return o->order.rasterizationOrderColorAttachmentAccess;
 }
@@ -879,7 +880,7 @@ bool vkglMakeDevice(VkInstance instance, VkPhysicalDevice gpu, VkSurfaceKHR surf
 		                                        { VK_STRUCTURE_TYPE_DEVICE_QUEUE_CREATE_INFO, NULL, 0, present, 1, &priority } };
 	struct Ordering o;
 	bool const ordered = ordering(instance, get, gpu, &o);
-	VkDeviceCreateInfo const info = { VK_STRUCTURE_TYPE_DEVICE_CREATE_INFO, ordered ? &o.features : NULL, 0, present == graphics ? 1u : 2u, queues, 0, NULL,
+	VkDeviceCreateInfo const info = { VK_STRUCTURE_TYPE_DEVICE_CREATE_INFO, ordered ? &o.order : NULL, 0, present == graphics ? 1u : 2u, queues, 0, NULL,
 		                              ordered ? 1u : 0u, ordered ? &o.extension : NULL, NULL };
 	VkDevice const device = create(gpu, opaque, &info);
 	PFN_vkGetDeviceQueue getQueue = device ? (PFN_vkGetDeviceQueue) deviceProc(device, "vkGetDeviceQueue") : NULL;
@@ -915,7 +916,17 @@ static bool ownDevice(char* error, size_t errorSize) {
 	}
 	VkApplicationInfo app = { VK_STRUCTURE_TYPE_APPLICATION_INFO, NULL, "armN64", 1, "armN64", 1,
 		                      version >= VK_API_VERSION_1_1 ? VK_API_VERSION_1_1 : VK_API_VERSION_1_0 };
-	VkInstanceCreateInfo info = { VK_STRUCTURE_TYPE_INSTANCE_CREATE_INFO, NULL, 0, &app, 0, NULL, 0, NULL };
+	PFN_vkEnumerateInstanceExtensionProperties instanceExtensions = (PFN_vkEnumerateInstanceExtensionProperties) get(NULL, "vkEnumerateInstanceExtensionProperties");
+	const char* properties2 = VK_KHR_GET_PHYSICAL_DEVICE_PROPERTIES_2_EXTENSION_NAME;
+	uint32_t found = 0, n = 0;
+	VkExtensionProperties* list = instanceExtensions && instanceExtensions(NULL, &n, NULL) == VK_SUCCESS ? calloc(n ? n : 1, sizeof(*list)) : NULL;
+	if (list && instanceExtensions(NULL, &n, list) == VK_SUCCESS) {
+		for (uint32_t i = 0; i < n; ++i) {
+			found |= !strcmp(list[i].extensionName, properties2);
+		}
+	}
+	free(list);
+	VkInstanceCreateInfo info = { VK_STRUCTURE_TYPE_INSTANCE_CREATE_INFO, NULL, 0, &app, 0, NULL, found, found ? &properties2 : NULL };
 	if (!vkCreateInstance || vkCreateInstance(&info, NULL, &V.instance) != VK_SUCCESS || !loadInstance(get)) {
 		return fail(error, errorSize, "no Vulkan instance");
 	}
@@ -950,7 +961,7 @@ static bool ownDevice(char* error, size_t errorSize) {
 	VkDeviceQueueCreateInfo queue = { VK_STRUCTURE_TYPE_DEVICE_QUEUE_CREATE_INFO, NULL, 0, V.queueFamily, 1, &priority };
 	struct Ordering o;
 	V.ordered = ordering(V.instance, get, V.gpu, &o);
-	VkDeviceCreateInfo dev = { VK_STRUCTURE_TYPE_DEVICE_CREATE_INFO, V.ordered ? &o.features : NULL, 0, 1, &queue, 0, NULL,
+	VkDeviceCreateInfo dev = { VK_STRUCTURE_TYPE_DEVICE_CREATE_INFO, V.ordered ? &o.order : NULL, 0, 1, &queue, 0, NULL,
 		                       V.ordered ? 1u : 0u, V.ordered ? &o.extension : NULL, NULL };
 	if (vkCreateDevice(V.gpu, &dev, NULL, &V.device) != VK_SUCCESS || !loadDevice()) {
 		return fail(error, errorSize, "no Vulkan device");
