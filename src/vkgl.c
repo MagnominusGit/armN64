@@ -55,7 +55,7 @@ enum {
 };
 
 enum { SUBS = 3, UNITS = 12, SAMPLERS = 16, MEMBERS = 64, ATTRIBS = 8, UBO_BYTES = 4 << 20, STAGE_BYTES = 16 << 20, SETS = 4096 };
-enum { LOCATION_ELEMENTS = 1024, SAMPLER_LOCATION = MEMBERS * LOCATION_ELEMENTS, SUBMIT_DRAWS = 256 };
+enum { LOCATION_ELEMENTS = 1024, SAMPLER_LOCATION = MEMBERS * LOCATION_ELEMENTS, SUBMIT_DRAWS = 256, SET_CACHE = 2048 };
 // Images up to 256 KB share 2 MB allocations, in power-of-two pieces from 4 KB.
 enum { SLAB_MIN = 12, SLAB_MAX = 18, SLAB_BYTES = 2 << 20 };
 
@@ -187,12 +187,8 @@ struct Prog {
 	// The sampler read as the image's own pixel (uMemory), or -1, and the block's member saying
 	// whether the texture bound to it is the image drawn to (then read as the input attachment).
 	int input, target;
-	VkImageView setInput;
 	uint32_t inputs;
-	// The set and uniform offset its last draw used, for the next one that changes neither.
-	VkDescriptorSet set;
-	uint64_t setSerial;
-	uint32_t setVersion;
+	// The uniform offset its last draw used, for the next one that changes none.
 	uint32_t uboOffset;
 	uint64_t uboSerial;
 };
@@ -205,6 +201,13 @@ struct Pipe {
 struct Garbage {
 	int kind;
 	uint64_t a, b;
+};
+
+struct SetEntry {
+	uint64_t serial;
+	VkDescriptorSetLayout layout;
+	VkDescriptorImageInfo images[SAMPLERS + 1];
+	VkDescriptorSet set;
 };
 
 struct Sub {
@@ -222,6 +225,8 @@ struct Sub {
 	// Images given up during the turn, destroyed once it's done.
 	struct Img* retired;
 	int retiredCount, retiredCapacity;
+	// The sets made this turn by their images (SET_CACHE of them, those of other turns unused).
+	struct SetEntry* setCache;
 };
 
 struct RenderPass {
@@ -886,6 +891,11 @@ bool vkglCreate(const struct VkglFrontend* frontend, char* error, size_t errorSi
 			freeAll();
 			return fail(error, errorSize, "Vulkan resources unavailable");
 		}
+		s->setCache = calloc(SET_CACHE, sizeof(*s->setCache));
+		if (!s->setCache) {
+			freeAll();
+			return fail(error, errorSize, "Vulkan resources unavailable");
+		}
 		VkCommandBufferAllocateInfo cb = { VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO, NULL, s->pool, VK_COMMAND_BUFFER_LEVEL_PRIMARY, 1 };
 		vkAllocateCommandBuffers(V.device, &cb, &s->cb);
 		vkAllocateCommandBuffers(V.device, &cb, &s->early);
@@ -991,6 +1001,8 @@ static void freeAll(void) {
 			s->garbage = NULL, s->garbageCount = s->garbageCapacity = 0;
 			free(s->retired);
 			s->retired = NULL, s->retiredCount = s->retiredCapacity = 0;
+			free(s->setCache);
+			s->setCache = NULL;
 			bufferFree(&s->ubo);
 			bufferFree(&s->stage);
 			if (s->sets) {
@@ -1647,7 +1659,6 @@ static bool linkProgram(struct Prog* p) {
 	p->shadow = calloc(1, (size_t) (p->blockSize ? p->blockSize : 16));
 	p->shadowDirty = true;
 	memset(p->unit, 0, sizeof(p->unit));
-	p->set = VK_NULL_HANDLE;
 	if (!ok) {
 		p->log = strdup("Vulkan objects unavailable");
 	}
@@ -1656,7 +1667,6 @@ static bool linkProgram(struct Prog* p) {
 
 // ---- Pipelines and drawing
 
-static uint32_t texVersion = 1;
 
 struct PipeKey {
 	VkRenderPass pass;
@@ -1830,25 +1840,7 @@ static bool bindings(struct Prog* p, VkDescriptorSet* set, uint32_t* offset) {
 	}
 	*offset = p->uboOffset;
 	VkImageView const inputView = p->input >= 0 && own ? own->view : VK_NULL_HANDLE;
-	if (p->set && p->setSerial == serial && p->setVersion == texVersion && p->setInput == inputView) {
-		*set = p->set;
-		return true;
-	}
-	VkDescriptorSetAllocateInfo alloc = { VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO, NULL, V.sub[V.current].sets, 1, &p->setLayout };
-	if (vkAllocateDescriptorSets(V.device, &alloc, set) != VK_SUCCESS) {
-		submit(false);
-		return false;
-	}
-	VkDescriptorBufferInfo ubo = { V.sub[V.current].ubo.buffer, 0, (VkDeviceSize) (p->blockSize ? p->blockSize : 16) };
 	VkDescriptorImageInfo images[SAMPLERS + 1];
-	VkWriteDescriptorSet writes[2 + SAMPLERS];
-	uint32_t n = 0;
-	writes[n++] = (VkWriteDescriptorSet) { VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, NULL, *set, 0, 0, 1, VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER_DYNAMIC, NULL, &ubo, NULL };
-	if (p->input >= 0) {
-		images[p->samplers] = (VkDescriptorImageInfo) { VK_NULL_HANDLE, inputView ? inputView : dummyImage()->view, VK_IMAGE_LAYOUT_GENERAL };
-		writes[n++] = (VkWriteDescriptorSet) { VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, NULL, *set, (uint32_t) (1 + p->samplers), 0, 1,
-			                                   VK_DESCRIPTOR_TYPE_INPUT_ATTACHMENT, &images[p->samplers], NULL, NULL };
-	}
 	for (int i = 0; i < p->samplers; ++i) {
 		int const unit = p->unit[i] >= 0 && p->unit[i] < UNITS ? p->unit[i] : 0;
 		// The image drawn to isn't sampled as well (it is the input attachment then).
@@ -1858,11 +1850,54 @@ static bool bindings(struct Prog* p, VkDescriptorSet* set, uint32_t* offset) {
 		touch(img);
 		images[i] = (VkDescriptorImageInfo) { tex ? sampler(tex->filter[0], tex->wrap[0], tex->wrap[1], tex->filter[1]) : sampler(GL_NEAREST, 0, 0, GL_NEAREST),
 			                                  img->view, VK_IMAGE_LAYOUT_GENERAL };
+	}
+	images[p->samplers] = (VkDescriptorImageInfo) { VK_NULL_HANDLE, inputView ? inputView : dummyImage()->view, VK_IMAGE_LAYOUT_GENERAL };
+	// A set made this turn with the same images is used again (views are only destroyed when their
+	// turn is done, so the same view this turn is the same image).
+	int const count = p->samplers + 1;
+	uint64_t h = (uint64_t) (uintptr_t) p->setLayout;
+	for (int i = 0; i < count; ++i) {
+		h = (h ^ (uint64_t) (uintptr_t) images[i].imageView) * 0x100000001B3ull;
+		h = (h ^ (uint64_t) (uintptr_t) images[i].sampler) * 0x100000001B3ull;
+	}
+	struct SetEntry* entry = NULL;
+	for (int probe = 0; probe < 8; ++probe) {
+		struct SetEntry* e = &V.sub[V.current].setCache[(h + (uint64_t) probe) & (SET_CACHE - 1)];
+		if (e->serial != serial) {
+			entry = e;
+			break;
+		}
+		bool same = e->layout == p->setLayout;
+		for (int i = 0; i < count && same; ++i) {
+			same = e->images[i].imageView == images[i].imageView && e->images[i].sampler == images[i].sampler;
+		}
+		if (same) {
+			*set = e->set;
+			return true;
+		}
+	}
+	VkDescriptorSetAllocateInfo alloc = { VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO, NULL, V.sub[V.current].sets, 1, &p->setLayout };
+	if (vkAllocateDescriptorSets(V.device, &alloc, set) != VK_SUCCESS) {
+		submit(false);
+		return false;
+	}
+	VkDescriptorBufferInfo ubo = { V.sub[V.current].ubo.buffer, 0, (VkDeviceSize) (p->blockSize ? p->blockSize : 16) };
+	VkWriteDescriptorSet writes[2 + SAMPLERS];
+	uint32_t n = 0;
+	writes[n++] = (VkWriteDescriptorSet) { VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, NULL, *set, 0, 0, 1, VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER_DYNAMIC, NULL, &ubo, NULL };
+	if (p->input >= 0) {
+		writes[n++] = (VkWriteDescriptorSet) { VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, NULL, *set, (uint32_t) (1 + p->samplers), 0, 1,
+			                                   VK_DESCRIPTOR_TYPE_INPUT_ATTACHMENT, &images[p->samplers], NULL, NULL };
+	}
+	for (int i = 0; i < p->samplers; ++i) {
 		writes[n++] = (VkWriteDescriptorSet) { VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, NULL, *set, (uint32_t) (1 + i), 0, 1,
 			                                   VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, &images[i], NULL, NULL };
 	}
 	vkUpdateDescriptorSets(V.device, n, writes, 0, NULL);
-	p->set = *set, p->setSerial = serial, p->setVersion = texVersion, p->setInput = inputView;
+	if (entry) {
+		entry->serial = serial, entry->layout = p->setLayout, entry->set = *set;
+		memcpy(entry->images, images, (size_t) count * sizeof(images[0]));
+	}
 	return true;
 }
 
@@ -2116,7 +2151,6 @@ static void glDeleteTextures_(GLsizei n, const GLuint* names) {
 			for (int u = 0; u < UNITS; ++u) {
 				V.st.texture[u] = V.st.texture[u] == t ? 0 : V.st.texture[u];
 			}
-			++texVersion;
 		}
 	}
 }
@@ -2130,7 +2164,6 @@ static void glBindTexture_(GLenum target, GLuint t) {
 	(void) target;
 	if (V.st.texture[V.st.unit] != t) {
 		V.st.texture[V.st.unit] = t;
-		++texVersion;
 	}
 }
 
@@ -2154,7 +2187,6 @@ static void glTexParameteri_(GLenum target, GLenum pname, GLint v) {
 	} else if (pname == GL_TEXTURE_WRAP_T) {
 		t->wrap[1] = (GLenum) v;
 	}
-	++texVersion;
 }
 
 static void glTexImage2D_(GLenum target, GLint level, GLint internal, GLsizei w, GLsizei h, GLint border, GLenum format, GLenum type, const void* data) {
@@ -2176,7 +2208,6 @@ static void glTexImage2D_(GLenum target, GLint level, GLint internal, GLsizei w,
 		if (!data && !unpack) {
 			imageReady(&t->img);
 		}
-		++texVersion;
 	}
 	if (data || unpack) {
 		upload(&t->img, 0, 0, w, h, data, (size_t) w * (size_t) h * 4, unpack ? unpack->buffer : VK_NULL_HANDLE, (VkDeviceSize) (uintptr_t) data);
@@ -2615,7 +2646,6 @@ static void glUniform1i_(GLint location, GLint v) {
 	if (p && location >= SAMPLER_LOCATION && location - SAMPLER_LOCATION < p->samplers) {
 		if (p->unit[location - SAMPLER_LOCATION] != v) {
 			p->unit[location - SAMPLER_LOCATION] = v;
-			++texVersion;
 		}
 		return;
 	}
