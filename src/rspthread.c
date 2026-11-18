@@ -32,6 +32,8 @@ struct RspThread {
 	// The RDRAM pages a DMA asks the main thread about.
 	uint32_t askAddr, askLen;
 	bool askWrite;
+	// The main thread is answering one: the RSP waits on it, so there is nothing to join meanwhile.
+	bool answering;
 	// The window's SP interrupt changes, in order, and the RDP's command words.
 	bool interrupts[8];
 	int interruptCount;
@@ -141,18 +143,22 @@ void rspThreadStop(struct N64* n) {
 }
 
 static void answer(struct N64* n, struct RspThread* t) {
+	// The RSP's own access: a write there to a page its DMA read would have it catch up (rspSeesWrite),
+	// joining the thread that waits on this answer.
+	t->answering = true;
 	if (t->askWrite) {
 		n64RdramWrite(n, t->askAddr, t->askLen);
 	} else {
 		n64RdramRead(n, t->askAddr, t->askLen);
 	}
+	t->answering = false;
 	set(t, RUN, &t->sleeping);
 }
 
 // The window done: its interrupts and the RDP's commands now.
 void rspThreadJoin(struct N64* n) {
 	struct RspThread* t = n->rspThread;
-	if (onThread) {
+	if (onThread || t->answering) {
 		return;
 	}
 	// A graphics task there is waited for at its end only.
