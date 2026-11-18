@@ -27,6 +27,20 @@ struct VkglFrontend {
 	uint32_t (*syncIndexMask)(void* handle);
 };
 
+// A device the frontend uses as well (libretro's context negotiation): on gpu, or the best GPU when
+// that's VK_NULL_HANDLE, with a queue for graphics and compute that presents to surface (or a second
+// that does), and what the context draws better with that the GPU has. create makes it (the
+// frontend's wrapper of vkCreateDevice, which adds what the frontend needs).
+struct VkglDevice {
+	VkPhysicalDevice gpu;
+	VkDevice device;
+	VkQueue queue, presentQueue;
+	uint32_t queueFamily, presentFamily;
+};
+
+bool vkglMakeDevice(VkInstance instance, VkPhysicalDevice gpu, VkSurfaceKHR surface, PFN_vkGetInstanceProcAddr get,
+                    VkDevice (*create)(VkPhysicalDevice, void*, const VkDeviceCreateInfo*), void* opaque, struct VkglDevice* out);
+
 // Starts the context: on the frontend's device, or with frontend NULL, on a device of its own. False,
 // with why in error, when Vulkan or a usable device isn't there.
 bool vkglCreate(const struct VkglFrontend* frontend, char* error, size_t errorSize);

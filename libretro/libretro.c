@@ -843,6 +843,23 @@ static void vulkanDestroy(void) {
 }
 
 // A Vulkan context for the GL renderer, when it is asked for or the frontend draws with Vulkan.
+// The frontend's device made here (when the frontend lets the core make it), with what vkgl draws
+// better with that the GPU has.
+static const VkApplicationInfo* vulkanApplication(void) {
+	static const VkApplicationInfo app = { VK_STRUCTURE_TYPE_APPLICATION_INFO, NULL, "armN64", 1, "armN64", 1, VK_API_VERSION_1_1 };
+	return &app;
+}
+
+static bool vulkanDevice(struct retro_vulkan_context* context, VkInstance instance, VkPhysicalDevice gpu, VkSurfaceKHR surface,
+                         PFN_vkGetInstanceProcAddr get, retro_vulkan_create_device_wrapper_t create, void* opaque) {
+	struct VkglDevice d;
+	if (!vkglMakeDevice(instance, gpu, surface, get, create, opaque, &d)) {
+		return false;
+	}
+	*context = (struct retro_vulkan_context) { d.gpu, d.device, d.queue, d.queueFamily, d.presentQueue, d.presentFamily };
+	return true;
+}
+
 static bool askVulkanContext(void) {
 	unsigned preferred = RETRO_HW_CONTEXT_NONE;
 	environment(RETRO_ENVIRONMENT_GET_PREFERRED_HW_RENDER, &preferred);
@@ -857,6 +874,13 @@ static bool askVulkanContext(void) {
 	if (!environment(RETRO_ENVIRONMENT_SET_HW_RENDER, &hw)) {
 		hw.context_type = RETRO_HW_CONTEXT_NONE;
 		return false;
+	}
+	struct retro_hw_render_context_negotiation_interface support = { RETRO_HW_RENDER_CONTEXT_NEGOTIATION_INTERFACE_VULKAN, 0 };
+	if (environment(RETRO_ENVIRONMENT_GET_HW_RENDER_CONTEXT_NEGOTIATION_INTERFACE_SUPPORT, &support) && support.interface_version >= 2) {
+		static const struct retro_hw_render_context_negotiation_interface_vulkan negotiation = {
+			RETRO_HW_RENDER_CONTEXT_NEGOTIATION_INTERFACE_VULKAN, 2, vulkanApplication, NULL, NULL, NULL, vulkanDevice,
+		};
+		environment(RETRO_ENVIRONMENT_SET_HW_RENDER_CONTEXT_NEGOTIATION_INTERFACE, (void*) &negotiation);
 	}
 	return true;
 }

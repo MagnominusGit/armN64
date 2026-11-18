@@ -24,9 +24,10 @@
 // Work goes to the queue in turns of three; what GL would have done at once (a read of pixels or of
 // a mapped buffer) submits and waits. The image's own pixel (GL_NV_texture_barrier, the renderer's
 // sampler uMemory, when the image drawn to is the texture bound to it) is read as an input
-// attachment, a by-region barrier between the draws that need what the one before wrote; with another
-// texture bound, uMemory samples that, as GL does. Rows are as GL keeps them: a framebuffer's row 0 is GL's y = 0,
-// the bottom, which is the first row in memory for both, so nothing is flipped.
+// attachment, a by-region barrier between the draws that need what the one before wrote (none where
+// the GPU reads it in rasterization order); with another texture bound, uMemory samples that, as GL
+// does. Rows are as GL keeps them: a framebuffer's row 0 is GL's y = 0, the bottom, which is the
+// first row in memory for both, so nothing is flipped.
 
 typedef unsigned GLenum;
 typedef unsigned GLuint;
@@ -263,6 +264,8 @@ struct State {
 };
 
 static struct Vkgl {
+	// Draws read the pixels drawn before them in rasterization order (no barriers between them).
+	bool ordered;
 	bool active, external;
 	char renderer[256];
 	struct VkglFrontend frontend;
@@ -759,6 +762,132 @@ static bool loadInstance(PFN_vkGetInstanceProcAddr get) {
 	return true;
 }
 
+// What a device is made with for draws to read the pixels drawn before them in rasterization order,
+// when gpu can: extension and features (order chained on it), for the device's create info.
+struct Ordering {
+	const char* extension;
+	VkPhysicalDeviceFeatures2 features;
+	VkPhysicalDeviceRasterizationOrderAttachmentAccessFeaturesEXT order;
+};
+
+static VkDevice orderedDevice;
+
+static bool ordering(VkInstance instance, PFN_vkGetInstanceProcAddr get, VkPhysicalDevice gpu, struct Ordering* o) {
+	PFN_vkGetPhysicalDeviceProperties properties = (PFN_vkGetPhysicalDeviceProperties) get(instance, "vkGetPhysicalDeviceProperties");
+	PFN_vkEnumerateDeviceExtensionProperties extensions = (PFN_vkEnumerateDeviceExtensionProperties) get(instance, "vkEnumerateDeviceExtensionProperties");
+	PFN_vkGetPhysicalDeviceFeatures2 features = (PFN_vkGetPhysicalDeviceFeatures2) get(instance, "vkGetPhysicalDeviceFeatures2");
+	if (!properties || !extensions || !features) {
+		return false;
+	}
+	VkPhysicalDeviceProperties p;
+	properties(gpu, &p);
+	uint32_t n = 0;
+	if (p.apiVersion < VK_API_VERSION_1_1 || extensions(gpu, NULL, &n, NULL) != VK_SUCCESS) {
+		return false;
+	}
+	VkExtensionProperties* list = calloc(n ? n : 1, sizeof(*list));
+	if (!list || extensions(gpu, NULL, &n, list) != VK_SUCCESS) {
+		free(list);
+		return false;
+	}
+	o->extension = NULL;
+	for (uint32_t i = 0; i < n; ++i) {
+		if (!strcmp(list[i].extensionName, VK_EXT_RASTERIZATION_ORDER_ATTACHMENT_ACCESS_EXTENSION_NAME)) {
+			o->extension = VK_EXT_RASTERIZATION_ORDER_ATTACHMENT_ACCESS_EXTENSION_NAME;
+		} else if (!strcmp(list[i].extensionName, VK_ARM_RASTERIZATION_ORDER_ATTACHMENT_ACCESS_EXTENSION_NAME) && !o->extension) {
+			o->extension = VK_ARM_RASTERIZATION_ORDER_ATTACHMENT_ACCESS_EXTENSION_NAME;
+		}
+	}
+	free(list);
+	if (!o->extension) {
+		return false;
+	}
+	o->order = (VkPhysicalDeviceRasterizationOrderAttachmentAccessFeaturesEXT) { VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_RASTERIZATION_ORDER_ATTACHMENT_ACCESS_FEATURES_EXT,
+		                                                                         NULL, VK_FALSE, VK_FALSE, VK_FALSE };
+	o->features = (VkPhysicalDeviceFeatures2) { VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FEATURES_2, &o->order, { 0 } };
+	features(gpu, &o->features);
+	memset(&o->features.features, 0, sizeof(o->features.features));
+	o->order.rasterizationOrderDepthAttachmentAccess = o->order.rasterizationOrderStencilAttachmentAccess = VK_FALSE;
+	return o->order.rasterizationOrderColorAttachmentAccess;
+}
+
+// The GPU a device goes on: discrete, then integrated, then any, with a graphics queue.
+static VkPhysicalDevice bestGpu(VkInstance instance, PFN_vkGetInstanceProcAddr get) {
+	PFN_vkEnumeratePhysicalDevices enumerate = (PFN_vkEnumeratePhysicalDevices) get(instance, "vkEnumeratePhysicalDevices");
+	PFN_vkGetPhysicalDeviceProperties properties = (PFN_vkGetPhysicalDeviceProperties) get(instance, "vkGetPhysicalDeviceProperties");
+	PFN_vkGetPhysicalDeviceQueueFamilyProperties families = (PFN_vkGetPhysicalDeviceQueueFamilyProperties) get(instance, "vkGetPhysicalDeviceQueueFamilyProperties");
+	VkPhysicalDevice gpus[16];
+	uint32_t count = 16;
+	if (!enumerate || !properties || !families || enumerate(instance, &count, gpus) < 0) {
+		return VK_NULL_HANDLE;
+	}
+	VkPhysicalDevice best = VK_NULL_HANDLE;
+	int bestRank = -1;
+	for (uint32_t i = 0; i < count; ++i) {
+		VkPhysicalDeviceProperties p;
+		properties(gpus[i], &p);
+		VkQueueFamilyProperties f[16];
+		uint32_t n = 16;
+		families(gpus[i], &n, f);
+		for (uint32_t k = 0; k < n; ++k) {
+			int const rank = p.deviceType == VK_PHYSICAL_DEVICE_TYPE_DISCRETE_GPU ? 3 : p.deviceType == VK_PHYSICAL_DEVICE_TYPE_INTEGRATED_GPU ? 2 : 1;
+			if ((f[k].queueFlags & VK_QUEUE_GRAPHICS_BIT) && rank > bestRank) {
+				best = gpus[i], bestRank = rank;
+			}
+		}
+	}
+	return best;
+}
+
+bool vkglMakeDevice(VkInstance instance, VkPhysicalDevice gpu, VkSurfaceKHR surface, PFN_vkGetInstanceProcAddr get,
+                    VkDevice (*create)(VkPhysicalDevice, void*, const VkDeviceCreateInfo*), void* opaque, struct VkglDevice* out) {
+	PFN_vkGetPhysicalDeviceQueueFamilyProperties families = (PFN_vkGetPhysicalDeviceQueueFamilyProperties) get(instance, "vkGetPhysicalDeviceQueueFamilyProperties");
+	PFN_vkGetPhysicalDeviceSurfaceSupportKHR presents = (PFN_vkGetPhysicalDeviceSurfaceSupportKHR) get(instance, "vkGetPhysicalDeviceSurfaceSupportKHR");
+	PFN_vkGetDeviceProcAddr deviceProc = (PFN_vkGetDeviceProcAddr) get(instance, "vkGetDeviceProcAddr");
+	gpu = gpu ? gpu : bestGpu(instance, get);
+	if (!gpu || !families || !deviceProc || (surface && !presents)) {
+		return false;
+	}
+	VkQueueFamilyProperties f[16];
+	uint32_t n = 16;
+	families(gpu, &n, f);
+	// One family for graphics, compute and the surface if there is one, else one for each.
+	uint32_t graphics = UINT32_MAX, present = UINT32_MAX;
+	for (uint32_t i = 0; i < n; ++i) {
+		VkBool32 can = !surface;
+		if (surface) {
+			presents(gpu, i, surface, &can);
+		}
+		bool const draws = (f[i].queueFlags & (VK_QUEUE_GRAPHICS_BIT | VK_QUEUE_COMPUTE_BIT)) == (VK_QUEUE_GRAPHICS_BIT | VK_QUEUE_COMPUTE_BIT);
+		if (draws && can) {
+			graphics = present = i;
+			break;
+		}
+		graphics = draws && graphics == UINT32_MAX ? i : graphics;
+		present = can && present == UINT32_MAX ? i : present;
+	}
+	if (graphics == UINT32_MAX || present == UINT32_MAX) {
+		return false;
+	}
+	float const priority = 1.0f;
+	VkDeviceQueueCreateInfo const queues[2] = { { VK_STRUCTURE_TYPE_DEVICE_QUEUE_CREATE_INFO, NULL, 0, graphics, 1, &priority },
+		                                        { VK_STRUCTURE_TYPE_DEVICE_QUEUE_CREATE_INFO, NULL, 0, present, 1, &priority } };
+	struct Ordering o;
+	bool const ordered = ordering(instance, get, gpu, &o);
+	VkDeviceCreateInfo const info = { VK_STRUCTURE_TYPE_DEVICE_CREATE_INFO, ordered ? &o.features : NULL, 0, present == graphics ? 1u : 2u, queues, 0, NULL,
+		                              ordered ? 1u : 0u, ordered ? &o.extension : NULL, NULL };
+	VkDevice const device = create(gpu, opaque, &info);
+	PFN_vkGetDeviceQueue getQueue = device ? (PFN_vkGetDeviceQueue) deviceProc(device, "vkGetDeviceQueue") : NULL;
+	if (!getQueue) {
+		return false;
+	}
+	*out = (struct VkglDevice) { gpu, device, VK_NULL_HANDLE, VK_NULL_HANDLE, graphics, present };
+	getQueue(device, graphics, 0, &out->queue);
+	getQueue(device, present, 0, &out->presentQueue);
+	orderedDevice = ordered ? device : VK_NULL_HANDLE;
+	return true;
+}
+
 // An instance and device of its own: the first GPU with a graphics queue, discrete or integrated
 // first.
 static bool ownDevice(char* error, size_t errorSize) {
@@ -814,7 +943,10 @@ static bool ownDevice(char* error, size_t errorSize) {
 	V.queueFamily = bestFamily;
 	float const priority = 1.0f;
 	VkDeviceQueueCreateInfo queue = { VK_STRUCTURE_TYPE_DEVICE_QUEUE_CREATE_INFO, NULL, 0, V.queueFamily, 1, &priority };
-	VkDeviceCreateInfo dev = { VK_STRUCTURE_TYPE_DEVICE_CREATE_INFO, NULL, 0, 1, &queue, 0, NULL, 0, NULL, NULL };
+	struct Ordering o;
+	V.ordered = ordering(V.instance, get, V.gpu, &o);
+	VkDeviceCreateInfo dev = { VK_STRUCTURE_TYPE_DEVICE_CREATE_INFO, V.ordered ? &o.features : NULL, 0, 1, &queue, 0, NULL,
+		                       V.ordered ? 1u : 0u, V.ordered ? &o.extension : NULL, NULL };
 	if (vkCreateDevice(V.gpu, &dev, NULL, &V.device) != VK_SUCCESS || !loadDevice()) {
 		return fail(error, errorSize, "no Vulkan device");
 	}
@@ -839,6 +971,7 @@ bool vkglCreate(const struct VkglFrontend* frontend, char* error, size_t errorSi
 		V.frontend = *frontend;
 		V.instance = frontend->instance, V.gpu = frontend->gpu, V.device = frontend->device, V.queue = frontend->queue;
 		V.queueFamily = frontend->queueFamily;
+		V.ordered = frontend->device == orderedDevice;
 		if (!loadInstance(frontend->getInstanceProcAddr)) {
 			return fail(error, errorSize, "Vulkan functions missing");
 		}
@@ -1090,7 +1223,8 @@ static VkRenderPass renderPass(VkFormat color, VkFormat depth) {
 	}
 	// The color attachment is also the subpass's input (the image's own pixel), with a dependency on
 	// itself for the barriers between draws.
-	VkSubpassDescription sub = { 0, VK_PIPELINE_BIND_POINT_GRAPHICS, color ? 1u : 0u, color ? &colorRef : NULL, color ? 1u : 0u, color ? &colorRef : NULL, NULL,
+	VkSubpassDescriptionFlags const flags = color && V.ordered ? VK_SUBPASS_DESCRIPTION_RASTERIZATION_ORDER_ATTACHMENT_COLOR_ACCESS_BIT_EXT : 0;
+	VkSubpassDescription sub = { flags, VK_PIPELINE_BIND_POINT_GRAPHICS, color ? 1u : 0u, color ? &colorRef : NULL, color ? 1u : 0u, color ? &colorRef : NULL, NULL,
 		                         depth ? &depthRef : NULL, 0, NULL };
 	VkSubpassDependency deps[3] = {
 		{ VK_SUBPASS_EXTERNAL, 0, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, VK_PIPELINE_STAGE_ALL_GRAPHICS_BIT, VK_ACCESS_MEMORY_WRITE_BIT,
@@ -1781,7 +1915,8 @@ static VkPipeline pipeline(const struct PipeKey* k, struct Prog* p) {
 		                                         compareOp(k->depthFunc), VK_FALSE, k->stencilTest, so, so, 0, 1 };
 	VkPipelineColorBlendAttachmentState ba = { k->blend, blendFactor(k->blendSrc[0]), blendFactor(k->blendDst[0]), blendOp(k->blendEq[0]),
 		                                       blendFactor(k->blendSrc[1]), blendFactor(k->blendDst[1]), blendOp(k->blendEq[1]), k->colorMask };
-	VkPipelineColorBlendStateCreateInfo cb = { VK_STRUCTURE_TYPE_PIPELINE_COLOR_BLEND_STATE_CREATE_INFO, NULL, 0, VK_FALSE, VK_LOGIC_OP_COPY,
+	VkPipelineColorBlendStateCreateInfo cb = { VK_STRUCTURE_TYPE_PIPELINE_COLOR_BLEND_STATE_CREATE_INFO, NULL,
+		                                       k->hasColor && V.ordered ? VK_PIPELINE_COLOR_BLEND_STATE_CREATE_RASTERIZATION_ORDER_ATTACHMENT_ACCESS_BIT_EXT : 0, VK_FALSE, VK_LOGIC_OP_COPY,
 		                                       k->hasColor ? 1u : 0u, &ba, { 0, 0, 0, 0 } };
 	static const VkDynamicState dynamic[] = { VK_DYNAMIC_STATE_VIEWPORT, VK_DYNAMIC_STATE_SCISSOR, VK_DYNAMIC_STATE_DEPTH_BIAS,
 		                                      VK_DYNAMIC_STATE_BLEND_CONSTANTS, VK_DYNAMIC_STATE_STENCIL_COMPARE_MASK,
@@ -2812,7 +2947,7 @@ static void glFinish_(void) {
 // What the draws before wrote, for the next to read as its own pixel: within the render pass, pixel
 // by pixel.
 static void glTextureBarrierNV_(void) {
-	if (V.passOpen) {
+	if (V.passOpen && !V.ordered) {
 		VkMemoryBarrier m = { VK_STRUCTURE_TYPE_MEMORY_BARRIER, NULL, VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT, VK_ACCESS_INPUT_ATTACHMENT_READ_BIT };
 		vkCmdPipelineBarrier(V.sub[V.current].cb, VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT, VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT,
 		                     VK_DEPENDENCY_BY_REGION_BIT, 1, &m, 0, NULL, 0, NULL);
