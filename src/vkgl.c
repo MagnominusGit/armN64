@@ -6,6 +6,8 @@
 #include "gles.h"
 
 #include <dlfcn.h>
+#include <pthread.h>
+#include <stdatomic.h>
 #include <unistd.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -823,6 +825,9 @@ static bool ownDevice(char* error, size_t errorSize) {
 static void freeAll(void);
 static struct Img* dummyImage(void);
 static struct Img dummy;
+static void queueStart(void);
+static void queueStop(void);
+static void drain(void);
 
 bool vkglCreate(const struct VkglFrontend* frontend, char* error, size_t errorSize) {
 	if (V.active) {
@@ -910,6 +915,7 @@ bool vkglCreate(const struct VkglFrontend* frontend, char* error, size_t errorSi
 	}
 	V.active = true;
 	dummyImage();
+	queueStart();
 	return true;
 }
 
@@ -1046,6 +1052,7 @@ static void freeAll(void) {
 }
 
 void vkglDestroy(void) {
+	queueStop();
 	if (V.active || V.device) {
 		freeAll();
 	}
@@ -1666,7 +1673,6 @@ static bool linkProgram(struct Prog* p) {
 }
 
 // ---- Pipelines and drawing
-
 
 struct PipeKey {
 	VkRenderPass pass;
@@ -2891,6 +2897,7 @@ static void glBlitFramebuffer_(GLint sx0, GLint sy0, GLint sx1, GLint sy1, GLint
 // ---- The frontend's picture
 
 unsigned vkglFrontendFramebuffer(int width, int height) {
+	drain();
 	if (!V.pictureFbo) {
 		V.pictureFbo = new_fbo();
 		if (!V.pictureFbo) {
@@ -2920,6 +2927,7 @@ unsigned vkglFrontendFramebuffer(int width, int height) {
 }
 
 bool vkglPicture(VkImage* image, VkImageView* view, VkImageLayout* layout, VkImageViewCreateInfo* info) {
+	drain();
 	struct Img* img = &V.picture[V.pictureIndex];
 	if (!img->image) {
 		return false;
@@ -2935,6 +2943,370 @@ bool vkglPicture(VkImage* image, VkImageView* view, VkImageLayout* layout, VkIma
 	return true;
 }
 
+// ---- A thread of its own
+//
+// The calls that return nothing go to a ring of records that a thread of its own runs (and records
+// in Vulkan) while the emulator goes on; the others wait until it has run every record before them
+// and run here. Mapping the vertex buffer to write without waiting is done here as well, from the
+// buffer bindings copied as they're queued (the buffer itself only changes with calls that wait).
+
+// Records are handed over QUEUE_BATCH at a time (and all before a wait), so the thread sleeps between
+// batches instead of waiting for each.
+enum { QUEUE_BYTES = 16 << 20, QUEUE_BATCH = 128, GL_MAP_UNSYNCHRONIZED_BIT = 0x20 };
+
+struct Call {
+	void (*run)(const struct Call*);
+	uint32_t size;
+	int32_t i[10];
+	float f[4];
+	intptr_t p;
+};
+
+static struct {
+	pthread_t thread;
+	bool running;
+	uint8_t* ring;
+	// Bytes queued (head, the queuer's), run (tail) and handed over (published): ring positions.
+	size_t head;
+	int unpublished;
+	_Atomic size_t tail, published;
+	_Atomic bool sleeping, waiting, stop;
+	pthread_mutex_t lock;
+	pthread_cond_t wake, idle;
+	GLuint buffers[3];
+} Q;
+
+static void relax(void) {
+#if defined(__x86_64__)
+	__builtin_ia32_pause();
+#elif defined(__aarch64__)
+	__asm__ volatile("yield");
+#endif
+}
+
+static void publish(void) {
+	Q.unpublished = 0;
+	atomic_store(&Q.published, Q.head);
+	if (atomic_load(&Q.sleeping)) {
+		pthread_mutex_lock(&Q.lock);
+		pthread_cond_signal(&Q.wake);
+		pthread_mutex_unlock(&Q.lock);
+	}
+}
+
+// Every record queued run.
+static void drain(void) {
+	if (!Q.running) {
+		return;
+	}
+	publish();
+	for (int spin = 0; spin < 4000; ++spin) {
+		if (atomic_load(&Q.tail) == Q.head) {
+			return;
+		}
+		relax();
+	}
+	pthread_mutex_lock(&Q.lock);
+	atomic_store(&Q.waiting, true);
+	while (atomic_load(&Q.tail) != Q.head) {
+		pthread_cond_wait(&Q.idle, &Q.lock);
+	}
+	atomic_store(&Q.waiting, false);
+	pthread_mutex_unlock(&Q.lock);
+}
+
+// A record for run with data bytes after it (an end-of-ring mark first when it doesn't fit there).
+static struct Call* callNew(void (*run)(const struct Call*), size_t data) {
+	size_t const size = (sizeof(struct Call) + data + 7) & ~(size_t) 7;
+	size_t const room = QUEUE_BYTES - Q.head % QUEUE_BYTES;
+	if (QUEUE_BYTES - (Q.head - atomic_load(&Q.tail)) < size + (room < size ? room : 0)) {
+		drain();
+	}
+	if (room < size) {
+		*(void**) (Q.ring + Q.head % QUEUE_BYTES) = NULL;
+		Q.head += room;
+	}
+	struct Call* c = (struct Call*) (Q.ring + Q.head % QUEUE_BYTES);
+	c->run = run, c->size = (uint32_t) size;
+	return c;
+}
+
+static void callEnd(struct Call* c) {
+	Q.head += c->size;
+	if (++Q.unpublished == QUEUE_BATCH) {
+		publish();
+	}
+}
+
+static void* queueRun(void* unused) {
+	(void) unused;
+	size_t tail = 0;
+	while (!atomic_load(&Q.stop) || tail != atomic_load(&Q.published)) {
+		if (tail == atomic_load(&Q.published)) {
+			int spin = 0;
+			while (tail == atomic_load(&Q.published) && spin++ < 200) {
+				relax();
+			}
+			pthread_mutex_lock(&Q.lock);
+			atomic_store(&Q.sleeping, true);
+			while (tail == atomic_load(&Q.published) && !atomic_load(&Q.stop)) {
+				pthread_cond_wait(&Q.wake, &Q.lock);
+			}
+			atomic_store(&Q.sleeping, false);
+			pthread_mutex_unlock(&Q.lock);
+			continue;
+		}
+		struct Call* c = (struct Call*) (Q.ring + tail % QUEUE_BYTES);
+		if (c->run) {
+			c->run(c);
+			tail += c->size;
+		} else {
+			tail += QUEUE_BYTES - tail % QUEUE_BYTES;
+		}
+		atomic_store(&Q.tail, tail);
+		if (atomic_load(&Q.waiting) && tail == atomic_load(&Q.published)) {
+			pthread_mutex_lock(&Q.lock);
+			pthread_cond_signal(&Q.idle);
+			pthread_mutex_unlock(&Q.lock);
+		}
+	}
+	return NULL;
+}
+
+static void queueStart(void) {
+	Q.ring = malloc(QUEUE_BYTES);
+	Q.head = 0, Q.unpublished = 0;
+	atomic_store(&Q.tail, 0);
+	atomic_store(&Q.published, 0);
+	atomic_store(&Q.sleeping, false);
+	atomic_store(&Q.waiting, false);
+	atomic_store(&Q.stop, false);
+	memset(Q.buffers, 0, sizeof(Q.buffers));
+	pthread_mutex_init(&Q.lock, NULL);
+	pthread_cond_init(&Q.wake, NULL);
+	pthread_cond_init(&Q.idle, NULL);
+	Q.running = Q.ring && pthread_create(&Q.thread, NULL, queueRun, NULL) == 0;
+	if (!Q.running) {
+		free(Q.ring);
+		Q.ring = NULL;
+	}
+}
+
+static void queueStop(void) {
+	if (!Q.running) {
+		return;
+	}
+	drain();
+	pthread_mutex_lock(&Q.lock);
+	atomic_store(&Q.stop, true);
+	pthread_cond_signal(&Q.wake);
+	pthread_mutex_unlock(&Q.lock);
+	pthread_join(Q.thread, NULL);
+	Q.running = false;
+	pthread_cond_destroy(&Q.wake);
+	pthread_cond_destroy(&Q.idle);
+	pthread_mutex_destroy(&Q.lock);
+	free(Q.ring);
+	Q.ring = NULL;
+}
+
+// A queued call: store puts its arguments in the record c, call runs it from there. Without the
+// thread it runs at once from a record here.
+#define QUEUED(name, params, store, call)                                                   \
+	static void run_##name(const struct Call* c) {                                          \
+		(void) c;                                                                           \
+		call;                                                                               \
+	}                                                                                       \
+	static void q_##name params {                                                           \
+		struct Call local, *c = Q.running ? callNew(run_##name, 0) : &local;                \
+		store;                                                                              \
+		if (c == &local) {                                                                  \
+			run_##name(c);                                                                  \
+		} else {                                                                            \
+			callEnd(c);                                                                     \
+		}                                                                                   \
+	}
+
+// A call that waits for the thread, then runs here.
+#define WAITS(type, name, params, args) \
+	static type w_##name params {       \
+		drain();                        \
+		return gl##name##_ args;        \
+	}
+#define WAITS_VOID(name, params, args) \
+	static void w_##name params {      \
+		drain();                       \
+		gl##name##_ args;              \
+	}
+
+QUEUED(BindFramebuffer, (GLenum t, GLuint f), (c->i[0] = (int32_t) t, c->i[1] = (int32_t) f), glBindFramebuffer_((GLenum) c->i[0], (GLuint) c->i[1]))
+QUEUED(BlitFramebuffer, (GLint a, GLint b, GLint d, GLint e, GLint g, GLint h, GLint j, GLint k, GLbitfield mask, GLenum filter),
+       (c->i[0] = a, c->i[1] = b, c->i[2] = d, c->i[3] = e, c->i[4] = g, c->i[5] = h, c->i[6] = j, c->i[7] = k, c->i[8] = (int32_t) mask, c->i[9] = (int32_t) filter),
+       glBlitFramebuffer_(c->i[0], c->i[1], c->i[2], c->i[3], c->i[4], c->i[5], c->i[6], c->i[7], (GLbitfield) c->i[8], (GLenum) c->i[9]))
+QUEUED(FramebufferTexture2D, (GLenum t, GLenum a, GLenum tt, GLuint x, GLint l),
+       (c->i[0] = (int32_t) t, c->i[1] = (int32_t) a, c->i[2] = (int32_t) tt, c->i[3] = (int32_t) x, c->i[4] = l),
+       glFramebufferTexture2D_((GLenum) c->i[0], (GLenum) c->i[1], (GLenum) c->i[2], (GLuint) c->i[3], c->i[4]))
+QUEUED(FramebufferRenderbuffer, (GLenum t, GLenum a, GLenum rt, GLuint r),
+       (c->i[0] = (int32_t) t, c->i[1] = (int32_t) a, c->i[2] = (int32_t) rt, c->i[3] = (int32_t) r),
+       glFramebufferRenderbuffer_((GLenum) c->i[0], (GLenum) c->i[1], (GLenum) c->i[2], (GLuint) c->i[3]))
+QUEUED(BindRenderbuffer, (GLenum t, GLuint r), (c->i[0] = (int32_t) t, c->i[1] = (int32_t) r), glBindRenderbuffer_((GLenum) c->i[0], (GLuint) c->i[1]))
+QUEUED(RenderbufferStorage, (GLenum t, GLenum f, GLsizei w, GLsizei h), (c->i[0] = (int32_t) t, c->i[1] = (int32_t) f, c->i[2] = w, c->i[3] = h),
+       glRenderbufferStorage_((GLenum) c->i[0], (GLenum) c->i[1], c->i[2], c->i[3]))
+QUEUED(RenderbufferStorageMultisample, (GLenum t, GLsizei s, GLenum f, GLsizei w, GLsizei h),
+       (c->i[0] = (int32_t) t, c->i[1] = s, c->i[2] = (int32_t) f, c->i[3] = w, c->i[4] = h),
+       glRenderbufferStorageMultisample_((GLenum) c->i[0], c->i[1], (GLenum) c->i[2], c->i[3], c->i[4]))
+QUEUED(BindTexture, (GLenum t, GLuint x), (c->i[0] = (int32_t) t, c->i[1] = (int32_t) x), glBindTexture_((GLenum) c->i[0], (GLuint) c->i[1]))
+QUEUED(ActiveTexture, (GLenum u), c->i[0] = (int32_t) u, glActiveTexture_((GLenum) c->i[0]))
+QUEUED(TexParameteri, (GLenum t, GLenum n, GLint v), (c->i[0] = (int32_t) t, c->i[1] = (int32_t) n, c->i[2] = v),
+       glTexParameteri_((GLenum) c->i[0], (GLenum) c->i[1], c->i[2]))
+QUEUED(Viewport, (GLint x, GLint y, GLsizei w, GLsizei h), (c->i[0] = x, c->i[1] = y, c->i[2] = w, c->i[3] = h), glViewport_(c->i[0], c->i[1], c->i[2], c->i[3]))
+QUEUED(Scissor, (GLint x, GLint y, GLsizei w, GLsizei h), (c->i[0] = x, c->i[1] = y, c->i[2] = w, c->i[3] = h), glScissor_(c->i[0], c->i[1], c->i[2], c->i[3]))
+QUEUED(Enable, (GLenum x), c->i[0] = (int32_t) x, glEnable_((GLenum) c->i[0]))
+QUEUED(Disable, (GLenum x), c->i[0] = (int32_t) x, glDisable_((GLenum) c->i[0]))
+QUEUED(ClearColor, (float r, float g, float b, float a), (c->f[0] = r, c->f[1] = g, c->f[2] = b, c->f[3] = a), glClearColor_(c->f[0], c->f[1], c->f[2], c->f[3]))
+QUEUED(ClearDepthf, (float d), c->f[0] = d, glClearDepthf_(c->f[0]))
+QUEUED(ClearStencil, (GLint s), c->i[0] = s, glClearStencil_(c->i[0]))
+QUEUED(Clear, (GLbitfield m), c->i[0] = (int32_t) m, glClear_((GLbitfield) c->i[0]))
+QUEUED(DepthFunc, (GLenum x), c->i[0] = (int32_t) x, glDepthFunc_((GLenum) c->i[0]))
+QUEUED(DepthMask, (GLboolean x), c->i[0] = x, glDepthMask_((GLboolean) c->i[0]))
+QUEUED(BlendFunc, (GLenum s, GLenum d), (c->i[0] = (int32_t) s, c->i[1] = (int32_t) d), glBlendFunc_((GLenum) c->i[0], (GLenum) c->i[1]))
+QUEUED(BlendFuncSeparate, (GLenum a, GLenum b, GLenum d, GLenum e), (c->i[0] = (int32_t) a, c->i[1] = (int32_t) b, c->i[2] = (int32_t) d, c->i[3] = (int32_t) e),
+       glBlendFuncSeparate_((GLenum) c->i[0], (GLenum) c->i[1], (GLenum) c->i[2], (GLenum) c->i[3]))
+QUEUED(BlendEquationSeparate, (GLenum a, GLenum b), (c->i[0] = (int32_t) a, c->i[1] = (int32_t) b), glBlendEquationSeparate_((GLenum) c->i[0], (GLenum) c->i[1]))
+QUEUED(BlendColor, (float r, float g, float b, float a), (c->f[0] = r, c->f[1] = g, c->f[2] = b, c->f[3] = a), glBlendColor_(c->f[0], c->f[1], c->f[2], c->f[3]))
+QUEUED(PolygonOffset, (float a, float b), (c->f[0] = a, c->f[1] = b), glPolygonOffset_(c->f[0], c->f[1]))
+QUEUED(StencilFunc, (GLenum x, GLint r, GLuint m), (c->i[0] = (int32_t) x, c->i[1] = r, c->i[2] = (int32_t) m), glStencilFunc_((GLenum) c->i[0], c->i[1], (GLuint) c->i[2]))
+QUEUED(StencilOp, (GLenum a, GLenum b, GLenum d), (c->i[0] = (int32_t) a, c->i[1] = (int32_t) b, c->i[2] = (int32_t) d),
+       glStencilOp_((GLenum) c->i[0], (GLenum) c->i[1], (GLenum) c->i[2]))
+QUEUED(ColorMask, (GLboolean r, GLboolean g, GLboolean b, GLboolean a), (c->i[0] = r, c->i[1] = g, c->i[2] = b, c->i[3] = a),
+       glColorMask_((GLboolean) c->i[0], (GLboolean) c->i[1], (GLboolean) c->i[2], (GLboolean) c->i[3]))
+QUEUED(PixelStorei, (GLenum n, GLint v), (c->i[0] = (int32_t) n, c->i[1] = v), glPixelStorei_((GLenum) c->i[0], c->i[1]))
+QUEUED(UseProgram, (GLuint x), c->i[0] = (int32_t) x, glUseProgram_((GLuint) c->i[0]))
+QUEUED(Uniform1i, (GLint l, GLint v), (c->i[0] = l, c->i[1] = v), glUniform1i_(c->i[0], c->i[1]))
+QUEUED(Uniform1f, (GLint l, float v), (c->i[0] = l, c->f[0] = v), glUniform1f_(c->i[0], c->f[0]))
+QUEUED(Uniform2f, (GLint l, float a, float b), (c->i[0] = l, c->f[0] = a, c->f[1] = b), glUniform2f_(c->i[0], c->f[0], c->f[1]))
+QUEUED(Uniform4f, (GLint l, float a, float b, float d, float e), (c->i[0] = l, c->f[0] = a, c->f[1] = b, c->f[2] = d, c->f[3] = e),
+       glUniform4f_(c->i[0], c->f[0], c->f[1], c->f[2], c->f[3]))
+QUEUED(BindVertexArray, (GLuint x), c->i[0] = (int32_t) x, glBindVertexArray_((GLuint) c->i[0]))
+QUEUED(VertexAttribPointer, (GLuint x, GLint s, GLenum t, GLboolean n, GLsizei st, const void* p),
+       (c->i[0] = (int32_t) x, c->i[1] = s, c->i[2] = (int32_t) t, c->i[3] = n, c->i[4] = st, c->p = (intptr_t) p),
+       glVertexAttribPointer_((GLuint) c->i[0], c->i[1], (GLenum) c->i[2], (GLboolean) c->i[3], c->i[4], (const void*) c->p))
+QUEUED(VertexAttribIPointer, (GLuint x, GLint s, GLenum t, GLsizei st, const void* p),
+       (c->i[0] = (int32_t) x, c->i[1] = s, c->i[2] = (int32_t) t, c->i[3] = st, c->p = (intptr_t) p),
+       glVertexAttribIPointer_((GLuint) c->i[0], c->i[1], (GLenum) c->i[2], c->i[3], (const void*) c->p))
+QUEUED(EnableVertexAttribArray, (GLuint x), c->i[0] = (int32_t) x, glEnableVertexAttribArray_((GLuint) c->i[0]))
+QUEUED(DrawArrays, (GLenum m, GLint first, GLsizei n), (c->i[0] = (int32_t) m, c->i[1] = first, c->i[2] = n), glDrawArrays_((GLenum) c->i[0], c->i[1], c->i[2]))
+QUEUED(Flush, (void), (void) c, glFlush_())
+QUEUED(MemoryBarrier, (GLbitfield b), c->i[0] = (int32_t) b, glMemoryBarrier_((GLbitfield) c->i[0]))
+QUEUED(TextureBarrierNV, (void), (void) c, glTextureBarrierNV_())
+
+QUEUED(BindBufferRun, (GLenum t, GLuint b), (c->i[0] = (int32_t) t, c->i[1] = (int32_t) b), glBindBuffer_((GLenum) c->i[0], (GLuint) c->i[1]))
+static void q_BindBuffer(GLenum target, GLuint b) {
+	Q.buffers[target == GL_PIXEL_PACK_BUFFER ? 1 : target == GL_PIXEL_UNPACK_BUFFER ? 2 : 0] = b;
+	q_BindBufferRun(target, b);
+}
+
+// Pixels (from memory, not a buffer) go in the record; very many wait and go at once.
+static void run_TexImage2D(const struct Call* c) {
+	glTexImage2D_((GLenum) c->i[0], c->i[1], c->i[2], c->i[3], c->i[4], c->i[5], (GLenum) c->i[6], (GLenum) c->i[7], c->i[8] ? (const void*) (c + 1) : (const void*) c->p);
+}
+
+static void q_TexImage2D(GLenum target, GLint level, GLint internal, GLsizei w, GLsizei h, GLint border, GLenum format, GLenum type, const void* data) {
+	size_t const bytes = data && !Q.buffers[2] && w > 0 && h > 0 ? (size_t) w * (size_t) h * 4 : 0;
+	if (!Q.running || bytes > QUEUE_BYTES / 4) {
+		drain();
+		glTexImage2D_(target, level, internal, w, h, border, format, type, data);
+		return;
+	}
+	struct Call* c = callNew(run_TexImage2D, bytes);
+	c->i[0] = (int32_t) target, c->i[1] = level, c->i[2] = internal, c->i[3] = w, c->i[4] = h, c->i[5] = border;
+	c->i[6] = (int32_t) format, c->i[7] = (int32_t) type, c->i[8] = bytes != 0, c->p = (intptr_t) data;
+	if (bytes) {
+		memcpy(c + 1, data, bytes);
+	}
+	callEnd(c);
+}
+
+static void run_TexSubImage2D(const struct Call* c) {
+	glTexSubImage2D_((GLenum) c->i[0], c->i[1], c->i[2], c->i[3], c->i[4], c->i[5], (GLenum) c->i[6], (GLenum) c->i[7], c->i[8] ? (const void*) (c + 1) : (const void*) c->p);
+}
+
+static void q_TexSubImage2D(GLenum target, GLint level, GLint x, GLint y, GLsizei w, GLsizei h, GLenum format, GLenum type, const void* data) {
+	size_t const bytes = data && !Q.buffers[2] && w > 0 && h > 0 ? (size_t) w * (size_t) h * 4 : 0;
+	if (!Q.running || bytes > QUEUE_BYTES / 4) {
+		drain();
+		glTexSubImage2D_(target, level, x, y, w, h, format, type, data);
+		return;
+	}
+	struct Call* c = callNew(run_TexSubImage2D, bytes);
+	c->i[0] = (int32_t) target, c->i[1] = level, c->i[2] = x, c->i[3] = y, c->i[4] = w, c->i[5] = h;
+	c->i[6] = (int32_t) format, c->i[7] = (int32_t) type, c->i[8] = bytes != 0, c->p = (intptr_t) data;
+	if (bytes) {
+		memcpy(c + 1, data, bytes);
+	}
+	callEnd(c);
+}
+
+static void run_Uniform4iv(const struct Call* c) {
+	glUniform4iv_(c->i[0], c->i[1], (const GLint*) (c + 1));
+}
+
+static void q_Uniform4iv(GLint location, GLsizei n, const GLint* v) {
+	size_t const bytes = n > 0 ? (size_t) n * 16 : 0;
+	if (!Q.running || bytes > QUEUE_BYTES / 4) {
+		drain();
+		glUniform4iv_(location, n, v);
+		return;
+	}
+	struct Call* c = callNew(run_Uniform4iv, bytes);
+	c->i[0] = location, c->i[1] = n;
+	if (bytes) {
+		memcpy(c + 1, v, bytes);
+	}
+	callEnd(c);
+}
+
+// Writing without waiting: the buffer's memory at once; else after the thread's done.
+static void* q_MapBufferRange(GLenum target, GLintptr offset, GLsizeiptr length, GLbitfield access) {
+	GLuint const name = Q.buffers[target == GL_PIXEL_PACK_BUFFER ? 1 : target == GL_PIXEL_UNPACK_BUFFER ? 2 : 0];
+	if (Q.running && (access & GL_MAP_UNSYNCHRONIZED_BIT) && !(access & GL_MAP_READ_BIT)) {
+		return name && name < (GLuint) V.bufCount && V.buf[name].map ? V.buf[name].map + offset : NULL;
+	}
+	drain();
+	return glMapBufferRange_(target, offset, length, access);
+}
+
+WAITS_VOID(GenFramebuffers, (GLsizei n, GLuint* out), (n, out))
+WAITS_VOID(DeleteFramebuffers, (GLsizei n, const GLuint* names), (n, names))
+WAITS(GLenum, CheckFramebufferStatus, (GLenum t), (t))
+WAITS_VOID(GenRenderbuffers, (GLsizei n, GLuint* out), (n, out))
+WAITS_VOID(DeleteRenderbuffers, (GLsizei n, const GLuint* names), (n, names))
+WAITS_VOID(GenTextures, (GLsizei n, GLuint* out), (n, out))
+WAITS_VOID(DeleteTextures, (GLsizei n, const GLuint* names), (n, names))
+WAITS(const unsigned char*, GetString, (GLenum n), (n))
+WAITS_VOID(GetIntegerv, (GLenum n, GLint* out), (n, out))
+WAITS_VOID(ReadPixels, (GLint x, GLint y, GLsizei w, GLsizei h, GLenum f, GLenum t, void* out), (x, y, w, h, f, t, out))
+WAITS(GLuint, CreateShader, (GLenum t), (t))
+WAITS_VOID(ShaderSource, (GLuint s, GLsizei n, const char* const* strings, const GLint* lengths), (s, n, strings, lengths))
+WAITS_VOID(CompileShader, (GLuint s), (s))
+WAITS_VOID(GetShaderiv, (GLuint s, GLenum n, GLint* out), (s, n, out))
+WAITS_VOID(GetShaderInfoLog, (GLuint s, GLsizei max, GLsizei* length, char* log), (s, max, length, log))
+WAITS_VOID(DeleteShader, (GLuint s), (s))
+WAITS(GLuint, CreateProgram, (void), ())
+WAITS_VOID(AttachShader, (GLuint p, GLuint s), (p, s))
+WAITS_VOID(LinkProgram, (GLuint p), (p))
+WAITS_VOID(GetProgramiv, (GLuint p, GLenum n, GLint* out), (p, n, out))
+WAITS_VOID(GetProgramInfoLog, (GLuint p, GLsizei max, GLsizei* length, char* log), (p, max, length, log))
+WAITS_VOID(DeleteProgram, (GLuint p), (p))
+WAITS(GLint, GetUniformLocation, (GLuint p, const char* name), (p, name))
+WAITS_VOID(GenVertexArrays, (GLsizei n, GLuint* out), (n, out))
+WAITS_VOID(DeleteVertexArrays, (GLsizei n, const GLuint* names), (n, names))
+WAITS_VOID(GenBuffers, (GLsizei n, GLuint* out), (n, out))
+WAITS_VOID(DeleteBuffers, (GLsizei n, const GLuint* names), (n, names))
+WAITS_VOID(BufferData, (GLenum t, GLsizeiptr size, const void* data, GLenum usage), (t, size, data, usage))
+WAITS_VOID(Finish, (void), ())
+WAITS(GLenum, GetError, (void), ())
+
 // ---- GL's functions by name
 
 void* vkglProc(const char* name) {
@@ -2942,20 +3314,22 @@ void* vkglProc(const char* name) {
 		const char* name;
 		void* f;
 	} table[] = {
-#define F(n) { "gl" #n, (void*) gl##n##_ }
-		F(GenFramebuffers), F(BindFramebuffer), F(BlitFramebuffer), F(FramebufferTexture2D), F(FramebufferRenderbuffer),
-		F(CheckFramebufferStatus), F(DeleteFramebuffers), F(GenRenderbuffers), F(DeleteRenderbuffers), F(BindRenderbuffer),
-		F(RenderbufferStorage), F(RenderbufferStorageMultisample), F(GenTextures), F(DeleteTextures), F(BindTexture), F(ActiveTexture),
-		F(TexImage2D), F(TexSubImage2D), F(TexParameteri), F(Viewport), F(Scissor), F(Enable), F(Disable), F(ClearColor),
-		F(ClearDepthf), F(Clear), F(DepthFunc), F(DepthMask), F(BlendFunc), F(BlendFuncSeparate), F(BlendEquationSeparate),
-		F(BlendColor), F(PolygonOffset), F(StencilFunc), F(StencilOp), F(ColorMask), F(ClearStencil), F(GetString), F(GetIntegerv),
-		F(ReadPixels), F(PixelStorei), F(CreateShader), F(ShaderSource), F(CompileShader), F(GetShaderiv), F(GetShaderInfoLog),
-		F(DeleteShader), F(CreateProgram), F(AttachShader), F(LinkProgram), F(GetProgramiv), F(GetProgramInfoLog), F(UseProgram),
-		F(DeleteProgram), F(GetUniformLocation), F(Uniform1i), F(Uniform1f), F(Uniform2f), F(Uniform4f), F(Uniform4iv),
-		F(GenVertexArrays), F(DeleteVertexArrays), F(BindVertexArray), F(GenBuffers), F(DeleteBuffers), F(BindBuffer), F(BufferData),
-		F(MapBufferRange), F(UnmapBuffer), F(VertexAttribPointer), F(VertexAttribIPointer), F(EnableVertexAttribArray), F(DrawArrays),
-		F(Flush), F(Finish), F(MemoryBarrier), F(GetError), F(TextureBarrierNV),
-#undef F
+#define Q_(n) { "gl" #n, (void*) q_##n }
+#define W_(n) { "gl" #n, (void*) w_##n }
+		W_(GenFramebuffers), Q_(BindFramebuffer), Q_(BlitFramebuffer), Q_(FramebufferTexture2D), Q_(FramebufferRenderbuffer),
+		W_(CheckFramebufferStatus), W_(DeleteFramebuffers), W_(GenRenderbuffers), W_(DeleteRenderbuffers), Q_(BindRenderbuffer),
+		Q_(RenderbufferStorage), Q_(RenderbufferStorageMultisample), W_(GenTextures), W_(DeleteTextures), Q_(BindTexture), Q_(ActiveTexture),
+		Q_(TexImage2D), Q_(TexSubImage2D), Q_(TexParameteri), Q_(Viewport), Q_(Scissor), Q_(Enable), Q_(Disable), Q_(ClearColor),
+		Q_(ClearDepthf), Q_(Clear), Q_(DepthFunc), Q_(DepthMask), Q_(BlendFunc), Q_(BlendFuncSeparate), Q_(BlendEquationSeparate),
+		Q_(BlendColor), Q_(PolygonOffset), Q_(StencilFunc), Q_(StencilOp), Q_(ColorMask), Q_(ClearStencil), W_(GetString), W_(GetIntegerv),
+		W_(ReadPixels), Q_(PixelStorei), W_(CreateShader), W_(ShaderSource), W_(CompileShader), W_(GetShaderiv), W_(GetShaderInfoLog),
+		W_(DeleteShader), W_(CreateProgram), W_(AttachShader), W_(LinkProgram), W_(GetProgramiv), W_(GetProgramInfoLog), Q_(UseProgram),
+		W_(DeleteProgram), W_(GetUniformLocation), Q_(Uniform1i), Q_(Uniform1f), Q_(Uniform2f), Q_(Uniform4f), Q_(Uniform4iv),
+		W_(GenVertexArrays), W_(DeleteVertexArrays), Q_(BindVertexArray), W_(GenBuffers), W_(DeleteBuffers), Q_(BindBuffer), W_(BufferData),
+		Q_(MapBufferRange), { "glUnmapBuffer", (void*) glUnmapBuffer_ }, Q_(VertexAttribPointer), Q_(VertexAttribIPointer), Q_(EnableVertexAttribArray), Q_(DrawArrays),
+		Q_(Flush), W_(Finish), Q_(MemoryBarrier), W_(GetError), Q_(TextureBarrierNV),
+#undef Q_
+#undef W_
 	};
 	for (size_t i = 0; i < sizeof(table) / sizeof(*table); ++i) {
 		if (!strcmp(table[i].name, name)) {
