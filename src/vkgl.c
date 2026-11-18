@@ -6,6 +6,7 @@
 #include "gles.h"
 
 #include <dlfcn.h>
+#include <unistd.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -755,7 +756,7 @@ static void keepPipelines(void) {
 		vkGetPhysicalDeviceProperties(V.gpu, &p);
 		char path[4300], temp[4400];
 		snprintf(path, sizeof(path), "%s/vk-pipelines-%08x-%08x.bin", glesCacheDirectory(), p.vendorID, p.deviceID);
-		snprintf(temp, sizeof(temp), "%s.tmp", path);
+		snprintf(temp, sizeof(temp), "%s.%ld.tmp", path, (long) getpid());
 		FILE* out = fopen(temp, "wb");
 		if (out && fwrite(data, 1, size, out) == size && !fclose(out)) {
 			rename(temp, path);
@@ -1343,12 +1344,20 @@ static uint32_t* spirv(const char* source, bool vertex, size_t* words, char** lo
 	return code;
 }
 
+static uint32_t wordsHash(uint32_t h, const uint32_t* words, size_t count) {
+	for (size_t i = 0; i < count; ++i) {
+		h = (h ^ words[i]) * 16777619u;
+	}
+	return h;
+}
+
 // A program's SPIR-V kept on disk by its sources' hash (the shader cache folder): the two stages'
-// word counts, then their words.
+// word counts and a hash of their words, then the words. A file that doesn't check out is left (the
+// driver would take broken SPIR-V as it is).
 static void cachedSpirv(const char* path, uint32_t** v, size_t* vWords, uint32_t** f, size_t* fWords) {
 	FILE* in = fopen(path, "rb");
-	uint32_t counts[2];
-	if (!in || fread(counts, 4, 2, in) != 2 || !counts[0] || !counts[1] || counts[0] > (1u << 22) || counts[1] > (1u << 22)) {
+	uint32_t counts[3];
+	if (!in || fread(counts, 4, 3, in) != 3 || !counts[0] || !counts[1] || counts[0] > (1u << 22) || counts[1] > (1u << 22)) {
 		if (in) {
 			fclose(in);
 		}
@@ -1356,7 +1365,8 @@ static void cachedSpirv(const char* path, uint32_t** v, size_t* vWords, uint32_t
 	}
 	*v = malloc((size_t) counts[0] * 4);
 	*f = malloc((size_t) counts[1] * 4);
-	if (*v && *f && fread(*v, 4, counts[0], in) == counts[0] && fread(*f, 4, counts[1], in) == counts[1]) {
+	if (*v && *f && fread(*v, 4, counts[0], in) == counts[0] && fread(*f, 4, counts[1], in) == counts[1] && (*v)[0] == 0x07230203u &&
+	    (*f)[0] == 0x07230203u && wordsHash(wordsHash(2166136261u, *v, counts[0]), *f, counts[1]) == counts[2]) {
 		*vWords = counts[0], *fWords = counts[1];
 	} else {
 		free(*v);
@@ -1368,10 +1378,10 @@ static void cachedSpirv(const char* path, uint32_t** v, size_t* vWords, uint32_t
 
 static void keepSpirv(const char* path, const uint32_t* v, size_t vWords, const uint32_t* f, size_t fWords) {
 	char temp[4400];
-	snprintf(temp, sizeof(temp), "%s.tmp", path);
+	snprintf(temp, sizeof(temp), "%s.%ld.tmp", path, (long) getpid());
 	FILE* out = fopen(temp, "wb");
-	uint32_t const counts[2] = { (uint32_t) vWords, (uint32_t) fWords };
-	if (out && fwrite(counts, 4, 2, out) == 2 && fwrite(v, 4, vWords, out) == vWords && fwrite(f, 4, fWords, out) == fWords && !fclose(out)) {
+	uint32_t const counts[3] = { (uint32_t) vWords, (uint32_t) fWords, wordsHash(wordsHash(2166136261u, v, vWords), f, fWords) };
+	if (out && fwrite(counts, 4, 3, out) == 3 && fwrite(v, 4, vWords, out) == vWords && fwrite(f, 4, fWords, out) == fWords && !fclose(out)) {
 		rename(temp, path);
 	} else if (out) {
 		fclose(out);
@@ -1379,7 +1389,7 @@ static void keepSpirv(const char* path, const uint32_t* v, size_t vWords, const 
 	}
 }
 
-static bool link(struct Prog* p) {
+static bool linkProgram(struct Prog* p) {
 	const char* vs = p->shader[0] && p->shader[0] < (GLuint) V.shaderCount ? V.shader[p->shader[0]].source : NULL;
 	const char* fs = p->shader[1] && p->shader[1] < (GLuint) V.shaderCount ? V.shader[p->shader[1]].source : NULL;
 	free(p->log);
@@ -2316,7 +2326,7 @@ static void glLinkProgram_(GLuint program) {
 	struct Prog* p = progGet(program);
 	if (p) {
 		progRelease(p, program);
-		p->linked = link(p);
+		p->linked = linkProgram(p);
 	}
 }
 
