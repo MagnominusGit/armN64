@@ -233,6 +233,15 @@ struct DrawState {
 	float blendConstant;
 };
 
+// The triangles drawn to the bound image since the last barrier: copies and bounds; DRAWN of them
+// when that's unknown.
+enum { DRAWN = 64 };
+struct Drawn {
+	int count;
+	float triangle[DRAWN][3 * VERTEX_FLOATS];
+	float box[DRAWN][4];
+};
+
 struct Glr {
 	struct Gles* gles;
 	// Each tile's texture as of a TMEM generation.
@@ -344,6 +353,7 @@ struct Glr {
 	// Without framebuffer fetch the shader reads the image from its texture (GL_NV_texture_barrier),
 	// a draw at a time where they may overlap.
 	bool barrier;
+	struct Drawn drawn;
 	bool depthReady;
 	// The HLE's corners for triangles it has sent and the RDP hasn't reached yet (a ring).
 	struct GlrCorners* queue;
@@ -2347,34 +2357,48 @@ static bool separated(const float* a, const float* b) {
 	return false;
 }
 
-// The triangles of a batch drawn since the last barrier: where each starts and its bounds.
-struct Drawn {
-	int count;
-	int first[64];
-	float box[64][4];
-};
-
-// Whether the triangle at vertex i of the batch covers pixels of one drawn since the last barrier; if
-// not it joins them.
-static bool overlapsDrawn(const float* batch, struct Drawn* d, int i) {
-	const float* v = batch + i * VERTEX_FLOATS;
-	float box[4] = { v[0], v[1], v[0], v[1] };
+static void triangleBox(const float* v, float* box) {
+	box[0] = box[2] = v[0], box[1] = box[3] = v[1];
 	for (int k = 1; k < 3; ++k) {
 		const float* p = v + k * VERTEX_FLOATS;
 		box[0] = p[0] < box[0] ? p[0] : box[0], box[1] = p[1] < box[1] ? p[1] : box[1];
 		box[2] = p[0] > box[2] ? p[0] : box[2], box[3] = p[1] > box[3] ? p[1] : box[3];
 	}
-	bool overlaps = d->count == 64;
-	for (int k = 0; k < d->count && !overlaps; ++k) {
+}
+
+// Whether the triangle covers pixels of one drawn since the last barrier.
+static bool overlapsDrawn(const struct Drawn* d, const float* v) {
+	if (d->count == DRAWN) {
+		return true;
+	}
+	float box[4];
+	triangleBox(v, box);
+	for (int k = 0; k < d->count; ++k) {
 		const float* b = d->box[k];
-		overlaps = box[0] < b[2] && b[0] < box[2] && box[1] < b[3] && b[1] < box[3] && !separated(batch + d->first[k] * VERTEX_FLOATS, v);
+		if (box[0] < b[2] && b[0] < box[2] && box[1] < b[3] && b[1] < box[3] && !separated(d->triangle[k], v)) {
+			return true;
+		}
 	}
-	if (overlaps) {
-		d->count = 0;
+	return false;
+}
+
+static void addDrawn(struct Drawn* d, const float* v) {
+	if (d->count < DRAWN) {
+		memcpy(d->triangle[d->count], v, sizeof(d->triangle[0]));
+		triangleBox(v, d->box[d->count++]);
 	}
-	d->first[d->count] = i;
-	memcpy(d->box[d->count++], box, sizeof(box));
-	return overlaps;
+}
+
+// A barrier before a batch drawn at once that reads the image where it covers pixels drawn since the
+// last.
+static void barrierBefore(struct Glr* g) {
+	for (int i = 0; i < g->batchCount; i += 3) {
+		if (overlapsDrawn(&g->drawn, g->batch + i * VERTEX_FLOATS)) {
+			g->gl.TextureBarrierNV();
+			g->drawn.count = 0;
+			return;
+		}
+	}
 }
 
 static void flushBatch(struct N64* n, struct Glr* g) {
@@ -2386,7 +2410,12 @@ static void flushBatch(struct N64* n, struct Glr* g) {
 	struct DrawState* s = &g->state;
 	struct Program* p = s->program;
 	struct Applied* a = &g->applied;
-	useFramebuffer(g, drawTo(g, s->target));
+	GLuint const framebuffer = drawTo(g, s->target);
+	// Another framebuffer or state set elsewhere since the last batch: the image may have been written.
+	if (a->framebuffer != framebuffer) {
+		g->drawn.count = DRAWN;
+	}
+	useFramebuffer(g, framebuffer);
 	if (a->viewport != ((int) s->target->width << 4 | s->target->scale)) {
 		gl->Viewport(0, 0, (GLsizei) s->target->width * s->target->scale, TARGET_ROWS * s->target->scale);
 		a->viewport = (int) s->target->width << 4 | s->target->scale;
@@ -2499,6 +2528,10 @@ static void flushBatch(struct N64* n, struct Glr* g) {
 		if (s->coverageSave) {
 			gl->ColorMask(1, 1, 1, 0);
 		}
+		bool tracked = false;
+		if (g->barrier && s->readsImage && (s->decal || s->depthOnly)) {
+			barrierBefore(g);
+		}
 		if (s->decal) {
 			// The RDP's decal passes only within the depth slope either way (rdp.c, z mode 3): first
 			// the pixels no more than that in front marked, then those no more than that behind drawn.
@@ -2535,19 +2568,23 @@ static void flushBatch(struct N64* n, struct Glr* g) {
 			gl->DrawArrays(GL_TRIANGLES, first, g->batchCount);
 			gl->Disable(GL_STENCIL_TEST);
 		} else if (g->barrier && !s->depthOnly && s->readsImage) {
-			// What each triangle reads of the image is what those before it drew: triangles covering none
-			// of each other's pixels go in one draw, each pixel read only by the fragment that writes it.
+			// What each triangle reads of the image is what those before it drew: a barrier only before
+			// one covering pixels of a triangle drawn since the last, each pixel read only by the
+			// fragment that writes it.
 			useTexture(g, LEVELS + 1, s->target->texture);
-			gl->TextureBarrierNV();
-			struct Drawn drawn = { 0 };
-			overlapsDrawn(g->batch, &drawn, 0);
+			tracked = true;
 			int from = 0;
-			for (int i = 3; i < g->batchCount; i += 3) {
-				if (overlapsDrawn(g->batch, &drawn, i)) {
-					gl->DrawArrays(GL_TRIANGLES, first + from, i - from);
+			for (int i = 0; i < g->batchCount; i += 3) {
+				const float* v = g->batch + i * VERTEX_FLOATS;
+				if (overlapsDrawn(&g->drawn, v)) {
+					if (i > from) {
+						gl->DrawArrays(GL_TRIANGLES, first + from, i - from);
+					}
 					gl->TextureBarrierNV();
+					g->drawn.count = 0;
 					from = i;
 				}
+				addDrawn(&g->drawn, v);
 			}
 			gl->DrawArrays(GL_TRIANGLES, first + from, g->batchCount - from);
 		} else {
@@ -2559,8 +2596,15 @@ static void flushBatch(struct N64* n, struct Glr* g) {
 				gl->ColorMask(1, 1, 1, 1);
 			}
 		}
+		if (g->barrier && !s->depthOnly && !tracked) {
+			for (int i = 0; i < g->batchCount; i += 3) {
+				addDrawn(&g->drawn, g->batch + i * VERTEX_FLOATS);
+			}
+		}
 		if (s->coverageSave) {
 			markSaved(g, s, first);
+			// Its alpha only where the batch drew, the framebuffer still bound.
+			a->framebuffer = framebuffer;
 		}
 		if (s->coverageSave) {
 			gl->ColorMask(1, 1, 1, 1);
@@ -3345,6 +3389,7 @@ static void draw(struct N64* n, struct RDP* r, const uint64_t* w, int op) {
 				gl->ClearColor(((v >> 11) & 31) / 31.0f, ((v >> 6) & 31) / 31.0f, ((v >> 1) & 31) / 31.0f, 1.0f);
 			}
 			gl->Clear(GL_COLOR_BUFFER_BIT);
+			g->drawn.count = DRAWN;
 			return;
 		}
 		// Rectangles have the primitive's depth whatever the depth source (Robot Poncots' dimmed scene

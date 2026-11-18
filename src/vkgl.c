@@ -2270,13 +2270,6 @@ static void glClear_(GLbitfield mask) {
 	}
 	VkClearRect rect = { { { x0, y0 }, { (uint32_t) (x1 - x0), (uint32_t) (y1 - y0) } }, 0, 1 };
 	vkCmdClearAttachments(V.sub[V.current].cb, n, att, 1, &rect);
-	// A draw reading its own pixels next reads the cleared ones (GL's clears are done before).
-	if (mask & GL_COLOR_BUFFER_BIT) {
-		VkMemoryBarrier m = { VK_STRUCTURE_TYPE_MEMORY_BARRIER, NULL, VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT, VK_ACCESS_INPUT_ATTACHMENT_READ_BIT };
-		vkCmdPipelineBarrier(V.sub[V.current].cb, VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT, VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT,
-		                     VK_DEPENDENCY_BY_REGION_BIT, 1, &m, 0, NULL, 0, NULL);
-		++V.pendingBarriers;
-	}
 }
 
 // ---- Copies
