@@ -59,7 +59,7 @@ target_link_libraries(n64 m Threads::Threads ${CMAKE_DL_LIBS})
 # in from ARMN64_GLSLANG_DIR.
 option(ARMN64_VULKAN "Build the Vulkan renderer" ON)
 set(ARMN64_GLSLANG_DIR "${CMAKE_SOURCE_DIR}/deps/glslang" CACHE PATH "glslang's source")
-if(ARMN64_VULKAN AND EXISTS ${ARMN64_GLSLANG_DIR}/CMakeLists.txt)
+if(ARMN64_VULKAN AND EXISTS ${ARMN64_GLSLANG_DIR}/glslang/MachineIndependent/ShaderLang.cpp)
 	enable_language(CXX)
 	include(cmake/glslang.cmake)
 	target_sources(n64 PRIVATE src/vkgl.c)
