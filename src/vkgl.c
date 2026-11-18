@@ -53,7 +53,7 @@ enum {
 };
 
 enum { SUBS = 3, UNITS = 12, SAMPLERS = 16, MEMBERS = 64, ATTRIBS = 8, UBO_BYTES = 4 << 20, STAGE_BYTES = 16 << 20, SETS = 4096 };
-enum { LOCATION_ELEMENTS = 1024, SAMPLER_LOCATION = MEMBERS * LOCATION_ELEMENTS };
+enum { LOCATION_ELEMENTS = 1024, SAMPLER_LOCATION = MEMBERS * LOCATION_ELEMENTS, SUBMIT_DRAWS = 256 };
 
 // ---- Vulkan's functions
 
@@ -288,6 +288,9 @@ static struct Vkgl {
 	VkPipeline lastPipe;
 	int pipeHash[4096];
 	bool barrierNeeded;
+	// Draws since the last submission: the queue gets them a few hundred at a time, as GL's drivers
+	// do, so the GPU works while the next are made.
+	int pendingDraws;
 	// The frontend's pictures, one for each of its frames in flight, and the framebuffer for them.
 	struct Img picture[4];
 	int pictureIndex;
@@ -439,6 +442,8 @@ static void barrier(VkCommandBuffer cb) {
 	V.barrierNeeded = false;
 }
 
+static void submit(bool wait);
+
 static void passEnd(void) {
 	if (V.passOpen) {
 		vkCmdEndRenderPass(V.sub[V.current].cb);
@@ -446,6 +451,9 @@ static void passEnd(void) {
 		V.boundPipeline = VK_NULL_HANDLE;
 		V.bound.valid = false;
 		V.barrierNeeded = true;
+		if (V.pendingDraws >= SUBMIT_DRAWS) {
+			submit(false);
+		}
 	}
 }
 
@@ -494,6 +502,7 @@ static void submit(bool wait) {
 			V.frontend.lockQueue(V.frontend.handle);
 		}
 		vkQueueSubmit(V.queue, 1, &info, s->fence);
+		V.pendingDraws = 0;
 		if (V.external && V.frontend.unlockQueue) {
 			V.frontend.unlockQueue(V.frontend.handle);
 		}
@@ -1768,6 +1777,7 @@ static void glDrawArrays_(GLenum mode, GLint first, GLsizei count) {
 	}
 	V.bound.valid = true;
 	vkCmdDraw(cb, (uint32_t) count, 1, (uint32_t) first, 0);
+	++V.pendingDraws;
 }
 
 static void glClear_(GLbitfield mask) {
