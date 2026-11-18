@@ -171,6 +171,8 @@ struct Member {
 	char type[16];
 	int offset, size, count;
 	bool isInt;
+	// A constant array's values in the source, put in the block when linked.
+	const char* values;
 };
 
 struct Prog {
@@ -1474,6 +1476,40 @@ static bool uniformLine(const char* line, char* type, size_t typeSize, char name
 	return t > 0;
 }
 
+static void addMember(struct Prog* p, const char* name, const char* type, int count, const char* values) {
+	int size, align;
+	bool isInt;
+	int k = 0;
+	while (k < p->members && strcmp(p->member[k].name, name)) {
+		++k;
+	}
+	if (k == p->members && k < MEMBERS && typeLayout(type, &size, &align, &isInt)) {
+		struct Member* m = &p->member[p->members++];
+		snprintf(m->name, sizeof(m->name), "%s", name);
+		snprintf(m->type, sizeof(m->type), "%s", type);
+		int const stride = count ? (size + 15) / 16 * 16 : size;
+		align = count ? 16 : align;
+		m->offset = (p->blockSize + align - 1) / align * align;
+		m->size = count ? stride : size;
+		m->count = count;
+		m->isInt = isInt;
+		m->values = values;
+		p->blockSize = m->offset + (count ? stride * count : size);
+	}
+}
+
+// A constant array ("const ivec2 rcpTable[64] = ivec2[64](...);", at the start of a line): Vulkan
+// compilers may copy it to every invocation's scratch memory to index it, GL's make it uniforms.
+static bool constArray(const char* line, char* type, char* name, int* count, const char** values) {
+	if (strncmp(line, "const ", 6) || sscanf(line + 6, "%31s %47[A-Za-z0-9_][%d] =", type, name, count) != 3 || *count <= 0) {
+		return false;
+	}
+	const char* v = strchr(line, '=');
+	v = v ? strchr(v, '(') : NULL;
+	*values = v ? v + 1 : NULL;
+	return v != NULL;
+}
+
 // First pass over both stages: the uniforms (members, then samplers) and the varyings' locations.
 static void gather(struct Prog* p, const char* source, char varyings[][48], int* varyingCount) {
 	for (const char* line = source; line && *line;) {
@@ -1495,25 +1531,12 @@ static void gather(struct Prog* p, const char* source, char varyings[][48], int*
 					}
 					continue;
 				}
-				int k = 0;
-				while (k < p->members && strcmp(p->member[k].name, names[i])) {
-					++k;
-				}
-				int size, align;
-				bool isInt;
-				if (k == p->members && k < MEMBERS && typeLayout(type, &size, &align, &isInt)) {
-					struct Member* m = &p->member[p->members++];
-					snprintf(m->name, sizeof(m->name), "%s", names[i]);
-					snprintf(m->type, sizeof(m->type), "%s", type);
-					int const stride = counts[i] ? (size + 15) / 16 * 16 : size;
-					align = counts[i] ? 16 : align;
-					m->offset = (p->blockSize + align - 1) / align * align;
-					m->size = counts[i] ? stride : size;
-					m->count = counts[i];
-					m->isInt = isInt;
-					p->blockSize = m->offset + (counts[i] ? stride * counts[i] : size);
-				}
+				addMember(p, names[i], type, counts[i], NULL);
 			}
+		}
+		const char* values;
+		if (constArray(line, type, names[0], &counts[0], &values)) {
+			addMember(p, names[0], type, counts[0], values);
 		}
 		const char* q = skipSpace(buf);
 		bool const flat = startsWord(q, "flat");
@@ -1541,6 +1564,51 @@ static int varyingLocation(char varyings[][48], int count, const char* name) {
 	return count;
 }
 
+static void putBlock(const struct Prog* p, struct Str* out) {
+	puts_(out, "layout(std140, set = 0, binding = 0) uniform VkglUniforms {\n");
+	for (int k = 0; k < p->members; ++k) {
+		char decl[160];
+		if (p->member[k].count) {
+			snprintf(decl, sizeof(decl), "\thighp %s %s[%d];\n", p->member[k].type, p->member[k].name, p->member[k].count);
+		} else {
+			snprintf(decl, sizeof(decl), "\thighp %s %s;\n", p->member[k].type, p->member[k].name);
+		}
+		puts_(out, decl);
+	}
+	puts_(out, "};\n");
+}
+
+// A constant array's values (numbers in its source, constructors' names skipped) into the shadow.
+static void putValues(struct Prog* p, struct Member* m) {
+	int size = 4, align;
+	bool isInt = true;
+	typeLayout(m->type, &size, &align, &isInt);
+	int const per = size / 4;
+	int i = 0;
+	for (const char* c = m->values; *c && !(c[0] == ')' && c[1] == ';') && i < m->count * per;) {
+		if ((*c >= 'a' && *c <= 'z') || (*c >= 'A' && *c <= 'Z') || *c == '_') {
+			while ((*c >= 'a' && *c <= 'z') || (*c >= 'A' && *c <= 'Z') || (*c >= '0' && *c <= '9') || *c == '_') {
+				++c;
+			}
+		} else if ((*c >= '0' && *c <= '9') || ((*c == '-' || *c == '.') && c[1] >= '0' && c[1] <= '9')) {
+			char* end;
+			uint8_t* at = p->shadow + m->offset + (i / per) * m->size + (i % per) * 4;
+			if (isInt) {
+				int32_t const v = (int32_t) strtol(c, &end, 0);
+				memcpy(at, &v, 4);
+			} else {
+				float const v = strtof(c, &end);
+				memcpy(at, &v, 4);
+			}
+			c = end;
+			++i;
+		} else {
+			++c;
+		}
+	}
+	m->values = NULL;
+}
+
 // Second pass: one stage's Vulkan GLSL.
 static char* translate(const struct Prog* p, const char* source, bool vertex, char varyings[][48], int varyingCount, uint32_t* inputs) {
 	struct Str out = { 0 };
@@ -1550,6 +1618,7 @@ static char* translate(const struct Prog* p, const char* source, bool vertex, ch
 		size_t const len = end ? (size_t) (end - line) : strlen(line);
 		char buf[2048];
 		snprintf(buf, sizeof(buf), "%.*s", (int) (len < sizeof(buf) - 1 ? len : sizeof(buf) - 1), line);
+		const char* const here = line;
 		line = end ? end + 1 : NULL;
 		const char* q = skipSpace(buf);
 		if (!strncmp(q, "#version", 8)) {
@@ -1577,19 +1646,20 @@ static char* translate(const struct Prog* p, const char* source, bool vertex, ch
 					puts_(&out, decl);
 				}
 			} else if (!blockDone && p->members) {
-				puts_(&out, "layout(std140, set = 0, binding = 0) uniform VkglUniforms {\n");
-				for (int k = 0; k < p->members; ++k) {
-					char decl[160];
-					if (p->member[k].count) {
-						snprintf(decl, sizeof(decl), "\thighp %s %s[%d];\n", p->member[k].type, p->member[k].name, p->member[k].count);
-					} else {
-						snprintf(decl, sizeof(decl), "\thighp %s %s;\n", p->member[k].type, p->member[k].name);
-					}
-					puts_(&out, decl);
-				}
-				puts_(&out, "};\n");
+				putBlock(p, &out);
 				blockDone = true;
 			}
+			continue;
+		}
+		const char* values;
+		if (constArray(here, type, names[0], &counts[0], &values)) {
+			if (!blockDone && p->members) {
+				putBlock(p, &out);
+				blockDone = true;
+			}
+			const char* close = strstr(values, ");");
+			line = close ? strchr(close, '\n') : NULL;
+			line = line ? line + 1 : NULL;
 			continue;
 		}
 		bool const flat = startsWord(q, "flat");
@@ -1743,7 +1813,7 @@ static bool linkProgram(struct Prog* p) {
 	}
 	if (p->input >= 0 && p->members < MEMBERS) {
 		struct Member* m = &p->member[p->target = p->members++];
-		*m = (struct Member) { "vkglTarget", "int", p->blockSize, 4, 0, true };
+		*m = (struct Member) { "vkglTarget", "int", p->blockSize, 4, 0, true, NULL };
 		p->blockSize += 16;
 	}
 	p->inputs = 0;
@@ -1803,6 +1873,11 @@ static bool linkProgram(struct Prog* p) {
 	free(p->shadow);
 	p->shadow = calloc(1, (size_t) (p->blockSize ? p->blockSize : 16));
 	p->shadowDirty = true;
+	for (int k = 0; k < p->members && p->shadow; ++k) {
+		if (p->member[k].values) {
+			putValues(p, &p->member[k]);
+		}
+	}
 	memset(p->unit, 0, sizeof(p->unit));
 	if (!ok) {
 		p->log = strdup("Vulkan objects unavailable");
