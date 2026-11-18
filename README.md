@@ -62,7 +62,7 @@ effect while the game runs, the Expansion Pak's when the game restarts.
 | | Frame Skip | Off, Auto, Every Other Frame |
 | | Expansion Pak (at the next restart) | On, Off |
 | | Game on Top (with a cheat cartridge; at the next restart) | None, the games beside the cartridge |
-| Video | Renderer | GL (Fast, HD), GPU (Exact, HD), CPU (Exact, Native) |
+| Video | Renderer | GL (Fast, HD), Vulkan (Fast, HD), GPU (Exact, HD), CPU (Exact, Native) |
 | | Resolution (GL and GPU) | Native, Auto, 2x to 8x |
 | | Resolution Scaling (GL) | Fixed (320x240), Internal |
 | | Widescreen | Off, 16:9, 16:10, 16:9 Picture Only, 16:10 Picture Only |
@@ -104,7 +104,9 @@ effect while the game runs, the Expansion Pak's when the game restarts.
 
 ### Video
 
-- **Renderer.** GL is the fastest and can draw above the N64's resolution, but isn't exact. CPU and
+- **Renderer.** GL is the fastest and can draw above the N64's resolution, but isn't exact. Vulkan
+  is the GL renderer drawing with Vulkan, with the same pictures: RetroArch switches to its Vulkan
+  video driver for it, and armN64 uses it by itself when RetroArch already runs Vulkan. CPU and
   GPU draw exactly as the console does at its own resolution: CPU on the processor (full speed on
   handhelds), GPU on the graphics chip (for desktop graphics cards; below full speed on handhelds).
   GPU can also draw higher (Resolution): close to exact, with the native picture kept for what
@@ -283,6 +285,11 @@ Code taken from other projects, each under its own license (see License):
 - **ares**, as forked by Nekokabu (ares team, Near et al, ISC): the RDP's command times
   (`src/rdp_timing.h`) and the model around them.
 - **Inter** (The Inter Project Authors, OFL-1.1): the Controller Pak Manager's font, in `shared/`.
+- **glslang** (Khronos Group and contributors, BSD-3-Clause and others, `deps/glslang/LICENSE.txt`):
+  compiles the Vulkan renderer's shaders, the parts the build uses of 16.5.0 in `deps/glslang/`.
+  Its two Apache-2.0 SPIR-V headers are replaced by armN64's own `hex_float.h`.
+- **Vulkan headers** (Khronos Group, Apache-2.0 OR MIT), in `deps/vulkan/`, and RetroArch's
+  `libretro_vulkan.h` (MIT).
 
 Read for how the hardware behaves, without code taken: **Angrylion's RDP**, the **cxd4** RSP and
 **n64brew**; the cheat cartridges' logic chip from **RWeick's and Jhynjhiruu's LZ9FC17
