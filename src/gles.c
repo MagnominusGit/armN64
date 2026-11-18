@@ -1,5 +1,9 @@
 #include "gles.h"
 
+#ifdef ARMN64_VULKAN
+#include "vkgl.h"
+#endif
+
 #include <dlfcn.h>
 #include <stdint.h>
 #include <stdio.h>
@@ -35,6 +39,8 @@ enum {
 };
 
 struct Gles {
+	// GL done with Vulkan (vkgl.c), and whether this context started it.
+	bool vulkan, ownsVulkan;
 	void* egl;
 	void* gles;
 	EGLDisplay display;
@@ -410,18 +416,18 @@ static bool pairPath(struct Gles* g, const char* vertex, const char* fragment, c
 
 unsigned glesCachedProgram(struct Gles* g, const char* vertex, const char* fragment) {
 	char path[4200];
-	return pairPath(g, vertex, fragment, path, sizeof(path)) ? cachedProgram(g, path) : 0;
+	return !g->vulkan && pairPath(g, vertex, fragment, path, sizeof(path)) ? cachedProgram(g, path) : 0;
 }
 
 void glesKeepable(struct Gles* g, unsigned program) {
-	if (cacheDir[0] && g->glProgramParameteri) {
+	if (cacheDir[0] && !g->vulkan && g->glProgramParameteri) {
 		g->glProgramParameteri(program, GL_PROGRAM_BINARY_RETRIEVABLE_HINT, 1);
 	}
 }
 
 void glesKeepProgram(struct Gles* g, unsigned program, const char* vertex, const char* fragment) {
 	char path[4200];
-	if (pairPath(g, vertex, fragment, path, sizeof(path))) {
+	if (!g->vulkan && pairPath(g, vertex, fragment, path, sizeof(path))) {
 		saveProgram(g, program, path);
 	}
 }
@@ -475,11 +481,29 @@ static bool program(struct Gles* g, const char* source, char* error, size_t erro
 	return true;
 }
 
+static bool vulkanContexts;
+
+void glesUseVulkan(bool on) {
+	vulkanContexts = on;
+}
+
 struct Gles* glesCreateContext(char* error, size_t errorSize) {
 	struct Gles* g = calloc(1, sizeof(*g));
 	if (!g) {
 		return NULL;
 	}
+#ifdef ARMN64_VULKAN
+	if (vulkanContexts) {
+		g->vulkan = true;
+		g->ownsVulkan = !vkglActive();
+		if (!vkglCreate(NULL, error, errorSize)) {
+			free(g);
+			return NULL;
+		}
+		snprintf(g->renderer, sizeof(g->renderer), "%s", vkglRenderer());
+		return g;
+	}
+#endif
 	if (!context(g, error, errorSize)) {
 		glesDestroy(g);
 		return NULL;
@@ -488,11 +512,18 @@ struct Gles* glesCreateContext(char* error, size_t errorSize) {
 }
 
 void* glesProc(struct Gles* g, const char* name) {
+#ifdef ARMN64_VULKAN
+	if (g->vulkan) {
+		return vkglProc(name);
+	}
+#endif
 	return lookup(g, name);
 }
 
 void glesUse(struct Gles* g) {
-	use(g);
+	if (!g->vulkan) {
+		use(g);
+	}
 }
 
 struct Gles* glesCreate(const char* source, char* error, size_t errorSize) {
@@ -509,6 +540,15 @@ struct Gles* glesCreate(const char* source, char* error, size_t errorSize) {
 
 void glesDestroy(struct Gles* g) {
 	if (!g) {
+		return;
+	}
+	if (g->vulkan) {
+#ifdef ARMN64_VULKAN
+		if (g->ownsVulkan) {
+			vkglDestroy();
+		}
+#endif
+		free(g);
 		return;
 	}
 	if (g->external) {

@@ -55,9 +55,28 @@ find_package(Threads REQUIRED)
 # code generators, the libretro core's helpers and the Pak manager's font.
 target_include_directories(n64 PRIVATE shared/emit)
 target_link_libraries(n64 m Threads::Threads ${CMAKE_DL_LIBS})
+# Vulkan: the GL renderer's GL done with Vulkan (src/vkgl.c), its shaders compiled by glslang, built
+# in from ARMN64_GLSLANG_DIR.
+option(ARMN64_VULKAN "Build the Vulkan renderer" ON)
+set(ARMN64_GLSLANG_DIR "${CMAKE_SOURCE_DIR}/deps/glslang" CACHE PATH "glslang's source")
+if(ARMN64_VULKAN AND EXISTS ${ARMN64_GLSLANG_DIR}/CMakeLists.txt)
+	enable_language(CXX)
+	foreach(OFF_OPTION ENABLE_GLSLANG_BINARIES ENABLE_HLSL ENABLE_OPT BUILD_EXTERNAL GLSLANG_TESTS GLSLANG_ENABLE_INSTALL ENABLE_PCH BUILD_SHARED_LIBS)
+		set(${OFF_OPTION} OFF CACHE BOOL "" FORCE)
+	endforeach()
+	add_subdirectory(${ARMN64_GLSLANG_DIR} glslang EXCLUDE_FROM_ALL)
+	target_sources(n64 PRIVATE src/vkgl.c)
+	target_include_directories(n64 PUBLIC deps/vulkan/include PRIVATE ${ARMN64_GLSLANG_DIR})
+	target_compile_definitions(n64 PUBLIC ARMN64_VULKAN)
+	target_link_libraries(n64 glslang glslang-default-resource-limits)
+	set(ARMN64_LINKER_LANGUAGE CXX)
+else()
+	set(ARMN64_LINKER_LANGUAGE C)
+endif()
 
 add_executable(n64run tools/n64run.c)
 target_link_libraries(n64run n64)
+set_target_properties(n64run PROPERTIES LINKER_LANGUAGE ${ARMN64_LINKER_LANGUAGE})
 
 # The libretro core.
 # The Controller Pak manager's font (Inter, OFL) as a C array.
@@ -78,7 +97,7 @@ if(ZLIB_FOUND)
 	target_link_libraries(armn64_libretro ZLIB::ZLIB)
 	set(GAMES_ZLIB ZLIB::ZLIB)
 endif()
-set_target_properties(armn64_libretro PROPERTIES PREFIX "")
+set_target_properties(armn64_libretro PROPERTIES PREFIX "" LINKER_LANGUAGE ${ARMN64_LINKER_LANGUAGE})
 target_link_options(armn64_libretro PRIVATE -Wl,--version-script=${CMAKE_CURRENT_SOURCE_DIR}/shared/libretro/link.T -Wl,--no-undefined)
 
 # armn64, the standalone app: Armulators' (armulators/app, the only part that needs the submodule)

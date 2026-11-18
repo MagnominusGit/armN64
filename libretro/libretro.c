@@ -4,6 +4,11 @@
 // else in one of the core's own, made current only while the core runs.
 #include "gles.h"
 #include "n64.h"
+#include "rdp.h"
+#ifdef ARMN64_VULKAN
+#include "vkgl.h"
+#include "libretro_vulkan.h"
+#endif
 
 #include "libretro.h"
 #include "options.h"
@@ -146,8 +151,8 @@ static struct retro_core_option_v2_definition optionDefinitions[] = {
 	  "The controller button that presses the cheat cartridge's own button.",
 	  NULL, "input", { { "r3", "R3" }, { "l3", "L3" }, { "disabled", "Off" }, { NULL, NULL } }, "r3" },
 	{ "armn64_renderer", "Renderer", NULL,
-	  "GL: fastest, HD, not exact. CPU: exact, the choice on handhelds. GPU: exact, for desktop graphics cards, also HD.",
-	  NULL, "video", { { "gl", "GL (Fast, HD)" }, { "gpu", "GPU (Exact, HD)" }, { "cpu", "CPU (Exact, Native)" }, { NULL, NULL } }, "gl" },
+	  "GL: fastest, HD, not exact. Vulkan: GL's drawing done with Vulkan (RetroArch switches to its Vulkan video driver). CPU: exact, the choice on handhelds. GPU: exact, for desktop graphics cards, also HD.",
+	  NULL, "video", { { "gl", "GL (Fast, HD)" }, { "vulkan", "Vulkan (Fast, HD)" }, { "gpu", "GPU (Exact, HD)" }, { "cpu", "CPU (Exact, Native)" }, { NULL, NULL } }, "gl" },
 	{ "armn64_resolution", "Resolution", NULL,
 	  "GL and GPU drawing resolution. Auto fits the display with GL and is Native with GPU (exact only at Native). GL draws high-resolution games at half (Resolution Scaling).",
 	  NULL, "video", { { "auto", "Auto" }, { "1", "Native" }, { "2", "2x" }, { "3", "3x" }, { "4", "4x" }, { "5", "5x" }, { "6", "6x" }, { "7", "7x" }, { "8", "8x" }, { NULL, NULL } }, "1" },
@@ -279,7 +284,11 @@ static bool highLevel(void) {
 	return !strcmp(accuracy(), "hle") || !strcmp(accuracy(), "fle");
 }
 
-// The renderer the option picks (GL for a value from before Auto went).
+// Whether the GL renderer draws with Vulkan: in the frontend's Vulkan context.
+static bool vulkanContext;
+
+// The renderer the option picks (GL for a value from before Auto went, and for Vulkan, which is GL's
+// drawing done with Vulkan).
 static const char* renderer(void) {
 	const char* value = optionValue(environment, "armn64_renderer");
 	if (value && (!strcmp(value, "gpu") || !strcmp(value, "cpu"))) {
@@ -292,7 +301,7 @@ static const char* renderer(void) {
 // (beside a Vulkan frontend, say). With the renderer threads, the VI's filters use the GL context.
 static void chooseRenderer(void) {
 	hwWanted = strcmp(renderer(), "cpu") != 0 && (contextGiven || ownContext);
-	viInContext = contextGiven && strcmp(renderer(), "cpu") == 0;
+	viInContext = contextGiven && !vulkanContext && strcmp(renderer(), "cpu") == 0;
 }
 
 static const char* overclock(void) {
@@ -440,6 +449,9 @@ static const char* settings(const char* name) {
 	}
 	if (!strcmp(name, "N64_JIT") || !strcmp(name, "N64_RSPJIT")) {
 		return "1";
+	}
+	if ((!strcmp(name, "N64_RDP_GL") || !strcmp(name, "N64_RDP_GPU")) && vulkanContext) {
+		return !strcmp(name, "N64_RDP_GL") && hwWanted && !strcmp(renderer(), "gl") ? "vk" : "0";
 	}
 	if (!strcmp(name, "N64_RDP_GL") || !strcmp(name, "N64_RDP_GPU")) {
 		return hwWanted && !strcmp(renderer(), strcmp(name, "N64_RDP_GL") ? "gpu" : "gl") ? "1" : "0";
@@ -762,6 +774,94 @@ static void hwDestroy(void) {
 	hwReady = false;
 }
 
+#ifdef ARMN64_VULKAN
+// The frontend's Vulkan device: the GL renderer's GL done on it (vkgl.c), the picture handed over
+// with set_image.
+static const struct retro_hw_render_interface_vulkan* vulkan;
+
+static void vulkanLock(void* handle) {
+	vulkan->lock_queue(handle);
+}
+
+static void vulkanUnlock(void* handle) {
+	vulkan->unlock_queue(handle);
+}
+
+static uint32_t vulkanSyncIndex(void* handle) {
+	return vulkan->get_sync_index(handle);
+}
+
+static uint32_t vulkanSyncIndexMask(void* handle) {
+	return vulkan->get_sync_index_mask(handle);
+}
+
+static void vulkanReset(void) {
+	hwReady = false;
+	if (!environment(RETRO_ENVIRONMENT_GET_HW_RENDER_INTERFACE, (void*) &vulkan) || !vulkan ||
+	    vulkan->interface_type != RETRO_HW_RENDER_INTERFACE_VULKAN || vulkan->interface_version != RETRO_HW_RENDER_INTERFACE_VULKAN_VERSION) {
+		logMessage(RETRO_LOG_ERROR, "the frontend's Vulkan interface is missing or of another version");
+		return;
+	}
+	struct VkglFrontend fe = { vulkan->instance, vulkan->gpu, vulkan->device, vulkan->queue, vulkan->queue_index,
+		                       vulkan->get_instance_proc_addr, vulkan->get_device_proc_addr, vulkan->handle,
+		                       vulkan->lock_queue ? vulkanLock : NULL, vulkan->unlock_queue ? vulkanUnlock : NULL,
+		                       vulkanSyncIndex, vulkanSyncIndexMask };
+	char error[256] = "";
+	if (!vkglCreate(&fe, error, sizeof(error))) {
+		logMessage(RETRO_LOG_ERROR, error);
+		return;
+	}
+	void** fns = (void**) &gl;
+	static const char* const names[] = { "glGenTextures", "glDeleteTextures", "glBindTexture", "glTexImage2D", "glTexSubImage2D", "glGenFramebuffers",
+		                                   "glDeleteFramebuffers", "glBindFramebuffer", "glFramebufferTexture2D", "glBlitFramebuffer", "glDisable",
+		                                   "glBindBuffer", "glMemoryBarrier" };
+	hwReady = true;
+	for (size_t i = 0; i < sizeof(names) / sizeof(*names); ++i) {
+		fns[i] = vkglProc(names[i]);
+		hwReady &= fns[i] != NULL;
+	}
+	gl.GenTextures(1, &presentTexture);
+	gl.BindTexture(GL_TEXTURE_2D, presentTexture);
+	gl.TexImage2D(GL_TEXTURE_2D, 0, GL_RGBA8, 640, 480, 0, GL_RGBA, GL_UNSIGNED_BYTE, NULL);
+	presentWidth = 640, presentHeight = 480;
+	gl.GenFramebuffers(1, &presentFramebuffer);
+	gl.BindFramebuffer(GL_READ_FRAMEBUFFER, presentFramebuffer);
+	gl.FramebufferTexture2D(GL_READ_FRAMEBUFFER, GL_COLOR_ATTACHMENT0, GL_TEXTURE_2D, presentTexture, 0);
+}
+
+// The device goes: the renderer's pictures back to RDRAM, the renderer gone (made again on the next
+// device, from RDRAM).
+static void vulkanDestroy(void) {
+	if (machine && machine->glr) {
+		glrSync(machine);
+		glrDestroy(machine->glr);
+		machine->glr = NULL;
+	}
+	hwReady = false;
+	vkglDestroy();
+	vulkan = NULL;
+}
+
+// A Vulkan context for the GL renderer, when it is asked for or the frontend draws with Vulkan.
+static bool askVulkanContext(void) {
+	unsigned preferred = RETRO_HW_CONTEXT_NONE;
+	environment(RETRO_ENVIRONMENT_GET_PREFERRED_HW_RENDER, &preferred);
+	if (strcmp(renderer(), "gl") || (!optionIs(environment, "armn64_renderer", "vulkan") && preferred != RETRO_HW_CONTEXT_VULKAN)) {
+		return false;
+	}
+	hw = (struct retro_hw_render_callback) { 0 };
+	hw.context_type = RETRO_HW_CONTEXT_VULKAN;
+	hw.version_major = VK_API_VERSION_1_0;
+	hw.context_reset = vulkanReset;
+	hw.context_destroy = vulkanDestroy;
+	if (!environment(RETRO_ENVIRONMENT_SET_HW_RENDER, &hw)) {
+		hw.context_type = RETRO_HW_CONTEXT_NONE;
+		return false;
+	}
+	return true;
+}
+#endif
+
 // The GPU renderer in the frontend's context when it draws with GL: a context of the same kind,
 // version 3.1 for GLES and 4.3 for a core profile (both run the renderer's GLSL ES shaders); a
 // compatibility profile is asked for without a version.
@@ -826,6 +926,33 @@ static struct Crop overscan(int width, int height, int k) {
 	return (struct Crop) { side[0], side[1], side[2], side[3] };
 }
 
+// The frontend's framebuffer for a picture of width by height: GL's (rows bottom first, so the picture
+// goes in upside down) or, with Vulkan, the picture's image (top row first).
+static unsigned frontendFramebuffer(int width, int height, bool* flip) {
+#ifdef ARMN64_VULKAN
+	if (vulkanContext) {
+		*flip = false;
+		return vkglFrontendFramebuffer(width, height);
+	}
+#endif
+	*flip = true;
+	return (unsigned) hw.get_current_framebuffer();
+}
+
+// The picture drawn to the frontend's framebuffer goes out (with Vulkan, its image handed over).
+static void frontendShow(unsigned width, unsigned height) {
+#ifdef ARMN64_VULKAN
+	if (vulkanContext && vulkan) {
+		struct retro_vulkan_image image;
+		VkImage handle;
+		if (vkglPicture(&handle, &image.image_view, &image.image_layout, &image.create_info)) {
+			vulkan->set_image(vulkan->handle, &image, 0, NULL, vulkan->queue_index);
+		}
+	}
+#endif
+	videoRefresh(RETRO_HW_FRAME_BUFFER_VALID, width, height, 0);
+}
+
 // The VI's picture into the frontend's framebuffer, upside down as GL keeps it: from the GL buffer
 // the GPU made it in, else from picture.
 static void present(int width, int height, unsigned buffer) {
@@ -855,10 +982,11 @@ static void present(int width, int height, unsigned buffer) {
 	int const up = machine->glr && machine->glrScale > k ? machine->glrScale / k : 1;
 	setGeometry(w * up, h * up);
 	gl.BindFramebuffer(GL_READ_FRAMEBUFFER, presentFramebuffer);
-	gl.BindFramebuffer(GL_DRAW_FRAMEBUFFER, (unsigned) hw.get_current_framebuffer());
-	gl.BlitFramebuffer(c.left, c.top, c.left + w, c.top + h, 0, h * up, w * up, 0, GL_COLOR_BUFFER_BIT, GL_NEAREST);
+	bool flip;
+	gl.BindFramebuffer(GL_DRAW_FRAMEBUFFER, frontendFramebuffer(w * up, h * up, &flip));
+	gl.BlitFramebuffer(c.left, c.top, c.left + w, c.top + h, 0, flip ? h * up : 0, w * up, flip ? 0 : h * up, GL_COLOR_BUFFER_BIT, GL_NEAREST);
 	glrForget(machine);
-	videoRefresh(RETRO_HW_FRAME_BUFFER_VALID, (unsigned) (w * up), (unsigned) (h * up), 0);
+	frontendShow((unsigned) (w * up), (unsigned) (h * up));
 }
 
 // The GL renderer's picture from its framebuffer into the frontend's, upside down as GL keeps it, at
@@ -874,10 +1002,11 @@ static void presentGl(unsigned framebuffer, int x, int y, int width, int height)
 	int const w = width - c.left - c.right, h = height - c.top - c.bottom;
 	setGeometry(w, h);
 	gl.BindFramebuffer(GL_READ_FRAMEBUFFER, framebuffer);
-	gl.BindFramebuffer(GL_DRAW_FRAMEBUFFER, (unsigned) hw.get_current_framebuffer());
-	gl.BlitFramebuffer(x * k + c.left, y * k + c.top, x * k + c.left + w, y * k + c.top + h, 0, h, w, 0, GL_COLOR_BUFFER_BIT, GL_NEAREST);
+	bool flip;
+	gl.BindFramebuffer(GL_DRAW_FRAMEBUFFER, frontendFramebuffer(w, h, &flip));
+	gl.BlitFramebuffer(x * k + c.left, y * k + c.top, x * k + c.left + w, y * k + c.top + h, 0, flip ? h : 0, w, flip ? 0 : h, GL_COLOR_BUFFER_BIT, GL_NEAREST);
 	glrForget(machine);
-	videoRefresh(RETRO_HW_FRAME_BUFFER_VALID, (unsigned) w, (unsigned) h, 0);
+	frontendShow((unsigned) w, (unsigned) h);
 }
 
 // A notice on screen for a few seconds.
@@ -1062,7 +1191,10 @@ bool retro_load_game(const struct retro_game_info* info) {
 		return false;
 	}
 	showOptions();
-	contextGiven = askHardwareContext();
+#ifdef ARMN64_VULKAN
+	vulkanContext = askVulkanContext();
+#endif
+	contextGiven = vulkanContext || askHardwareContext();
 	if (!contextGiven) {
 		unsigned preferred = RETRO_HW_CONTEXT_NONE;
 		environment(RETRO_ENVIRONMENT_GET_PREFERRED_HW_RENDER, &preferred);

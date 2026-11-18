@@ -217,13 +217,15 @@ static void start(struct N64* n) {
 	n->skip.on = skip && (skip[0] == '1' || skip[0] == '2');
 	n->skip.automatic = skip && skip[0] == '2';
 	const char* rdpGl = setting(n, "N64_RDP_GL");
-	n->rdpGl = rdpGl && rdpGl[0] == '1';
+	// "vk": the GL renderer with its GL done on Vulkan.
+	n->rdpGl = rdpGl && (rdpGl[0] == '1' || rdpGl[0] == 'v');
+	glesUseVulkan(rdpGl && rdpGl[0] == 'v');
 	if (n->rdpGl) {
 		n->rdpThreads = 0;
 		n->rdpGpu = false;
 	}
 	const char* viGpu = setting(n, "N64_VI_GPU");
-	n->viGpu = viGpu && viGpu[0] == '1';
+	n->viGpu = viGpu && viGpu[0] == '1' && !(rdpGl && rdpGl[0] == 'v');
 	const char* filters = setting(n, "N64_VI_FILTERS");
 	n->viFilters = filters ? filters[0] == '1' : n->accuracy != ACCURACY_HLE && !n->rdpGl;
 	rspJitFree(n);

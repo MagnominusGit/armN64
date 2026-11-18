@@ -13,6 +13,8 @@ enum { GLES_BUFFERS = 8 };
 struct Gles* glesCreate(const char* source, char* error, size_t errorSize);
 // A context without a program, for code making its own GL calls: glesProc finds them, glesUse
 // makes the context current first.
+// With on, contexts made from now on do their GL with Vulkan (vkgl.c).
+void glesUseVulkan(bool on);
 struct Gles* glesCreateContext(char* error, size_t errorSize);
 void* glesProc(struct Gles*, const char* name);
 void glesUse(struct Gles*);

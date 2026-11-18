@@ -1,0 +1,2708 @@
+#include "vkgl.h"
+
+// Names and shader lines are cut at their buffers, longer than any the renderer makes.
+#pragma GCC diagnostic ignored "-Wformat-truncation"
+
+#include "gles.h"
+
+#include <dlfcn.h>
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+
+#include <glslang/Include/glslang_c_interface.h>
+#include <glslang/Public/resource_limits_c.h>
+
+// The GL subset the GL renderer and the core's picture code use, on Vulkan. GL's state is kept here
+// and turned into Vulkan's when something draws: a render pass for the bound framebuffer (begun when
+// a draw or clear needs it, ended by anything else), a pipeline for each program and fixed-function
+// state, the program's uniforms in a uniform buffer and its textures in a descriptor set. Images stay
+// in the general layout, with a full barrier between a render pass and a copy and around each copy.
+// Work goes to the queue in turns of three; what GL would have done at once (a read of pixels or of
+// a mapped buffer) submits and waits. The image's own pixel (GL_NV_texture_barrier, the renderer's
+// sampler uMemory) is read as an input attachment, a by-region barrier between the draws that need
+// what the one before wrote. Rows are as GL keeps them: a framebuffer's row 0 is GL's y = 0,
+// the bottom, which is the first row in memory for both, so nothing is flipped.
+
+typedef unsigned GLenum;
+typedef unsigned GLuint;
+typedef int GLint;
+typedef int GLsizei;
+typedef unsigned GLbitfield;
+typedef intptr_t GLintptr;
+typedef intptr_t GLsizeiptr;
+typedef unsigned char GLboolean;
+
+enum {
+	GL_TEXTURE_2D = 0x0DE1, GL_RGBA8 = 0x8058, GL_R32F = 0x822E, GL_FLOAT = 0x1406, GL_UNSIGNED_INT = 0x1405,
+	GL_FRAMEBUFFER = 0x8D40, GL_READ_FRAMEBUFFER = 0x8CA8, GL_DRAW_FRAMEBUFFER = 0x8CA9, GL_COLOR_ATTACHMENT0 = 0x8CE0,
+	GL_DEPTH_ATTACHMENT = 0x8D00, GL_STENCIL_ATTACHMENT = 0x8D20, GL_DEPTH_STENCIL_ATTACHMENT = 0x821A,
+	GL_FRAMEBUFFER_COMPLETE = 0x8CD5, GL_FRAMEBUFFER_INCOMPLETE_MISSING_ATTACHMENT = 0x8CD7,
+	GL_STENCIL_TEST = 0x0B90, GL_DEPTH_TEST = 0x0B71, GL_BLEND = 0x0BE2, GL_SCISSOR_TEST = 0x0C11, GL_POLYGON_OFFSET_FILL = 0x8037,
+	GL_EXTENSIONS = 0x1F03, GL_RENDERER = 0x1F01, GL_VERSION = 0x1F02, GL_VENDOR = 0x1F00, GL_SHADING_LANGUAGE_VERSION = 0x8B8C,
+	GL_MAX_TEXTURE_SIZE = 0x0D33, GL_MAX_RENDERBUFFER_SIZE = 0x84E8, GL_MAX_SAMPLES = 0x8D57,
+	GL_COLOR_BUFFER_BIT = 0x4000, GL_DEPTH_BUFFER_BIT = 0x100, GL_STENCIL_BUFFER_BIT = 0x400,
+	GL_NEAREST = 0x2600, GL_LINEAR = 0x2601, GL_TEXTURE_MIN_FILTER = 0x2801, GL_TEXTURE_MAG_FILTER = 0x2800,
+	GL_TEXTURE_WRAP_S = 0x2802, GL_TEXTURE_WRAP_T = 0x2803, GL_CLAMP_TO_EDGE = 0x812F, GL_REPEAT = 0x2901, GL_MIRRORED_REPEAT = 0x8370,
+	GL_TEXTURE0 = 0x84C0, GL_ARRAY_BUFFER = 0x8892, GL_PIXEL_PACK_BUFFER = 0x88EB, GL_PIXEL_UNPACK_BUFFER = 0x88EC,
+	GL_MAP_READ_BIT = 1, GL_MAP_WRITE_BIT = 2,
+	GL_VERTEX_SHADER = 0x8B31, GL_FRAGMENT_SHADER = 0x8B30, GL_COMPILE_STATUS = 0x8B81, GL_LINK_STATUS = 0x8B82,
+	GL_INFO_LOG_LENGTH = 0x8B84, GL_COMPLETION_STATUS_KHR = 0x91B1,
+	GL_TRIANGLES = 4, GL_TRIANGLE_STRIP = 5, GL_TRIANGLE_FAN = 6,
+	GL_PACK_ALIGNMENT = 0x0D05, GL_UNPACK_ALIGNMENT = 0x0CF5, GL_UNPACK_ROW_LENGTH = 0x0CF2, GL_PACK_ROW_LENGTH = 0x0D02,
+};
+
+enum { SUBS = 3, UNITS = 12, SAMPLERS = 16, MEMBERS = 64, ATTRIBS = 8, UBO_BYTES = 4 << 20, STAGE_BYTES = 16 << 20, SETS = 4096 };
+enum { LOCATION_ELEMENTS = 1024, SAMPLER_LOCATION = MEMBERS * LOCATION_ELEMENTS };
+
+// ---- Vulkan's functions
+
+#define VKGL_GLOBAL(X) X(vkCreateInstance) X(vkEnumerateInstanceVersion)
+#define VKGL_INSTANCE(X)                                                                                                       \
+	X(vkDestroyInstance) X(vkEnumeratePhysicalDevices) X(vkGetPhysicalDeviceProperties) X(vkGetPhysicalDeviceMemoryProperties) \
+	X(vkGetPhysicalDeviceFormatProperties) X(vkGetPhysicalDeviceQueueFamilyProperties) X(vkCreateDevice) X(vkGetDeviceProcAddr)
+#define VKGL_DEVICE(X)                                                                                                         \
+	X(vkGetDeviceQueue) X(vkDestroyDevice) X(vkDeviceWaitIdle) X(vkCreateCommandPool) X(vkDestroyCommandPool)                   \
+	X(vkAllocateCommandBuffers) X(vkResetCommandPool) X(vkBeginCommandBuffer) X(vkEndCommandBuffer) X(vkQueueSubmit)            \
+	X(vkCreateFence) X(vkDestroyFence) X(vkWaitForFences) X(vkResetFences) X(vkCreateBuffer) X(vkDestroyBuffer)                 \
+	X(vkGetBufferMemoryRequirements) X(vkBindBufferMemory) X(vkCreateImage) X(vkDestroyImage) X(vkGetImageMemoryRequirements)   \
+	X(vkBindImageMemory) X(vkAllocateMemory) X(vkFreeMemory) X(vkMapMemory) X(vkInvalidateMappedMemoryRanges)                   \
+	X(vkCreateImageView) X(vkDestroyImageView) X(vkCreateSampler) X(vkDestroySampler) X(vkCreateRenderPass)                     \
+	X(vkDestroyRenderPass) X(vkCreateFramebuffer) X(vkDestroyFramebuffer) X(vkCreateShaderModule) X(vkDestroyShaderModule)      \
+	X(vkCreateDescriptorSetLayout) X(vkDestroyDescriptorSetLayout) X(vkCreatePipelineLayout) X(vkDestroyPipelineLayout)         \
+	X(vkCreateGraphicsPipelines) X(vkDestroyPipeline) X(vkCreatePipelineCache) X(vkDestroyPipelineCache)                        \
+	X(vkCreateDescriptorPool) X(vkDestroyDescriptorPool) X(vkResetDescriptorPool) X(vkAllocateDescriptorSets)                   \
+	X(vkUpdateDescriptorSets) X(vkCmdBeginRenderPass) X(vkCmdEndRenderPass) X(vkCmdBindPipeline) X(vkCmdBindDescriptorSets)     \
+	X(vkCmdBindVertexBuffers) X(vkCmdDraw) X(vkCmdSetViewport) X(vkCmdSetScissor) X(vkCmdSetDepthBias)                         \
+	X(vkCmdSetBlendConstants) X(vkCmdSetStencilReference) X(vkCmdSetStencilCompareMask) X(vkCmdSetStencilWriteMask)             \
+	X(vkCmdClearAttachments) X(vkCmdPipelineBarrier) X(vkCmdCopyBufferToImage) X(vkCmdCopyImageToBuffer) X(vkCmdCopyImage)      \
+	X(vkCmdBlitImage)
+
+#define VKGL_DECLARE(name) static PFN_##name name;
+VKGL_GLOBAL(VKGL_DECLARE)
+VKGL_INSTANCE(VKGL_DECLARE)
+VKGL_DEVICE(VKGL_DECLARE)
+#undef VKGL_DECLARE
+
+// ---- Objects
+
+struct Img {
+	VkImage image;
+	VkDeviceMemory memory;
+	VkImageView view;
+	VkFormat format;
+	VkImageAspectFlags aspect;
+	int width, height;
+	VkImageLayout layout;
+};
+
+struct Tex {
+	bool used;
+	struct Img img;
+	GLenum filter[2], wrap[2];
+	// Bumped whenever what a descriptor of it holds changes (its image or how it's sampled).
+	uint32_t version;
+};
+
+struct Rb {
+	bool used;
+	struct Img img;
+};
+
+struct Fbo {
+	bool used;
+	GLuint color, depthStencil;
+	bool colorIsRb;
+};
+
+struct Buf {
+	bool used;
+	VkBuffer buffer;
+	VkDeviceMemory memory;
+	uint8_t* map;
+	size_t size;
+	// The submission that last used it (sub serial).
+	uint64_t serial;
+};
+
+struct Attrib {
+	bool enabled, integer;
+	GLuint buffer;
+	int size, stride;
+	GLenum type;
+	size_t offset;
+};
+
+struct Vao {
+	bool used;
+	struct Attrib attrib[ATTRIBS];
+};
+
+struct Shader {
+	bool used;
+	GLenum type;
+	char* source;
+};
+
+struct Member {
+	char name[48];
+	char type[16];
+	int offset, size, count;
+	bool isInt;
+};
+
+struct Prog {
+	bool used, linked;
+	GLuint shader[2];
+	char* log;
+	VkShaderModule vertex, fragment;
+	VkDescriptorSetLayout setLayout;
+	VkPipelineLayout layout;
+	struct Member member[MEMBERS];
+	int members, blockSize;
+	uint8_t* shadow;
+	bool shadowDirty;
+	char sampler[SAMPLERS][48];
+	int unit[SAMPLERS];
+	int samplers;
+	// The sampler read as the image's own pixel (uMemory), or -1.
+	int input;
+	VkImageView setInput;
+	uint32_t inputs;
+	// The set and uniform offset its last draw used, for the next one that changes neither.
+	VkDescriptorSet set;
+	uint64_t setSerial;
+	uint32_t setVersion;
+	uint32_t uboOffset;
+	uint64_t uboSerial;
+};
+
+struct Pipe {
+	uint8_t key[128];
+	VkPipeline pipeline;
+};
+
+struct Garbage {
+	int kind;
+	uint64_t a, b;
+};
+
+struct Sub {
+	VkCommandPool pool;
+	VkCommandBuffer cb;
+	VkFence fence;
+	bool recording, submitted;
+	uint64_t serial;
+	VkDescriptorPool sets;
+	struct Buf ubo, stage;
+	size_t uboUsed, stageUsed;
+	struct Garbage* garbage;
+	int garbageCount, garbageCapacity;
+};
+
+struct RenderPass {
+	VkFormat color, depth;
+	VkRenderPass pass;
+};
+
+struct FbCache {
+	VkRenderPass pass;
+	VkImageView color, depth;
+	int width, height;
+	VkFramebuffer framebuffer;
+};
+
+struct State {
+	GLuint drawFbo, readFbo, program, vao, arrayBuffer, packBuffer, unpackBuffer, renderbuffer;
+	GLuint texture[UNITS];
+	int unit;
+	int viewport[4], scissor[4];
+	bool scissorOn, depthTest, stencilTest, blend, polygonOffset;
+	GLenum depthFunc;
+	bool depthMask;
+	GLenum blendSrc[2], blendDst[2], blendEq[2];
+	float blendColor[4];
+	float offsetFactor, offsetUnits;
+	GLenum stencilFunc, stencilFail, stencilZfail, stencilZpass;
+	int stencilRef;
+	unsigned stencilMask;
+	bool colorMask[4];
+	float clearColor[4], clearDepth;
+	int clearStencil;
+};
+
+static struct Vkgl {
+	bool active, external;
+	char renderer[256];
+	struct VkglFrontend frontend;
+	void* library;
+	VkInstance instance;
+	VkPhysicalDevice gpu;
+	VkDevice device;
+	VkQueue queue;
+	uint32_t queueFamily;
+	VkPhysicalDeviceMemoryProperties memory;
+	VkPhysicalDeviceLimits limits;
+	VkFormat depthFormat;
+	VkPipelineCache pipelineCache;
+	struct Sub sub[SUBS];
+	int current;
+	uint64_t serial;
+	struct Tex* tex;
+	struct Rb* rb;
+	struct Fbo* fbo;
+	struct Buf* buf;
+	struct Vao* vao;
+	struct Shader* shader;
+	struct Prog* prog;
+	int texCount, rbCount, fboCount, bufCount, vaoCount, shaderCount, progCount;
+	struct Pipe* pipes;
+	int pipeCount, pipeCapacity;
+	struct RenderPass passes[8];
+	int passCount;
+	struct FbCache* fbs;
+	int fbCount, fbCapacity;
+	VkSampler samplers[2][3][3][2];
+	struct State st;
+	// The render pass open, on that framebuffer, and what the command buffer has set in it.
+	bool passOpen;
+	GLuint passFbo;
+	VkRenderPass pass;
+	int passWidth, passHeight;
+	VkPipeline boundPipeline;
+	// What the command buffer has set within the render pass (valid since it began).
+	struct {
+		bool valid;
+		VkViewport viewport;
+		VkRect2D scissor;
+		float bias[2], blend[4];
+		uint32_t stencil[2];
+		VkPipelineLayout layout;
+		VkDescriptorSet set;
+		uint32_t offset;
+		VkBuffer vb[ATTRIBS];
+		VkDeviceSize vo[ATTRIBS];
+	} bound;
+	// The last pipeline found, by its key, and the rest by a hash of theirs.
+	uint8_t lastKey[128];
+	VkPipeline lastPipe;
+	int pipeHash[4096];
+	bool barrierNeeded;
+	// The frontend's pictures, one for each of its frames in flight, and the framebuffer for them.
+	struct Img picture[4];
+	int pictureIndex;
+	GLuint pictureFbo, pictureTex;
+	uint8_t* readback;
+	struct Buf readBuffer;
+	bool glslangReady;
+} V;
+
+static bool fail(char* error, size_t size, const char* what) {
+	snprintf(error, size, "%s", what);
+	return false;
+}
+
+// ---- Memory, buffers and images
+
+static int memoryType(uint32_t bits, VkMemoryPropertyFlags want, VkMemoryPropertyFlags also) {
+	for (int pass = 0; pass < 2; ++pass) {
+		for (uint32_t i = 0; i < V.memory.memoryTypeCount; ++i) {
+			VkMemoryPropertyFlags const f = V.memory.memoryTypes[i].propertyFlags;
+			if ((bits & (1u << i)) && (f & want) == want && (pass || (f & also) == also)) {
+				return (int) i;
+			}
+		}
+	}
+	return -1;
+}
+
+static bool bufferMake(struct Buf* b, size_t size, VkBufferUsageFlags usage, bool cached) {
+	VkBufferCreateInfo info = { VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO, NULL, 0, size ? size : 4, usage, VK_SHARING_MODE_EXCLUSIVE, 0, NULL };
+	if (vkCreateBuffer(V.device, &info, NULL, &b->buffer) != VK_SUCCESS) {
+		return false;
+	}
+	VkMemoryRequirements req;
+	vkGetBufferMemoryRequirements(V.device, b->buffer, &req);
+	int const type = memoryType(req.memoryTypeBits, VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT,
+	                            cached ? VK_MEMORY_PROPERTY_HOST_CACHED_BIT : 0);
+	VkMemoryAllocateInfo alloc = { VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO, NULL, req.size, (uint32_t) type };
+	if (type < 0 || vkAllocateMemory(V.device, &alloc, NULL, &b->memory) != VK_SUCCESS) {
+		vkDestroyBuffer(V.device, b->buffer, NULL);
+		b->buffer = VK_NULL_HANDLE;
+		return false;
+	}
+	vkBindBufferMemory(V.device, b->buffer, b->memory, 0);
+	void* p = NULL;
+	vkMapMemory(V.device, b->memory, 0, VK_WHOLE_SIZE, 0, &p);
+	b->map = p;
+	b->size = size;
+	return true;
+}
+
+static void bufferFree(struct Buf* b) {
+	if (b->buffer) {
+		vkDestroyBuffer(V.device, b->buffer, NULL);
+		vkFreeMemory(V.device, b->memory, NULL);
+	}
+	b->buffer = VK_NULL_HANDLE, b->memory = VK_NULL_HANDLE, b->map = NULL, b->size = 0;
+}
+
+static bool imageMake(struct Img* img, VkFormat format, int width, int height) {
+	bool const depth = format == V.depthFormat;
+	VkImageUsageFlags usage = VK_IMAGE_USAGE_TRANSFER_SRC_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT |
+	                          (depth ? VK_IMAGE_USAGE_DEPTH_STENCIL_ATTACHMENT_BIT : VK_IMAGE_USAGE_SAMPLED_BIT);
+	if (format == VK_FORMAT_R8G8B8A8_UNORM) {
+		usage |= VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT | VK_IMAGE_USAGE_INPUT_ATTACHMENT_BIT;
+	}
+	VkImageCreateInfo info = { VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO, NULL, 0, VK_IMAGE_TYPE_2D, format,
+		                       { (uint32_t) (width > 0 ? width : 1), (uint32_t) (height > 0 ? height : 1), 1 }, 1, 1,
+		                       VK_SAMPLE_COUNT_1_BIT, VK_IMAGE_TILING_OPTIMAL, usage, VK_SHARING_MODE_EXCLUSIVE, 0, NULL,
+		                       VK_IMAGE_LAYOUT_UNDEFINED };
+	if (vkCreateImage(V.device, &info, NULL, &img->image) != VK_SUCCESS) {
+		return false;
+	}
+	VkMemoryRequirements req;
+	vkGetImageMemoryRequirements(V.device, img->image, &req);
+	int const type = memoryType(req.memoryTypeBits, VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT, 0);
+	VkMemoryAllocateInfo alloc = { VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO, NULL, req.size, (uint32_t) (type < 0 ? memoryType(req.memoryTypeBits, 0, 0) : type) };
+	if (vkAllocateMemory(V.device, &alloc, NULL, &img->memory) != VK_SUCCESS) {
+		vkDestroyImage(V.device, img->image, NULL);
+		img->image = VK_NULL_HANDLE;
+		return false;
+	}
+	vkBindImageMemory(V.device, img->image, img->memory, 0);
+	img->aspect = depth ? VK_IMAGE_ASPECT_DEPTH_BIT | VK_IMAGE_ASPECT_STENCIL_BIT : VK_IMAGE_ASPECT_COLOR_BIT;
+	VkImageViewCreateInfo view = { VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO, NULL, 0, img->image, VK_IMAGE_VIEW_TYPE_2D, format,
+		                           { VK_COMPONENT_SWIZZLE_IDENTITY, VK_COMPONENT_SWIZZLE_IDENTITY, VK_COMPONENT_SWIZZLE_IDENTITY, VK_COMPONENT_SWIZZLE_IDENTITY },
+		                           { img->aspect, 0, 1, 0, 1 } };
+	if (vkCreateImageView(V.device, &view, NULL, &img->view) != VK_SUCCESS) {
+		vkDestroyImage(V.device, img->image, NULL);
+		vkFreeMemory(V.device, img->memory, NULL);
+		img->image = VK_NULL_HANDLE;
+		return false;
+	}
+	img->format = format, img->width = width, img->height = height, img->layout = VK_IMAGE_LAYOUT_UNDEFINED;
+	return true;
+}
+
+// ---- Submission
+
+enum { GARBAGE_BUFFER, GARBAGE_IMAGE, GARBAGE_FRAMEBUFFER, GARBAGE_PIPELINE, GARBAGE_VIEW };
+
+static void garbage(int kind, uint64_t a, uint64_t b) {
+	struct Sub* s = &V.sub[V.current];
+	if (s->garbageCount == s->garbageCapacity) {
+		int const n = s->garbageCapacity ? s->garbageCapacity * 2 : 64;
+		struct Garbage* more = realloc(s->garbage, (size_t) n * sizeof(*more));
+		if (!more) {
+			return;
+		}
+		s->garbage = more, s->garbageCapacity = n;
+	}
+	s->garbage[s->garbageCount++] = (struct Garbage) { kind, a, b };
+}
+
+static void collect(struct Sub* s) {
+	for (int i = 0; i < s->garbageCount; ++i) {
+		struct Garbage* g = &s->garbage[i];
+		if (g->kind == GARBAGE_BUFFER) {
+			vkDestroyBuffer(V.device, (VkBuffer) (uintptr_t) g->a, NULL);
+			vkFreeMemory(V.device, (VkDeviceMemory) (uintptr_t) g->b, NULL);
+		} else if (g->kind == GARBAGE_IMAGE) {
+			vkDestroyImage(V.device, (VkImage) (uintptr_t) g->a, NULL);
+			vkFreeMemory(V.device, (VkDeviceMemory) (uintptr_t) g->b, NULL);
+		} else if (g->kind == GARBAGE_FRAMEBUFFER) {
+			vkDestroyFramebuffer(V.device, (VkFramebuffer) (uintptr_t) g->a, NULL);
+		} else if (g->kind == GARBAGE_VIEW) {
+			vkDestroyImageView(V.device, (VkImageView) (uintptr_t) g->a, NULL);
+		}
+	}
+	s->garbageCount = 0;
+}
+
+static void imageFree(struct Img* img);
+
+static VkCommandBuffer cmd(void) {
+	struct Sub* s = &V.sub[V.current];
+	if (!s->recording) {
+		VkCommandBufferBeginInfo begin = { VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO, NULL, VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT, NULL };
+		vkBeginCommandBuffer(s->cb, &begin);
+		s->recording = true;
+	}
+	return s->cb;
+}
+
+// Everything before against everything after, outside a render pass.
+static void barrier(VkCommandBuffer cb) {
+	VkMemoryBarrier m = { VK_STRUCTURE_TYPE_MEMORY_BARRIER, NULL, VK_ACCESS_MEMORY_WRITE_BIT, VK_ACCESS_MEMORY_READ_BIT | VK_ACCESS_MEMORY_WRITE_BIT };
+	vkCmdPipelineBarrier(cb, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, 0, 1, &m, 0, NULL, 0, NULL);
+	V.barrierNeeded = false;
+}
+
+static void passEnd(void) {
+	if (V.passOpen) {
+		vkCmdEndRenderPass(V.sub[V.current].cb);
+		V.passOpen = false;
+		V.boundPipeline = VK_NULL_HANDLE;
+		V.bound.valid = false;
+		V.barrierNeeded = true;
+	}
+}
+
+// The command buffer for a copy, the render pass ended and a barrier before it.
+static VkCommandBuffer transfer(void) {
+	passEnd();
+	VkCommandBuffer cb = cmd();
+	if (V.barrierNeeded) {
+		barrier(cb);
+	}
+	V.barrierNeeded = true;
+	return cb;
+}
+
+static void layoutTo(VkCommandBuffer cb, struct Img* img, VkImageLayout to) {
+	if (img->layout == to) {
+		return;
+	}
+	VkImageMemoryBarrier b = { VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER, NULL, VK_ACCESS_MEMORY_WRITE_BIT,
+		                       VK_ACCESS_MEMORY_READ_BIT | VK_ACCESS_MEMORY_WRITE_BIT, img->layout, to, VK_QUEUE_FAMILY_IGNORED,
+		                       VK_QUEUE_FAMILY_IGNORED, img->image, { img->aspect, 0, 1, 0, 1 } };
+	vkCmdPipelineBarrier(cb, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, 0, 0, NULL, 0, NULL, 1, &b);
+	img->layout = to;
+}
+
+static void subWait(struct Sub* s) {
+	if (s->submitted) {
+		vkWaitForFences(V.device, 1, &s->fence, VK_TRUE, UINT64_MAX);
+		vkResetFences(V.device, 1, &s->fence);
+		s->submitted = false;
+		collect(s);
+	}
+}
+
+// The work so far to the queue; the next turn's resources ready (its last work done). With wait, the
+// work submitted is done too.
+static void submit(bool wait) {
+	passEnd();
+	struct Sub* s = &V.sub[V.current];
+	if (s->recording) {
+		VkMemoryBarrier host = { VK_STRUCTURE_TYPE_MEMORY_BARRIER, NULL, VK_ACCESS_MEMORY_WRITE_BIT, VK_ACCESS_HOST_READ_BIT };
+		vkCmdPipelineBarrier(s->cb, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, VK_PIPELINE_STAGE_HOST_BIT, 0, 1, &host, 0, NULL, 0, NULL);
+		vkEndCommandBuffer(s->cb);
+		VkSubmitInfo info = { VK_STRUCTURE_TYPE_SUBMIT_INFO, NULL, 0, NULL, NULL, 1, &s->cb, 0, NULL };
+		if (V.external && V.frontend.lockQueue) {
+			V.frontend.lockQueue(V.frontend.handle);
+		}
+		vkQueueSubmit(V.queue, 1, &info, s->fence);
+		if (V.external && V.frontend.unlockQueue) {
+			V.frontend.unlockQueue(V.frontend.handle);
+		}
+		s->recording = false;
+		s->submitted = true;
+		V.barrierNeeded = false;
+		int const done = V.current;
+		V.current = (V.current + 1) % SUBS;
+		struct Sub* next = &V.sub[V.current];
+		subWait(next);
+		vkResetCommandPool(V.device, next->pool, 0);
+		vkResetDescriptorPool(V.device, next->sets, 0);
+		next->uboUsed = next->stageUsed = 0;
+		next->serial = ++V.serial;
+		if (wait) {
+			subWait(&V.sub[done]);
+		}
+	} else if (wait) {
+		for (int i = 0; i < SUBS; ++i) {
+			subWait(&V.sub[i]);
+		}
+	}
+}
+
+// Waits for the work that used a buffer up to serial.
+static void waitSerial(uint64_t serial) {
+	if (serial >= V.sub[V.current].serial) {
+		submit(true);
+		return;
+	}
+	for (int i = 0; i < SUBS; ++i) {
+		if (V.sub[i].submitted && V.sub[i].serial <= serial) {
+			subWait(&V.sub[i]);
+		}
+	}
+}
+
+// Room for size bytes of a turn's ring buffer, aligned; the next turn's when this one's is full.
+static size_t ringTake(bool ubo, size_t size, size_t align) {
+	for (int tries = 0; tries < 2; ++tries) {
+		struct Sub* s = &V.sub[V.current];
+		size_t* used = ubo ? &s->uboUsed : &s->stageUsed;
+		size_t const capacity = ubo ? s->ubo.size : s->stage.size;
+		size_t const at = (*used + align - 1) / align * align;
+		if (at + size <= capacity) {
+			*used = at + size;
+			return at;
+		}
+		submit(false);
+	}
+	return SIZE_MAX;
+}
+
+static void imageFree(struct Img* img) {
+	if (!img->image) {
+		return;
+	}
+	for (int i = 0; i < V.fbCount; ++i) {
+		if (V.fbs[i].color == img->view || V.fbs[i].depth == img->view) {
+			garbage(GARBAGE_FRAMEBUFFER, (uint64_t) (uintptr_t) V.fbs[i].framebuffer, 0);
+			V.fbs[i--] = V.fbs[--V.fbCount];
+		}
+	}
+	garbage(GARBAGE_VIEW, (uint64_t) (uintptr_t) img->view, 0);
+	garbage(GARBAGE_IMAGE, (uint64_t) (uintptr_t) img->image, (uint64_t) (uintptr_t) img->memory);
+	memset(img, 0, sizeof(*img));
+}
+
+// A new image's layout set (general, for everything), so it can be used at once.
+static void imageReady(struct Img* img) {
+	VkCommandBuffer cb = transfer();
+	layoutTo(cb, img, VK_IMAGE_LAYOUT_GENERAL);
+}
+
+// ---- The device
+
+static bool loadDevice(void) {
+#define VKGL_LOAD(name) name = (PFN_##name) vkGetDeviceProcAddr(V.device, #name); if (!name) return false;
+	VKGL_DEVICE(VKGL_LOAD)
+#undef VKGL_LOAD
+	return true;
+}
+
+static bool loadInstance(PFN_vkGetInstanceProcAddr get) {
+#define VKGL_LOAD(name) name = (PFN_##name) get(V.instance, #name); if (!name) return false;
+	VKGL_INSTANCE(VKGL_LOAD)
+#undef VKGL_LOAD
+	return true;
+}
+
+// An instance and device of its own: the first GPU with a graphics queue, discrete or integrated
+// first.
+static bool ownDevice(char* error, size_t errorSize) {
+	V.library = dlopen("libvulkan.so.1", RTLD_NOW | RTLD_LOCAL);
+	if (!V.library) {
+		V.library = dlopen("libvulkan.so", RTLD_NOW | RTLD_LOCAL);
+	}
+	if (!V.library) {
+		return fail(error, errorSize, "no libvulkan");
+	}
+	PFN_vkGetInstanceProcAddr get = (PFN_vkGetInstanceProcAddr) dlsym(V.library, "vkGetInstanceProcAddr");
+	if (!get) {
+		return fail(error, errorSize, "no vkGetInstanceProcAddr");
+	}
+	vkCreateInstance = (PFN_vkCreateInstance) get(NULL, "vkCreateInstance");
+	vkEnumerateInstanceVersion = (PFN_vkEnumerateInstanceVersion) get(NULL, "vkEnumerateInstanceVersion");
+	uint32_t version = VK_API_VERSION_1_0;
+	if (vkEnumerateInstanceVersion) {
+		vkEnumerateInstanceVersion(&version);
+	}
+	VkApplicationInfo app = { VK_STRUCTURE_TYPE_APPLICATION_INFO, NULL, "armN64", 1, "armN64", 1,
+		                      version >= VK_API_VERSION_1_1 ? VK_API_VERSION_1_1 : VK_API_VERSION_1_0 };
+	VkInstanceCreateInfo info = { VK_STRUCTURE_TYPE_INSTANCE_CREATE_INFO, NULL, 0, &app, 0, NULL, 0, NULL };
+	if (!vkCreateInstance || vkCreateInstance(&info, NULL, &V.instance) != VK_SUCCESS || !loadInstance(get)) {
+		return fail(error, errorSize, "no Vulkan instance");
+	}
+	VkPhysicalDevice gpus[16];
+	uint32_t count = 16;
+	vkEnumeratePhysicalDevices(V.instance, &count, gpus);
+	int best = -1, bestRank = -1;
+	uint32_t bestFamily = 0;
+	for (uint32_t i = 0; i < count; ++i) {
+		VkPhysicalDeviceProperties p;
+		vkGetPhysicalDeviceProperties(gpus[i], &p);
+		VkQueueFamilyProperties families[16];
+		uint32_t n = 16;
+		vkGetPhysicalDeviceQueueFamilyProperties(gpus[i], &n, families);
+		for (uint32_t f = 0; f < n; ++f) {
+			if (!(families[f].queueFlags & VK_QUEUE_GRAPHICS_BIT)) {
+				continue;
+			}
+			int const rank = p.deviceType == VK_PHYSICAL_DEVICE_TYPE_DISCRETE_GPU ? 3 : p.deviceType == VK_PHYSICAL_DEVICE_TYPE_INTEGRATED_GPU ? 2 : 1;
+			if (rank > bestRank) {
+				best = (int) i, bestRank = rank, bestFamily = f;
+			}
+			break;
+		}
+	}
+	if (best < 0) {
+		return fail(error, errorSize, "no Vulkan GPU with a graphics queue");
+	}
+	V.gpu = gpus[best];
+	V.queueFamily = bestFamily;
+	float const priority = 1.0f;
+	VkDeviceQueueCreateInfo queue = { VK_STRUCTURE_TYPE_DEVICE_QUEUE_CREATE_INFO, NULL, 0, V.queueFamily, 1, &priority };
+	VkDeviceCreateInfo dev = { VK_STRUCTURE_TYPE_DEVICE_CREATE_INFO, NULL, 0, 1, &queue, 0, NULL, 0, NULL, NULL };
+	if (vkCreateDevice(V.gpu, &dev, NULL, &V.device) != VK_SUCCESS || !loadDevice()) {
+		return fail(error, errorSize, "no Vulkan device");
+	}
+	vkGetDeviceQueue(V.device, V.queueFamily, 0, &V.queue);
+	return true;
+}
+
+static void freeAll(void);
+static struct Img* dummyImage(void);
+static struct Img dummy;
+
+bool vkglCreate(const struct VkglFrontend* frontend, char* error, size_t errorSize) {
+	if (V.active) {
+		return true;
+	}
+	memset(&V, 0, sizeof(V));
+	if (frontend) {
+		V.external = true;
+		V.frontend = *frontend;
+		V.instance = frontend->instance, V.gpu = frontend->gpu, V.device = frontend->device, V.queue = frontend->queue;
+		V.queueFamily = frontend->queueFamily;
+		if (!loadInstance(frontend->getInstanceProcAddr)) {
+			return fail(error, errorSize, "Vulkan functions missing");
+		}
+		vkGetDeviceProcAddr = frontend->getDeviceProcAddr;
+		if (!loadDevice()) {
+			return fail(error, errorSize, "Vulkan functions missing");
+		}
+	} else if (!ownDevice(error, errorSize)) {
+		freeAll();
+		return false;
+	}
+	VkPhysicalDeviceProperties p;
+	vkGetPhysicalDeviceProperties(V.gpu, &p);
+	V.limits = p.limits;
+	snprintf(V.renderer, sizeof(V.renderer), "%s (Vulkan %u.%u)", p.deviceName, VK_VERSION_MAJOR(p.apiVersion), VK_VERSION_MINOR(p.apiVersion));
+	vkGetPhysicalDeviceMemoryProperties(V.gpu, &V.memory);
+	VkFormatProperties fp;
+	vkGetPhysicalDeviceFormatProperties(V.gpu, VK_FORMAT_D24_UNORM_S8_UINT, &fp);
+	V.depthFormat = (fp.optimalTilingFeatures & VK_FORMAT_FEATURE_DEPTH_STENCIL_ATTACHMENT_BIT) ? VK_FORMAT_D24_UNORM_S8_UINT : VK_FORMAT_D32_SFLOAT_S8_UINT;
+	// The pipelines made before on this GPU and driver (the cache's header checks they match).
+	char path[4300];
+	void* saved = NULL;
+	size_t savedSize = 0;
+	if (glesCacheDirectory()[0]) {
+		snprintf(path, sizeof(path), "%s/vk-pipelines-%08x-%08x.bin", glesCacheDirectory(), p.vendorID, p.deviceID);
+		FILE* in = fopen(path, "rb");
+		if (in && !fseek(in, 0, SEEK_END)) {
+			long const n = ftell(in);
+			saved = n > 0 && n < (64 << 20) ? malloc((size_t) n) : NULL;
+			if (saved && !fseek(in, 0, SEEK_SET) && fread(saved, 1, (size_t) n, in) == (size_t) n) {
+				savedSize = (size_t) n;
+			}
+		}
+		if (in) {
+			fclose(in);
+		}
+	}
+	VkPipelineCacheCreateInfo cache = { VK_STRUCTURE_TYPE_PIPELINE_CACHE_CREATE_INFO, NULL, 0, savedSize, saved };
+	if (vkCreatePipelineCache(V.device, &cache, NULL, &V.pipelineCache) != VK_SUCCESS) {
+		cache.initialDataSize = 0, cache.pInitialData = NULL;
+		vkCreatePipelineCache(V.device, &cache, NULL, &V.pipelineCache);
+	}
+	free(saved);
+	VkDescriptorPoolSize sizes[3] = { { VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER_DYNAMIC, SETS }, { VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, SETS * 4 },
+		                              { VK_DESCRIPTOR_TYPE_INPUT_ATTACHMENT, SETS } };
+	for (int i = 0; i < SUBS; ++i) {
+		struct Sub* s = &V.sub[i];
+		VkCommandPoolCreateInfo pool = { VK_STRUCTURE_TYPE_COMMAND_POOL_CREATE_INFO, NULL, VK_COMMAND_POOL_CREATE_TRANSIENT_BIT, V.queueFamily };
+		VkFenceCreateInfo fence = { VK_STRUCTURE_TYPE_FENCE_CREATE_INFO, NULL, 0 };
+		VkDescriptorPoolCreateInfo sets = { VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO, NULL, 0, SETS, 3, sizes };
+		if (vkCreateCommandPool(V.device, &pool, NULL, &s->pool) != VK_SUCCESS || vkCreateFence(V.device, &fence, NULL, &s->fence) != VK_SUCCESS ||
+		    vkCreateDescriptorPool(V.device, &sets, NULL, &s->sets) != VK_SUCCESS ||
+		    !bufferMake(&s->ubo, UBO_BYTES, VK_BUFFER_USAGE_UNIFORM_BUFFER_BIT, false) ||
+		    !bufferMake(&s->stage, STAGE_BYTES, VK_BUFFER_USAGE_TRANSFER_SRC_BIT, false)) {
+			freeAll();
+			return fail(error, errorSize, "Vulkan resources unavailable");
+		}
+		VkCommandBufferAllocateInfo cb = { VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO, NULL, s->pool, VK_COMMAND_BUFFER_LEVEL_PRIMARY, 1 };
+		vkAllocateCommandBuffers(V.device, &cb, &s->cb);
+	}
+	V.sub[0].serial = V.serial = 1;
+	V.st = (struct State) { .depthFunc = 0x201, .depthMask = true, .blendSrc = { 1, 1 }, .blendDst = { 0, 0 }, .blendEq = { 0x8006, 0x8006 },
+		                    .stencilFunc = 0x207, .stencilFail = 0x1E00, .stencilZfail = 0x1E00, .stencilZpass = 0x1E00, .stencilMask = ~0u,
+		                    .colorMask = { true, true, true, true }, .clearDepth = 1.0f };
+	if (!V.glslangReady) {
+		glslang_initialize_process();
+		V.glslangReady = true;
+	}
+	V.active = true;
+	dummyImage();
+	return true;
+}
+
+static void keepPipelines(void) {
+	PFN_vkGetPipelineCacheData get = (PFN_vkGetPipelineCacheData) vkGetDeviceProcAddr(V.device, "vkGetPipelineCacheData");
+	size_t size = 0;
+	if (!glesCacheDirectory()[0] || !get || get(V.device, V.pipelineCache, &size, NULL) != VK_SUCCESS || !size) {
+		return;
+	}
+	void* data = malloc(size);
+	if (data && get(V.device, V.pipelineCache, &size, data) == VK_SUCCESS) {
+		VkPhysicalDeviceProperties p;
+		vkGetPhysicalDeviceProperties(V.gpu, &p);
+		char path[4300], temp[4400];
+		snprintf(path, sizeof(path), "%s/vk-pipelines-%08x-%08x.bin", glesCacheDirectory(), p.vendorID, p.deviceID);
+		snprintf(temp, sizeof(temp), "%s.tmp", path);
+		FILE* out = fopen(temp, "wb");
+		if (out && fwrite(data, 1, size, out) == size && !fclose(out)) {
+			rename(temp, path);
+		} else if (out) {
+			fclose(out);
+			remove(temp);
+		}
+	}
+	free(data);
+}
+
+static void freeAll(void) {
+	if (V.device) {
+		vkDeviceWaitIdle(V.device);
+		for (int i = 0; i < SUBS; ++i) {
+			V.sub[i].submitted = false;
+		}
+		// The objects first (what they free goes to the turns' garbage), then the turns.
+		for (int i = 0; i < V.texCount; ++i) {
+			imageFree(&V.tex[i].img);
+		}
+		for (int i = 0; i < V.rbCount; ++i) {
+			imageFree(&V.rb[i].img);
+		}
+		for (int i = 0; i < 4; ++i) {
+			imageFree(&V.picture[i]);
+		}
+		imageFree(&dummy);
+		for (int i = 0; i < V.bufCount; ++i) {
+			bufferFree(&V.buf[i]);
+		}
+		bufferFree(&V.readBuffer);
+		for (int i = 0; i < V.progCount; ++i) {
+			struct Prog* p = &V.prog[i];
+			if (p->vertex) {
+				vkDestroyShaderModule(V.device, p->vertex, NULL);
+				vkDestroyShaderModule(V.device, p->fragment, NULL);
+			}
+			if (p->layout) {
+				vkDestroyPipelineLayout(V.device, p->layout, NULL);
+				vkDestroyDescriptorSetLayout(V.device, p->setLayout, NULL);
+			}
+			free(p->shadow);
+			free(p->log);
+		}
+		for (int i = 0; i < V.shaderCount; ++i) {
+			free(V.shader[i].source);
+		}
+		for (int i = 0; i < V.pipeCount; ++i) {
+			vkDestroyPipeline(V.device, V.pipes[i].pipeline, NULL);
+		}
+		for (int i = 0; i < V.fbCount; ++i) {
+			vkDestroyFramebuffer(V.device, V.fbs[i].framebuffer, NULL);
+		}
+		for (int i = 0; i < V.passCount; ++i) {
+			vkDestroyRenderPass(V.device, V.passes[i].pass, NULL);
+		}
+		for (int a = 0; a < 2; ++a) {
+			for (int b = 0; b < 3; ++b) {
+				for (int c = 0; c < 3; ++c) {
+					for (int d = 0; d < 2; ++d) {
+						if (V.samplers[a][b][c][d]) {
+							vkDestroySampler(V.device, V.samplers[a][b][c][d], NULL);
+						}
+					}
+				}
+			}
+		}
+		for (int i = 0; i < SUBS; ++i) {
+			struct Sub* s = &V.sub[i];
+			collect(s);
+			free(s->garbage);
+			s->garbage = NULL, s->garbageCount = s->garbageCapacity = 0;
+			bufferFree(&s->ubo);
+			bufferFree(&s->stage);
+			if (s->sets) {
+				vkDestroyDescriptorPool(V.device, s->sets, NULL);
+			}
+			if (s->fence) {
+				vkDestroyFence(V.device, s->fence, NULL);
+			}
+			if (s->pool) {
+				vkDestroyCommandPool(V.device, s->pool, NULL);
+			}
+		}
+		if (V.pipelineCache) {
+			keepPipelines();
+			vkDestroyPipelineCache(V.device, V.pipelineCache, NULL);
+		}
+		if (!V.external) {
+			vkDestroyDevice(V.device, NULL);
+		}
+	}
+	if (!V.external && V.instance) {
+		vkDestroyInstance(V.instance, NULL);
+	}
+	if (V.library) {
+		dlclose(V.library);
+	}
+	free(V.tex), free(V.rb), free(V.fbo), free(V.buf), free(V.vao), free(V.shader), free(V.prog), free(V.pipes), free(V.fbs);
+	free(V.readback);
+	bool const glslang = V.glslangReady;
+	memset(&V, 0, sizeof(V));
+	V.glslangReady = glslang;
+}
+
+void vkglDestroy(void) {
+	if (V.active || V.device) {
+		freeAll();
+	}
+}
+
+bool vkglActive(void) {
+	return V.active;
+}
+
+const char* vkglRenderer(void) {
+	return V.renderer;
+}
+
+// ---- Render passes, framebuffers and samplers
+
+static VkRenderPass renderPass(VkFormat color, VkFormat depth) {
+	for (int i = 0; i < V.passCount; ++i) {
+		if (V.passes[i].color == color && V.passes[i].depth == depth) {
+			return V.passes[i].pass;
+		}
+	}
+	if (V.passCount == 8) {
+		return VK_NULL_HANDLE;
+	}
+	VkAttachmentDescription att[2];
+	VkAttachmentReference colorRef = { 0, VK_IMAGE_LAYOUT_GENERAL }, depthRef = { color ? 1u : 0u, VK_IMAGE_LAYOUT_GENERAL };
+	uint32_t n = 0;
+	if (color) {
+		att[n++] = (VkAttachmentDescription) { 0, color, VK_SAMPLE_COUNT_1_BIT, VK_ATTACHMENT_LOAD_OP_LOAD, VK_ATTACHMENT_STORE_OP_STORE,
+			                                   VK_ATTACHMENT_LOAD_OP_DONT_CARE, VK_ATTACHMENT_STORE_OP_DONT_CARE, VK_IMAGE_LAYOUT_GENERAL, VK_IMAGE_LAYOUT_GENERAL };
+	}
+	if (depth) {
+		att[n++] = (VkAttachmentDescription) { 0, depth, VK_SAMPLE_COUNT_1_BIT, VK_ATTACHMENT_LOAD_OP_LOAD, VK_ATTACHMENT_STORE_OP_STORE,
+			                                   VK_ATTACHMENT_LOAD_OP_LOAD, VK_ATTACHMENT_STORE_OP_STORE, VK_IMAGE_LAYOUT_GENERAL, VK_IMAGE_LAYOUT_GENERAL };
+	}
+	// The color attachment is also the subpass's input (the image's own pixel), with a dependency on
+	// itself for the barriers between draws.
+	VkSubpassDescription sub = { 0, VK_PIPELINE_BIND_POINT_GRAPHICS, color ? 1u : 0u, color ? &colorRef : NULL, color ? 1u : 0u, color ? &colorRef : NULL, NULL,
+		                         depth ? &depthRef : NULL, 0, NULL };
+	VkSubpassDependency deps[3] = {
+		{ VK_SUBPASS_EXTERNAL, 0, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, VK_PIPELINE_STAGE_ALL_GRAPHICS_BIT, VK_ACCESS_MEMORY_WRITE_BIT,
+		  VK_ACCESS_MEMORY_READ_BIT | VK_ACCESS_MEMORY_WRITE_BIT, 0 },
+		{ 0, VK_SUBPASS_EXTERNAL, VK_PIPELINE_STAGE_ALL_GRAPHICS_BIT, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, VK_ACCESS_MEMORY_WRITE_BIT,
+		  VK_ACCESS_MEMORY_READ_BIT | VK_ACCESS_MEMORY_WRITE_BIT, 0 },
+		{ 0, 0, VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT, VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT, VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT,
+		  VK_ACCESS_INPUT_ATTACHMENT_READ_BIT, VK_DEPENDENCY_BY_REGION_BIT },
+	};
+	VkRenderPassCreateInfo info = { VK_STRUCTURE_TYPE_RENDER_PASS_CREATE_INFO, NULL, 0, n, att, 1, &sub, color ? 3u : 2u, deps };
+	VkRenderPass pass;
+	if (vkCreateRenderPass(V.device, &info, NULL, &pass) != VK_SUCCESS) {
+		return VK_NULL_HANDLE;
+	}
+	V.passes[V.passCount++] = (struct RenderPass) { color, depth, pass };
+	return pass;
+}
+
+static struct Img* fboColor(struct Fbo* f) {
+	if (V.pictureFbo && f == &V.fbo[V.pictureFbo]) {
+		return V.picture[V.pictureIndex].image ? &V.picture[V.pictureIndex] : NULL;
+	}
+	if (!f->color) {
+		return NULL;
+	}
+	if (f->colorIsRb) {
+		return f->color < (GLuint) V.rbCount && V.rb[f->color].img.image ? &V.rb[f->color].img : NULL;
+	}
+	return f->color < (GLuint) V.texCount && V.tex[f->color].img.image ? &V.tex[f->color].img : NULL;
+}
+
+static struct Img* fboDepth(struct Fbo* f) {
+	return f->depthStencil && f->depthStencil < (GLuint) V.rbCount && V.rb[f->depthStencil].img.image ? &V.rb[f->depthStencil].img : NULL;
+}
+
+static struct Fbo* fboGet(GLuint name) {
+	return name && name < (GLuint) V.fboCount && V.fbo[name].used ? &V.fbo[name] : NULL;
+}
+
+// The render pass on the draw framebuffer, begun when not open on it. False when it can't be drawn to.
+static bool passBegin(void) {
+	if (V.passOpen && V.passFbo == V.st.drawFbo) {
+		return true;
+	}
+	passEnd();
+	struct Fbo* f = fboGet(V.st.drawFbo);
+	if (!f) {
+		return false;
+	}
+	struct Img* color = fboColor(f);
+	struct Img* depth = fboDepth(f);
+	if (!color && !depth) {
+		return false;
+	}
+	VkCommandBuffer cb = cmd();
+	if (V.barrierNeeded) {
+		barrier(cb);
+	}
+	if (color) {
+		layoutTo(cb, color, VK_IMAGE_LAYOUT_GENERAL);
+	}
+	if (depth) {
+		layoutTo(cb, depth, VK_IMAGE_LAYOUT_GENERAL);
+	}
+	int w = color ? color->width : depth->width, h = color ? color->height : depth->height;
+	if (color && depth) {
+		w = w < depth->width ? w : depth->width;
+		h = h < depth->height ? h : depth->height;
+	}
+	VkRenderPass pass = renderPass(color ? color->format : VK_FORMAT_UNDEFINED, depth ? depth->format : VK_FORMAT_UNDEFINED);
+	VkImageView const cv = color ? color->view : VK_NULL_HANDLE, dv = depth ? depth->view : VK_NULL_HANDLE;
+	VkFramebuffer fb = VK_NULL_HANDLE;
+	for (int i = 0; i < V.fbCount; ++i) {
+		struct FbCache* c = &V.fbs[i];
+		if (c->pass == pass && c->color == cv && c->depth == dv && c->width == w && c->height == h) {
+			fb = c->framebuffer;
+			break;
+		}
+	}
+	if (!fb) {
+		VkImageView views[2];
+		uint32_t n = 0;
+		if (color) {
+			views[n++] = cv;
+		}
+		if (depth) {
+			views[n++] = dv;
+		}
+		VkFramebufferCreateInfo info = { VK_STRUCTURE_TYPE_FRAMEBUFFER_CREATE_INFO, NULL, 0, pass, n, views, (uint32_t) w, (uint32_t) h, 1 };
+		if (!pass || vkCreateFramebuffer(V.device, &info, NULL, &fb) != VK_SUCCESS) {
+			return false;
+		}
+		if (V.fbCount == V.fbCapacity) {
+			int const cap = V.fbCapacity ? V.fbCapacity * 2 : 32;
+			struct FbCache* more = realloc(V.fbs, (size_t) cap * sizeof(*more));
+			if (!more) {
+				vkDestroyFramebuffer(V.device, fb, NULL);
+				return false;
+			}
+			V.fbs = more, V.fbCapacity = cap;
+		}
+		V.fbs[V.fbCount++] = (struct FbCache) { pass, cv, dv, w, h, fb };
+	}
+	VkRenderPassBeginInfo begin = { VK_STRUCTURE_TYPE_RENDER_PASS_BEGIN_INFO, NULL, pass, fb, { { 0, 0 }, { (uint32_t) w, (uint32_t) h } }, 0, NULL };
+	vkCmdBeginRenderPass(cb, &begin, VK_SUBPASS_CONTENTS_INLINE);
+	V.passOpen = true;
+	V.passFbo = V.st.drawFbo;
+	V.pass = pass;
+	V.passWidth = w, V.passHeight = h;
+	V.boundPipeline = VK_NULL_HANDLE;
+	memset(&V.bound, 0, sizeof(V.bound));
+	return true;
+}
+
+static VkSampler sampler(GLenum minFilter, GLenum wrapS, GLenum wrapT, GLenum magFilter) {
+	int const lin = minFilter == GL_LINEAR, mag = magFilter == GL_LINEAR;
+	int const s = wrapS == GL_REPEAT ? 1 : wrapS == GL_MIRRORED_REPEAT ? 2 : 0;
+	int const t = wrapT == GL_REPEAT ? 1 : wrapT == GL_MIRRORED_REPEAT ? 2 : 0;
+	VkSampler* slot = &V.samplers[lin][s][t][mag];
+	if (!*slot) {
+		static const VkSamplerAddressMode modes[3] = { VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE, VK_SAMPLER_ADDRESS_MODE_REPEAT, VK_SAMPLER_ADDRESS_MODE_MIRRORED_REPEAT };
+		VkSamplerCreateInfo info = { VK_STRUCTURE_TYPE_SAMPLER_CREATE_INFO, NULL, 0, mag ? VK_FILTER_LINEAR : VK_FILTER_NEAREST,
+			                         lin ? VK_FILTER_LINEAR : VK_FILTER_NEAREST, VK_SAMPLER_MIPMAP_MODE_NEAREST, modes[s], modes[t],
+			                         VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE, 0, VK_FALSE, 1, VK_FALSE, VK_COMPARE_OP_ALWAYS, 0, 0,
+			                         VK_BORDER_COLOR_FLOAT_TRANSPARENT_BLACK, VK_FALSE };
+		vkCreateSampler(V.device, &info, NULL, slot);
+	}
+	return *slot;
+}
+
+// ---- Shaders and programs
+//
+// The renderer's GLSL ES 3.00 becomes Vulkan's: its loose uniforms one std140 block (set 0, binding
+// 0) both stages share, laid out here so a GL uniform location is an offset into it; each sampler a
+// binding after it, its texture unit given with Uniform1i; varyings given locations by name, the
+// output location 0; gl_VertexID gl_VertexIndex; and GL's -1 to 1 depth Vulkan's 0 to 1.
+
+struct Str {
+	char* p;
+	size_t n, cap;
+};
+
+static void put(struct Str* s, const char* text, size_t len) {
+	if (s->n + len + 1 > s->cap) {
+		size_t cap = s->cap ? s->cap * 2 : 4096;
+		while (cap < s->n + len + 1) {
+			cap *= 2;
+		}
+		char* more = realloc(s->p, cap);
+		if (!more) {
+			return;
+		}
+		s->p = more, s->cap = cap;
+	}
+	memcpy(s->p + s->n, text, len);
+	s->n += len;
+	s->p[s->n] = 0;
+}
+
+static void puts_(struct Str* s, const char* text) {
+	put(s, text, strlen(text));
+}
+
+static const char* skipSpace(const char* p) {
+	while (*p == ' ' || *p == '\t') {
+		++p;
+	}
+	return p;
+}
+
+static bool startsWord(const char* p, const char* word) {
+	size_t const n = strlen(word);
+	return !strncmp(p, word, n) && (p[n] == ' ' || p[n] == '\t');
+}
+
+// A type's std140 size and alignment (arrays: each element 16-byte aligned).
+static bool typeLayout(const char* type, int* size, int* align, bool* isInt) {
+	static const struct {
+		const char* name;
+		int size, align;
+		bool isInt;
+	} types[] = {
+		{ "float", 4, 4, false }, { "int", 4, 4, true }, { "uint", 4, 4, true }, { "bool", 4, 4, true },
+		{ "vec2", 8, 8, false }, { "ivec2", 8, 8, true }, { "uvec2", 8, 8, true },
+		{ "vec3", 12, 16, false }, { "ivec3", 12, 16, true }, { "uvec3", 12, 16, true },
+		{ "vec4", 16, 16, false }, { "ivec4", 16, 16, true }, { "uvec4", 16, 16, true }, { "mat4", 64, 16, false },
+	};
+	for (size_t i = 0; i < sizeof(types) / sizeof(*types); ++i) {
+		if (!strcmp(type, types[i].name)) {
+			*size = types[i].size, *align = types[i].align, *isInt = types[i].isInt;
+			return true;
+		}
+	}
+	return false;
+}
+
+// A uniform line's type and names ("uniform highp ivec4 uTile[24], uImage[8];"): calls each(name,
+// count) and returns the type in type; false when it isn't one.
+static bool uniformLine(const char* line, char* type, size_t typeSize, char names[][48], int* counts, int* n, int max) {
+	const char* p = skipSpace(line);
+	if (!startsWord(p, "uniform")) {
+		return false;
+	}
+	p = skipSpace(p + 7);
+	for (int k = 0; k < 2; ++k) {
+		if (startsWord(p, "highp") || startsWord(p, "mediump") || startsWord(p, "lowp")) {
+			p = skipSpace(strchr(p, ' ') + 1);
+		}
+	}
+	size_t t = 0;
+	while (*p && *p != ' ' && *p != '\t' && t + 1 < typeSize) {
+		type[t++] = *p++;
+	}
+	type[t] = 0;
+	*n = 0;
+	while (*p && *p != ';' && *n < max) {
+		p = skipSpace(p);
+		if (*p == ',') {
+			p = skipSpace(p + 1);
+		}
+		size_t k = 0;
+		while (*p && *p != ',' && *p != ';' && *p != '[' && *p != ' ' && k < 47) {
+			names[*n][k++] = *p++;
+		}
+		names[*n][k] = 0;
+		counts[*n] = 0;
+		if (*p == '[') {
+			counts[*n] = atoi(p + 1);
+			while (*p && *p != ']') {
+				++p;
+			}
+			if (*p) {
+				++p;
+			}
+		}
+		if (k) {
+			++*n;
+		}
+		p = skipSpace(p);
+	}
+	return t > 0;
+}
+
+// First pass over both stages: the uniforms (members, then samplers) and the varyings' locations.
+static void gather(struct Prog* p, const char* source, char varyings[][48], int* varyingCount) {
+	for (const char* line = source; line && *line;) {
+		const char* end = strchr(line, '\n');
+		size_t const len = end ? (size_t) (end - line) : strlen(line);
+		char buf[1024];
+		snprintf(buf, sizeof(buf), "%.*s", (int) (len < sizeof(buf) - 1 ? len : sizeof(buf) - 1), line);
+		char type[32], names[24][48];
+		int counts[24], n = 0;
+		if (uniformLine(buf, type, sizeof(type), names, counts, &n, 24)) {
+			for (int i = 0; i < n; ++i) {
+				if (strstr(type, "sampler")) {
+					int k = 0;
+					while (k < p->samplers && strcmp(p->sampler[k], names[i])) {
+						++k;
+					}
+					if (k == p->samplers && k < SAMPLERS) {
+						snprintf(p->sampler[p->samplers++], 48, "%s", names[i]);
+					}
+					continue;
+				}
+				int k = 0;
+				while (k < p->members && strcmp(p->member[k].name, names[i])) {
+					++k;
+				}
+				int size, align;
+				bool isInt;
+				if (k == p->members && k < MEMBERS && typeLayout(type, &size, &align, &isInt)) {
+					struct Member* m = &p->member[p->members++];
+					snprintf(m->name, sizeof(m->name), "%s", names[i]);
+					snprintf(m->type, sizeof(m->type), "%s", type);
+					int const stride = counts[i] ? (size + 15) / 16 * 16 : size;
+					align = counts[i] ? 16 : align;
+					m->offset = (p->blockSize + align - 1) / align * align;
+					m->size = counts[i] ? stride : size;
+					m->count = counts[i];
+					m->isInt = isInt;
+					p->blockSize = m->offset + (counts[i] ? stride * counts[i] : size);
+				}
+			}
+		}
+		const char* q = skipSpace(buf);
+		bool const flat = startsWord(q, "flat");
+		if (flat) {
+			q = skipSpace(q + 4);
+		}
+		if (startsWord(q, "out") && varyings) {
+			const char* name = strrchr(q, ' ');
+			if (name && *varyingCount < 16) {
+				snprintf(varyings[*varyingCount], 48, "%.*s", (int) strcspn(name + 1, ";"), name + 1);
+				++*varyingCount;
+			}
+		}
+		line = end ? end + 1 : NULL;
+	}
+	p->blockSize = (p->blockSize + 15) / 16 * 16;
+}
+
+static int varyingLocation(char varyings[][48], int count, const char* name) {
+	for (int i = 0; i < count; ++i) {
+		if (!strcmp(varyings[i], name)) {
+			return i;
+		}
+	}
+	return count;
+}
+
+// Second pass: one stage's Vulkan GLSL.
+static char* translate(const struct Prog* p, const char* source, bool vertex, char varyings[][48], int varyingCount, uint32_t* inputs) {
+	struct Str out = { 0 };
+	bool blockDone = false;
+	for (const char* line = source; line && *line;) {
+		const char* end = strchr(line, '\n');
+		size_t const len = end ? (size_t) (end - line) : strlen(line);
+		char buf[2048];
+		snprintf(buf, sizeof(buf), "%.*s", (int) (len < sizeof(buf) - 1 ? len : sizeof(buf) - 1), line);
+		line = end ? end + 1 : NULL;
+		const char* q = skipSpace(buf);
+		if (!strncmp(q, "#version", 8)) {
+			puts_(&out, "#version 310 es\n");
+			continue;
+		}
+		char type[32], names[24][48];
+		int counts[24], n = 0;
+		if (uniformLine(buf, type, sizeof(type), names, counts, &n, 24)) {
+			if (strstr(type, "sampler")) {
+				for (int i = 0; i < n; ++i) {
+					int k = 0;
+					while (k < p->samplers && strcmp(p->sampler[k], names[i])) {
+						++k;
+					}
+					char decl[160];
+					if (k == p->input) {
+						snprintf(decl, sizeof(decl), "layout(input_attachment_index = 0, set = 0, binding = %d) uniform highp subpassInput %s;\n", 1 + k, names[i]);
+					} else {
+						snprintf(decl, sizeof(decl), "layout(set = 0, binding = %d) uniform highp %s %s;\n", 1 + k, type, names[i]);
+					}
+					puts_(&out, decl);
+				}
+			} else if (!blockDone && p->members) {
+				puts_(&out, "layout(std140, set = 0, binding = 0) uniform VkglUniforms {\n");
+				for (int k = 0; k < p->members; ++k) {
+					char decl[160];
+					if (p->member[k].count) {
+						snprintf(decl, sizeof(decl), "\thighp %s %s[%d];\n", p->member[k].type, p->member[k].name, p->member[k].count);
+					} else {
+						snprintf(decl, sizeof(decl), "\thighp %s %s;\n", p->member[k].type, p->member[k].name);
+					}
+					puts_(&out, decl);
+				}
+				puts_(&out, "};\n");
+				blockDone = true;
+			}
+			continue;
+		}
+		bool const flat = startsWord(q, "flat");
+		const char* r = flat ? skipSpace(q + 4) : q;
+		if (startsWord(r, "out") || (startsWord(r, "in") && !vertex)) {
+			const char* name = strrchr(r, ' ');
+			char nm[48];
+			snprintf(nm, sizeof(nm), "%.*s", name ? (int) strcspn(name + 1, ";") : 0, name ? name + 1 : "");
+			int const location = !vertex && startsWord(r, "out") ? 0 : varyingLocation(varyings, varyingCount, nm);
+			char decl[64];
+			snprintf(decl, sizeof(decl), "layout(location = %d) ", location);
+			puts_(&out, decl);
+			puts_(&out, q);
+			puts_(&out, "\n");
+			continue;
+		}
+		if (vertex && !strncmp(q, "layout(location", 15) && strstr(q, ") in ")) {
+			*inputs |= 1u << atoi(q + strcspn(q, "=") + 1);
+		}
+		// The rest as it is, with Vulkan's names.
+		for (char* v = strstr(buf, "texelFetch(uMemory, ivec2(gl_FragCoord.xy), 0)"); v && p->input >= 0; v = strstr(v + 1, "texelFetch(uMemory, ivec2(gl_FragCoord.xy), 0)")) {
+			char rest[2048];
+			snprintf(rest, sizeof(rest), "subpassLoad(uMemory)%s", v + strlen("texelFetch(uMemory, ivec2(gl_FragCoord.xy), 0)"));
+			snprintf(v, sizeof(buf) - (size_t) (v - buf), "%s", rest);
+		}
+		for (char* v = strstr(buf, "gl_VertexID"); v; v = strstr(v + 1, "gl_VertexID")) {
+			char rest[2048];
+			snprintf(rest, sizeof(rest), "gl_VertexIndex%s", v + 11);
+			snprintf(v, sizeof(buf) - (size_t) (v - buf), "%s", rest);
+		}
+		if (vertex && strstr(buf, "void main()")) {
+			char* m = strstr(buf, "void main()");
+			char rest[2048];
+			snprintf(rest, sizeof(rest), "void vkglMain()%s", m + 11);
+			snprintf(m, sizeof(buf) - (size_t) (m - buf), "%s", rest);
+		}
+		puts_(&out, buf);
+		puts_(&out, "\n");
+	}
+	if (vertex) {
+		puts_(&out, "void main() {\n\tvkglMain();\n\tgl_Position.z = (gl_Position.z + gl_Position.w) * 0.5;\n}\n");
+	}
+	return out.p;
+}
+
+// SPIR-V for a stage, or NULL with the compiler's messages in log.
+static uint32_t* spirv(const char* source, bool vertex, size_t* words, char** log) {
+	glslang_input_t input = {
+		.language = GLSLANG_SOURCE_GLSL,
+		.stage = vertex ? GLSLANG_STAGE_VERTEX : GLSLANG_STAGE_FRAGMENT,
+		.client = GLSLANG_CLIENT_VULKAN,
+		.client_version = GLSLANG_TARGET_VULKAN_1_0,
+		.target_language = GLSLANG_TARGET_SPV,
+		.target_language_version = GLSLANG_TARGET_SPV_1_0,
+		.code = source,
+		.default_version = 310,
+		.default_profile = GLSLANG_ES_PROFILE,
+		.messages = GLSLANG_MSG_SPV_RULES_BIT | GLSLANG_MSG_VULKAN_RULES_BIT,
+		.resource = glslang_default_resource(),
+	};
+	glslang_shader_t* shader = glslang_shader_create(&input);
+	uint32_t* code = NULL;
+	if (!glslang_shader_preprocess(shader, &input) || !glslang_shader_parse(shader, &input)) {
+		const char* msg = glslang_shader_get_info_log(shader);
+		*log = strdup(msg ? msg : "compile failed");
+		glslang_shader_delete(shader);
+		return NULL;
+	}
+	glslang_program_t* program = glslang_program_create();
+	glslang_program_add_shader(program, shader);
+	if (!glslang_program_link(program, GLSLANG_MSG_SPV_RULES_BIT | GLSLANG_MSG_VULKAN_RULES_BIT)) {
+		const char* msg = glslang_program_get_info_log(program);
+		*log = strdup(msg ? msg : "link failed");
+	} else {
+		glslang_program_SPIRV_generate(program, input.stage);
+		*words = glslang_program_SPIRV_get_size(program);
+		code = malloc(*words * 4);
+		if (code) {
+			glslang_program_SPIRV_get(program, code);
+		}
+	}
+	glslang_program_delete(program);
+	glslang_shader_delete(shader);
+	return code;
+}
+
+// A program's SPIR-V kept on disk by its sources' hash (the shader cache folder): the two stages'
+// word counts, then their words.
+static void cachedSpirv(const char* path, uint32_t** v, size_t* vWords, uint32_t** f, size_t* fWords) {
+	FILE* in = fopen(path, "rb");
+	uint32_t counts[2];
+	if (!in || fread(counts, 4, 2, in) != 2 || !counts[0] || !counts[1] || counts[0] > (1u << 22) || counts[1] > (1u << 22)) {
+		if (in) {
+			fclose(in);
+		}
+		return;
+	}
+	*v = malloc((size_t) counts[0] * 4);
+	*f = malloc((size_t) counts[1] * 4);
+	if (*v && *f && fread(*v, 4, counts[0], in) == counts[0] && fread(*f, 4, counts[1], in) == counts[1]) {
+		*vWords = counts[0], *fWords = counts[1];
+	} else {
+		free(*v);
+		free(*f);
+		*v = *f = NULL;
+	}
+	fclose(in);
+}
+
+static void keepSpirv(const char* path, const uint32_t* v, size_t vWords, const uint32_t* f, size_t fWords) {
+	char temp[4400];
+	snprintf(temp, sizeof(temp), "%s.tmp", path);
+	FILE* out = fopen(temp, "wb");
+	uint32_t const counts[2] = { (uint32_t) vWords, (uint32_t) fWords };
+	if (out && fwrite(counts, 4, 2, out) == 2 && fwrite(v, 4, vWords, out) == vWords && fwrite(f, 4, fWords, out) == fWords && !fclose(out)) {
+		rename(temp, path);
+	} else if (out) {
+		fclose(out);
+		remove(temp);
+	}
+}
+
+static bool link(struct Prog* p) {
+	const char* vs = p->shader[0] && p->shader[0] < (GLuint) V.shaderCount ? V.shader[p->shader[0]].source : NULL;
+	const char* fs = p->shader[1] && p->shader[1] < (GLuint) V.shaderCount ? V.shader[p->shader[1]].source : NULL;
+	free(p->log);
+	p->log = NULL;
+	if (!vs || !fs) {
+		p->log = strdup("a stage is missing");
+		return false;
+	}
+	p->members = p->samplers = p->blockSize = 0;
+	char varyings[16][48];
+	int varyingCount = 0;
+	gather(p, vs, varyings, &varyingCount);
+	gather(p, fs, NULL, NULL);
+	p->input = -1;
+	for (int i = 0; i < p->samplers; ++i) {
+		p->input = !strcmp(p->sampler[i], "uMemory") ? i : p->input;
+	}
+	p->inputs = 0;
+	char* vText = translate(p, vs, true, varyings, varyingCount, &p->inputs);
+	char* fText = translate(p, fs, false, varyings, varyingCount, NULL);
+	size_t vWords = 0, fWords = 0;
+	uint32_t* vCode = NULL;
+	uint32_t* fCode = NULL;
+	char path[4300] = "";
+	if (vText && fText && glesCacheDirectory()[0]) {
+		uint64_t h = 0xCBF29CE484222325ull;
+		for (const char* c = vText; *c; ++c) {
+			h = (h ^ (uint8_t) *c) * 0x100000001B3ull;
+		}
+		for (const char* c = fText; *c; ++c) {
+			h = (h ^ (uint8_t) *c) * 0x100000001B3ull;
+		}
+		snprintf(path, sizeof(path), "%s/vk-%016llx.spv", glesCacheDirectory(), (unsigned long long) h);
+		cachedSpirv(path, &vCode, &vWords, &fCode, &fWords);
+	}
+	if (!vCode) {
+		vCode = vText ? spirv(vText, true, &vWords, &p->log) : NULL;
+		fCode = vCode && fText ? spirv(fText, false, &fWords, &p->log) : NULL;
+		if (vCode && fCode && path[0]) {
+			keepSpirv(path, vCode, vWords, fCode, fWords);
+		}
+	}
+	if (getenv("N64_VKGL_SHADERS") && (!vCode || !fCode)) {
+		fprintf(stderr, "vkgl: program failed:\n%s\n---\n%s\n---\n%s\n", vText ? vText : "", fText ? fText : "", p->log ? p->log : "");
+	}
+	free(vText);
+	free(fText);
+	if (!vCode || !fCode) {
+		free(vCode);
+		free(fCode);
+		return false;
+	}
+	VkShaderModuleCreateInfo vm = { VK_STRUCTURE_TYPE_SHADER_MODULE_CREATE_INFO, NULL, 0, vWords * 4, vCode };
+	VkShaderModuleCreateInfo fm = { VK_STRUCTURE_TYPE_SHADER_MODULE_CREATE_INFO, NULL, 0, fWords * 4, fCode };
+	bool ok = vkCreateShaderModule(V.device, &vm, NULL, &p->vertex) == VK_SUCCESS && vkCreateShaderModule(V.device, &fm, NULL, &p->fragment) == VK_SUCCESS;
+	free(vCode);
+	free(fCode);
+	VkDescriptorSetLayoutBinding bindings[1 + SAMPLERS];
+	uint32_t n = 0;
+	bindings[n++] = (VkDescriptorSetLayoutBinding) { 0, VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER_DYNAMIC, 1, VK_SHADER_STAGE_VERTEX_BIT | VK_SHADER_STAGE_FRAGMENT_BIT, NULL };
+	for (int i = 0; i < p->samplers; ++i) {
+		bool const input = i == p->input;
+		bindings[n++] = (VkDescriptorSetLayoutBinding) { (uint32_t) (1 + i), input ? VK_DESCRIPTOR_TYPE_INPUT_ATTACHMENT : VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, 1,
+			                                             input ? VK_SHADER_STAGE_FRAGMENT_BIT : VK_SHADER_STAGE_VERTEX_BIT | VK_SHADER_STAGE_FRAGMENT_BIT, NULL };
+	}
+	VkDescriptorSetLayoutCreateInfo sl = { VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO, NULL, 0, n, bindings };
+	ok = ok && vkCreateDescriptorSetLayout(V.device, &sl, NULL, &p->setLayout) == VK_SUCCESS;
+	VkPipelineLayoutCreateInfo pl = { VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO, NULL, 0, 1, &p->setLayout, 0, NULL };
+	ok = ok && vkCreatePipelineLayout(V.device, &pl, NULL, &p->layout) == VK_SUCCESS;
+	free(p->shadow);
+	p->shadow = calloc(1, (size_t) (p->blockSize ? p->blockSize : 16));
+	p->shadowDirty = true;
+	memset(p->unit, 0, sizeof(p->unit));
+	p->set = VK_NULL_HANDLE;
+	if (!ok) {
+		p->log = strdup("Vulkan objects unavailable");
+	}
+	return ok;
+}
+
+// ---- Pipelines and drawing
+
+static uint32_t texVersion = 1;
+
+struct PipeKey {
+	VkRenderPass pass;
+	uint32_t prog;
+	uint16_t mode, depthFunc, blendSrc[2], blendDst[2], blendEq[2], stencilFunc, stencilFail, stencilZfail, stencilZpass;
+	uint8_t blend, colorMask, depthTest, depthWrite, stencilTest, offset, hasColor, pad;
+	uint8_t format[ATTRIBS];
+	uint16_t stride[ATTRIBS];
+};
+
+_Static_assert(sizeof(struct PipeKey) <= 128, "pipeline key");
+
+static VkBlendFactor blendFactor(GLenum f) {
+	switch (f) {
+	case 0: return VK_BLEND_FACTOR_ZERO;
+	case 1: return VK_BLEND_FACTOR_ONE;
+	case 0x300: return VK_BLEND_FACTOR_SRC_COLOR;
+	case 0x301: return VK_BLEND_FACTOR_ONE_MINUS_SRC_COLOR;
+	case 0x302: return VK_BLEND_FACTOR_SRC_ALPHA;
+	case 0x303: return VK_BLEND_FACTOR_ONE_MINUS_SRC_ALPHA;
+	case 0x304: return VK_BLEND_FACTOR_DST_ALPHA;
+	case 0x305: return VK_BLEND_FACTOR_ONE_MINUS_DST_ALPHA;
+	case 0x306: return VK_BLEND_FACTOR_DST_COLOR;
+	case 0x307: return VK_BLEND_FACTOR_ONE_MINUS_DST_COLOR;
+	case 0x8001: return VK_BLEND_FACTOR_CONSTANT_COLOR;
+	case 0x8002: return VK_BLEND_FACTOR_ONE_MINUS_CONSTANT_COLOR;
+	case 0x8003: return VK_BLEND_FACTOR_CONSTANT_ALPHA;
+	case 0x8004: return VK_BLEND_FACTOR_ONE_MINUS_CONSTANT_ALPHA;
+	}
+	return VK_BLEND_FACTOR_ONE;
+}
+
+static VkBlendOp blendOp(GLenum e) {
+	return e == 0x8007 ? VK_BLEND_OP_MIN : e == 0x8008 ? VK_BLEND_OP_MAX : e == 0x800A ? VK_BLEND_OP_SUBTRACT : e == 0x800B ? VK_BLEND_OP_REVERSE_SUBTRACT : VK_BLEND_OP_ADD;
+}
+
+static VkCompareOp compareOp(GLenum f) {
+	return f >= 0x200 && f <= 0x207 ? (VkCompareOp) (f - 0x200) : VK_COMPARE_OP_ALWAYS;
+}
+
+static VkStencilOp stencilOp(GLenum op) {
+	switch (op) {
+	case 0: return VK_STENCIL_OP_ZERO;
+	case 0x1E01: return VK_STENCIL_OP_REPLACE;
+	case 0x1E02: return VK_STENCIL_OP_INCREMENT_AND_CLAMP;
+	case 0x1E03: return VK_STENCIL_OP_DECREMENT_AND_CLAMP;
+	case 0x150A: return VK_STENCIL_OP_INVERT;
+	}
+	return VK_STENCIL_OP_KEEP;
+}
+
+static const VkFormat attribFormats[6] = { VK_FORMAT_UNDEFINED, VK_FORMAT_R32_SFLOAT, VK_FORMAT_R32G32_SFLOAT, VK_FORMAT_R32G32B32_SFLOAT,
+	                                       VK_FORMAT_R32G32B32A32_SFLOAT, VK_FORMAT_R32_UINT };
+
+static uint32_t keyHash(const struct PipeKey* k) {
+	const uint8_t* b = (const uint8_t*) k;
+	uint32_t h = 2166136261u;
+	for (size_t i = 0; i < sizeof(*k); ++i) {
+		h = (h ^ b[i]) * 16777619u;
+	}
+	return h;
+}
+
+static VkPipeline pipeline(const struct PipeKey* k, struct Prog* p) {
+	if (V.lastPipe && !memcmp(V.lastKey, k, sizeof(*k))) {
+		return V.lastPipe;
+	}
+	uint32_t const h = keyHash(k);
+	for (uint32_t i = 0; i < 4096; ++i) {
+		int const at = V.pipeHash[(h + i) & 4095];
+		if (!at) {
+			break;
+		}
+		if (!memcmp(V.pipes[at - 1].key, k, sizeof(*k))) {
+			memcpy(V.lastKey, k, sizeof(*k));
+			V.lastPipe = V.pipes[at - 1].pipeline;
+			return V.lastPipe;
+		}
+	}
+	VkPipelineShaderStageCreateInfo stages[2] = {
+		{ VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO, NULL, 0, VK_SHADER_STAGE_VERTEX_BIT, p->vertex, "main", NULL },
+		{ VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO, NULL, 0, VK_SHADER_STAGE_FRAGMENT_BIT, p->fragment, "main", NULL },
+	};
+	VkVertexInputBindingDescription bindings[ATTRIBS];
+	VkVertexInputAttributeDescription attributes[ATTRIBS];
+	uint32_t n = 0;
+	for (uint32_t i = 0; i < ATTRIBS; ++i) {
+		if (k->format[i]) {
+			bindings[n] = (VkVertexInputBindingDescription) { i, k->stride[i], VK_VERTEX_INPUT_RATE_VERTEX };
+			attributes[n] = (VkVertexInputAttributeDescription) { i, i, attribFormats[k->format[i]], 0 };
+			++n;
+		}
+	}
+	VkPipelineVertexInputStateCreateInfo vi = { VK_STRUCTURE_TYPE_PIPELINE_VERTEX_INPUT_STATE_CREATE_INFO, NULL, 0, n, bindings, n, attributes };
+	VkPipelineInputAssemblyStateCreateInfo ia = { VK_STRUCTURE_TYPE_PIPELINE_INPUT_ASSEMBLY_STATE_CREATE_INFO, NULL, 0,
+		                                          k->mode == GL_TRIANGLE_STRIP ? VK_PRIMITIVE_TOPOLOGY_TRIANGLE_STRIP
+		                                          : k->mode == GL_TRIANGLE_FAN ? VK_PRIMITIVE_TOPOLOGY_TRIANGLE_FAN
+		                                                                       : VK_PRIMITIVE_TOPOLOGY_TRIANGLE_LIST,
+		                                          VK_FALSE };
+	VkPipelineViewportStateCreateInfo vp = { VK_STRUCTURE_TYPE_PIPELINE_VIEWPORT_STATE_CREATE_INFO, NULL, 0, 1, NULL, 1, NULL };
+	VkPipelineRasterizationStateCreateInfo rs = { VK_STRUCTURE_TYPE_PIPELINE_RASTERIZATION_STATE_CREATE_INFO, NULL, 0, VK_FALSE, VK_FALSE,
+		                                          VK_POLYGON_MODE_FILL, VK_CULL_MODE_NONE, VK_FRONT_FACE_COUNTER_CLOCKWISE, k->offset, 0, 0, 0, 1.0f };
+	VkPipelineMultisampleStateCreateInfo ms = { VK_STRUCTURE_TYPE_PIPELINE_MULTISAMPLE_STATE_CREATE_INFO, NULL, 0, VK_SAMPLE_COUNT_1_BIT, VK_FALSE, 0, NULL, VK_FALSE, VK_FALSE };
+	VkStencilOpState so = { stencilOp(k->stencilFail), stencilOp(k->stencilZpass), stencilOp(k->stencilZfail), compareOp(k->stencilFunc), 0xFF, 0xFF, 0 };
+	VkPipelineDepthStencilStateCreateInfo ds = { VK_STRUCTURE_TYPE_PIPELINE_DEPTH_STENCIL_STATE_CREATE_INFO, NULL, 0, k->depthTest, k->depthWrite,
+		                                         compareOp(k->depthFunc), VK_FALSE, k->stencilTest, so, so, 0, 1 };
+	VkPipelineColorBlendAttachmentState ba = { k->blend, blendFactor(k->blendSrc[0]), blendFactor(k->blendDst[0]), blendOp(k->blendEq[0]),
+		                                       blendFactor(k->blendSrc[1]), blendFactor(k->blendDst[1]), blendOp(k->blendEq[1]), k->colorMask };
+	VkPipelineColorBlendStateCreateInfo cb = { VK_STRUCTURE_TYPE_PIPELINE_COLOR_BLEND_STATE_CREATE_INFO, NULL, 0, VK_FALSE, VK_LOGIC_OP_COPY,
+		                                       k->hasColor ? 1u : 0u, &ba, { 0, 0, 0, 0 } };
+	static const VkDynamicState dynamic[] = { VK_DYNAMIC_STATE_VIEWPORT, VK_DYNAMIC_STATE_SCISSOR, VK_DYNAMIC_STATE_DEPTH_BIAS,
+		                                      VK_DYNAMIC_STATE_BLEND_CONSTANTS, VK_DYNAMIC_STATE_STENCIL_COMPARE_MASK,
+		                                      VK_DYNAMIC_STATE_STENCIL_WRITE_MASK, VK_DYNAMIC_STATE_STENCIL_REFERENCE };
+	VkPipelineDynamicStateCreateInfo dy = { VK_STRUCTURE_TYPE_PIPELINE_DYNAMIC_STATE_CREATE_INFO, NULL, 0, 7, dynamic };
+	VkGraphicsPipelineCreateInfo info = { VK_STRUCTURE_TYPE_GRAPHICS_PIPELINE_CREATE_INFO, NULL, 0, 2, stages, &vi, &ia, NULL, &vp, &rs, &ms, &ds, &cb,
+		                                  &dy, p->layout, k->pass, 0, VK_NULL_HANDLE, -1 };
+	VkPipeline pipe;
+	if (vkCreateGraphicsPipelines(V.device, V.pipelineCache, 1, &info, NULL, &pipe) != VK_SUCCESS) {
+		return VK_NULL_HANDLE;
+	}
+	if (V.pipeCount == V.pipeCapacity) {
+		int const cap = V.pipeCapacity ? V.pipeCapacity * 2 : 64;
+		struct Pipe* more = realloc(V.pipes, (size_t) cap * sizeof(*more));
+		if (!more) {
+			vkDestroyPipeline(V.device, pipe, NULL);
+			return VK_NULL_HANDLE;
+		}
+		V.pipes = more, V.pipeCapacity = cap;
+	}
+	struct Pipe* e = &V.pipes[V.pipeCount++];
+	memset(e->key, 0, sizeof(e->key));
+	memcpy(e->key, k, sizeof(*k));
+	e->pipeline = pipe;
+	for (uint32_t i = 0; i < 4096; ++i) {
+		if (!V.pipeHash[(h + i) & 4095]) {
+			V.pipeHash[(h + i) & 4095] = V.pipeCount;
+			break;
+		}
+	}
+	memcpy(V.lastKey, k, sizeof(*k));
+	V.lastPipe = pipe;
+	return pipe;
+}
+
+static struct Prog* progGet(GLuint name) {
+	return name && name < (GLuint) V.progCount && V.prog[name].used ? &V.prog[name] : NULL;
+}
+
+static struct Img* dummyImage(void);
+
+// The program's descriptor set (its uniforms at *offset in this turn's ring): reused while nothing it
+// holds changed. False when the turn moved on while taking room (then try again).
+static bool bindings(struct Prog* p, VkDescriptorSet* set, uint32_t* offset) {
+	uint64_t const serial = V.sub[V.current].serial;
+	if (p->shadowDirty || p->uboSerial != serial) {
+		size_t const at = ringTake(true, (size_t) p->blockSize ? (size_t) p->blockSize : 16, V.limits.minUniformBufferOffsetAlignment);
+		if (at == SIZE_MAX || V.sub[V.current].serial != serial) {
+			return false;
+		}
+		memcpy(V.sub[V.current].ubo.map + at, p->shadow, (size_t) p->blockSize);
+		p->uboOffset = (uint32_t) at, p->uboSerial = serial, p->shadowDirty = false;
+	}
+	*offset = p->uboOffset;
+	struct Fbo* drawing = fboGet(V.st.drawFbo);
+	struct Img* own = drawing ? fboColor(drawing) : NULL;
+	VkImageView const inputView = p->input >= 0 && own ? own->view : VK_NULL_HANDLE;
+	if (p->set && p->setSerial == serial && p->setVersion == texVersion && p->setInput == inputView) {
+		*set = p->set;
+		return true;
+	}
+	VkDescriptorSetAllocateInfo alloc = { VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO, NULL, V.sub[V.current].sets, 1, &p->setLayout };
+	if (vkAllocateDescriptorSets(V.device, &alloc, set) != VK_SUCCESS) {
+		submit(false);
+		return false;
+	}
+	VkDescriptorBufferInfo ubo = { V.sub[V.current].ubo.buffer, 0, (VkDeviceSize) (p->blockSize ? p->blockSize : 16) };
+	VkDescriptorImageInfo images[SAMPLERS];
+	VkWriteDescriptorSet writes[1 + SAMPLERS];
+	uint32_t n = 0;
+	writes[n++] = (VkWriteDescriptorSet) { VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, NULL, *set, 0, 0, 1, VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER_DYNAMIC, NULL, &ubo, NULL };
+	for (int i = 0; i < p->samplers; ++i) {
+		if (i == p->input) {
+			images[i] = (VkDescriptorImageInfo) { VK_NULL_HANDLE, inputView ? inputView : dummyImage()->view, VK_IMAGE_LAYOUT_GENERAL };
+			writes[n++] = (VkWriteDescriptorSet) { VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, NULL, *set, (uint32_t) (1 + i), 0, 1,
+				                                   VK_DESCRIPTOR_TYPE_INPUT_ATTACHMENT, &images[i], NULL, NULL };
+			continue;
+		}
+		int const unit = p->unit[i] >= 0 && p->unit[i] < UNITS ? p->unit[i] : 0;
+		GLuint const t = V.st.texture[unit];
+		struct Tex* tex = t && t < (GLuint) V.texCount && V.tex[t].used && V.tex[t].img.image ? &V.tex[t] : NULL;
+		struct Img* img = tex ? &tex->img : dummyImage();
+		images[i] = (VkDescriptorImageInfo) { tex ? sampler(tex->filter[0], tex->wrap[0], tex->wrap[1], tex->filter[1]) : sampler(GL_NEAREST, 0, 0, GL_NEAREST),
+			                                  img->view, VK_IMAGE_LAYOUT_GENERAL };
+		writes[n++] = (VkWriteDescriptorSet) { VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, NULL, *set, (uint32_t) (1 + i), 0, 1,
+			                                   VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, &images[i], NULL, NULL };
+	}
+	vkUpdateDescriptorSets(V.device, n, writes, 0, NULL);
+	p->set = *set, p->setSerial = serial, p->setVersion = texVersion, p->setInput = inputView;
+	return true;
+}
+
+static void glDrawArrays_(GLenum mode, GLint first, GLsizei count) {
+	struct Prog* p = progGet(V.st.program);
+	if (!p || !p->linked || count <= 0) {
+		return;
+	}
+	VkDescriptorSet set = VK_NULL_HANDLE;
+	uint32_t offset = 0;
+	for (int tries = 0; tries < 3 && !bindings(p, &set, &offset); ++tries) {
+		set = VK_NULL_HANDLE;
+	}
+	if (!set || !passBegin()) {
+		return;
+	}
+	VkCommandBuffer cb = V.sub[V.current].cb;
+	struct Fbo* f = fboGet(V.passFbo);
+	bool const hasColor = fboColor(f) != NULL, hasDepth = fboDepth(f) != NULL;
+	struct PipeKey k;
+	memset(&k, 0, sizeof(k));
+	k.pass = V.pass, k.prog = (uint32_t) V.st.program, k.mode = (uint16_t) mode;
+	k.hasColor = hasColor;
+	k.blend = hasColor && V.st.blend;
+	if (k.blend) {
+		for (int i = 0; i < 2; ++i) {
+			k.blendSrc[i] = (uint16_t) V.st.blendSrc[i], k.blendDst[i] = (uint16_t) V.st.blendDst[i], k.blendEq[i] = (uint16_t) V.st.blendEq[i];
+		}
+	}
+	k.colorMask = (uint8_t) (V.st.colorMask[0] | V.st.colorMask[1] << 1 | V.st.colorMask[2] << 2 | V.st.colorMask[3] << 3);
+	k.depthTest = hasDepth && V.st.depthTest;
+	k.depthWrite = k.depthTest && V.st.depthMask;
+	k.depthFunc = k.depthTest ? (uint16_t) V.st.depthFunc : 0;
+	k.stencilTest = hasDepth && V.st.stencilTest;
+	if (k.stencilTest) {
+		k.stencilFunc = (uint16_t) V.st.stencilFunc, k.stencilFail = (uint16_t) V.st.stencilFail;
+		k.stencilZfail = (uint16_t) V.st.stencilZfail, k.stencilZpass = (uint16_t) V.st.stencilZpass;
+	}
+	k.offset = V.st.polygonOffset;
+	struct Vao* vao = V.st.vao < (GLuint) V.vaoCount ? &V.vao[V.st.vao] : NULL;
+	VkBuffer buffers[ATTRIBS];
+	VkDeviceSize offsets[ATTRIBS];
+	for (int i = 0; i < ATTRIBS; ++i) {
+		buffers[i] = VK_NULL_HANDLE;
+		if (!(p->inputs & (1u << i)) || !vao || !vao->attrib[i].enabled) {
+			continue;
+		}
+		struct Attrib* a = &vao->attrib[i];
+		struct Buf* b = a->buffer && a->buffer < (GLuint) V.bufCount ? &V.buf[a->buffer] : NULL;
+		if (!b || !b->buffer) {
+			continue;
+		}
+		k.format[i] = a->integer ? 5 : (uint8_t) (a->size >= 1 && a->size <= 4 ? a->size : 4);
+		k.stride[i] = (uint16_t) (a->stride ? a->stride : (a->integer ? 4 : 4 * a->size));
+		buffers[i] = b->buffer;
+		offsets[i] = (VkDeviceSize) a->offset;
+		b->serial = V.sub[V.current].serial;
+	}
+	VkPipeline pipe = pipeline(&k, p);
+	if (!pipe) {
+		return;
+	}
+	if (pipe != V.boundPipeline) {
+		vkCmdBindPipeline(cb, VK_PIPELINE_BIND_POINT_GRAPHICS, pipe);
+		V.boundPipeline = pipe;
+	}
+	VkViewport viewport = { (float) V.st.viewport[0], (float) V.st.viewport[1], (float) V.st.viewport[2], (float) V.st.viewport[3], 0.0f, 1.0f };
+	if (viewport.width <= 0 || viewport.height <= 0) {
+		viewport.width = (float) V.passWidth, viewport.height = (float) V.passHeight;
+	}
+	if (!V.bound.valid || memcmp(&viewport, &V.bound.viewport, sizeof(viewport))) {
+		vkCmdSetViewport(cb, 0, 1, &viewport);
+		V.bound.viewport = viewport;
+	}
+	int x0 = 0, y0 = 0, x1 = V.passWidth, y1 = V.passHeight;
+	if (V.st.scissorOn) {
+		x0 = V.st.scissor[0] > 0 ? V.st.scissor[0] : 0, y0 = V.st.scissor[1] > 0 ? V.st.scissor[1] : 0;
+		x1 = V.st.scissor[0] + V.st.scissor[2], y1 = V.st.scissor[1] + V.st.scissor[3];
+		x1 = x1 < V.passWidth ? x1 : V.passWidth, y1 = y1 < V.passHeight ? y1 : V.passHeight;
+	}
+	if (x1 <= x0 || y1 <= y0) {
+		return;
+	}
+	VkRect2D scissor = { { x0, y0 }, { (uint32_t) (x1 - x0), (uint32_t) (y1 - y0) } };
+	bool const fresh = !V.bound.valid;
+	if (fresh || memcmp(&scissor, &V.bound.scissor, sizeof(scissor))) {
+		vkCmdSetScissor(cb, 0, 1, &scissor);
+		V.bound.scissor = scissor;
+	}
+	if (fresh || V.bound.bias[0] != V.st.offsetUnits || V.bound.bias[1] != V.st.offsetFactor) {
+		vkCmdSetDepthBias(cb, V.st.offsetUnits, 0.0f, V.st.offsetFactor);
+		V.bound.bias[0] = V.st.offsetUnits, V.bound.bias[1] = V.st.offsetFactor;
+	}
+	if (fresh || memcmp(V.bound.blend, V.st.blendColor, sizeof(V.bound.blend))) {
+		vkCmdSetBlendConstants(cb, V.st.blendColor);
+		memcpy(V.bound.blend, V.st.blendColor, sizeof(V.bound.blend));
+	}
+	uint32_t const stencil[2] = { V.st.stencilMask & 0xFF, (uint32_t) V.st.stencilRef & 0xFF };
+	if (fresh || memcmp(stencil, V.bound.stencil, sizeof(stencil))) {
+		vkCmdSetStencilCompareMask(cb, VK_STENCIL_FACE_FRONT_AND_BACK, stencil[0]);
+		vkCmdSetStencilWriteMask(cb, VK_STENCIL_FACE_FRONT_AND_BACK, 0xFF);
+		vkCmdSetStencilReference(cb, VK_STENCIL_FACE_FRONT_AND_BACK, stencil[1]);
+		memcpy(V.bound.stencil, stencil, sizeof(stencil));
+	}
+	if (fresh || V.bound.set != set || V.bound.offset != offset || V.bound.layout != p->layout) {
+		vkCmdBindDescriptorSets(cb, VK_PIPELINE_BIND_POINT_GRAPHICS, p->layout, 0, 1, &set, 1, &offset);
+		V.bound.set = set, V.bound.offset = offset, V.bound.layout = p->layout;
+	}
+	for (uint32_t i = 0; i < ATTRIBS; ++i) {
+		if (buffers[i] && (fresh || V.bound.vb[i] != buffers[i] || V.bound.vo[i] != offsets[i])) {
+			vkCmdBindVertexBuffers(cb, i, 1, &buffers[i], &offsets[i]);
+			V.bound.vb[i] = buffers[i], V.bound.vo[i] = offsets[i];
+		}
+	}
+	V.bound.valid = true;
+	vkCmdDraw(cb, (uint32_t) count, 1, (uint32_t) first, 0);
+}
+
+static void glClear_(GLbitfield mask) {
+	if (!passBegin()) {
+		return;
+	}
+	struct Fbo* f = fboGet(V.passFbo);
+	VkClearAttachment att[2];
+	uint32_t n = 0;
+	if ((mask & GL_COLOR_BUFFER_BIT) && fboColor(f)) {
+		att[n].aspectMask = VK_IMAGE_ASPECT_COLOR_BIT, att[n].colorAttachment = 0;
+		memcpy(att[n].clearValue.color.float32, V.st.clearColor, sizeof(V.st.clearColor));
+		++n;
+	}
+	VkImageAspectFlags aspects = ((mask & GL_DEPTH_BUFFER_BIT) ? VK_IMAGE_ASPECT_DEPTH_BIT : 0) | ((mask & GL_STENCIL_BUFFER_BIT) ? VK_IMAGE_ASPECT_STENCIL_BIT : 0);
+	if (aspects && fboDepth(f)) {
+		att[n].aspectMask = aspects, att[n].colorAttachment = 0;
+		att[n].clearValue.depthStencil = (VkClearDepthStencilValue) { V.st.clearDepth, (uint32_t) V.st.clearStencil };
+		++n;
+	}
+	if (!n) {
+		return;
+	}
+	int x0 = 0, y0 = 0, x1 = V.passWidth, y1 = V.passHeight;
+	if (V.st.scissorOn) {
+		x0 = V.st.scissor[0] > 0 ? V.st.scissor[0] : 0, y0 = V.st.scissor[1] > 0 ? V.st.scissor[1] : 0;
+		x1 = V.st.scissor[0] + V.st.scissor[2], y1 = V.st.scissor[1] + V.st.scissor[3];
+		x1 = x1 < V.passWidth ? x1 : V.passWidth, y1 = y1 < V.passHeight ? y1 : V.passHeight;
+	}
+	if (x1 <= x0 || y1 <= y0) {
+		return;
+	}
+	VkClearRect rect = { { { x0, y0 }, { (uint32_t) (x1 - x0), (uint32_t) (y1 - y0) } }, 0, 1 };
+	vkCmdClearAttachments(V.sub[V.current].cb, n, att, 1, &rect);
+}
+
+// ---- Copies
+
+// size bytes of data into the image's rectangle (RGBA bytes or floats, rows tight).
+static void upload(struct Img* img, int x, int y, int w, int h, const void* data, size_t size, VkBuffer from, VkDeviceSize fromOffset) {
+	if (w <= 0 || h <= 0 || !img->image) {
+		return;
+	}
+	VkBuffer src = from;
+	VkDeviceSize at = fromOffset;
+	if (!src) {
+		size_t const ring = size <= STAGE_BYTES ? ringTake(false, size, 16) : SIZE_MAX;
+		if (ring != SIZE_MAX) {
+			memcpy(V.sub[V.current].stage.map + ring, data, size);
+			src = V.sub[V.current].stage.buffer, at = ring;
+		} else {
+			struct Buf temp = { 0 };
+			if (!bufferMake(&temp, size, VK_BUFFER_USAGE_TRANSFER_SRC_BIT, false)) {
+				return;
+			}
+			memcpy(temp.map, data, size);
+			garbage(GARBAGE_BUFFER, (uint64_t) (uintptr_t) temp.buffer, (uint64_t) (uintptr_t) temp.memory);
+			src = temp.buffer, at = 0;
+		}
+	}
+	VkCommandBuffer cb = transfer();
+	layoutTo(cb, img, VK_IMAGE_LAYOUT_GENERAL);
+	VkBufferImageCopy region = { at, 0, 0, { VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1 }, { x, y, 0 }, { (uint32_t) w, (uint32_t) h, 1 } };
+	vkCmdCopyBufferToImage(cb, src, img->image, VK_IMAGE_LAYOUT_GENERAL, 1, &region);
+}
+
+static struct Img* dummyImage(void) {
+	if (!dummy.image && imageMake(&dummy, VK_FORMAT_R8G8B8A8_UNORM, 1, 1)) {
+		imageReady(&dummy);
+		uint32_t const black = 0;
+		upload(&dummy, 0, 0, 1, 1, &black, 4, VK_NULL_HANDLE, 0);
+	}
+	return &dummy;
+}
+
+// ---- GL: objects
+
+#define NAMES(type, array, count)                                         \
+	static GLuint new_##type(void) {                                      \
+		for (int i = 1; i < count; ++i) {                                 \
+			if (!array[i].used) {                                         \
+				memset(&array[i], 0, sizeof(array[i]));                   \
+				array[i].used = true;                                     \
+				return (GLuint) i;                                        \
+			}                                                             \
+		}                                                                 \
+		int const n = count ? count * 2 : 64;                             \
+		void* more = realloc(array, (size_t) n * sizeof(*array));         \
+		if (!more) {                                                      \
+			return 0;                                                     \
+		}                                                                 \
+		array = more;                                                     \
+		memset(&array[count], 0, (size_t) (n - count) * sizeof(*array));  \
+		int const at = count ? count : 1;                                 \
+		count = n;                                                        \
+		array[at].used = true;                                            \
+		return (GLuint) at;                                               \
+	}
+
+NAMES(tex, V.tex, V.texCount)
+NAMES(rb, V.rb, V.rbCount)
+NAMES(fbo, V.fbo, V.fboCount)
+NAMES(buf, V.buf, V.bufCount)
+NAMES(vao, V.vao, V.vaoCount)
+NAMES(shader, V.shader, V.shaderCount)
+NAMES(prog, V.prog, V.progCount)
+#undef NAMES
+
+static void glGenTextures_(GLsizei n, GLuint* out) {
+	for (GLsizei i = 0; i < n; ++i) {
+		out[i] = new_tex();
+		if (out[i]) {
+			V.tex[out[i]].filter[0] = V.tex[out[i]].filter[1] = GL_LINEAR;
+			V.tex[out[i]].wrap[0] = V.tex[out[i]].wrap[1] = GL_REPEAT;
+		}
+	}
+}
+
+static void glDeleteTextures_(GLsizei n, const GLuint* names) {
+	for (GLsizei i = 0; i < n; ++i) {
+		GLuint const t = names[i];
+		if (t && t < (GLuint) V.texCount && V.tex[t].used) {
+			passEnd();
+			imageFree(&V.tex[t].img);
+			V.tex[t].used = false;
+			for (int u = 0; u < UNITS; ++u) {
+				V.st.texture[u] = V.st.texture[u] == t ? 0 : V.st.texture[u];
+			}
+			++texVersion;
+		}
+	}
+}
+
+static void glActiveTexture_(GLenum unit) {
+	int const u = (int) (unit - GL_TEXTURE0);
+	V.st.unit = u >= 0 && u < UNITS ? u : 0;
+}
+
+static void glBindTexture_(GLenum target, GLuint t) {
+	(void) target;
+	if (V.st.texture[V.st.unit] != t) {
+		V.st.texture[V.st.unit] = t;
+		++texVersion;
+	}
+}
+
+static struct Tex* boundTex(void) {
+	GLuint const t = V.st.texture[V.st.unit];
+	return t && t < (GLuint) V.texCount && V.tex[t].used ? &V.tex[t] : NULL;
+}
+
+static void glTexParameteri_(GLenum target, GLenum pname, GLint v) {
+	(void) target;
+	struct Tex* t = boundTex();
+	if (!t) {
+		return;
+	}
+	if (pname == GL_TEXTURE_MIN_FILTER) {
+		t->filter[0] = v == GL_LINEAR ? GL_LINEAR : GL_NEAREST;
+	} else if (pname == GL_TEXTURE_MAG_FILTER) {
+		t->filter[1] = (GLenum) v;
+	} else if (pname == GL_TEXTURE_WRAP_S) {
+		t->wrap[0] = (GLenum) v;
+	} else if (pname == GL_TEXTURE_WRAP_T) {
+		t->wrap[1] = (GLenum) v;
+	}
+	++texVersion;
+}
+
+static void glTexImage2D_(GLenum target, GLint level, GLint internal, GLsizei w, GLsizei h, GLint border, GLenum format, GLenum type, const void* data) {
+	(void) target, (void) border, (void) format, (void) type;
+	struct Tex* t = boundTex();
+	if (!t || level) {
+		return;
+	}
+	VkFormat const f = internal == GL_R32F ? VK_FORMAT_R32_SFLOAT : VK_FORMAT_R8G8B8A8_UNORM;
+	if (!t->img.image || t->img.format != f || t->img.width != w || t->img.height != h) {
+		passEnd();
+		imageFree(&t->img);
+		if (!imageMake(&t->img, f, w, h)) {
+			return;
+		}
+		imageReady(&t->img);
+		++texVersion;
+	}
+	struct Buf* unpack = V.st.unpackBuffer && V.st.unpackBuffer < (GLuint) V.bufCount ? &V.buf[V.st.unpackBuffer] : NULL;
+	if (data || unpack) {
+		upload(&t->img, 0, 0, w, h, data, (size_t) w * (size_t) h * 4, unpack ? unpack->buffer : VK_NULL_HANDLE, (VkDeviceSize) (uintptr_t) data);
+	}
+}
+
+static void glTexSubImage2D_(GLenum target, GLint level, GLint x, GLint y, GLsizei w, GLsizei h, GLenum format, GLenum type, const void* data) {
+	(void) target, (void) format, (void) type;
+	struct Tex* t = boundTex();
+	if (!t || level || !t->img.image) {
+		return;
+	}
+	struct Buf* unpack = V.st.unpackBuffer && V.st.unpackBuffer < (GLuint) V.bufCount ? &V.buf[V.st.unpackBuffer] : NULL;
+	if (unpack) {
+		unpack->serial = V.sub[V.current].serial;
+	}
+	upload(&t->img, x, y, w, h, data, (size_t) w * (size_t) h * 4, unpack ? unpack->buffer : VK_NULL_HANDLE, (VkDeviceSize) (uintptr_t) data);
+}
+
+static void glGenRenderbuffers_(GLsizei n, GLuint* out) {
+	for (GLsizei i = 0; i < n; ++i) {
+		out[i] = new_rb();
+	}
+}
+
+static void glDeleteRenderbuffers_(GLsizei n, const GLuint* names) {
+	for (GLsizei i = 0; i < n; ++i) {
+		GLuint const r = names[i];
+		if (r && r < (GLuint) V.rbCount && V.rb[r].used) {
+			passEnd();
+			imageFree(&V.rb[r].img);
+			V.rb[r].used = false;
+		}
+	}
+}
+
+static void glBindRenderbuffer_(GLenum target, GLuint r) {
+	(void) target;
+	V.st.renderbuffer = r;
+}
+
+static void glRenderbufferStorage_(GLenum target, GLenum internal, GLsizei w, GLsizei h) {
+	(void) target;
+	GLuint const r = V.st.renderbuffer;
+	if (!r || r >= (GLuint) V.rbCount || !V.rb[r].used) {
+		return;
+	}
+	struct Img* img = &V.rb[r].img;
+	VkFormat const f = internal == 0x88F0 ? V.depthFormat : VK_FORMAT_R8G8B8A8_UNORM;
+	if (img->image && img->format == f && img->width == w && img->height == h) {
+		return;
+	}
+	passEnd();
+	imageFree(img);
+	if (imageMake(img, f, w, h)) {
+		imageReady(img);
+	}
+}
+
+static void glRenderbufferStorageMultisample_(GLenum target, GLsizei samples, GLenum internal, GLsizei w, GLsizei h) {
+	(void) samples;
+	glRenderbufferStorage_(target, internal, w, h);
+}
+
+static void glGenFramebuffers_(GLsizei n, GLuint* out) {
+	for (GLsizei i = 0; i < n; ++i) {
+		out[i] = new_fbo();
+	}
+}
+
+static void glDeleteFramebuffers_(GLsizei n, const GLuint* names) {
+	for (GLsizei i = 0; i < n; ++i) {
+		GLuint const f = names[i];
+		if (f && f < (GLuint) V.fboCount && V.fbo[f].used) {
+			if (V.passOpen && V.passFbo == f) {
+				passEnd();
+			}
+			V.fbo[f].used = false;
+			V.st.drawFbo = V.st.drawFbo == f ? 0 : V.st.drawFbo;
+			V.st.readFbo = V.st.readFbo == f ? 0 : V.st.readFbo;
+		}
+	}
+}
+
+static void glBindFramebuffer_(GLenum target, GLuint f) {
+	if (target == GL_FRAMEBUFFER || target == GL_DRAW_FRAMEBUFFER) {
+		V.st.drawFbo = f;
+	}
+	if (target == GL_FRAMEBUFFER || target == GL_READ_FRAMEBUFFER) {
+		V.st.readFbo = f;
+	}
+}
+
+static struct Fbo* targetFbo(GLenum target) {
+	return fboGet(target == GL_READ_FRAMEBUFFER ? V.st.readFbo : V.st.drawFbo);
+}
+
+static void glFramebufferTexture2D_(GLenum target, GLenum attachment, GLenum textarget, GLuint t, GLint level) {
+	(void) textarget, (void) level;
+	struct Fbo* f = targetFbo(target);
+	if (!f) {
+		return;
+	}
+	if (V.passOpen && &V.fbo[V.passFbo] == f) {
+		passEnd();
+	}
+	if (attachment == GL_COLOR_ATTACHMENT0) {
+		f->color = t, f->colorIsRb = false;
+	}
+}
+
+static void glFramebufferRenderbuffer_(GLenum target, GLenum attachment, GLenum rbtarget, GLuint r) {
+	(void) rbtarget;
+	struct Fbo* f = targetFbo(target);
+	if (!f) {
+		return;
+	}
+	if (V.passOpen && &V.fbo[V.passFbo] == f) {
+		passEnd();
+	}
+	if (attachment == GL_COLOR_ATTACHMENT0) {
+		f->color = r, f->colorIsRb = true;
+	} else if (attachment == GL_DEPTH_STENCIL_ATTACHMENT || attachment == GL_DEPTH_ATTACHMENT || attachment == GL_STENCIL_ATTACHMENT) {
+		f->depthStencil = r;
+	}
+}
+
+static GLenum glCheckFramebufferStatus_(GLenum target) {
+	struct Fbo* f = targetFbo(target);
+	return f && (fboColor(f) || fboDepth(f)) ? GL_FRAMEBUFFER_COMPLETE : GL_FRAMEBUFFER_INCOMPLETE_MISSING_ATTACHMENT;
+}
+
+static void glGenBuffers_(GLsizei n, GLuint* out) {
+	for (GLsizei i = 0; i < n; ++i) {
+		out[i] = new_buf();
+	}
+}
+
+static void glDeleteBuffers_(GLsizei n, const GLuint* names) {
+	for (GLsizei i = 0; i < n; ++i) {
+		GLuint const b = names[i];
+		if (b && b < (GLuint) V.bufCount && V.buf[b].used) {
+			if (V.buf[b].buffer) {
+				garbage(GARBAGE_BUFFER, (uint64_t) (uintptr_t) V.buf[b].buffer, (uint64_t) (uintptr_t) V.buf[b].memory);
+			}
+			memset(&V.buf[b], 0, sizeof(V.buf[b]));
+		}
+	}
+}
+
+static GLuint* bufferBinding(GLenum target) {
+	return target == GL_PIXEL_PACK_BUFFER ? &V.st.packBuffer : target == GL_PIXEL_UNPACK_BUFFER ? &V.st.unpackBuffer : &V.st.arrayBuffer;
+}
+
+static void glBindBuffer_(GLenum target, GLuint b) {
+	*bufferBinding(target) = b;
+}
+
+static void glBufferData_(GLenum target, GLsizeiptr size, const void* data, GLenum usage) {
+	(void) usage;
+	GLuint const name = *bufferBinding(target);
+	if (!name || name >= (GLuint) V.bufCount || !V.buf[name].used) {
+		return;
+	}
+	struct Buf* b = &V.buf[name];
+	if (b->buffer) {
+		garbage(GARBAGE_BUFFER, (uint64_t) (uintptr_t) b->buffer, (uint64_t) (uintptr_t) b->memory);
+		b->buffer = VK_NULL_HANDLE;
+	}
+	if (!bufferMake(b, (size_t) size, VK_BUFFER_USAGE_VERTEX_BUFFER_BIT | VK_BUFFER_USAGE_TRANSFER_SRC_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT,
+	                target == GL_PIXEL_PACK_BUFFER)) {
+		return;
+	}
+	b->serial = 0;
+	if (data) {
+		memcpy(b->map, data, (size_t) size);
+	}
+}
+
+static void* glMapBufferRange_(GLenum target, GLintptr offset, GLsizeiptr length, GLbitfield access) {
+	(void) length;
+	GLuint const name = *bufferBinding(target);
+	if (!name || name >= (GLuint) V.bufCount || !V.buf[name].map) {
+		return NULL;
+	}
+	struct Buf* b = &V.buf[name];
+	if (!(access & 0x20) && b->serial) {
+		waitSerial(b->serial);
+	}
+	return b->map + offset;
+}
+
+static GLboolean glUnmapBuffer_(GLenum target) {
+	(void) target;
+	return 1;
+}
+
+static void glGenVertexArrays_(GLsizei n, GLuint* out) {
+	for (GLsizei i = 0; i < n; ++i) {
+		out[i] = new_vao();
+	}
+}
+
+static void glDeleteVertexArrays_(GLsizei n, const GLuint* names) {
+	for (GLsizei i = 0; i < n; ++i) {
+		if (names[i] && names[i] < (GLuint) V.vaoCount) {
+			V.vao[names[i]].used = false;
+		}
+	}
+}
+
+static void glBindVertexArray_(GLuint a) {
+	V.st.vao = a;
+}
+
+static struct Attrib* attrib(GLuint index) {
+	if (index >= ATTRIBS) {
+		return NULL;
+	}
+	if (!V.st.vao) {
+		if (!V.vaoCount) {
+			GLuint const a = new_vao();
+			(void) a;
+		}
+		return V.vaoCount ? &V.vao[0].attrib[index] : NULL;
+	}
+	return V.st.vao < (GLuint) V.vaoCount ? &V.vao[V.st.vao].attrib[index] : NULL;
+}
+
+static void glVertexAttribPointer_(GLuint index, GLint size, GLenum type, GLboolean normalized, GLsizei stride, const void* pointer) {
+	(void) normalized;
+	struct Attrib* a = attrib(index);
+	if (a) {
+		a->buffer = V.st.arrayBuffer, a->size = size, a->type = type, a->stride = stride, a->offset = (size_t) (uintptr_t) pointer, a->integer = false;
+	}
+}
+
+static void glVertexAttribIPointer_(GLuint index, GLint size, GLenum type, GLsizei stride, const void* pointer) {
+	struct Attrib* a = attrib(index);
+	if (a) {
+		a->buffer = V.st.arrayBuffer, a->size = size, a->type = type, a->stride = stride, a->offset = (size_t) (uintptr_t) pointer, a->integer = true;
+	}
+}
+
+static void glEnableVertexAttribArray_(GLuint index) {
+	struct Attrib* a = attrib(index);
+	if (a) {
+		a->enabled = true;
+	}
+}
+
+// ---- GL: shaders and programs
+
+static GLuint glCreateShader_(GLenum type) {
+	GLuint const s = new_shader();
+	if (s) {
+		V.shader[s].type = type;
+	}
+	return s;
+}
+
+static void glShaderSource_(GLuint s, GLsizei count, const char* const* strings, const GLint* lengths) {
+	if (!s || s >= (GLuint) V.shaderCount) {
+		return;
+	}
+	struct Str text = { 0 };
+	for (GLsizei i = 0; i < count; ++i) {
+		put(&text, strings[i], lengths && lengths[i] >= 0 ? (size_t) lengths[i] : strlen(strings[i]));
+	}
+	free(V.shader[s].source);
+	V.shader[s].source = text.p;
+}
+
+static void glCompileShader_(GLuint s) {
+	(void) s;
+}
+
+static void glGetShaderiv_(GLuint s, GLenum pname, GLint* out) {
+	(void) s;
+	*out = pname == GL_COMPILE_STATUS || pname == GL_INFO_LOG_LENGTH ? 1 : 0;
+}
+
+static void glGetShaderInfoLog_(GLuint s, GLsizei max, GLsizei* length, char* log) {
+	(void) s;
+	if (max > 0) {
+		log[0] = 0;
+	}
+	if (length) {
+		*length = 0;
+	}
+}
+
+static void glDeleteShader_(GLuint s) {
+	if (s && s < (GLuint) V.shaderCount && V.shader[s].used) {
+		free(V.shader[s].source);
+		memset(&V.shader[s], 0, sizeof(V.shader[s]));
+	}
+}
+
+static GLuint glCreateProgram_(void) {
+	return new_prog();
+}
+
+static void glAttachShader_(GLuint program, GLuint s) {
+	struct Prog* p = progGet(program);
+	if (p && s && s < (GLuint) V.shaderCount) {
+		p->shader[V.shader[s].type == GL_FRAGMENT_SHADER ? 1 : 0] = s;
+	}
+}
+
+static void progRelease(struct Prog* p, GLuint name) {
+	if (!p->vertex && !p->layout) {
+		return;
+	}
+	submit(true);
+	vkDeviceWaitIdle(V.device);
+	for (int i = 0; i < V.pipeCount; ++i) {
+		struct PipeKey k;
+		memcpy(&k, V.pipes[i].key, sizeof(k));
+		if (k.prog == name) {
+			vkDestroyPipeline(V.device, V.pipes[i].pipeline, NULL);
+			V.pipes[i--] = V.pipes[--V.pipeCount];
+		}
+	}
+	// The lookups made again for the pipelines left.
+	memset(V.pipeHash, 0, sizeof(V.pipeHash));
+	for (int i = 0; i < V.pipeCount; ++i) {
+		struct PipeKey k;
+		memcpy(&k, V.pipes[i].key, sizeof(k));
+		uint32_t const h = keyHash(&k);
+		for (uint32_t j = 0; j < 4096; ++j) {
+			if (!V.pipeHash[(h + j) & 4095]) {
+				V.pipeHash[(h + j) & 4095] = i + 1;
+				break;
+			}
+		}
+	}
+	V.lastPipe = VK_NULL_HANDLE;
+	if (p->vertex) {
+		vkDestroyShaderModule(V.device, p->vertex, NULL);
+		vkDestroyShaderModule(V.device, p->fragment, NULL);
+	}
+	if (p->layout) {
+		vkDestroyPipelineLayout(V.device, p->layout, NULL);
+		vkDestroyDescriptorSetLayout(V.device, p->setLayout, NULL);
+	}
+	p->vertex = p->fragment = VK_NULL_HANDLE, p->layout = VK_NULL_HANDLE, p->setLayout = VK_NULL_HANDLE;
+}
+
+static void glLinkProgram_(GLuint program) {
+	struct Prog* p = progGet(program);
+	if (p) {
+		progRelease(p, program);
+		p->linked = link(p);
+	}
+}
+
+static void glGetProgramiv_(GLuint program, GLenum pname, GLint* out) {
+	struct Prog* p = progGet(program);
+	if (pname == GL_LINK_STATUS) {
+		*out = p && p->linked;
+	} else if (pname == GL_COMPLETION_STATUS_KHR) {
+		*out = 1;
+	} else if (pname == GL_INFO_LOG_LENGTH) {
+		*out = p && p->log ? (GLint) strlen(p->log) + 1 : 1;
+	} else {
+		*out = 0;
+	}
+}
+
+static void glGetProgramInfoLog_(GLuint program, GLsizei max, GLsizei* length, char* log) {
+	struct Prog* p = progGet(program);
+	if (max <= 0) {
+		return;
+	}
+	snprintf(log, (size_t) max, "%s", p && p->log ? p->log : "");
+	if (length) {
+		*length = (GLsizei) strlen(log);
+	}
+}
+
+static void glUseProgram_(GLuint program) {
+	V.st.program = program;
+}
+
+static void glDeleteProgram_(GLuint program) {
+	struct Prog* p = progGet(program);
+	if (!p) {
+		return;
+	}
+	progRelease(p, program);
+	free(p->shadow);
+	free(p->log);
+	memset(p, 0, sizeof(*p));
+	V.st.program = V.st.program == program ? 0 : V.st.program;
+}
+
+static GLint glGetUniformLocation_(GLuint program, const char* name) {
+	struct Prog* p = progGet(program);
+	if (!p) {
+		return -1;
+	}
+	// A location: the member times LOCATION_ELEMENTS plus the array element named ("uTile[3]"); a
+	// sampler's, SAMPLER_LOCATION plus its index.
+	char base[48];
+	snprintf(base, sizeof(base), "%.*s", (int) strcspn(name, "["), name);
+	const char* bracket = strchr(name, '[');
+	int const element = bracket ? atoi(bracket + 1) : 0;
+	for (int i = 0; i < p->members; ++i) {
+		if (!strcmp(p->member[i].name, base)) {
+			return element >= 0 && element < (p->member[i].count ? p->member[i].count : 1) ? i * LOCATION_ELEMENTS + element : -1;
+		}
+	}
+	for (int i = 0; i < p->samplers; ++i) {
+		if (!strcmp(p->sampler[i], base)) {
+			return SAMPLER_LOCATION + i;
+		}
+	}
+	return -1;
+}
+
+static void* uniformAt(GLint location, int* stride, int* count) {
+	struct Prog* p = progGet(V.st.program);
+	if (!p || location < 0 || location >= SAMPLER_LOCATION || location / LOCATION_ELEMENTS >= p->members || !p->shadow) {
+		return NULL;
+	}
+	struct Member* m = &p->member[location / LOCATION_ELEMENTS];
+	int const element = location % LOCATION_ELEMENTS;
+	*stride = m->size, *count = (m->count ? m->count : 1) - element;
+	p->shadowDirty = true;
+	return p->shadow + m->offset + element * m->size;
+}
+
+static void glUniform1i_(GLint location, GLint v) {
+	struct Prog* p = progGet(V.st.program);
+	if (p && location >= SAMPLER_LOCATION && location - SAMPLER_LOCATION < p->samplers) {
+		if (p->unit[location - SAMPLER_LOCATION] != v) {
+			p->unit[location - SAMPLER_LOCATION] = v;
+			++texVersion;
+		}
+		return;
+	}
+	int stride, count;
+	void* at = uniformAt(location, &stride, &count);
+	if (at) {
+		memcpy(at, &v, 4);
+	}
+}
+
+static void glUniform1f_(GLint location, float v) {
+	int stride, count;
+	void* at = uniformAt(location, &stride, &count);
+	if (at) {
+		memcpy(at, &v, 4);
+	}
+}
+
+static void glUniform2f_(GLint location, float a, float b) {
+	int stride, count;
+	float* at = uniformAt(location, &stride, &count);
+	if (at) {
+		at[0] = a, at[1] = b;
+	}
+}
+
+static void glUniform4f_(GLint location, float a, float b, float c, float d) {
+	int stride, count;
+	float* at = uniformAt(location, &stride, &count);
+	if (at) {
+		at[0] = a, at[1] = b, at[2] = c, at[3] = d;
+	}
+}
+
+static void glUniform4iv_(GLint location, GLsizei n, const GLint* v) {
+	int stride, count;
+	uint8_t* at = uniformAt(location, &stride, &count);
+	for (GLsizei i = 0; at && i < n && i < count; ++i) {
+		memcpy(at + (size_t) i * (size_t) stride, v + i * 4, 16);
+	}
+}
+
+// ---- GL: state
+
+static void cap(GLenum c, bool on) {
+	if (c == GL_SCISSOR_TEST) {
+		V.st.scissorOn = on;
+	} else if (c == GL_DEPTH_TEST) {
+		V.st.depthTest = on;
+	} else if (c == GL_STENCIL_TEST) {
+		V.st.stencilTest = on;
+	} else if (c == GL_BLEND) {
+		V.st.blend = on;
+	} else if (c == GL_POLYGON_OFFSET_FILL) {
+		V.st.polygonOffset = on;
+	}
+}
+
+static void glEnable_(GLenum c) {
+	cap(c, true);
+}
+
+static void glDisable_(GLenum c) {
+	cap(c, false);
+}
+
+static void glViewport_(GLint x, GLint y, GLsizei w, GLsizei h) {
+	V.st.viewport[0] = x, V.st.viewport[1] = y, V.st.viewport[2] = w, V.st.viewport[3] = h;
+}
+
+static void glScissor_(GLint x, GLint y, GLsizei w, GLsizei h) {
+	V.st.scissor[0] = x, V.st.scissor[1] = y, V.st.scissor[2] = w, V.st.scissor[3] = h;
+}
+
+static void glClearColor_(float r, float g, float b, float a) {
+	V.st.clearColor[0] = r, V.st.clearColor[1] = g, V.st.clearColor[2] = b, V.st.clearColor[3] = a;
+}
+
+static void glClearDepthf_(float d) {
+	V.st.clearDepth = d;
+}
+
+static void glClearStencil_(GLint s) {
+	V.st.clearStencil = s;
+}
+
+static void glDepthFunc_(GLenum f) {
+	V.st.depthFunc = f;
+}
+
+static void glDepthMask_(GLboolean on) {
+	V.st.depthMask = on != 0;
+}
+
+static void glBlendFuncSeparate_(GLenum sc, GLenum dc, GLenum sa, GLenum da) {
+	V.st.blendSrc[0] = sc, V.st.blendDst[0] = dc, V.st.blendSrc[1] = sa, V.st.blendDst[1] = da;
+}
+
+static void glBlendFunc_(GLenum s, GLenum d) {
+	glBlendFuncSeparate_(s, d, s, d);
+}
+
+static void glBlendEquationSeparate_(GLenum c, GLenum a) {
+	V.st.blendEq[0] = c, V.st.blendEq[1] = a;
+}
+
+static void glBlendColor_(float r, float g, float b, float a) {
+	V.st.blendColor[0] = r, V.st.blendColor[1] = g, V.st.blendColor[2] = b, V.st.blendColor[3] = a;
+}
+
+static void glPolygonOffset_(float factor, float units) {
+	V.st.offsetFactor = factor, V.st.offsetUnits = units;
+}
+
+static void glStencilFunc_(GLenum f, GLint ref, GLuint mask) {
+	V.st.stencilFunc = f, V.st.stencilRef = ref, V.st.stencilMask = mask;
+}
+
+static void glStencilOp_(GLenum fail, GLenum zfail, GLenum zpass) {
+	V.st.stencilFail = fail, V.st.stencilZfail = zfail, V.st.stencilZpass = zpass;
+}
+
+static void glColorMask_(GLboolean r, GLboolean g, GLboolean b, GLboolean a) {
+	V.st.colorMask[0] = r != 0, V.st.colorMask[1] = g != 0, V.st.colorMask[2] = b != 0, V.st.colorMask[3] = a != 0;
+}
+
+static const unsigned char* glGetString_(GLenum name) {
+	const char* s = name == GL_RENDERER ? V.renderer : name == GL_VERSION ? "OpenGL ES 3.1 (armN64 on Vulkan)"
+	              : name == GL_VENDOR ? "armN64"
+	              : name == GL_SHADING_LANGUAGE_VERSION ? "OpenGL ES GLSL ES 3.10"
+	              : name == GL_EXTENSIONS               ? "GL_NV_texture_barrier"
+	                                                    : "";
+	return (const unsigned char*) s;
+}
+
+static void glGetIntegerv_(GLenum pname, GLint* out) {
+	if (pname == GL_MAX_TEXTURE_SIZE || pname == GL_MAX_RENDERBUFFER_SIZE) {
+		*out = (GLint) V.limits.maxImageDimension2D;
+	} else if (pname == GL_MAX_SAMPLES) {
+		*out = 1;
+	} else {
+		*out = 0;
+	}
+}
+
+static void glPixelStorei_(GLenum pname, GLint v) {
+	(void) pname, (void) v;
+}
+
+static void glFlush_(void) {
+	submit(false);
+}
+
+static void glFinish_(void) {
+	submit(true);
+}
+
+// What the draws before wrote, for the next to read as its own pixel: within the render pass, pixel
+// by pixel.
+static void glTextureBarrierNV_(void) {
+	if (V.passOpen) {
+		VkMemoryBarrier m = { VK_STRUCTURE_TYPE_MEMORY_BARRIER, NULL, VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT, VK_ACCESS_INPUT_ATTACHMENT_READ_BIT };
+		vkCmdPipelineBarrier(V.sub[V.current].cb, VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT, VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT,
+		                     VK_DEPENDENCY_BY_REGION_BIT, 1, &m, 0, NULL, 0, NULL);
+	}
+}
+
+static void glMemoryBarrier_(GLbitfield bits) {
+	(void) bits;
+}
+
+static GLenum glGetError_(void) {
+	return 0;
+}
+
+// ---- GL: reading and copying pixels
+
+static void glReadPixels_(GLint x, GLint y, GLsizei w, GLsizei h, GLenum format, GLenum type, void* out) {
+	(void) format, (void) type;
+	struct Fbo* f = fboGet(V.st.readFbo);
+	struct Img* img = f ? fboColor(f) : NULL;
+	if (!img || w <= 0 || h <= 0) {
+		return;
+	}
+	size_t const size = (size_t) w * (size_t) h * 4;
+	struct Buf* pack = V.st.packBuffer && V.st.packBuffer < (GLuint) V.bufCount && V.buf[V.st.packBuffer].buffer ? &V.buf[V.st.packBuffer] : NULL;
+	if (!pack && V.readBuffer.size < size) {
+		if (V.readBuffer.buffer) {
+			garbage(GARBAGE_BUFFER, (uint64_t) (uintptr_t) V.readBuffer.buffer, (uint64_t) (uintptr_t) V.readBuffer.memory);
+			V.readBuffer.buffer = VK_NULL_HANDLE;
+		}
+		if (!bufferMake(&V.readBuffer, size, VK_BUFFER_USAGE_TRANSFER_DST_BIT, true)) {
+			return;
+		}
+	}
+	VkCommandBuffer cb = transfer();
+	layoutTo(cb, img, VK_IMAGE_LAYOUT_GENERAL);
+	VkBufferImageCopy region = { pack ? (VkDeviceSize) (uintptr_t) out : 0, 0, 0, { VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1 }, { x, y, 0 },
+		                         { (uint32_t) w, (uint32_t) h, 1 } };
+	vkCmdCopyImageToBuffer(cb, img->image, VK_IMAGE_LAYOUT_GENERAL, pack ? pack->buffer : V.readBuffer.buffer, 1, &region);
+	if (pack) {
+		pack->serial = V.sub[V.current].serial;
+		return;
+	}
+	submit(true);
+	memcpy(out, V.readBuffer.map, size);
+}
+
+static void glBlitFramebuffer_(GLint sx0, GLint sy0, GLint sx1, GLint sy1, GLint dx0, GLint dy0, GLint dx1, GLint dy1, GLbitfield mask, GLenum filter) {
+	struct Fbo* r = fboGet(V.st.readFbo);
+	struct Fbo* d = fboGet(V.st.drawFbo);
+	if (!r || !d) {
+		return;
+	}
+	if (mask & GL_COLOR_BUFFER_BIT) {
+		struct Img* src = fboColor(r);
+		struct Img* dst = fboColor(d);
+		if (src && dst) {
+			VkCommandBuffer cb = transfer();
+			layoutTo(cb, src, VK_IMAGE_LAYOUT_GENERAL);
+			layoutTo(cb, dst, VK_IMAGE_LAYOUT_GENERAL);
+			VkImageBlit blit = { { VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1 }, { { sx0, sy0, 0 }, { sx1, sy1, 1 } }, { VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1 },
+				                 { { dx0, dy0, 0 }, { dx1, dy1, 1 } } };
+			vkCmdBlitImage(cb, src->image, VK_IMAGE_LAYOUT_GENERAL, dst->image, VK_IMAGE_LAYOUT_GENERAL, 1, &blit,
+			               filter == GL_LINEAR ? VK_FILTER_LINEAR : VK_FILTER_NEAREST);
+		}
+	}
+	if (mask & (GL_DEPTH_BUFFER_BIT | GL_STENCIL_BUFFER_BIT)) {
+		struct Img* src = fboDepth(r);
+		struct Img* dst = fboDepth(d);
+		int const w = sx1 - sx0, h = sy1 - sy0;
+		if (src && dst && w > 0 && h > 0 && w == dx1 - dx0 && h == dy1 - dy0) {
+			VkCommandBuffer cb = transfer();
+			VkImageCopy copy = { { src->aspect, 0, 0, 1 }, { sx0, sy0, 0 }, { dst->aspect, 0, 0, 1 }, { dx0, dy0, 0 }, { (uint32_t) w, (uint32_t) h, 1 } };
+			vkCmdCopyImage(cb, src->image, VK_IMAGE_LAYOUT_GENERAL, dst->image, VK_IMAGE_LAYOUT_GENERAL, 1, &copy);
+		}
+	}
+}
+
+// ---- The frontend's picture
+
+unsigned vkglFrontendFramebuffer(int width, int height) {
+	if (!V.pictureFbo) {
+		V.pictureFbo = new_fbo();
+		if (!V.pictureFbo) {
+			return 0;
+		}
+	}
+	uint32_t const mask = V.external && V.frontend.syncIndexMask ? V.frontend.syncIndexMask(V.frontend.handle) : 1;
+	int count = 0;
+	for (uint32_t m = mask; m && count < 4; m >>= 1) {
+		count += (int) (m & 1);
+	}
+	count = count ? count : 1;
+	V.pictureIndex = V.external && V.frontend.syncIndex ? (int) (V.frontend.syncIndex(V.frontend.handle) % (uint32_t) count) : 0;
+	struct Img* img = &V.picture[V.pictureIndex];
+	if (!img->image || img->width != width || img->height != height) {
+		passEnd();
+		imageFree(img);
+		if (!imageMake(img, VK_FORMAT_R8G8B8A8_UNORM, width, height)) {
+			return 0;
+		}
+		imageReady(img);
+	}
+	// The framebuffer's color is this frame's picture (picture slot, not a texture).
+	V.fbo[V.pictureFbo].color = 0;
+	V.fbo[V.pictureFbo].colorIsRb = false;
+	return V.pictureFbo;
+}
+
+bool vkglPicture(VkImage* image, VkImageView* view, VkImageLayout* layout, VkImageViewCreateInfo* info) {
+	struct Img* img = &V.picture[V.pictureIndex];
+	if (!img->image) {
+		return false;
+	}
+	VkCommandBuffer cb = transfer();
+	layoutTo(cb, img, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL);
+	submit(false);
+	*image = img->image, *view = img->view, *layout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
+	*info = (VkImageViewCreateInfo) { VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO, NULL, 0, img->image, VK_IMAGE_VIEW_TYPE_2D, img->format,
+		                              { VK_COMPONENT_SWIZZLE_IDENTITY, VK_COMPONENT_SWIZZLE_IDENTITY, VK_COMPONENT_SWIZZLE_IDENTITY, VK_COMPONENT_SWIZZLE_IDENTITY },
+		                              { VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1 } };
+	return true;
+}
+
+// ---- GL's functions by name
+
+void* vkglProc(const char* name) {
+	static const struct {
+		const char* name;
+		void* f;
+	} table[] = {
+#define F(n) { "gl" #n, (void*) gl##n##_ }
+		F(GenFramebuffers), F(BindFramebuffer), F(BlitFramebuffer), F(FramebufferTexture2D), F(FramebufferRenderbuffer),
+		F(CheckFramebufferStatus), F(DeleteFramebuffers), F(GenRenderbuffers), F(DeleteRenderbuffers), F(BindRenderbuffer),
+		F(RenderbufferStorage), F(RenderbufferStorageMultisample), F(GenTextures), F(DeleteTextures), F(BindTexture), F(ActiveTexture),
+		F(TexImage2D), F(TexSubImage2D), F(TexParameteri), F(Viewport), F(Scissor), F(Enable), F(Disable), F(ClearColor),
+		F(ClearDepthf), F(Clear), F(DepthFunc), F(DepthMask), F(BlendFunc), F(BlendFuncSeparate), F(BlendEquationSeparate),
+		F(BlendColor), F(PolygonOffset), F(StencilFunc), F(StencilOp), F(ColorMask), F(ClearStencil), F(GetString), F(GetIntegerv),
+		F(ReadPixels), F(PixelStorei), F(CreateShader), F(ShaderSource), F(CompileShader), F(GetShaderiv), F(GetShaderInfoLog),
+		F(DeleteShader), F(CreateProgram), F(AttachShader), F(LinkProgram), F(GetProgramiv), F(GetProgramInfoLog), F(UseProgram),
+		F(DeleteProgram), F(GetUniformLocation), F(Uniform1i), F(Uniform1f), F(Uniform2f), F(Uniform4f), F(Uniform4iv),
+		F(GenVertexArrays), F(DeleteVertexArrays), F(BindVertexArray), F(GenBuffers), F(DeleteBuffers), F(BindBuffer), F(BufferData),
+		F(MapBufferRange), F(UnmapBuffer), F(VertexAttribPointer), F(VertexAttribIPointer), F(EnableVertexAttribArray), F(DrawArrays),
+		F(Flush), F(Finish), F(MemoryBarrier), F(GetError), F(TextureBarrierNV),
+#undef F
+	};
+	for (size_t i = 0; i < sizeof(table) / sizeof(*table); ++i) {
+		if (!strcmp(table[i].name, name)) {
+			return table[i].f;
+		}
+	}
+	return NULL;
+}
