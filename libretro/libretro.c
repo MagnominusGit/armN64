@@ -14,6 +14,7 @@
 #include "options.h"
 #include "games.h"
 #include "paks.h"
+#include "vkpresent.h"
 
 #include <dirent.h>
 #ifndef __ANDROID__
@@ -88,6 +89,10 @@ static struct retro_hw_render_callback hw;
 static bool hwWanted, hwReady, viInContext;
 // Whether the frontend gave its GL context, and without it whether the core may make its own.
 static bool contextGiven, ownContext;
+// A Vulkan frontend taking the pictures of the core's own GL context, which stands in for a frontend's
+// (current while the core runs).
+static bool vkFrontend;
+static struct Gles* vkGles;
 
 static struct {
 	void (*GenTextures)(int, unsigned*);
@@ -741,16 +746,15 @@ static void* hwProc(const char* name) {
 	return (void*) hw.get_proc_address(name);
 }
 
-// The frontend made the context (again): the renderer starts in it, and the picture's texture.
-static void hwReset(void) {
-	glesFrontend(hwProc);
+// The picture's texture, and the functions that put it in the frontend's framebuffer.
+static void glReady(void* (*getProc)(const char* name)) {
 	void** fns = (void**) &gl;
 	static const char* const names[] = { "glGenTextures", "glDeleteTextures", "glBindTexture", "glTexImage2D", "glTexSubImage2D", "glGenFramebuffers",
 		                                   "glDeleteFramebuffers", "glBindFramebuffer", "glFramebufferTexture2D", "glBlitFramebuffer", "glDisable",
 		                                   "glBindBuffer", "glMemoryBarrier" };
 	hwReady = true;
 	for (size_t i = 0; i < sizeof(names) / sizeof(*names); ++i) {
-		fns[i] = hwProc(names[i]);
+		fns[i] = getProc(names[i]);
 		hwReady &= fns[i] != NULL;
 	}
 	if (!hwReady) {
@@ -764,6 +768,12 @@ static void hwReset(void) {
 	gl.GenFramebuffers(1, &presentFramebuffer);
 	gl.BindFramebuffer(GL_READ_FRAMEBUFFER, presentFramebuffer);
 	gl.FramebufferTexture2D(GL_READ_FRAMEBUFFER, GL_COLOR_ATTACHMENT0, GL_TEXTURE_2D, presentTexture, 0);
+}
+
+// The frontend made the context (again): the renderer starts in it, and the picture's texture.
+static void hwReset(void) {
+	glesFrontend(hwProc);
+	glReady(hwProc);
 }
 
 static void hwDestroy(void) {
@@ -811,22 +821,7 @@ static void vulkanReset(void) {
 		logMessage(RETRO_LOG_ERROR, error);
 		return;
 	}
-	void** fns = (void**) &gl;
-	static const char* const names[] = { "glGenTextures", "glDeleteTextures", "glBindTexture", "glTexImage2D", "glTexSubImage2D", "glGenFramebuffers",
-		                                   "glDeleteFramebuffers", "glBindFramebuffer", "glFramebufferTexture2D", "glBlitFramebuffer", "glDisable",
-		                                   "glBindBuffer", "glMemoryBarrier" };
-	hwReady = true;
-	for (size_t i = 0; i < sizeof(names) / sizeof(*names); ++i) {
-		fns[i] = vkglProc(names[i]);
-		hwReady &= fns[i] != NULL;
-	}
-	gl.GenTextures(1, &presentTexture);
-	gl.BindTexture(GL_TEXTURE_2D, presentTexture);
-	gl.TexImage2D(GL_TEXTURE_2D, 0, GL_RGBA8, 640, 480, 0, GL_RGBA, GL_UNSIGNED_BYTE, NULL);
-	presentWidth = 640, presentHeight = 480;
-	gl.GenFramebuffers(1, &presentFramebuffer);
-	gl.BindFramebuffer(GL_READ_FRAMEBUFFER, presentFramebuffer);
-	gl.FramebufferTexture2D(GL_READ_FRAMEBUFFER, GL_COLOR_ATTACHMENT0, GL_TEXTURE_2D, presentTexture, 0);
+	glReady(vkglProc);
 }
 
 // The device goes: the renderer's pictures back to RDRAM, the renderer gone (made again on the next
@@ -921,6 +916,73 @@ static bool askHardwareContext(void) {
 	return true;
 }
 
+static void* vkGlProc(const char* name) {
+	return glesProc(vkGles, name);
+}
+
+// The frontend's Vulkan context made (again): the pictures go to its images from the core's GL context.
+static void vkReset(void) {
+	glesUse(vkGles);
+	if (vkPresentReset(environment, vkGlProc)) {
+		glReady(vkGlProc);
+		logMessage(RETRO_LOG_INFO, vkPresentShared() ? "Vulkan: the GL pictures go to the frontend's images in place"
+		                                             : "Vulkan: the GL pictures are read back into the frontend's images");
+	} else {
+		logMessage(RETRO_LOG_ERROR, "the frontend's Vulkan context can't take the core's pictures");
+	}
+	glesYield();
+}
+
+static void vkDestroy(void) {
+	if (vkGles) {
+		glesUse(vkGles);
+	}
+	vkPresentDestroy(vkGles != NULL);
+	if (vkGles) {
+		hwDestroy();
+		glesYield();
+	}
+	hwReady = false;
+}
+
+// A Vulkan frontend: a GL context of the core's own takes the place of a frontend's, and its pictures
+// go to Vulkan images the frontend shows.
+static bool askVulkanPresent(void) {
+	char error[256];
+	vkGles = glesCreateContext(error, sizeof(error));
+	if (!vkGles) {
+		return false;
+	}
+	glesYield();
+	hw = (struct retro_hw_render_callback) { 0 };
+	hw.context_reset = vkReset;
+	hw.context_destroy = vkDestroy;
+	if (!vkPresentAsk(environment, &hw)) {
+		hw.context_type = RETRO_HW_CONTEXT_NONE;
+		glesDestroy(vkGles);
+		glesYield();
+		vkGles = NULL;
+		return false;
+	}
+	glesFrontend(vkGlProc);
+	return true;
+}
+
+// The game's end: the Vulkan frontend's images and the GL context.
+static void vkEnd(void) {
+	if (!vkGles) {
+		return;
+	}
+	glesUse(vkGles);
+	vkPresentDestroy(true);
+	hwDestroy();
+	glesDestroy(vkGles);
+	glesYield();
+	vkGles = NULL;
+	vkFrontend = false;
+	glesFrontend(NULL);
+}
+
 static void setGeometry(int width, int height);
 
 // The columns and rows hidden at each edge of a picture made at k times its size (Crop Overscan).
@@ -951,16 +1013,17 @@ static struct Crop overscan(int width, int height, int k) {
 }
 
 // The frontend's framebuffer for a picture of width by height: GL's (rows bottom first, so the picture
-// goes in upside down) or, with Vulkan, the picture's image (top row first).
+// goes in upside down) or, with Vulkan, an image of the GL renderer's on Vulkan or one shared with the
+// core's GL context (top row first); 0 when there is none.
 static unsigned frontendFramebuffer(int width, int height, bool* flip) {
+	*flip = !vkFrontend;
 #ifdef ARMN64_VULKAN
 	if (vulkanContext) {
 		*flip = false;
 		return vkglFrontendFramebuffer(width, height);
 	}
 #endif
-	*flip = true;
-	return (unsigned) hw.get_current_framebuffer();
+	return vkFrontend ? vkPresentTarget(width, height) : (unsigned) hw.get_current_framebuffer();
 }
 
 // The picture drawn to the frontend's framebuffer goes out (with Vulkan, its image handed over).
@@ -974,12 +1037,28 @@ static void frontendShow(unsigned width, unsigned height) {
 		}
 	}
 #endif
+	if (vkFrontend) {
+		vkPresentSubmit();
+	}
 	videoRefresh(RETRO_HW_FRAME_BUFFER_VALID, width, height, 0);
 }
 
-// The VI's picture into the frontend's framebuffer, upside down as GL keeps it: from the GL buffer
-// the GPU made it in, else from picture.
+// The VI's picture into the frontend's framebuffer, upside down for GL: from the GL buffer the GPU
+// made it in, else from picture.
 static void present(int width, int height, unsigned buffer) {
+	int const k = n64PictureScale(machine);
+	struct Crop const c = overscan(width, height, k);
+	int const w = width - c.left - c.right, h = height - c.top - c.bottom;
+	// With the GL renderer, a picture from RDRAM goes out at its scale too: the frontend's picture
+	// keeps its size when a game shows one and then the other.
+	int const up = machine->glr && machine->glrScale > k ? machine->glrScale / k : 1;
+	setGeometry(w * up, h * up);
+	bool flip;
+	unsigned const target = frontendFramebuffer(w * up, h * up, &flip);
+	if (vkFrontend && !target) {
+		videoRefresh(NULL, (unsigned) (w * up), (unsigned) (h * up), 0);
+		return;
+	}
 	gl.Disable(GL_SCISSOR_TEST);
 	gl.BindTexture(GL_TEXTURE_2D, presentTexture);
 	if (width > presentWidth || height > presentHeight) {
@@ -998,26 +1077,17 @@ static void present(int width, int height, unsigned buffer) {
 		}
 		gl.TexSubImage2D(GL_TEXTURE_2D, 0, 0, 0, width, height, GL_RGBA, GL_UNSIGNED_BYTE, presentRgba);
 	}
-	int const k = n64PictureScale(machine);
-	struct Crop const c = overscan(width, height, k);
-	int const w = width - c.left - c.right, h = height - c.top - c.bottom;
-	// With the GL renderer, a picture from RDRAM goes out at its scale too: the frontend's picture
-	// keeps its size when a game shows one and then the other.
-	int const up = machine->glr && machine->glrScale > k ? machine->glrScale / k : 1;
-	setGeometry(w * up, h * up);
 	gl.BindFramebuffer(GL_READ_FRAMEBUFFER, presentFramebuffer);
-	bool flip;
-	gl.BindFramebuffer(GL_DRAW_FRAMEBUFFER, frontendFramebuffer(w * up, h * up, &flip));
+	gl.BindFramebuffer(GL_DRAW_FRAMEBUFFER, target);
 	gl.BlitFramebuffer(c.left, c.top, c.left + w, c.top + h, 0, flip ? h * up : 0, w * up, flip ? 0 : h * up, GL_COLOR_BUFFER_BIT, GL_NEAREST);
 	glrForget(machine);
 	frontendShow((unsigned) (w * up), (unsigned) (h * up));
 }
 
-// The GL renderer's picture from its framebuffer into the frontend's, upside down as GL keeps it, at
-// the renderer's scale (width and height are already scaled).
+// The GL renderer's picture from its framebuffer into the frontend's, upside down for GL, at the
+// renderer's scale (width and height are already scaled).
 static void presentGl(unsigned framebuffer, int x, int y, int width, int height) {
 	int const k = machine->glrScale;
-	gl.Disable(GL_SCISSOR_TEST);
 	struct Crop c = overscan(width, height, k);
 	// Columns left of the framebuffer (a picture starting at the end of the row before) are cropped too
 	if (x * k + c.left < 0) {
@@ -1025,9 +1095,15 @@ static void presentGl(unsigned framebuffer, int x, int y, int width, int height)
 	}
 	int const w = width - c.left - c.right, h = height - c.top - c.bottom;
 	setGeometry(w, h);
-	gl.BindFramebuffer(GL_READ_FRAMEBUFFER, framebuffer);
 	bool flip;
-	gl.BindFramebuffer(GL_DRAW_FRAMEBUFFER, frontendFramebuffer(w, h, &flip));
+	unsigned const target = frontendFramebuffer(w, h, &flip);
+	if (vkFrontend && !target) {
+		videoRefresh(NULL, (unsigned) w, (unsigned) h, 0);
+		return;
+	}
+	gl.Disable(GL_SCISSOR_TEST);
+	gl.BindFramebuffer(GL_READ_FRAMEBUFFER, framebuffer);
+	gl.BindFramebuffer(GL_DRAW_FRAMEBUFFER, target);
 	gl.BlitFramebuffer(x * k + c.left, y * k + c.top, x * k + c.left + w, y * k + c.top + h, 0, flip ? h : 0, w, flip ? 0 : h, GL_COLOR_BUFFER_BIT, GL_NEAREST);
 	glrForget(machine);
 	frontendShow((unsigned) w, (unsigned) h);
@@ -1215,8 +1291,10 @@ bool retro_load_game(const struct retro_game_info* info) {
 		return false;
 	}
 	showOptions();
+	// The Vulkan renderer when it's the option; a GL frontend's context; with a Vulkan frontend, a GL
+	// context of the core's own for its pictures, else the Vulkan renderer.
 #ifdef ARMN64_VULKAN
-	vulkanContext = askVulkanContext();
+	vulkanContext = optionIs(environment, "armn64_renderer", "vulkan") && askVulkanContext();
 #endif
 	contextGiven = vulkanContext || askHardwareContext();
 	if (!contextGiven) {
@@ -1224,6 +1302,12 @@ bool retro_load_game(const struct retro_game_info* info) {
 		environment(RETRO_ENVIRONMENT_GET_PREFERRED_HW_RENDER, &preferred);
 		ownContext = preferred == RETRO_HW_CONTEXT_VULKAN || preferred == RETRO_HW_CONTEXT_NONE;
 		hw.context_type = RETRO_HW_CONTEXT_NONE;
+		contextGiven = vkFrontend = preferred == RETRO_HW_CONTEXT_VULKAN && askVulkanPresent();
+#ifdef ARMN64_VULKAN
+		if (!contextGiven && preferred == RETRO_HW_CONTEXT_VULKAN) {
+			contextGiven = vulkanContext = askVulkanContext();
+		}
+#endif
 	}
 	chooseRenderer();
 	memcpy(game, info->data, info->size);
@@ -1301,9 +1385,13 @@ void retro_unload_game(void) {
 	cheatCart = cheatFlashReady = false;
 	diskSave();
 	transferPaksSave();
+	if (vkFrontend) {
+		glesUse(vkGles);
+	}
 	n64Destroy(machine);
 	glesYield();
 	machine = NULL;
+	vkEnd();
 	free(game);
 	free(ipl);
 	free(ramView);
@@ -1318,6 +1406,9 @@ void retro_reset(void) {
 	diskSave();
 	transferPaksSave();
 	topSaveFlush();
+	if (vkFrontend) {
+		glesUse(vkGles);
+	}
 	n64Destroy(machine);
 	glesYield();
 	chooseRenderer();
@@ -1721,7 +1812,9 @@ static void applyOptions(void) {
 	diskSave();
 	transferPaksSave();
 	n64Destroy(machine);
-	glesYield();
+	if (!vkFrontend) {
+		glesYield();
+	}
 	rebuilding = true;
 	machine = startMachine();
 	rebuilding = false;
@@ -1752,6 +1845,10 @@ void retro_run(void) {
 	if (!machine) {
 		return;
 	}
+	// The core's GL context in a Vulkan frontend's place: current for the run, the options' rebuild too.
+	if (vkFrontend) {
+		glesUse(vkGles);
+	}
 	optionsRefresh(environment);
 	applyOptions();
 	if (!saveGiven) {
@@ -1773,15 +1870,17 @@ void retro_run(void) {
 		}
 	}
 	bool shared = hw.context_type != RETRO_HW_CONTEXT_NONE;
+	// The core's own context is current for the run (a Vulkan frontend's made current above).
+	bool const own = !shared || vkFrontend;
 	if (!shared) {
 		glesResume();
-	} else if (hwReady) {
+	} else if (hwReady && !vkFrontend) {
 		// The frontend drew in this context since the last frame.
 		glrForget(machine);
 	}
 	inputPoll();
 	if (pakManager(shared)) {
-		if (!shared) {
+		if (own) {
 			glesYield();
 		}
 		return;
@@ -1792,6 +1891,9 @@ void retro_run(void) {
 		showProgress(done, total);
 		if (done < total) {
 			videoRefresh(NULL, (unsigned) pictureWidth, (unsigned) pictureHeight, 0);
+			if (own) {
+				glesYield();
+			}
 			return;
 		}
 	}
@@ -1832,7 +1934,7 @@ void retro_run(void) {
 	} else {
 		videoRefresh(NULL, (unsigned) pictureWidth, (unsigned) pictureHeight, 0);
 	}
-	if (!shared) {
+	if (own) {
 		glesYield();
 	}
 	playAudio();
@@ -1875,9 +1977,11 @@ bool retro_serialize(void* data, size_t size) {
 	bool own = hw.context_type == RETRO_HW_CONTEXT_NONE;
 	if (own) {
 		glesResume();
+	} else if (vkFrontend) {
+		glesUse(vkGles);
 	}
 	bool saved = n64StateSave(machine, data, size, quickState());
-	if (own) {
+	if (own || vkFrontend) {
 		glesYield();
 	}
 	return saved;
@@ -1890,9 +1994,11 @@ bool retro_unserialize(const void* data, size_t size) {
 	bool own = hw.context_type == RETRO_HW_CONTEXT_NONE;
 	if (own) {
 		glesResume();
+	} else if (vkFrontend) {
+		glesUse(vkGles);
 	}
 	bool loaded = n64StateLoad(machine, data, size, quickState());
-	if (own) {
+	if (own || vkFrontend) {
 		glesYield();
 	}
 	// The state's saves stand (the save file takes them on the next run).
