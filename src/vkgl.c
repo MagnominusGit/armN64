@@ -77,7 +77,7 @@ enum { LOCATION_ELEMENTS = 1024, SAMPLER_LOCATION = MEMBERS * LOCATION_ELEMENTS,
 	X(vkCmdBindVertexBuffers) X(vkCmdDraw) X(vkCmdSetViewport) X(vkCmdSetScissor) X(vkCmdSetDepthBias)                         \
 	X(vkCmdSetBlendConstants) X(vkCmdSetStencilReference) X(vkCmdSetStencilCompareMask) X(vkCmdSetStencilWriteMask)             \
 	X(vkCmdClearAttachments) X(vkCmdPipelineBarrier) X(vkCmdCopyBufferToImage) X(vkCmdCopyImageToBuffer) X(vkCmdCopyImage)      \
-	X(vkCmdBlitImage)
+	X(vkCmdBlitImage) X(vkCmdClearColorImage) X(vkCmdClearDepthStencilImage)
 
 #define VKGL_DECLARE(name) static PFN_##name name;
 VKGL_GLOBAL(VKGL_DECLARE)
@@ -452,9 +452,14 @@ static void passEnd(void) {
 		V.boundPipeline = VK_NULL_HANDLE;
 		V.bound.valid = false;
 		V.barrierNeeded = true;
-		if (V.pendingDraws >= SUBMIT_DRAWS) {
-			submit(false);
-		}
+	}
+}
+
+// The draws so far to the queue when there are enough of them, at the start of something that takes
+// room in the turn's buffers (never in the middle: what it took would go with the turn before).
+static void submitDue(void) {
+	if (V.pendingDraws >= SUBMIT_DRAWS && (!V.passOpen || V.passFbo != V.st.drawFbo)) {
+		submit(false);
 	}
 }
 
@@ -509,7 +514,9 @@ static void submit(bool wait) {
 		}
 		s->recording = false;
 		s->submitted = true;
-		V.barrierNeeded = false;
+		// The queue doesn't order one submission's work after the last's: the next turn's first
+		// command waits on it.
+		V.barrierNeeded = true;
 		int const done = V.current;
 		V.current = (V.current + 1) % SUBS;
 		struct Sub* next = &V.sub[V.current];
@@ -572,10 +579,20 @@ static void imageFree(struct Img* img) {
 	memset(img, 0, sizeof(*img));
 }
 
-// A new image's layout set (general, for everything), so it can be used at once.
+// A new image's layout set (general, for everything), so it can be used at once, and its pixels
+// zero: Vulkan's memory comes with what it last held, GL's drivers give it cleared, and pixels the
+// renderer reads back before drawing them must be the same each run.
 static void imageReady(struct Img* img) {
 	VkCommandBuffer cb = transfer();
 	layoutTo(cb, img, VK_IMAGE_LAYOUT_GENERAL);
+	VkImageSubresourceRange const all = { img->aspect, 0, 1, 0, 1 };
+	if (img->aspect & VK_IMAGE_ASPECT_COLOR_BIT) {
+		VkClearColorValue const zero = { { 0, 0, 0, 0 } };
+		vkCmdClearColorImage(cb, img->image, VK_IMAGE_LAYOUT_GENERAL, &zero, 1, &all);
+	} else {
+		VkClearDepthStencilValue const far = { 1.0f, 0 };
+		vkCmdClearDepthStencilImage(cb, img->image, VK_IMAGE_LAYOUT_GENERAL, &far, 1, &all);
+	}
 }
 
 // ---- The device
@@ -1679,6 +1696,7 @@ static void glDrawArrays_(GLenum mode, GLint first, GLsizei count) {
 	if (!p || !p->linked || count <= 0) {
 		return;
 	}
+	submitDue();
 	VkDescriptorSet set = VK_NULL_HANDLE;
 	uint32_t offset = 0;
 	for (int tries = 0; tries < 3 && !bindings(p, &set, &offset); ++tries) {
@@ -1831,6 +1849,7 @@ static void upload(struct Img* img, int x, int y, int w, int h, const void* data
 	if (w <= 0 || h <= 0 || !img->image) {
 		return;
 	}
+	submitDue();
 	VkBuffer src = from;
 	VkDeviceSize at = fromOffset;
 	if (!src) {
