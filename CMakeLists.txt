@@ -70,7 +70,7 @@ set(PAKS_INCLUDES ${CMAKE_CURRENT_BINARY_DIR} ${CMAKE_CURRENT_SOURCE_DIR}/shared
 
 # Games on top of a cheat cartridge read out of a .zip too, where zlib is there.
 find_package(ZLIB QUIET)
-add_library(armn64_libretro SHARED libretro/libretro.c libretro/games.c shared/libretro/options.c ${PAKS_SOURCES})
+add_library(armn64_libretro SHARED libretro/libretro.c libretro/vkpresent.c libretro/games.c shared/libretro/options.c ${PAKS_SOURCES})
 target_include_directories(armn64_libretro PRIVATE ${PAKS_INCLUDES} shared/libretro)
 target_link_libraries(armn64_libretro n64)
 if(ZLIB_FOUND)
@@ -87,5 +87,5 @@ option(ARMN64_APP "Build armn64, the standalone SDL2 app" OFF)
 if(ARMN64_APP)
 	add_subdirectory(armulators)
 	armulators_app(armn64-app DESCRIPTOR ${CMAKE_CURRENT_SOURCE_DIR}/app.cmake
-		SOURCES libretro/libretro.c libretro/games.c ${PAKS_SOURCES} app/hooks.c INCLUDES ${CMAKE_CURRENT_SOURCE_DIR}/libretro ${PAKS_INCLUDES} LIBS n64 ${GAMES_ZLIB})
+		SOURCES libretro/libretro.c libretro/vkpresent.c libretro/games.c ${PAKS_SOURCES} app/hooks.c INCLUDES ${CMAKE_CURRENT_SOURCE_DIR}/libretro ${PAKS_INCLUDES} LIBS n64 ${GAMES_ZLIB})
 endif()
