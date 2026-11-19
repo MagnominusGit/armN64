@@ -1196,14 +1196,21 @@ static void otherMode(struct N64* n, struct Hle* h, bool high, int shift, int le
 	otherModeMask(n, h, high, (len >= 32 ? 0xFFFFFFFFu : ((1u << len) - 1)) << shift, bits);
 }
 
-// The RDP commands a display list passes on as they are, with segmented image addresses resolved;
-// a texture rectangle takes its second word from the next two commands.
+// The RDP commands a display list passes on as they are, with segmented image addresses resolved.
+// A texture rectangle as gSPTextureRectangle makes it takes its second word from the next two
+// commands, RDP halves (Fast3D's G_RDPHALF_2 and G_RDPHALF_CONT, 0xB3 and 0xB2, or G_RDPHALF_1,
+// 0xB4; F3DEX2's 0xE1 and 0xF1); as gDPTextureRectangle makes it, the RDP's own command, its second
+// word follows it as it is (Ken Griffey's Major League Baseball's text).
 static uint32_t rdpCommand(struct N64* n, struct Hle* h, uint32_t pc, uint32_t w0, uint32_t w1) {
 	int op = w0 >> 24;
 	if (op == 0xE4 || op == 0xE5) {
-		uint32_t st = rd32(n, pc + 12), d = rd32(n, pc + 20);
+		uint32_t const half = rd32(n, pc + 8) >> 24;
 		emit(n, h, (uint64_t) w0 << 32 | w1);
-		emit(n, h, (uint64_t) st << 32 | d);
+		if (half != 0xB2 && half != 0xB3 && half != 0xB4 && half != 0xE1 && half != 0xF1) {
+			emit(n, h, (uint64_t) rd32(n, pc + 8) << 32 | rd32(n, pc + 12));
+			return pc + 16;
+		}
+		emit(n, h, (uint64_t) rd32(n, pc + 12) << 32 | rd32(n, pc + 20));
 		return pc + 24;
 	}
 	if (op == 0xFD || op == 0xFE || op == 0xFF) {
