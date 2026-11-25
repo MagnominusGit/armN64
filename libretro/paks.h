@@ -1,3 +1,7 @@
+/* Copyright (c) 2026 Magnominus
+ *
+ * SPDX-License-Identifier: GPL-2.0-or-later
+ * Licensed under the GNU General Public License, version 2 or (at your option) any later version: see LICENSE. */
 // Controller Paks for the libretro core (paks.c): each port's pak is the game's own (kept in its save
 // file) or one of the shared cards (32 KiB .mpk files in saves/armN64/ControllerPak, carried from game
 // to game like a real pak), and a manager screen for the notes on them.

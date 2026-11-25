@@ -278,7 +278,8 @@ others (see `tools/n64run.c`):
 
 Code taken from other projects, each under its own license (see License):
 
-- **paraLLEl-RDP** (Themaister, MIT): how the RDP's rasterization, dither and texture sampling work.
+- **paraLLEl-RDP** (Themaister, MIT, `LICENSES/paraLLEl-RDP.txt`): how the RDP's rasterization,
+  dither and texture sampling work.
 - **GLideN64** (Sergey Lipskiy and contributors, GPL-2.0): some HLE microcode details (F3DAM's
   texture coordinates).
 - **mupen64plus-rsp-hle** (GPL-2.0-or-later): the audio HLE, in `src/audio_hle/`.

@@ -1,4 +1,9 @@
 #version 310 es
+// Copyright (c) 2026 Magnominus
+// SPDX-License-Identifier: GPL-2.0-or-later
+// Licensed under the GNU General Public License, version 2 or (at your option) any later version: see LICENSE.
+// Parts follow paraLLEl-RDP (Copyright (c) 2020 Themaister), under the MIT license: see
+// LICENSES/paraLLEl-RDP.txt.
 // The RDP's pixel work (rdp.c) on the GPU: a workgroup draws a 16x16 tile of the picture, each
 // invocation one pixel, through the tile's primitives in command order. Same integer arithmetic as
 // rdp.c; the CPU works out triangle spans and each row's starting attributes (64-bit).

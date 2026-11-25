@@ -1,3 +1,7 @@
+/* Copyright (c) 2026 Magnominus and sunshineinabox
+ *
+ * SPDX-License-Identifier: GPL-2.0-or-later
+ * Licensed under the GNU General Public License, version 2 or (at your option) any later version: see LICENSE. */
 // armN64 as a libretro core: a video field each run, the VI's picture, the AI's samples at
 // 44.1 kHz, controller 1, and the cartridge's save memory. The GPU renderer draws in a GL context the
 // frontend shares with its own when it draws with GL (the picture is then put in its framebuffer),

@@ -1,3 +1,7 @@
+/* Copyright (c) 2026 Magnominus
+ *
+ * SPDX-License-Identifier: GPL-2.0-or-later
+ * Licensed under the GNU General Public License, version 2 or (at your option) any later version: see LICENSE. */
 // Controller Paks: the game's own (four, in its save file) and the shared cards, which port has which,
 // and the manager screen. A pak's notes follow libultra's layout: the index of 128 pages at 0x100
 // (each a page's next: 1 ends a note, 3 is free; a copy at 0x200, and byte 1 the sum of the user
