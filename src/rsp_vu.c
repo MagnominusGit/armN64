@@ -9,7 +9,7 @@
 #include <tmmintrin.h>
 #elif defined(__SSE2__)
 #include <emmintrin.h>
-#elif defined(__ARM_NEON)
+#elif defined(__aarch64__)
 #include <arm_neon.h>
 #endif
 
@@ -112,7 +112,7 @@ static v8 ltu(v8 a, v8 b) {
 static v8 mulhiSS(v8 a, v8 b) {
 #if defined(__SSE2__)
 	return (v8) _mm_mulhi_epi16((__m128i) a, (__m128i) b);
-#elif defined(__ARM_NEON)
+#elif defined(__aarch64__)
 	int32x4_t lo = vmull_s16(vget_low_s16((int16x8_t) a), vget_low_s16((int16x8_t) b));
 	int32x4_t hi = vmull_high_s16((int16x8_t) a, (int16x8_t) b);
 	return (v8) vuzp2q_s16(vreinterpretq_s16_s32(lo), vreinterpretq_s16_s32(hi));
@@ -124,7 +124,7 @@ static v8 mulhiSS(v8 a, v8 b) {
 static v8 mulhiUU(v8 a, v8 b) {
 #if defined(__SSE2__)
 	return (v8) _mm_mulhi_epu16((__m128i) a, (__m128i) b);
-#elif defined(__ARM_NEON)
+#elif defined(__aarch64__)
 	uint32x4_t lo = vmull_u16(vget_low_u16((uint16x8_t) a), vget_low_u16((uint16x8_t) b));
 	uint32x4_t hi = vmull_high_u16((uint16x8_t) a, (uint16x8_t) b);
 	return (v8) vuzp2q_u16(vreinterpretq_u16_u32(lo), vreinterpretq_u16_u32(hi));
@@ -146,7 +146,7 @@ static v8 mulhiUS(v8 a, v8 b) {
 static unsigned bits(v8 mask) {
 #if defined(__SSE2__)
 	return (unsigned) _mm_movemask_epi8(_mm_packs_epi16((__m128i) mask, _mm_setzero_si128())) & 0xFF;
-#elif defined(__ARM_NEON)
+#elif defined(__aarch64__)
 	static const uint16_t lane[8] = { 1, 2, 4, 8, 16, 32, 64, 128 };
 	return vaddvq_u16(vandq_u16((uint16x8_t) mask, vld1q_u16(lane)));
 #else
@@ -187,7 +187,7 @@ static const uint8_t elementMasks[16][16] __attribute__((aligned(16))) = {
 static v8 pick(const int16_t* t, const uint8_t* mask) {
 #if defined(__SSSE3__)
 	return (v8) _mm_shuffle_epi8(_mm_loadu_si128((const __m128i*) t), _mm_load_si128((const __m128i*) mask));
-#elif defined(__ARM_NEON)
+#elif defined(__aarch64__)
 	return (v8) vqtbl1q_u8(vld1q_u8((const uint8_t*) t), vld1q_u8(mask));
 #else
 	typedef uint8_t b16 __attribute__((vector_size(16)));
@@ -210,7 +210,7 @@ static v8 addSaturated(v8 s, v8 t, v8 c, bool sub) {
 		parts[half] = sub ? _mm_sub_epi32(_mm_sub_epi32(a, b), k) : _mm_add_epi32(_mm_add_epi32(a, b), k);
 	}
 	return (v8) _mm_packs_epi32(parts[0], parts[1]);
-#elif defined(__ARM_NEON)
+#elif defined(__aarch64__)
 	int16x8_t a = (int16x8_t) s, b = (int16x8_t) t, k = (int16x8_t) c;
 	int32x4_t lo = sub ? vsubw_s16(vsubl_s16(vget_low_s16(a), vget_low_s16(b)), vget_low_s16(k))
 	                   : vaddw_s16(vaddl_s16(vget_low_s16(a), vget_low_s16(b)), vget_low_s16(k));
