@@ -60,16 +60,28 @@ static void put(uint8_t** at, const void* from, size_t size) {
 	*at += size;
 }
 
-// The hidden bits, a byte (0 to 3) for each halfword, four to a byte in the state.
+// The hidden bits, a byte (0 to 3) for each halfword, four to a byte in the state: eight at a time,
+// each pair of bits shifted down beside the last (a little-endian host).
 static void packHidden(uint8_t* to, const uint8_t* from, size_t size) {
-	for (size_t i = 0; i < size; ++i, from += 4) {
-		to[i] = (uint8_t) (from[0] | from[1] << 2 | from[2] << 4 | from[3] << 6);
+	for (size_t i = 0; i < size; i += 2, from += 8) {
+		uint64_t x;
+		memcpy(&x, from, 8);
+		x = (x | x >> 6) & 0x000F000F000F000Full;
+		x = (x | x >> 12) & 0x000000FF000000FFull;
+		uint16_t const packed = (uint16_t) (x | x >> 24);
+		memcpy(to + i, &packed, 2);
 	}
 }
 
 static void unpackHidden(uint8_t* to, const uint8_t* from, size_t size) {
-	for (size_t i = 0; i < size; ++i, to += 4) {
-		to[0] = from[i] & 3, to[1] = from[i] >> 2 & 3, to[2] = from[i] >> 4 & 3, to[3] = from[i] >> 6;
+	for (size_t i = 0; i < size; i += 2, to += 8) {
+		uint16_t packed;
+		memcpy(&packed, from + i, 2);
+		uint64_t x = packed;
+		x = (x | x << 24) & 0x000000FF000000FFull;
+		x = (x | x << 12) & 0x000F000F000F000Full;
+		x = (x | x << 6) & 0x0303030303030303ull;
+		memcpy(to, &x, 8);
 	}
 }
 
