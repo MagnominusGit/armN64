@@ -352,8 +352,8 @@ int main(int argc, char** argv) {
 	clock_gettime(CLOCK_MONOTONIC, &t0);
 	for (int f = 0; f < fields; ++f) {
 		if (f == stateAt && !again) {
-			state = malloc(n64StateSize());
-			if (!state || !n64StateSave(n, state, n64StateSize(), quick)) {
+			state = malloc(n64StateSize(n));
+			if (!state || !n64StateSave(n, state, n64StateSize(n), quick)) {
 				fprintf(stderr, "can't save a state\n");
 				return 1;
 			}
@@ -374,11 +374,11 @@ int main(int argc, char** argv) {
 		static void* ahead;
 		if (getenv("N64RUNAHEAD")) {
 			if (!ahead) {
-				ahead = malloc(n64StateSize());
+				ahead = malloc(n64StateSize(n));
 			}
-			n64StateSave(n, ahead, n64StateSize(), true);
+			n64StateSave(n, ahead, n64StateSize(n), true);
 			n64RunField(n);
-			n64StateLoad(n, ahead, n64StateSize(), true);
+			n64StateLoad(n, ahead, n64StateSize(n), true);
 		}
 		// N64DIRTYTEST=1: every page whose bytes changed in the field must have been marked written.
 		static uint8_t* before;
@@ -478,11 +478,11 @@ int main(int argc, char** argv) {
 			snprintf(path, sizeof(path), "%s-%05d.ppm", getenv("N64SHOTS"), f + 1);
 			writePicture(n, path);
 			// N64STATES=prefix: a save state with each picture too, as prefix-<field>.state.
-			void* saved = getenv("N64STATES") ? malloc(n64StateSize()) : NULL;
+			void* saved = getenv("N64STATES") ? malloc(n64StateSize(n)) : NULL;
 			snprintf(path, sizeof(path), "%s-%05d.state", getenv("N64STATES") ? getenv("N64STATES") : "", f + 1);
-			FILE* out = saved && n64StateSave(n, saved, n64StateSize(), false) ? fopen(path, "wb") : NULL;
+			FILE* out = saved && n64StateSave(n, saved, n64StateSize(n), false) ? fopen(path, "wb") : NULL;
 			if (out) {
-				fwrite(saved, 1, n64StateSize(), out);
+				fwrite(saved, 1, n64StateSize(n), out);
 				fclose(out);
 			}
 			free(saved);
@@ -509,7 +509,7 @@ int main(int argc, char** argv) {
 			if (!again) {
 				firstHash = hash;
 				again = true;
-				if (!n64StateLoad(n, state, n64StateSize(), quick)) {
+				if (!n64StateLoad(n, state, n64StateSize(n), quick)) {
 					fprintf(stderr, "can't load the state\n");
 					return 1;
 				}
@@ -638,10 +638,10 @@ int main(int argc, char** argv) {
 		}
 	}
 	if (getenv("N64STATEOUT")) {
-		void* out = malloc(n64StateSize());
-		FILE* f = out && n64StateSave(n, out, n64StateSize(), false) ? fopen(getenv("N64STATEOUT"), "wb") : NULL;
+		void* out = malloc(n64StateSize(n));
+		FILE* f = out && n64StateSave(n, out, n64StateSize(n), false) ? fopen(getenv("N64STATEOUT"), "wb") : NULL;
 		if (f) {
-			fwrite(out, 1, n64StateSize(), f);
+			fwrite(out, 1, n64StateSize(n), f);
 			fclose(f);
 		}
 		free(out);

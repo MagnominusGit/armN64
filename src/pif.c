@@ -126,6 +126,7 @@ void pifBoot(struct N64* n) {
 	bool const pakOff = expansion && (expansion[0] == '0' || (!strcmp(expansion, "auto") && !disk && !n->cheat.flash &&
 	                                                          n->rom && cartNoExpansion(n->rom, n->romSize)));
 	uint32_t const memory = pakOff ? 0x400000 : RDRAM_SIZE;
+	n->ramSize = memory;
 	put32(&n->rdram[0x318], memory);
 	put32(&n->rdram[0x3F0], memory);
 	// A dump without boot code (development cartridges were loaded another way): what the 6102's

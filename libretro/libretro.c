@@ -412,6 +412,9 @@ static int glScale(void) {
 // other options (applyOptions), when it keeps it.
 static char madeExpansion[16];
 static bool expansionTold, rebuilding;
+// The state's size, the largest this session has had: a Restart with the Expansion Pak changed
+// makes it larger or smaller, and smaller states fit.
+static size_t stateSize;
 
 // N64_EXPANSION by the option: 0 off, 1 on, auto by the cartridge (pifBoot).
 static const char* expansionSetting(void) {
@@ -1383,6 +1386,7 @@ bool retro_load_game_special(unsigned type, const struct retro_game_info* info, 
 }
 
 void retro_unload_game(void) {
+	stateSize = 0;
 	if (machine) {
 		paksSync(machine);
 	}
@@ -1802,7 +1806,7 @@ static void applyOptions(void) {
 		return;
 	}
 	bool const own = hw.context_type == RETRO_HW_CONTEXT_NONE;
-	size_t const size = n64StateSize();
+	size_t const size = n64StateSize(machine);
 	void* state = malloc(size);
 	if (own) {
 		glesResume();
@@ -1974,7 +1978,12 @@ static bool quickState(void) {
 }
 
 size_t retro_serialize_size(void) {
-	return n64StateSize();
+	size_t const size = n64StateSize(machine);
+	if (!machine) {
+		return size;
+	}
+	stateSize = size > stateSize ? size : stateSize;
+	return stateSize;
 }
 
 // Save states: the GPU's pictures come back to RDRAM, and go on loading, in the core's own GL

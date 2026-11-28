@@ -304,6 +304,9 @@ struct CheatCart {
 
 struct N64 {
 	uint8_t* rdram;
+	// The RDRAM the console has: RDRAM_SIZE with the Expansion Pak, 4 MiB without it (pifBoot). All
+	// of rdram is there either way; save states hold only this much.
+	uint32_t ramSize;
 	// RDRAM's hidden ninth bits, as the RDP keeps them: two coverage bits for each halfword.
 	uint8_t* hidden;
 	uint8_t* rom;
@@ -852,7 +855,7 @@ void rdpStateGet(struct N64*, struct RDP* out);
 size_t hleStateSize(void);
 size_t hleSize(void);
 size_t audioHleStateSize(void);
-size_t n64StateSize(void);
+size_t n64StateSize(const struct N64*);
 bool n64StateSave(struct N64*, void* data, size_t size, bool quick);
 bool n64StateLoad(struct N64*, const void* data, size_t size, bool quick);
 

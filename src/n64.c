@@ -23,6 +23,7 @@ struct N64* n64Create(void) {
 	}
 	n->rdram = calloc(1, RDRAM_SIZE);
 	n->hidden = calloc(1, RDRAM_SIZE / 2);
+	n->ramSize = RDRAM_SIZE;
 	n->vpages = malloc(2 * VPAGES * sizeof(*n->vpages));
 	if (!n->rdram || !n->hidden || !n->vpages) {
 		free(n->rdram);

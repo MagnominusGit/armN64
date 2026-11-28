@@ -216,7 +216,8 @@ follows ROCKNIX's other standalone emulators' folders.
 - **Fastest** (FLE) takes shortcuts in the CPU's timing on top of Fast; some effects may differ.
 - The CPU and GPU renderers draw exactly what the RDP would, at the console's resolution. The GL
   renderer is faster and can draw above it, but isn't exact.
-- Save states are deterministic, so rewind and run-ahead stay in step.
+- Save states are deterministic, so rewind and run-ahead stay in step. They are about 10 MB, or
+  about 5.5 MB for a game running without the Expansion Pak, and load only with the pak as it was.
 
 ## Testing
 
