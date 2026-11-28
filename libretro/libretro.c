@@ -151,8 +151,8 @@ static struct retro_core_option_v2_definition optionDefinitions[] = {
 	  "Skips drawing frames for full speed on slow devices. Auto: only when it falls behind.",
 	  NULL, "system", { { "disabled", "Off" }, { "auto", "Auto" }, { "enabled", "Every Other Frame" }, { NULL, NULL } }, "disabled" },
 	{ "armn64_expansion", "Expansion Pak", NULL,
-	  "The 4 MB memory add-on most later games use. Off: as without one, for games and hacks that need that. Takes effect when the game restarts.",
-	  NULL, "system", { { "enabled", "On" }, { "disabled", "Off" }, { NULL, NULL } }, "enabled" },
+	  "The 4 MB memory add-on some games need or use for extras. Auto: on, except for retail games known not to use it. Off: as without one, for games and hacks that need that. Takes effect when the game restarts.",
+	  NULL, "system", { { "auto", "Auto" }, { "enabled", "On" }, { "disabled", "Off" }, { NULL, NULL } }, "auto" },
 	{ "armn64_cheat_game", "Game on Top", NULL,
 	  "The game plugged in on top of the cheat cartridge (a GameShark or Action Replay), from the games beside it, those played last first. Takes effect when the game restarts.",
 	  NULL, "system", { { "none", "None" }, { NULL, NULL } }, "none" },
@@ -413,6 +413,11 @@ static int glScale(void) {
 static char madeExpansion[16];
 static bool expansionTold, rebuilding;
 
+// N64_EXPANSION by the option: 0 off, 1 on, auto by the cartridge (pifBoot).
+static const char* expansionSetting(void) {
+	return optionIs(environment, "armn64_expansion", "disabled") ? "0" : optionIs(environment, "armn64_expansion", "enabled") ? "1" : "auto";
+}
+
 // The emulator's settings, from the core's options; the recompilers are always on.
 static const char* settings(const char* name) {
 	static char threads[4], scale[2];
@@ -421,7 +426,7 @@ static const char* settings(const char* name) {
 	}
 	if (!strcmp(name, "N64_EXPANSION")) {
 		// A machine made again for other options keeps the memory the game booted with.
-		return rebuilding ? madeExpansion : optionIs(environment, "armn64_expansion", "disabled") ? "0" : "1";
+		return rebuilding ? madeExpansion : expansionSetting();
 	}
 	if (!strcmp(name, "N64_OVERCLOCK")) {
 		return overclock();
@@ -1786,7 +1791,7 @@ static bool settingsChanged(void) {
 // that ran (states load across accuracies and renderers), so the game goes on where it was. The
 // Expansion Pak waits for a Restart.
 static void applyOptions(void) {
-	const char* expansion = optionIs(environment, "armn64_expansion", "disabled") ? "0" : "1";
+	const char* expansion = expansionSetting();
 	if (!expansionTold && strcmp(madeExpansion, expansion)) {
 		notify("Expansion Pak: takes effect when the game restarts");
 		expansionTold = true;

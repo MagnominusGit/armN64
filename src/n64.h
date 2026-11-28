@@ -869,6 +869,8 @@ void cheatCartReset(struct N64*);
 bool cheatCartRead16(struct N64*, uint32_t addr, uint16_t* v);
 bool cheatCartWrite16(struct N64*, uint32_t addr, uint16_t v);
 bool cartBootUntimed(const uint8_t* rom);
+// A retail cartridge known to leave the Expansion Pak unused (N64_EXPANSION=auto boots it without one).
+bool cartNoExpansion(const uint8_t* rom, size_t size);
 bool gbCartLoad(struct GbCart*, const uint8_t* rom, size_t size);
 void gbCartFree(struct GbCart*);
 uint8_t gbCartRead(struct GbCart*, uint16_t addr);

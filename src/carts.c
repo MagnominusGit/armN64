@@ -136,6 +136,27 @@ bool cartBootUntimed(const uint8_t* rom) {
 	return false;
 }
 
+// Retail cartridges that leave the Expansion Pak unused, by the two CRCs at 0x10 in the header and
+// their size (a hack keeping the CRCs of the game it changes is mostly a different size). Each ran
+// 40 seconds with and without one, Start and A pressed along the way, wrote nothing above 4 MiB and
+// came out the same; none is on Nintendo's list of the games that use it.
+static const struct {
+	uint64_t id;
+	uint32_t size;
+} noExpansion[] = {
+#include "carts_pak.inc"
+};
+
+bool cartNoExpansion(const uint8_t* rom, size_t size) {
+	uint64_t id = (uint64_t) be32(rom + 0x10) << 32 | be32(rom + 0x14);
+	for (size_t i = 0; i < sizeof(noExpansion) / sizeof(*noExpansion); ++i) {
+		if (noExpansion[i].id == id && noExpansion[i].size == size) {
+			return true;
+		}
+	}
+	return false;
+}
+
 // The boot code's checksum over the first megabyte after the header (as the boot code works it out
 // for each lockout chip). False if the header has it already.
 bool cartBootChecksum(const uint8_t* rom, size_t size, int cic, uint8_t seedByte, uint32_t out[2]) {

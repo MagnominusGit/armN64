@@ -60,7 +60,7 @@ effect while the game runs, the Expansion Pak's when the game restarts.
 | System | Accuracy | Fast (HLE), Fastest (FLE), Balanced (MLE), Accurate (LLE) |
 | | Overclock | Off, 1.5x, 2x, 2.5x, 3x, 4x |
 | | Frame Skip | Off, Auto, Every Other Frame |
-| | Expansion Pak (at the next restart) | On, Off |
+| | Expansion Pak (at the next restart) | Auto, On, Off |
 | | Game on Top (with a cheat cartridge; at the next restart) | None, the games beside the cartridge |
 | Video | Renderer | GL (Fast, HD), Vulkan (Fast, HD), GPU (Exact, HD), CPU (Exact, Native) |
 | | Resolution (GL and GPU) | Native, Auto, 2x to 8x |
@@ -100,7 +100,9 @@ effect while the game runs, the Expansion Pak's when the game restarts.
   timing. Accurate: cycle for cycle. Graphics follow Graphics Microcode in every mode.
 - **Frame Skip.** Leaves frames undrawn and shows the one before again. Auto skips only when the
   device falls behind (the frontend's audio buffer runs low); Every Other Frame always does.
-- **Expansion Pak.** Off makes games see 4 MB, as on a console without one.
+- **Expansion Pak.** Off makes games see 4 MB, as on a console without one. Auto leaves it out for the
+  retail games known not to use it (run with and without one, checked against Nintendo's list of the
+  games that do) and keeps it for everything else: games that use it, hacks, homebrew and disks.
 
 ### Video
 
