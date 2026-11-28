@@ -180,6 +180,11 @@ static void start(struct N64* n) {
 		cheatCartReset(n);
 	}
 	pifBoot(n);
+	// Without the Expansion Pak (pifBoot), vpages again: kseg0's pages past 4 MiB go to the bus.
+	if (n->ramSize < RDRAM_SIZE) {
+		n->vpageFillCount = VPAGE_FILLED + 1;
+		cpuTlbChanged(n);
+	}
 	n->eeprom16k = n->rom ? cartEeprom16k(n->rom) : false;
 	n->hardwarePi = n->rom && cartHardwarePi(n->rom);
 	n->quickSi = n->rom && cartQuickSi(n->rom) && n->accuracy == ACCURACY_HLE;
@@ -410,8 +415,10 @@ void n64RunField(struct N64* n) {
 			n->si.busyUntil = 0;
 			if (n->si.status & SI_TO_RDRAM) {
 				uint32_t dram = n->si.dramAddr & (RDRAM_SIZE - 1) & ~3u;
-				n64RdramWrite(n, dram, 64);
-				memcpy(&n->rdram[dram], n->pifRam, 64);
+				if (dram + 64 <= n->ramSize) {
+					n64RdramWrite(n, dram, 64);
+					memcpy(&n->rdram[dram], n->pifRam, 64);
+				}
 			}
 			n->si.status = (n->si.status & ~(1u | SI_TO_RDRAM)) | 0x1000;
 			n64Interrupt(n, MI_SI, true);
@@ -786,6 +793,10 @@ void n64Poke(struct N64* n, uint32_t vaddr, int size, uint32_t value) {
 	struct CPU* c = &n->cpu;
 	uint32_t const p = vaddr & 0x7FFFFF & ~(uint32_t) (size - 1), d = (vaddr >> 4) & 511, k = (vaddr >> 5) & 511;
 	uint8_t const bytes[2] = { (uint8_t) (size == 2 ? value >> 8 : value), (uint8_t) value };
+	// Past the RDRAM the console has (without the Expansion Pak), nothing.
+	if (p >= n->ramSize) {
+		return;
+	}
 	n64RdramWrite(n, p, (uint32_t) size);
 	memcpy(&n->rdram[p], bytes, (size_t) size);
 	if (c->dcacheTag[d] != DCACHE_NONE && (c->dcacheTag[d] & ~DCACHE_FILLING) == (p & ~0xFu)) {

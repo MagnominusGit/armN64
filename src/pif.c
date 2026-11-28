@@ -119,14 +119,17 @@ void pifBoot(struct N64* n) {
 	n->riReg[1] = 0x40;
 	n->riReg[3] = 0x14;
 	n->riReg[4] = 0x00063634;
-	// The memory size games read (osMemSize): without the Expansion Pak (N64_EXPANSION=0), 4 MiB. Auto
-	// leaves it out for the cartridges known not to use it (carts.c), so disks, cheat cartridges,
-	// hacks and homebrew keep it.
+	// The RDRAM there is, and the size games read (osMemSize): without the Expansion Pak
+	// (N64_EXPANSION=0), 4 MiB. Auto leaves it out for the cartridges known not to use it (carts.c),
+	// so disks, cheat cartridges, hacks and homebrew keep it.
 	const char* expansion = n->settings ? n->settings("N64_EXPANSION") : getenv("N64_EXPANSION");
 	bool const pakOff = expansion && (expansion[0] == '0' || (!strcmp(expansion, "auto") && !disk && !n->cheat.flash &&
 	                                                          n->rom && cartNoExpansion(n->rom, n->romSize)));
 	uint32_t const memory = pakOff ? 0x400000 : RDRAM_SIZE;
 	n->ramSize = memory;
+	// What isn't there reads zeros (the bus, the RSP's and PI's DMA): none of the power-on pattern.
+	memset(n->rdram + memory, 0, RDRAM_SIZE - memory);
+	memset(n->hidden + memory / 2, 0, (RDRAM_SIZE - memory) / 2);
 	put32(&n->rdram[0x318], memory);
 	put32(&n->rdram[0x3F0], memory);
 	// A dump without boot code (development cartridges were loaded another way): what the 6102's

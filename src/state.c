@@ -83,9 +83,10 @@ static bool zeros(const uint8_t* p, size_t size) {
 	return !any;
 }
 
-// Without the Expansion Pak the state has no RDRAM above 4 MiB, memory the console doesn't have then
-// (the games Auto runs without it wrote nothing there in their test runs): anything written there
-// goes as the state is taken too, so the game goes on the same from the state as without it.
+// Without the Expansion Pak the state has no RDRAM above 4 MiB, memory the console doesn't have then,
+// which only the RDP, the VI and the HLE renderers still reach (a game made for 4 MiB doesn't point
+// them there): anything they wrote there goes as the state is taken too, so the game goes on the
+// same from the state as without it.
 static void clearAbove(struct N64* n, uint32_t ram) {
 	if (!zeros(n->rdram + ram, RDRAM_SIZE - ram)) {
 		n64RdramWrite(n, ram, RDRAM_SIZE - ram);

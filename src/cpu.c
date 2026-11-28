@@ -407,7 +407,7 @@ static uint32_t vpageUnknown(uint32_t page);
 // Compiled code finds cached mapped pages through vpages (data, and code's jitTable tags), by 32-bit
 // kernel addresses only.
 static void fillVpage(struct N64* n, uint32_t v, uint32_t paddr, uint64_t lo) {
-	if ((paddr & ~0xFFFu) >= RDRAM_SIZE || ((lo >> 3) & 7) == 2 || !cpuPlainMode(n)) {
+	if ((paddr & ~0xFFFu) >= n->ramSize || ((lo >> 3) & 7) == 2 || !cpuPlainMode(n)) {
 		return;
 	}
 	uint32_t delta = (paddr & ~0xFFFu) - (v & ~0xFFFu);
@@ -436,7 +436,7 @@ void cpuCachesFromState(struct N64* n, bool keptData) {
 	// To mle or hle the lines not written back go to RDRAM; to lle the valid lines are filled from it.
 	for (uint32_t i = 0; i < 512; ++i) {
 		uint32_t const a = dcacheAddress(c, i);
-		if (c->dcacheTag[i] == DCACHE_NONE || a + 16 > RDRAM_SIZE) {
+		if (c->dcacheTag[i] == DCACHE_NONE || a + 16 > n->ramSize) {
 			continue;
 		}
 		if (!keptData) {
@@ -464,10 +464,10 @@ void cpuTlbChanged(struct N64* n) {
 		}
 		// kseg0's RDRAM, which the TLB doesn't change; with FLE kseg1's too, uncached accesses costing
 		// nothing more.
-		for (uint32_t page = 0x80000; page < 0x80000 + (RDRAM_SIZE >> 12); ++page) {
+		for (uint32_t page = 0x80000; page < 0x80000 + (n->ramSize >> 12); ++page) {
 			n->vpages[page] = n->vpages[VPAGES + page] = 0x80000000u;
 		}
-		for (uint32_t page = 0xA0000; n->fast && n->fle && page < 0xA0000 + (RDRAM_SIZE >> 12); ++page) {
+		for (uint32_t page = 0xA0000; n->fast && n->fle && page < 0xA0000 + (n->ramSize >> 12); ++page) {
 			n->vpages[page] = n->vpages[VPAGES + page] = 0x60000000u;
 		}
 	} else {

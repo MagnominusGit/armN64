@@ -177,6 +177,8 @@ struct Jit {
 	// FLE (Fastest): cycles counted in runs, and no load interlocks, address checks or FPU result
 	// fix-ups.
 	bool fle;
+	// The RDRAM the console has (ramSize, 4 MiB without the Expansion Pak): past it, the bus's.
+	uint32_t ramSize;
 	// Status.FR as the block was compiled.
 	bool fr;
 	int opCycles;
@@ -1427,7 +1429,7 @@ static void emitMemory(struct Jit* j, struct Slow* slow) {
 	// With the fast CPU, an address known now (a constant base) that is kseg0's RDRAM, aligned, needs
 	// no checks.
 	uint32_t const at = (uint32_t) j->value[rs] + (uint32_t) (int16_t) op;
-	bool const direct = j->fast && (j->known >> rs & 1) && (at ^ 0x80000000u) < RDRAM_SIZE && !(at & (uint32_t) (size - 1));
+	bool const direct = j->fast && (j->known >> rs & 1) && (at ^ 0x80000000u) < j->ramSize && !(at & (uint32_t) (size - 1));
 	if (direct) {
 		xMovI(e, R8, at);
 		xMovI(e, RAX, at ^ 0x80000000u);
@@ -1448,7 +1450,7 @@ static void emitMemory(struct Jit* j, struct Slow* slow) {
 		// kseg0's RDRAM (and aligned, but with FLE) in one test; anything else through vpages in the
 		// cold code.
 		xAluI(e, X_XOR, 4, R(RAX), (int32_t) 0x80000000u);
-		xTestI(e, 4, R(RAX), ~(uint32_t) (RDRAM_SIZE - 1) | (j->fle ? 0 : (uint32_t) (size - 1)));
+		xTestI(e, 4, R(RAX), ~(j->ramSize - 1) | (j->fle ? 0 : (uint32_t) (size - 1)));
 		struct Miss* v = &j->mapped[j->mappedCount++];
 		v->site = xJcc(e, CC_NE, NULL);
 		v->resume = e->p;
@@ -1633,7 +1635,7 @@ static void pollSkip(struct Jit* j, const uint32_t* ops, uint32_t count, uint32_
 			out[sites++] = xJcc(e, CC_NE, NULL);
 		}
 		if (j->fast) {
-			xTestI(e, 4, R(RAX), ~(uint32_t) (RDRAM_SIZE - 1) | (uint32_t) (size - 1));
+			xTestI(e, 4, R(RAX), ~(j->ramSize - 1) | (uint32_t) (size - 1));
 			out[sites++] = xJcc(e, CC_NE, NULL);
 			continue;
 		}
@@ -1825,6 +1827,7 @@ void* jitCompile(struct N64* n, const uint32_t* ops, uint32_t count, uint32_t va
 	j->rdpGl = n->rdpGl;
 	j->fast = n->fast;
 	j->fle = n->fast && n->fle;
+	j->ramSize = n->ramSize;
 	pinSp = j->fle;
 	j->fr = n->cpu.cop0[CP0_STATUS] >> 26 & 1;
 	j->plainCount = n->countCycles == 2;
@@ -1962,7 +1965,7 @@ void* jitCompile(struct N64* n, const uint32_t* ops, uint32_t count, uint32_t va
 		patchHere(e, k->site);
 		// Past RDRAM, the interpreter. On a page the RDP draws to or reads, or the running RSP's DMA read,
 		// it waits for them there in C first.
-		xTestI(e, 4, R(RAX), ~(uint32_t) (RDRAM_SIZE - 1));
+		xTestI(e, 4, R(RAX), ~(j->ramSize - 1));
 		k->slow->site[k->slow->sites++] = xJcc(e, CC_NE, NULL);
 		xTestI(e, 1, MI(RBX, RCX, 1, (int32_t) offsetof(struct N64, pageFlags)), PAGE_RDP | PAGE_RSP_READS);
 		uint8_t* noRdp = xJcc(e, CC_E, NULL);
@@ -2003,7 +2006,7 @@ void* jitCompile(struct N64* n, const uint32_t* ops, uint32_t count, uint32_t va
 		xShiftI(e, X_SHR, 4, R(RCX), 12);
 		xLoad(e, 8, RDX, N64_AT(vpages));
 		xAluRM(e, X_ADD, 4, RAX, MI(RDX, RCX, 4, v->store ? VPAGES * 4 : 0));
-		xTestI(e, 4, R(RAX), ~(uint32_t) (RDRAM_SIZE - 1));
+		xTestI(e, 4, R(RAX), ~(j->ramSize - 1));
 		v->slow->site[v->slow->sites++] = xJcc(e, CC_NE, NULL);
 		if (v->size > 1 && !j->fle) {
 			xTestI(e, 4, R(R8), (uint32_t) (v->size - 1));
@@ -2021,7 +2024,7 @@ void* jitCompile(struct N64* n, const uint32_t* ops, uint32_t count, uint32_t va
 			xTestI(e, 4, R(R8), (uint32_t) (m->size - 1));
 			m->slow->site[m->slow->sites++] = xJcc(e, CC_NE, NULL);
 		}
-		xTestI(e, 4, R(RAX), ~(uint32_t) (RDRAM_SIZE - 1));
+		xTestI(e, 4, R(RAX), ~(j->ramSize - 1));
 		m->slow->site[m->slow->sites++] = xJcc(e, CC_NE, NULL);
 		if (m->glLoad) {
 			// A line coming in from a page the GPU draws to (a game invalidates its cache before

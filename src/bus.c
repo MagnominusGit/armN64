@@ -44,7 +44,7 @@ static void spDma(struct N64* n, uint32_t lenReg, bool toRdram) {
 				}
 			}
 		}
-		if ((mem & 0xFFF) + len <= 0x1000 && (dram & 0xFFFFFF) + len <= RDRAM_SIZE) {
+		if ((mem & 0xFFF) + len <= 0x1000 && (dram & 0xFFFFFF) + len <= n->ramSize) {
 			// The row wraps neither memory.
 			uint8_t* sp = &n->sp.mem[base | (mem & 0xFFF)];
 			uint8_t* d = &n->rdram[dram & 0xFFFFFF];
@@ -53,11 +53,11 @@ static void spDma(struct N64* n, uint32_t lenReg, bool toRdram) {
 			uint8_t* sp = &n->sp.mem[base | ((mem + i) & 0xFFF)];
 			uint32_t d = (dram + i) & 0xFFFFFF;
 			if (toRdram) {
-				if (d < RDRAM_SIZE) {
+				if (d < n->ramSize) {
 					n->rdram[d] = *sp;
 				}
 			} else {
-				*sp = d < RDRAM_SIZE ? n->rdram[d] : 0;
+				*sp = d < n->ramSize ? n->rdram[d] : 0;
 			}
 		}
 		mem = base | ((mem + len) & 0xFFF);
@@ -279,7 +279,7 @@ static uint8_t cartByte(struct N64* n, uint32_t c) {
 // A byte the PI writes at its 24-bit RDRAM address: nothing answers past the RDRAM there is.
 static void piRdramByte(struct N64* n, uint32_t addr, uint8_t v) {
 	addr &= 0xFFFFFF;
-	if (addr < RDRAM_SIZE) {
+	if (addr < n->ramSize) {
 		n->rdram[addr] = v;
 	}
 }
@@ -293,8 +293,8 @@ static void piWillWrite(struct N64* n, uint32_t dram, uint32_t len) {
 		piWillWrite(n, 0, dram + len - 0x1000000);
 		len = 0x1000000 - dram;
 	}
-	if (len && dram < RDRAM_SIZE) {
-		n64RdramWrite(n, dram, dram + len > RDRAM_SIZE ? RDRAM_SIZE - dram : len);
+	if (len && dram < n->ramSize) {
+		n64RdramWrite(n, dram, dram + len > n->ramSize ? n->ramSize - dram : len);
 	}
 }
 
@@ -468,7 +468,7 @@ uint32_t busRead32(struct N64* n, uint32_t addr) {
 		static const uint32_t chip[16] = { [0] = 0xB4190010, [2] = 0x2B3B1A0B, [6] = 0x101C0A04 };
 		return addr < 0x03F00200 ? chip[(addr >> 2) & 15] : 0;
 	}
-	if (addr < RDRAM_SIZE) {
+	if (addr < n->ramSize) {
 		if (n->pageFlags[addr >> 12] & PAGE_RDP_WRITES) {
 			rdpWaitRead(n, addr & ~3u, 4);
 		}
@@ -647,7 +647,7 @@ void busWrite32(struct N64* n, uint32_t addr, uint32_t v) {
 	if (rspShared(n, addr)) {
 		rspCatchUp(n);
 	}
-	if (addr < RDRAM_SIZE) {
+	if (addr < n->ramSize) {
 		if (n->pageFlags[addr >> 12]) {
 			n64RdramWrite(n, addr, 4);
 		}
@@ -923,7 +923,7 @@ uint64_t busRead64(struct N64* n, uint32_t addr) {
 
 static uint8_t* writable(struct N64* n, uint32_t addr, uint32_t len) {
 	addr &= 0x1FFFFFFF;
-	if (addr < RDRAM_SIZE) {
+	if (addr < n->ramSize) {
 		if (n->pageFlags[addr >> 12]) {
 			n64RdramWrite(n, addr, len);
 		}
@@ -962,7 +962,7 @@ bool busRepeatWrite(struct N64* n, uint32_t addr, int size, uint64_t value) {
 	if (size != 8) {
 		value = (value << 32) | (uint32_t) value;
 	}
-	uint32_t const end = (addr & ~7u) + length < RDRAM_SIZE ? (addr & ~7u) + length : RDRAM_SIZE;
+	uint32_t const end = (addr & ~7u) + length < n->ramSize ? (addr & ~7u) + length : n->ramSize;
 	if (end <= addr) {
 		return true;
 	}
@@ -1012,7 +1012,7 @@ void busWrite16(struct N64* n, uint32_t addr, uint64_t v) {
 
 void busReadLine(struct N64* n, uint32_t addr, uint8_t* out, int len) {
 	addr &= 0x1FFFFFFF;
-	if (addr < RDRAM_SIZE) {
+	if (addr < n->ramSize) {
 		n64RdramRead(n, addr, (uint32_t) len);
 		memcpy(out, &n->rdram[addr], (size_t) len);
 		return;
@@ -1039,7 +1039,7 @@ void busWriteLine(struct N64* n, uint32_t addr, const uint8_t* in, int len) {
 
 void busWrite64(struct N64* n, uint32_t addr, uint64_t v) {
 	busWrite32(n, addr, v >> 32);
-	if ((addr & 0x1FFFFFFF) < RDRAM_SIZE) {
+	if ((addr & 0x1FFFFFFF) < n->ramSize) {
 		busWrite32(n, addr + 4, (uint32_t) v);
 	}
 }

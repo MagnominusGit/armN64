@@ -234,6 +234,9 @@ struct Jit {
 	// FLE (Fastest): cycles counted at the block's exits, and no load interlocks, address checks or
 	// FPU result fix-ups.
 	bool fle;
+	// The RDRAM the console has (ramSize, 4 MiB without the Expansion Pak) as a shift: past it, the
+	// bus's.
+	int ramBits;
 	int opCycles;
 	// Status.FR as the block was compiled: with it clear, odd 32-bit FPU registers are the high
 	// halves of even ones.
@@ -1651,7 +1654,7 @@ static void emitMemory(struct Jit* j, struct Slow* slow) {
 	int32_t baseValue = 0;
 	bool const known = j->fast && constant(j, rs, &baseValue);
 	int64_t const at = (int64_t) baseValue + offset;
-	bool const direct = known && at == (int32_t) at && ((uint32_t) at ^ 0x80000000u) < RDRAM_SIZE && !((uint32_t) at & (uint32_t) (size - 1));
+	bool const direct = known && at == (int32_t) at && ((uint32_t) at ^ 0x80000000u) >> j->ramBits == 0 && !((uint32_t) at & (uint32_t) (size - 1));
 	if (direct) {
 		aMovImm(e, 6, (uint32_t) at ^ 0x80000000u);
 	} else {
@@ -1678,7 +1681,7 @@ static void emitMemory(struct Jit* j, struct Slow* slow) {
 		aLogicImm(e, A_EOR_IMM, 6, 0, 0x80000000);
 		if (j->fast) {
 			// kseg0's RDRAM and aligned in one test; anything else through vpages in the cold code.
-			aLogicImm(e, A_ANDS_IMM, ZR, 6, 0xFF800000u | (j->fle ? 0 : (uint32_t) (size - 1)));
+			aLogicImm(e, A_ANDS_IMM, ZR, 6, ~0u << j->ramBits | (j->fle ? 0 : (uint32_t) (size - 1)));
 			struct Miss* v = &j->mapped[j->mappedCount++];
 			v->site = aBcond(e, C_NE, NULL);
 			v->resume = e->p;
@@ -1689,7 +1692,7 @@ static void emitMemory(struct Jit* j, struct Slow* slow) {
 			slow->keep = true;
 		} else {
 			// kseg0's RDRAM directly; other pages from vpages, where one not looked up lands past RDRAM.
-			aLsrImm(e, 2, 6, 23);
+			aLsrImm(e, 2, 6, j->ramBits);
 			uint8_t* kseg0 = aCbz(e, 2, NULL);
 			aLsrImm(e, 1, 0, 12);
 			if (isStore) {
@@ -1956,7 +1959,7 @@ static uint8_t* fuseRun(struct Jit* j, const uint32_t* ops, uint32_t len, uint32
 	}
 	// The D-cache lines from the first address's to the last's; without caches, RDRAM.
 	if (j->fast) {
-		aLsrImm(e, 1, 6, 23);
+		aLsrImm(e, 1, 6, j->ramBits);
 		out[sites++] = aCbnz(e, 1, NULL);
 	}
 	for (int32_t step = 0; step <= hi - lo + 15 && !j->fast; step += 16) {
@@ -2111,7 +2114,7 @@ static void pollSkip(struct Jit* j, const uint32_t* ops, uint32_t count, uint32_
 			out[sites++] = aTbnz(e, 1, 1, NULL);
 		}
 		if (j->fast) {
-			aLsrImm(e, 1, 6, 23);
+			aLsrImm(e, 1, 6, j->ramBits);
 			out[sites++] = aCbnz(e, 1, NULL);
 			if (size > 1) {
 				aLogicImm(e, A_ANDS_IMM, ZR, 0, size - 1);
@@ -2451,6 +2454,7 @@ void* jitCompile(struct N64* n, const uint32_t* ops, uint32_t count, uint32_t va
 	j->rdpGl = n->rdpGl;
 	j->fast = n->fast;
 	j->fle = n->fast && n->fle;
+	j->ramBits = n->ramSize < RDRAM_SIZE ? 22 : 23;
 	j->plainCount = n->countCycles == 2;
 	j->opCycles = (int) n->opCycles;
 	j->cacheData = !n->compat && !n->fast;
@@ -2694,7 +2698,7 @@ void* jitCompile(struct N64* n, const uint32_t* ops, uint32_t count, uint32_t va
 			clean.dirty = 0;
 			// Past RDRAM, the interpreter. On a page the RDP draws to or reads, or the running RSP's DMA read,
 			// it waits for them there in C first.
-			aLsrImm(e, 2, 6, 23);
+			aLsrImm(e, 2, 6, j->ramBits);
 			slowSite(k->slow, aCbnz(e, 2, NULL), &clean);
 			aLogicImm(e, A_ANDS_IMM, ZR, 1, PAGE_RDP | PAGE_RSP_READS);
 			uint8_t* noRdp = aBcond(e, C_EQ, NULL);
@@ -2729,7 +2733,7 @@ void* jitCompile(struct N64* n, const uint32_t* ops, uint32_t count, uint32_t va
 				aLdst(e, L_LDR, 5, TLB, 1, L_UXTW | 0x1000);
 			}
 			aDp(e, A_ADD, 6, 0, 5, S_LSL, 0);
-			aLsrImm(e, 2, 6, 23);
+			aLsrImm(e, 2, 6, j->ramBits);
 			slowSite(v->slow, aCbnz(e, 2, NULL), &v->cache);
 			if (v->size > 1) {
 				aLogicImm(e, A_ANDS_IMM, ZR, 0, v->size - 1);
@@ -2761,7 +2765,7 @@ void* jitCompile(struct N64* n, const uint32_t* ops, uint32_t count, uint32_t va
 				aLogicImm(e, A_ANDS_IMM, ZR, 0, m->size - 1);
 				slowSite(m->slow, aBcond(e, C_NE, NULL), &clean);
 			}
-			aLsrImm(e, 2, 6, 23);
+			aLsrImm(e, 2, 6, j->ramBits);
 			slowSite(m->slow, aCbnz(e, 2, NULL), &clean);
 			if (m->glLoad) {
 				// A line coming in from a page the GPU draws to (a game invalidates its cache before

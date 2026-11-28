@@ -100,9 +100,11 @@ effect while the game runs, the Expansion Pak's when the game restarts.
   timing. Accurate: cycle for cycle. Graphics follow Graphics Microcode in every mode.
 - **Frame Skip.** Leaves frames undrawn and shows the one before again. Auto skips only when the
   device falls behind (the frontend's audio buffer runs low); Every Other Frame always does.
-- **Expansion Pak.** Off makes games see 4 MB, as on a console without one. Auto leaves it out for the
-  retail games known not to use it (run with and without one, checked against Nintendo's list of the
-  games that do) and keeps it for everything else: games that use it, hacks, homebrew and disks.
+- **Expansion Pak.** Off is a console without one: 4 MB, and nothing past it for a game that looks
+  (games that need the pak say so). Auto leaves it out for the retail games known not to use it (run
+  with and without one, checked against Nintendo's list of the games that do) and keeps it for
+  everything else: games that use it, hacks, homebrew and disks. As on a console, a change takes
+  effect when the game restarts.
 
 ### Video
 

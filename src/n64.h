@@ -304,8 +304,9 @@ struct CheatCart {
 
 struct N64 {
 	uint8_t* rdram;
-	// The RDRAM the console has: RDRAM_SIZE with the Expansion Pak, 4 MiB without it (pifBoot). All
-	// of rdram is there either way; save states hold only this much.
+	// The RDRAM the console has: RDRAM_SIZE with the Expansion Pak, 4 MiB without it (pifBoot). Past
+	// it, as on the console, the CPU (compiled code too), the RSP's, PI's and SI's DMA and cheats find
+	// nothing: reads are zeros, writes go nowhere. rdram is RDRAM_SIZE either way; states stop there.
 	uint32_t ramSize;
 	// RDRAM's hidden ninth bits, as the RDP keeps them: two coverage bits for each halfword.
 	uint8_t* hidden;
